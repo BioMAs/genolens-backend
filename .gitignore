@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+.venv/
+env/
+.env/
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+
+# Testing and Quality Assurance
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Project Specific - Data and Storage
+data_test/
+genolens_storage/
+postgres_data/
+ollama_data/
+app/data/
+
+# Docker
+.dockerignore
