@@ -66,7 +66,7 @@ services:
       - "traefik.enable=true"
       - "traefik.docker.network=web"
       # Router Definition
-      - "traefik.http.routers.genolens-api.rule=Host(`api.your-domain.com`)"
+      - "traefik.http.routers.genolens-api.rule=Host(`api-v2.genolens.com`)"
       - "traefik.http.routers.genolens-api.entrypoints=websecure"
       - "traefik.http.routers.genolens-api.tls.certresolver=myresolver"
       # Service Definition
