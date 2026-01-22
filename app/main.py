@@ -22,7 +22,8 @@ async def lifespan(app: FastAPI):
     # Startup
     print(f"🚀 Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     print(f"🌍 Environment: {settings.ENVIRONMENT}")
-    print(f"📊 Database: Connected")
+    print(f"� CORS Origins: {settings.CORS_ORIGINS}")
+    print(f"�📊 Database: Connected")
     print(f"🔄 Celery: Worker configured")
 
     yield

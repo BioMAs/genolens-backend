@@ -48,7 +48,7 @@ services:
       - ENVIRONMENT=production
       - LOCAL_STORAGE_PATH=/app/data
       - OLLAMA_BASE_URL=http://ollama:11434
-      - 'CORS_ORIGINS=["https://app.genolens.com","https://api-v2.genolens.com","http://localhost:3000"]'
+      - CORS_ORIGINS=https://app.genolens.com,https://api-v2.genolens.com,http://localhost:3000
 
     volumes:
       - genolens_storage:/app/data

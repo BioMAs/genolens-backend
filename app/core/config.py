@@ -2,9 +2,9 @@
 Application configuration using Pydantic Settings.
 Loads configuration from environment variables.
 """
-from typing import Optional
+from typing import Optional, Any, List, Union
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, field_validator
 
 
 class Settings(BaseSettings):
@@ -64,6 +64,13 @@ class Settings(BaseSettings):
         description="Allowed CORS origins"
     )
 
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def assemble_cors_origins(cls, v: Union[str, List[str]]) -> Union[List[str], str]:
+        if isinstance(v, str) and not v.strip().startswith("["):
+            return [i.strip() for i in v.split(",")]
+        return v
+    
     # File Processing
     LOCAL_STORAGE_PATH: str = Field(
         default="/app/data",
