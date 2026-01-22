@@ -49,6 +49,7 @@ async def create_project(
     return project
 
 
+@router.get("", response_model=ProjectListResponse)
 @router.get("/", response_model=ProjectListResponse)
 async def list_projects(
     db: Annotated[AsyncSession, Depends(get_db)],
