@@ -164,7 +164,7 @@ async def increment_ai_usage(
         was_free=was_free
     )
     db.add(log)
-    db.add(user)  # Update user counters
+    user = await db.merge(user)  # Update user counters (reattach to session)
     await db.commit()
 
 

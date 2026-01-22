@@ -11,7 +11,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U genolens"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -70,7 +70,7 @@ services:
       # Router Definition
       - "traefik.http.routers.genolens-api.rule=Host(`api-v2.genolens.com`)"
       - "traefik.http.routers.genolens-api.entrypoints=websecure"
-      - "traefik.http.routers.genolens-api.tls.certresolver=myresolver"
+      - "traefik.http.routers.genolens-api.tls.certresolver=letsencrypt"
       # Service Definition
       - "traefik.http.services.genolens-api.loadbalancer.server.port=8000"
 
