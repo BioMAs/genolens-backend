@@ -18,57 +18,38 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Create comment_type enum only if it doesn't already exist
-    bind = op.get_bind()
-    result = bind.execute(
-        sa.text("SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = 'comment_type_enum')")
-    )
-    if not result.scalar():
-        bind.execute(sa.text(
-            "CREATE TYPE comment_type_enum AS ENUM ('GENERAL', 'GENE', 'COMPARISON', 'PATHWAY')"
-        ))
-    
-    # Create project_comments table
-    op.create_table(
-        'project_comments',
-        sa.Column('id', postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column('project_id', postgresql.UUID(as_uuid=True), 
-                  sa.ForeignKey('projects.id', ondelete='CASCADE'), nullable=False,
-                  comment='Project this comment belongs to'),
-        sa.Column('user_id', postgresql.UUID(as_uuid=True), nullable=False,
-                  comment='Supabase Auth user UUID who created the comment'),
-        sa.Column('comment_type', sa.Enum(
-            'GENERAL', 'GENE', 'COMPARISON', 'PATHWAY',
-            name='comment_type_enum', 
-            create_type=False
-        ), nullable=False, server_default='GENERAL',
-                  comment='Type of comment (general, gene, comparison, pathway)'),
-        sa.Column('target_id', sa.String(255), nullable=True,
-                  comment='ID of the target entity (gene_symbol, comparison_name, pathway_id)'),
-        sa.Column('content', sa.Text, nullable=False,
-                  comment='Comment content in markdown format'),
-        sa.Column('parent_id', postgresql.UUID(as_uuid=True),
-                  sa.ForeignKey('project_comments.id', ondelete='CASCADE'), nullable=True,
-                  comment='Parent comment ID for threaded discussions'),
-        sa.Column('is_resolved', sa.Boolean, nullable=False, server_default='false',
-                  comment='Whether this comment thread is resolved'),
-        sa.Column('extra_metadata', postgresql.JSON, nullable=False, server_default='{}',
-                  comment='Additional metadata (mentions, tags, etc.)'),
-        sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, 
-                  server_default=sa.text('now()')),
-        sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text('now()'))
-    )
-    
-    # Indexes for project_comments
-    op.create_index('ix_project_comments_project_id', 'project_comments', ['project_id'])
-    op.create_index('ix_project_comments_user_id', 'project_comments', ['user_id'])
-    op.create_index('ix_project_comments_target_id', 'project_comments', ['target_id'])
-    op.create_index('ix_project_comments_parent_id', 'project_comments', ['parent_id'])
-    op.create_index('ix_project_comments_project_type', 'project_comments',
-                   ['project_id', 'comment_type'])
-    op.create_index('ix_project_comments_target', 'project_comments',
-                   ['project_id', 'target_id'])
+    # Create comment_type enum idempotently (works in all PostgreSQL versions)
+    op.execute(sa.text("""
+        DO $$ BEGIN
+            CREATE TYPE comment_type_enum AS ENUM ('GENERAL', 'GENE', 'COMPARISON', 'PATHWAY');
+        EXCEPTION WHEN duplicate_object THEN null;
+        END $$;
+    """))
+
+    # Create project_comments table (idempotent)
+    op.execute(sa.text("""
+        CREATE TABLE IF NOT EXISTS project_comments (
+            id UUID PRIMARY KEY,
+            project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL,
+            comment_type comment_type_enum NOT NULL DEFAULT 'GENERAL',
+            target_id VARCHAR(255),
+            content TEXT NOT NULL,
+            parent_id UUID REFERENCES project_comments(id) ON DELETE CASCADE,
+            is_resolved BOOLEAN NOT NULL DEFAULT false,
+            extra_metadata JSON NOT NULL DEFAULT '{}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """))
+
+    # Indexes (all idempotent)
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_comments_project_id ON project_comments (project_id)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_comments_user_id ON project_comments (user_id)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_comments_target_id ON project_comments (target_id)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_comments_parent_id ON project_comments (parent_id)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_comments_project_type ON project_comments (project_id, comment_type)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_comments_target ON project_comments (project_id, target_id)"))
 
 
 def downgrade() -> None:

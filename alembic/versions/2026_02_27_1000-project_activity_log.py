@@ -19,79 +19,41 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Create the enum type
-    activity_event_type_enum = sa.Enum(
-        'dataset_uploaded',
-        'dataset_deleted',
-        'comparison_created',
-        'enrichment_run',
-        'clustering_run',
-        'gsea_run',
-        'go_enrichment_run',
-        'bookmark_created',
-        'bookmark_batch_created',
-        'bookmark_deleted',
-        'gene_list_created',
-        'comment_added',
-        'project_shared',
-        name='activity_event_type_enum',
-    )
-    activity_event_type_enum.create(op.get_bind(), checkfirst=True)
+    # Create the enum type idempotently
+    op.execute(sa.text("""
+        DO $$ BEGIN
+            CREATE TYPE activity_event_type_enum AS ENUM (
+                'dataset_uploaded', 'dataset_deleted', 'comparison_created',
+                'enrichment_run', 'clustering_run', 'gsea_run', 'go_enrichment_run',
+                'bookmark_created', 'bookmark_batch_created', 'bookmark_deleted',
+                'gene_list_created', 'comment_added', 'project_shared'
+            );
+        EXCEPTION WHEN duplicate_object THEN null;
+        END $$;
+    """))
 
-    # Create the table
-    op.create_table(
-        'project_activity_log',
-        sa.Column('id', sa.UUID(), nullable=False),
-        sa.Column('project_id', sa.UUID(), nullable=False),
-        sa.Column('user_id', sa.UUID(), nullable=False),
-        sa.Column(
-            'event_type',
-            sa.Enum(
-                'dataset_uploaded',
-                'dataset_deleted',
-                'comparison_created',
-                'enrichment_run',
-                'clustering_run',
-                'gsea_run',
-                'go_enrichment_run',
-                'bookmark_created',
-                'bookmark_batch_created',
-                'bookmark_deleted',
-                'gene_list_created',
-                'comment_added',
-                'project_shared',
-                name='activity_event_type_enum',
-                create_type=False,
-            ),
-            nullable=False,
-        ),
-        sa.Column('entity_type', sa.String(length=100), nullable=True),
-        sa.Column('entity_id', sa.String(length=255), nullable=True),
-        sa.Column('entity_name', sa.String(length=500), nullable=True),
-        sa.Column('extra_metadata', sa.JSON(), nullable=False, server_default='{}'),
-        sa.Column(
-            'created_at',
-            sa.DateTime(timezone=True),
-            server_default=sa.text('now()'),
-            nullable=False,
-        ),
-        sa.ForeignKeyConstraint(
-            ['project_id'],
-            ['projects.id'],
-            ondelete='CASCADE',
-        ),
-        sa.PrimaryKeyConstraint('id'),
-    )
+    # Create the table idempotently
+    op.execute(sa.text("""
+        CREATE TABLE IF NOT EXISTS project_activity_log (
+            id UUID NOT NULL PRIMARY KEY,
+            project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL,
+            event_type activity_event_type_enum NOT NULL,
+            entity_type VARCHAR(100),
+            entity_id VARCHAR(255),
+            entity_name VARCHAR(500),
+            extra_metadata JSON NOT NULL DEFAULT '{}',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """))
 
-    # Simple indexes
-    op.create_index('ix_project_activity_log_project_id', 'project_activity_log', ['project_id'], unique=False)
-    op.create_index('ix_project_activity_log_user_id', 'project_activity_log', ['user_id'], unique=False)
-    op.create_index('ix_project_activity_log_event_type', 'project_activity_log', ['event_type'], unique=False)
-    op.create_index('ix_project_activity_log_created_at', 'project_activity_log', ['created_at'], unique=False)
-
-    # Composite indexes
-    op.create_index('ix_activity_log_project_created', 'project_activity_log', ['project_id', 'created_at'], unique=False)
-    op.create_index('ix_activity_log_project_event', 'project_activity_log', ['project_id', 'event_type'], unique=False)
+    # Indexes (all idempotent)
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_activity_log_project_id ON project_activity_log (project_id)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_activity_log_user_id ON project_activity_log (user_id)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_activity_log_event_type ON project_activity_log (event_type)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_project_activity_log_created_at ON project_activity_log (created_at)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_activity_log_project_created ON project_activity_log (project_id, created_at)"))
+    op.execute(sa.text("CREATE INDEX IF NOT EXISTS ix_activity_log_project_event ON project_activity_log (project_id, event_type)"))
 
 
 def downgrade() -> None:
