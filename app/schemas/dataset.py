@@ -11,37 +11,37 @@ from app.models.models import DatasetType, DatasetStatus
 
 
 class DatasetBase(BaseModel):
-    """Base dataset schema with enhanced validation."""
+    """Base dataset schema."""
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = Field(None, max_length=2000)
     type: DatasetType
     column_mapping: dict[str, str] = Field(default_factory=dict)
-    
-    @field_validator('name')
-    @classmethod
-    def validate_name(cls, v: str) -> str:
-        """Validate dataset name: alphanumeric, spaces, hyphens, underscores only."""
-        if not re.match(r'^[a-zA-Z0-9\s_-]+$', v):
-            raise ValueError(
-                'Dataset name must contain only alphanumeric characters, spaces, hyphens, and underscores'
-            )
-        return v.strip()
-    
-    @field_validator('column_mapping')
-    @classmethod
-    def validate_column_mapping(cls, v: dict) -> dict:
-        """Validate column mapping contains only safe characters."""
-        for key, value in v.items():
-            if not re.match(r'^[a-zA-Z0-9_.:/-]+$', key):
-                raise ValueError(f'Invalid column name: {key}')
-            if not re.match(r'^[a-zA-Z0-9_.:/-]+$', value):
-                raise ValueError(f'Invalid mapped column name: {value}')
-        return v
 
 
 class DatasetCreate(DatasetBase):
     """Schema for creating a dataset."""
     project_id: UUID
+
+    @field_validator('name')
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """Validate dataset name: alphanumeric, spaces, hyphens, underscores only."""
+        if not re.match(r'^[a-zA-Z0-9\s_\-\'éèêëàâîïôùûüçœæ().,+&]+$', v, re.UNICODE):
+            raise ValueError(
+                'Dataset name contains invalid characters'
+            )
+        return v.strip()
+
+    @field_validator('column_mapping')
+    @classmethod
+    def validate_column_mapping(cls, v: dict) -> dict:
+        """Validate column mapping contains only safe characters."""
+        for key, value in v.items():
+            if not re.match(r'^[a-zA-Z0-9_.:/ -]+$', key):
+                raise ValueError(f'Invalid column name: {key}')
+            if not re.match(r'^[a-zA-Z0-9_.:/ -]+$', value):
+                raise ValueError(f'Invalid mapped column name: {value}')
+        return v
 
 
 class DatasetUpdate(BaseModel):

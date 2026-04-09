@@ -678,7 +678,7 @@ async def list_project_datasets(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     dataset_type: Optional[DatasetType] = Query(None, description="Filter by dataset type"),
-    status: Optional[DatasetStatus] = Query(None, description="Filter by status"),
+    dataset_status: Optional[DatasetStatus] = Query(None, alias="status", description="Filter by status"),
     page: int = Query(default=1, ge=1, description="Page number"),
     page_size: int = Query(default=100, ge=1, le=500, description="Items per page")
 ) -> list[Dataset]:
@@ -710,8 +710,8 @@ async def list_project_datasets(
     if dataset_type:
         query = query.where(Dataset.type == dataset_type)
     
-    if status:
-        query = query.where(Dataset.status == status)
+    if dataset_status:
+        query = query.where(Dataset.status == dataset_status)
     
     offset = (page - 1) * page_size
     query = query.order_by(Dataset.created_at.desc()).offset(offset).limit(page_size)
