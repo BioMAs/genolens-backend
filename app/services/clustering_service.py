@@ -29,7 +29,8 @@ class ClusteringService:
         sort_by: Optional[str] = None,
         max_genes_for_clustering: int = 2000,
         precomputed_col_clustering: Optional[Dict[str, Any]] = None,
-        n_clusters: Optional[int] = None  # For K-means
+        n_clusters: Optional[int] = None,  # For K-means
+        return_zscore: bool = False  # If True, z in result is normalized [-1, 1]
     ) -> Dict[str, Any]:
         """
         Perform hierarchical or K-means clustering on the provided DataFrame.
@@ -178,10 +179,16 @@ class ClusteringService:
         # Let's return raw data + indices, frontend (plotly) handles mapping or we map there.
         # However, for heatmap, we usually send x, y, and z.
         
-        result["z"] = df.values.tolist() # raw values
-        
-        # Return z in row-major order ? No, just return as is, let client handle via row_order/col_order
-        
+        if return_zscore:
+            # Return z-scores normalized to [-1, 1] so the frontend can render directly
+            z_values = normalized_values  # already z-scored
+            # Scale each row to [-1, 1]
+            max_abs = np.abs(z_values).max(axis=1, keepdims=True)
+            max_abs[max_abs == 0] = 1.0
+            result["z"] = (z_values / max_abs).tolist()
+        else:
+            result["z"] = df.values.tolist()  # raw values
+
         return result
 
     def _compute_linkage(self, data: np.ndarray, method: str = "ward", metric: str = "euclidean") -> np.ndarray:

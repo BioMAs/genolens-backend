@@ -10,6 +10,7 @@ from uuid import UUID
 from pathlib import Path
 from typing import Annotated, Optional
 from app.services.storage import storage_service
+import asyncio
 from fastapi import (
     APIRouter,
     Depends,
@@ -21,6 +22,7 @@ from fastapi import (
     Query,
     Body
 )
+from fastapi.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_user, get_db
 from app.api.deps.subscription import (
@@ -3617,59 +3619,54 @@ async def cluster_dataset(
 
     try:
         # OPTIMIZATION: If gene_ids specified, use subset query (much faster)
-        if params.gene_ids and len(params.gene_ids) > 0:
-            logger.info(f"Loading subset of {len(params.gene_ids)} genes for clustering from dataset {dataset_id}")
-            # Download file and extract subset
+        # Always try the in-memory DataFrame cache first (avoids storage downloads)
+        df = cache_service.get_dataframe(str(dataset_id))
+
+        if df is not None:
+            logger.info(f"Using cached DataFrame for dataset {dataset_id}")
+            # If specific genes requested, subset the cached DataFrame
+            if params.gene_ids and len(params.gene_ids) > 0:
+                valid_genes = [g for g in params.gene_ids if g in df.index]
+                if not valid_genes:
+                    raise HTTPException(status_code=400, detail="None of the requested gene_ids were found in the cached dataset.")
+                df = df.loc[valid_genes]
+                logger.info(f"Subset from cache: {len(df)} genes x {len(df.columns)} samples")
+        else:
+            # Cache miss — download the full dataset, cache it, then subset if needed
+            logger.info(f"Loading full dataset {dataset_id} from storage (not in cache)")
             try:
                 file_data = await storage_service.download_file(parquet_path)
             except Exception as storage_error:
                 logger.error(f"Failed to download file {parquet_path}: {storage_error}")
                 raise HTTPException(
-                    status_code=500, 
-                    detail=f"Failed to access dataset file from storage. File may be missing or corrupted."
+                    status_code=500,
+                    detail="Failed to access dataset file from storage. File may be missing or corrupted."
                 )
-            
-            df = await data_processor.query_matrix_subset(
-                parquet_data=file_data,
-                gene_list=params.gene_ids,
-                sample_columns=None  # Will read all sample columns
-            )
-            logger.info(f"Loaded subset: {len(df)} genes x {len(df.columns)} samples (PyArrow optimized)")
-        else:
-            # Full dataset or top_n_genes mode
-            # Check DataFrame cache for hot datasets
-            df = cache_service.get_dataframe(str(dataset_id))
-            
-            if df is None:
-                # Not in cache, download and parse
-                logger.info(f"Loading full dataset {dataset_id} from storage (not in cache)")
-                try:
-                    file_data = await storage_service.download_file(parquet_path)
-                except Exception as storage_error:
-                    logger.error(f"Failed to download file {parquet_path}: {storage_error}")
-                    raise HTTPException(
-                        status_code=500, 
-                        detail=f"Failed to access dataset file from storage. File may be missing or corrupted."
-                    )
-                
-                df = await data_processor.get_dataframe(file_data)
-                
-                # Set index if needed
-                if "gene_id" in df.columns:
-                    df = df.set_index("gene_id")
-                elif "Unnamed: 0" in df.columns:
-                     df = df.set_index("Unnamed: 0")
-                else:
-                    logger.warning(f"Dataset {dataset_id} has no gene_id or Unnamed: 0 column, using default index")
-                
-                # Cache for future requests (only if reasonable size)
-                if df.memory_usage(deep=True).sum() < 500 * 1024 * 1024:  # < 500 MB
-                    cache_service.set_dataframe(str(dataset_id), df)
-                    logger.info(f"Cached DataFrame for dataset {dataset_id} ({df.memory_usage(deep=True).sum() / 1024 / 1024:.1f} MB)")
-                else:
-                    logger.info(f"Dataset {dataset_id} too large to cache ({df.memory_usage(deep=True).sum() / 1024 / 1024:.0f} MB)")
+
+            df = await data_processor.get_dataframe(file_data)
+
+            # Set index if needed
+            if "gene_id" in df.columns:
+                df = df.set_index("gene_id")
+            elif "Unnamed: 0" in df.columns:
+                df = df.set_index("Unnamed: 0")
             else:
-                logger.info(f"Using cached DataFrame for dataset {dataset_id}")
+                logger.warning(f"Dataset {dataset_id} has no gene_id or Unnamed: 0 column, using default index")
+
+            # Cache the full DataFrame for future requests (only if reasonable size)
+            if df.memory_usage(deep=True).sum() < 500 * 1024 * 1024:  # < 500 MB
+                cache_service.set_dataframe(str(dataset_id), df)
+                logger.info(f"Cached DataFrame for dataset {dataset_id} ({df.memory_usage(deep=True).sum() / 1024 / 1024:.1f} MB)")
+            else:
+                logger.info(f"Dataset {dataset_id} too large to cache ({df.memory_usage(deep=True).sum() / 1024 / 1024:.0f} MB)")
+
+            # Subset if specific genes requested
+            if params.gene_ids and len(params.gene_ids) > 0:
+                valid_genes = [g for g in params.gene_ids if g in df.index]
+                if not valid_genes:
+                    raise HTTPException(status_code=400, detail="None of the requested gene_ids were found in the dataset.")
+                df = df.loc[valid_genes]
+                logger.info(f"Loaded subset: {len(df)} genes x {len(df.columns)} samples")
         
         # Ensure all data is numeric for clustering
         # Filter out non-numeric columns just in case
@@ -3704,10 +3701,11 @@ async def cluster_dataset(
             if precomputed_col_clustering:
                 logger.info(f"⚡ Using pre-computed sample clustering for {dataset_id}")
         
-        # 4. Perform Clustering
+        # 4. Perform Clustering (run in thread pool — CPU-bound, must not block asyncio loop)
         try:
             logger.info(f"Starting clustering with params: top_n={params.top_n_genes}, genes={len(params.gene_ids or [])}, method={params.method}, metric={params.metric}")
-            result = clustering_service.perform_clustering(
+            result = await run_in_threadpool(
+                clustering_service.perform_clustering,
                 numeric_df,
                 top_n_genes=params.top_n_genes,
                 gene_ids=params.gene_ids,
@@ -3718,7 +3716,7 @@ async def cluster_dataset(
                 sort_by=params.sort_by,
                 max_genes_for_clustering=params.max_genes_for_clustering,
                 precomputed_col_clustering=precomputed_col_clustering,
-                n_clusters=params.n_clusters
+                n_clusters=params.n_clusters,
             )
             logger.info(f"Clustering completed successfully for dataset {dataset_id}")
 
@@ -3766,6 +3764,212 @@ async def cluster_dataset(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error accessing dataset data: {str(e)}")
+
+# ============================================================================
+# Combined Heatmap Clustering Endpoint (fast path for heatmap component)
+# ============================================================================
+
+class HeatmapClusteringRequest(BaseModel):
+    """Combined clustering request for UP and DOWN gene groups."""
+    up_gene_ids: List[str] = []
+    down_gene_ids: List[str] = []
+    method: str = "ward"
+    metric: str = "euclidean"
+    cluster_rows: bool = True
+    cluster_cols: bool = True
+    max_genes_for_clustering: int = 2000
+    n_clusters: Optional[int] = None
+
+from typing import List as _List  # already imported, just here for clarity
+
+@router.post("/{dataset_id}/cluster-heatmap")
+async def cluster_heatmap(
+    dataset_id: UUID,
+    params: HeatmapClusteringRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+):
+    """
+    Optimised single-call heatmap endpoint.
+
+    Instead of 2 separate /cluster calls (one for UP genes, one for DOWN genes),
+    this endpoint:
+      1. Loads the matrix DataFrame once (cache-first).
+      2. Computes column (sample) clustering once; shared between UP and DOWN.
+      3. Clusters UP and DOWN gene rows in parallel via a thread pool.
+      4. Returns pre-normalised z-scores [-1, 1] so the frontend needs no extra computation.
+    """
+    # 1. Check permissions and dataset
+    query = (
+        select(Dataset)
+        .join(Project)
+        .where(Dataset.id == dataset_id)
+    )
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found or access denied")
+
+    project_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
+    project = project_result.scalar_one()
+
+    if str(project.owner_id) != str(current_user.user_id):
+        member_query = select(ProjectMember).where(
+            ProjectMember.project_id == project.id,
+            ProjectMember.user_id == current_user.user_id,
+        )
+        member = (await db.execute(member_query)).scalar_one_or_none()
+        if not member:
+            raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+
+    if dataset.type != DatasetType.MATRIX:
+        raise HTTPException(status_code=400, detail="Clustering only supported for count/expression matrices")
+
+    if dataset.status != DatasetStatus.READY:
+        raise HTTPException(status_code=400, detail="Dataset is not ready for analysis")
+
+    all_gene_ids = list(dict.fromkeys(params.up_gene_ids + params.down_gene_ids))
+    if not all_gene_ids:
+        raise HTTPException(status_code=400, detail="No gene IDs provided")
+
+    parquet_path = dataset.parquet_file_path or dataset.raw_file_path
+    if not parquet_path:
+        raise HTTPException(status_code=500, detail="Dataset file path missing. Contact support.")
+
+    try:
+        # 2. Load DataFrame — cache first, then storage
+        df = cache_service.get_dataframe(str(dataset_id))
+        if df is not None:
+            logger.info(f"[cluster-heatmap] Using cached DataFrame for {dataset_id}")
+        else:
+            logger.info(f"[cluster-heatmap] Downloading full DataFrame for {dataset_id}")
+            try:
+                file_data = await storage_service.download_file(parquet_path)
+            except Exception as storage_error:
+                logger.error(f"[cluster-heatmap] Storage error {parquet_path}: {storage_error}")
+                raise HTTPException(status_code=500, detail="Failed to access dataset file from storage.")
+
+            df = await data_processor.get_dataframe(file_data)
+            if "gene_id" in df.columns:
+                df = df.set_index("gene_id")
+            elif "Unnamed: 0" in df.columns:
+                df = df.set_index("Unnamed: 0")
+
+            if df.memory_usage(deep=True).sum() < 500 * 1024 * 1024:
+                cache_service.set_dataframe(str(dataset_id), df)
+                logger.info(f"[cluster-heatmap] Cached full DataFrame ({df.memory_usage(deep=True).sum() / 1024 / 1024:.1f} MB)")
+
+        numeric_df = df.select_dtypes(include=[np.number])
+        if numeric_df.empty:
+            raise HTTPException(status_code=400, detail="No numeric data found in dataset.")
+
+        # 3. Compute column (sample) clustering ONCE using all requested genes
+        valid_all = [g for g in all_gene_ids if g in numeric_df.index]
+        if not valid_all:
+            raise HTTPException(status_code=400, detail="None of the provided gene_ids were found in the dataset.")
+
+        df_all_genes = numeric_df.loc[valid_all]
+
+        precomputed_col_clustering = None
+        if params.cluster_cols:
+            from app.services.persistent_cache_service import persistent_cache_service
+            precomputed_col_clustering = await persistent_cache_service.get_cached(
+                db=db,
+                computation_type="sample_clustering",
+                dataset_id=str(dataset_id),
+                params={"method": params.method, "metric": params.metric, "top_n_genes": 2000},
+            )
+            if precomputed_col_clustering:
+                logger.info(f"[cluster-heatmap] Using pre-computed sample clustering for {dataset_id}")
+
+        if precomputed_col_clustering is None and params.cluster_cols:
+            # Compute column clustering once on all requested genes
+            precomputed_col_clustering = await run_in_threadpool(
+                clustering_service.precompute_sample_clustering,
+                df_all_genes,
+                method=params.method,
+                metric=params.metric,
+                top_n_genes=len(valid_all),
+            )
+
+        # 4. Cluster UP and DOWN gene rows in parallel (thread pool)
+        up_valid = [g for g in params.up_gene_ids if g in numeric_df.index]
+        down_valid = [g for g in params.down_gene_ids if g in numeric_df.index]
+
+        async def _cluster_group(gene_ids: list) -> dict:
+            if not gene_ids:
+                return {}
+            return await run_in_threadpool(
+                clustering_service.perform_clustering,
+                numeric_df,
+                top_n_genes=len(gene_ids),
+                gene_ids=gene_ids,
+                cluster_rows=params.cluster_rows,
+                cluster_cols=False,  # columns clustered once above
+                method=params.method,
+                metric=params.metric,
+                max_genes_for_clustering=params.max_genes_for_clustering,
+                precomputed_col_clustering=precomputed_col_clustering,
+                n_clusters=params.n_clusters,
+                return_zscore=True,
+            )
+
+        up_result, down_result = await asyncio.gather(
+            _cluster_group(up_valid),
+            _cluster_group(down_valid),
+        )
+
+        # 5. Build unified column order from shared clustering
+        col_labels: list = []
+        col_order: list = []
+        if precomputed_col_clustering:
+            col_labels = precomputed_col_clustering.get("col_labels", [])
+            raw_col_order = precomputed_col_clustering.get("col_order", list(range(len(col_labels))))
+            col_order = raw_col_order
+        elif up_result:
+            col_labels = up_result.get("col_labels", [])
+            col_order = up_result.get("col_order", list(range(len(col_labels))))
+        elif down_result:
+            col_labels = down_result.get("col_labels", [])
+            col_order = down_result.get("col_order", list(range(len(col_labels))))
+
+        ordered_col_labels = [col_labels[i] for i in col_order] if col_labels else []
+
+        def _align_chunk(res: dict) -> dict:
+            """Align a clustering result to the shared column order."""
+            if not res:
+                return {"z": [], "y": []}
+            chunk_cols = res.get("col_labels", [])
+            col_map = {c: i for i, c in enumerate(chunk_cols)}
+            align_indices = [col_map.get(c) for c in ordered_col_labels]
+
+            row_order = res.get("row_order", list(range(len(res.get("z", [])))))
+            z_raw = res.get("z", [])
+            y_raw = res.get("row_labels", [])
+
+            aligned_z = [
+                [z_raw[i][j] if j is not None else 0.0 for j in align_indices]
+                for i in row_order
+            ]
+            ordered_y = [y_raw[i] for i in row_order]
+            return {"z": aligned_z, "y": ordered_y}
+
+        return {
+            "up": _align_chunk(up_result),
+            "down": _align_chunk(down_result),
+            "x": ordered_col_labels,
+            "col_order": col_order,
+            "col_labels": col_labels,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Heatmap clustering failed: {str(e)}")
+
 
 # ============================================================================
 # Heatmap Optimization Endpoints
