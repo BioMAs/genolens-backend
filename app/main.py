@@ -128,6 +128,14 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Handle unexpected errors gracefully."""
+    # Always log the full traceback so we can debug production issues
+    logger.exception(
+        "Unhandled exception on %s %s: %s",
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+    )
+
     response_content = {}
     
     if settings.is_development:
