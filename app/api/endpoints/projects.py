@@ -20,6 +20,7 @@ from app.schemas.project import (
     ProjectSummaryResponse,
     ProjectStats,
     ComparisonSummary,
+    PaginatedComparisonsResponse,
     ProjectMemberCreate,
     ProjectMemberUpdate,
     ProjectMemberResponse,
@@ -153,6 +154,102 @@ async def update_project(
     return project
 
 
+def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
+    """
+    Build the list of ComparisonSummary from a list of Dataset objects.
+    """
+    comparisons_dict: dict[str, ComparisonSummary] = {}
+
+    for d in datasets:
+        metadata = d.dataset_metadata or {}
+
+        # Single file per comparison (old way)
+        if d.type == "DEG":
+            comp_name = metadata.get('comparison_name', d.name) if metadata else d.name
+            deg_up = metadata.get('deg_up', 0) if metadata else 0
+            deg_down = metadata.get('deg_down', 0) if metadata else 0
+            deg_total = metadata.get('deg_total', deg_up + deg_down) if metadata else 0
+            comparisons_dict[comp_name] = ComparisonSummary(
+                name=comp_name,
+                deg_up=deg_up,
+                deg_down=deg_down,
+                deg_total=deg_total,
+                has_enrichment=False,
+                dataset_id=d.id,
+                dataset_type='SINGLE'
+            )
+
+        # Global DEG file (new way)
+        if metadata and 'comparisons' in metadata:
+            for comp_name, comp_info in metadata['comparisons'].items():
+                deg_up = comp_info.get('deg_up', 0)
+                deg_down = comp_info.get('deg_down', 0)
+                deg_total = comp_info.get('deg_total', deg_up + deg_down)
+                comparisons_dict[comp_name] = ComparisonSummary(
+                    name=comp_name,
+                    deg_up=deg_up,
+                    deg_down=deg_down,
+                    deg_total=deg_total,
+                    has_enrichment=False,
+                    dataset_id=d.id,
+                    dataset_type='GLOBAL'
+                )
+
+    # Mark comparisons with enrichment
+    for d in datasets:
+        metadata = d.dataset_metadata or {}
+        if d.type == "ENRICHMENT" and metadata:
+            enrichment_comparisons = metadata.get('enrichment_comparisons', [])
+            for comp_name in enrichment_comparisons:
+                if comp_name in comparisons_dict:
+                    comparisons_dict[comp_name].has_enrichment = True
+
+    return list(comparisons_dict.values())
+
+
+@router.get("/{project_id}/comparisons", response_model=PaginatedComparisonsResponse)
+async def list_project_comparisons(
+    project_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+) -> dict:
+    """
+    Get paginated comparisons for a project.
+    """
+    query = select(Project).where(
+        Project.id == project_id,
+        Project.owner_id == current_user.user_id
+    )
+    result = await db.execute(query)
+    project = result.scalar_one_or_none()
+
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found"
+        )
+
+    datasets_query = select(Dataset).where(Dataset.project_id == project_id).order_by(Dataset.created_at.desc())
+    result = await db.execute(datasets_query)
+    datasets = result.scalars().all()
+
+    all_comparisons = _build_comparisons_from_datasets(datasets)
+    total = len(all_comparisons)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    offset = (page - 1) * page_size
+    page_comparisons = all_comparisons[offset:offset + page_size]
+
+    return {
+        "comparisons": page_comparisons,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+    }
+
+
 @router.get("/{project_id}/summary", response_model=ProjectSummaryResponse)
 async def get_project_summary(
     project_id: UUID,
@@ -188,57 +285,9 @@ async def get_project_summary(
     failed_count = sum(1 for d in datasets if d.status == "FAILED")
     original_files_count = sum(1 for d in datasets if d.raw_file_path)
 
-    # Extract comparisons from datasets
-    comparisons_dict: dict[str, ComparisonSummary] = {}
-
-    for d in datasets:
-        metadata = d.dataset_metadata or {}
-
-        # Single file per comparison (old way)
-        if d.type == "DEG":
-            comp_name = metadata.get('comparison_name', d.name) if metadata else d.name
-
-            # Extract DEG counts from metadata if available
-            deg_up = metadata.get('deg_up', 0) if metadata else 0
-            deg_down = metadata.get('deg_down', 0) if metadata else 0
-            deg_total = metadata.get('deg_total', deg_up + deg_down) if metadata else 0
-
-            comparisons_dict[comp_name] = ComparisonSummary(
-                name=comp_name,
-                deg_up=deg_up,
-                deg_down=deg_down,
-                deg_total=deg_total,
-                has_enrichment=False,
-                dataset_id=d.id,
-                dataset_type='SINGLE'
-            )
-
-        # Global DEG file (new way)
-        if metadata and 'comparisons' in metadata:
-            for comp_name, comp_info in metadata['comparisons'].items():
-                # Extract pre-computed DEG counts if available
-                deg_up = comp_info.get('deg_up', 0)
-                deg_down = comp_info.get('deg_down', 0)
-                deg_total = comp_info.get('deg_total', deg_up + deg_down)
-
-                comparisons_dict[comp_name] = ComparisonSummary(
-                    name=comp_name,
-                    deg_up=deg_up,
-                    deg_down=deg_down,
-                    deg_total=deg_total,
-                    has_enrichment=False,
-                    dataset_id=d.id,
-                    dataset_type='GLOBAL'
-                )
-
-    # Mark comparisons with enrichment
-    for d in datasets:
-        metadata = d.dataset_metadata or {}
-        if d.type == "ENRICHMENT" and metadata:
-            enrichment_comparisons = metadata.get('enrichment_comparisons', [])
-            for comp_name in enrichment_comparisons:
-                if comp_name in comparisons_dict:
-                    comparisons_dict[comp_name].has_enrichment = True
+    # Count comparisons using the shared helper (no need to return them here)
+    all_comparisons = _build_comparisons_from_datasets(datasets)
+    total_comparisons = len(all_comparisons)
 
     # Get original file names
     original_files = [d.name for d in datasets if d.raw_file_path]
@@ -247,13 +296,13 @@ async def get_project_summary(
         "project": project,
         "stats": ProjectStats(
             total_datasets=total_datasets,
-            total_comparisons=len(comparisons_dict),
+            total_comparisons=total_comparisons,
             processing_count=processing_count,
             ready_count=ready_count,
             failed_count=failed_count,
             original_files_count=original_files_count
         ),
-        "comparisons": list(comparisons_dict.values()),
+        "comparisons": [],
         "original_files": original_files
     }
 

@@ -60,6 +60,15 @@ class ComparisonSummary(BaseModel):
     dataset_type: str  # 'SINGLE' or 'GLOBAL'
 
 
+class PaginatedComparisonsResponse(BaseModel):
+    """Paginated list of comparisons."""
+    comparisons: list[ComparisonSummary]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
 class ProjectStats(BaseModel):
     """Project statistics."""
     total_datasets: int
