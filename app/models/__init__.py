@@ -5,7 +5,9 @@ from app.models.models import (
     Sample,
     Dataset,
     DatasetType,
-    DatasetStatus
+    DatasetStatus,
+    ProjectComment,
+    CommentType
 )
 
 __all__ = [
@@ -15,5 +17,7 @@ __all__ = [
     "Sample",
     "Dataset",
     "DatasetType",
-    "DatasetStatus"
+    "DatasetStatus",
+    "ProjectComment",
+    "CommentType"
 ]

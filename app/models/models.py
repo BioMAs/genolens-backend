@@ -4,8 +4,11 @@ Following the asset-based architecture - only metadata stored in PostgreSQL.
 """
 from typing import Optional
 from uuid import UUID, uuid4
-from sqlalchemy import String, ForeignKey, JSON, Enum as SQLEnum, Text, Index, Float, Integer
+from datetime import datetime
+from sqlalchemy import String, ForeignKey, JSON, Enum as SQLEnum, Text, Index, Float, Integer, DateTime
+from sqlalchemy import func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import text as sa_text
 import enum
 
 from app.models.base import Base, TimestampMixin
@@ -214,6 +217,24 @@ class Dataset(Base, TimestampMixin):
         default=dict,
         comment="Additional dataset metadata (row count, file size, etc.)"
     )
+    
+    # Pre-calculated statistics for DEG datasets (performance optimization)
+    deg_up_count: Mapped[Optional[int]] = mapped_column(
+        nullable=True,
+        comment="Pre-calculated count of up-regulated genes (padj < 0.05, logFC > 0)"
+    )
+    deg_down_count: Mapped[Optional[int]] = mapped_column(
+        nullable=True,
+        comment="Pre-calculated count of down-regulated genes (padj < 0.05, logFC < 0)"
+    )
+    deg_significant_count: Mapped[Optional[int]] = mapped_column(
+        nullable=True,
+        comment="Pre-calculated count of significant genes (padj < 0.05)"
+    )
+    total_genes: Mapped[Optional[int]] = mapped_column(
+        nullable=True,
+        comment="Total number of genes in dataset"
+    )
 
     # Error information if processing failed
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -225,6 +246,8 @@ class Dataset(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_datasets_project_type", "project_id", "type"),
         Index("ix_datasets_status", "status"),
+        Index("ix_datasets_metadata_gin", "dataset_metadata", postgresql_using="gin"),
+        Index("ix_datasets_deg_counts", "type", "deg_significant_count"),
     )
 
     def __repr__(self) -> str:
@@ -585,3 +608,718 @@ class AIUsageLog(Base, TimestampMixin):
     def __repr__(self) -> str:
         return f"<AIUsageLog(user_id={self.user_id}, action={self.action_type}, tokens={self.tokens_used})>"
 
+
+class CachedComputation(Base, TimestampMixin):
+    """
+    CachedComputation: Persistent cache for expensive computations.
+    
+    Stores results of clustering, volcano plots, statistics, etc. to avoid
+    re-computing on every request. Provides database-backed caching with
+    expiration and hit tracking for monitoring.
+    """
+    __tablename__ = "cached_computations"
+    
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    dataset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+    
+    computation_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        comment="Type: clustering, volcano, stats, pca, etc."
+    )
+    
+    params_hash: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        comment="MD5 hash of computation parameters for cache key"
+    )
+    
+    result_data: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        comment="Cached computation result as JSON"
+    )
+    
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        nullable=True,
+        comment="Optional expiration timestamp (NULL = never expires)"
+    )
+    
+    hit_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Number of times this cache entry was accessed"
+    )
+    
+    last_accessed_at: Mapped[Optional[datetime]] = mapped_column(
+        nullable=True,
+        comment="Last time this cache entry was accessed"
+    )
+    
+    # Relationships
+    dataset: Mapped["Dataset"] = relationship()
+    
+    # Indexes
+    __table_args__ = (
+        # Composite unique index for fast cache lookups
+        Index(
+            "ix_cached_computations_lookup",
+            "dataset_id", "computation_type", "params_hash",
+            unique=True
+        ),
+        # Index for cleaning up expired entries
+        Index(
+            "ix_cached_computations_expires",
+            "expires_at",
+            postgresql_where=sa_text("expires_at IS NOT NULL")
+        ),
+        # GIN index on result_data for potential JSONB queries
+        Index(
+            "ix_cached_computations_result_gin",
+            "result_data",
+            postgresql_using="gin"
+        ),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<CachedComputation(dataset_id={self.dataset_id}, type={self.computation_type}, hits={self.hit_count})>"
+    
+    @property
+    def is_expired(self) -> bool:
+        """Check if this cache entry has expired."""
+        if self.expires_at is None:
+            return False
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc) > self.expires_at
+
+
+class SampleCorrelation(Base, TimestampMixin):
+    """
+    SampleCorrelation: Stores pre-computed sample-to-sample correlations and distances.
+    Used for instant heatmap rendering without recalculating clustering each time.
+    """
+    __tablename__ = "sample_correlations"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    dataset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True
+    )
+    
+    # Sample identifiers
+    sample_a: Mapped[str] = mapped_column(String(255), nullable=False)
+    sample_b: Mapped[str] = mapped_column(String(255), nullable=False)
+    
+    # Computed values
+    correlation: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Correlation coefficient between samples"
+    )
+    distance: Mapped[Optional[float]] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Distance metric value between samples"
+    )
+    
+    # Computation parameters (used for cache invalidation)
+    method: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        comment="Clustering method: ward, average, complete, single, kmeans"
+    )
+    metric: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        comment="Distance metric: euclidean, manhattan, correlation, cosine"
+    )
+    top_n_genes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=2000,
+        comment="Number of genes used for computation"
+    )
+    
+    # Relationships
+    dataset: Mapped["Dataset"] = relationship()
+    
+    # Indexes for fast lookups
+    __table_args__ = (
+        Index(
+            "ix_sample_correlations_dataset_method_metric",
+            "dataset_id", "method", "metric", "top_n_genes"
+        ),
+        Index(
+            "ix_sample_correlations_samples",
+            "dataset_id", "sample_a", "sample_b"
+        ),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<SampleCorrelation(dataset={self.dataset_id}, {self.sample_a}<->{self.sample_b}, method={self.method})>"
+
+
+class GOTerm(Base, TimestampMixin):
+    """
+    GOTerm: Stores Gene Ontology terms with their hierarchical relationships.
+    Enables GO enrichment analysis and visualization of term hierarchies.
+    """
+    __tablename__ = "go_terms"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    
+    # GO term identification
+    go_id: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        unique=True,
+        index=True,
+        comment="GO identifier (e.g., GO:0006955)"
+    )
+    
+    # Term information
+    name: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+        index=True,
+        comment="GO term name"
+    )
+    
+    namespace: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        index=True,
+        comment="GO namespace: biological_process, molecular_function, cellular_component"
+    )
+    
+    definition: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Textual definition of the GO term"
+    )
+    
+    # Hierarchical relationships (stored as JSON arrays)
+    is_a: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="List of parent GO IDs (is_a relationships)"
+    )
+    
+    part_of: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="List of parent GO IDs (part_of relationships)"
+    )
+    
+    regulates: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="List of GO IDs this term regulates"
+    )
+    
+    # Additional metadata
+    synonyms: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="Alternative names for this term"
+    )
+    
+    is_obsolete: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        index=True,
+        comment="Whether this term is obsolete"
+    )
+    
+    replaced_by: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="GO ID that replaces this obsolete term"
+    )
+    
+    # Denormalized for performance
+    level: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+        index=True,
+        comment="Depth level in GO hierarchy (0=root)"
+    )
+    
+    gene_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        index=True,
+        comment="Number of genes annotated to this term (including descendants)"
+    )
+    
+    # Indexes
+    __table_args__ = (
+        Index("ix_go_terms_namespace_level", "namespace", "level"),
+        Index("ix_go_terms_name_search", "name", postgresql_using="gin", postgresql_ops={"name": "gin_trgm_ops"}),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<GOTerm(go_id={self.go_id}, name={self.name}, namespace={self.namespace})>"
+
+
+class GOAnnotation(Base, TimestampMixin):
+    """
+    GOAnnotation: Links genes to GO terms with evidence codes.
+    Supports filtering by evidence type and enables GO enrichment analysis.
+    """
+    __tablename__ = "go_annotations"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    
+    # Gene identification
+    gene_symbol: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        index=True,
+        comment="Gene symbol (e.g., TP53)"
+    )
+    
+    gene_id: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        index=True,
+        comment="Entrez Gene ID or Ensembl ID"
+    )
+    
+    # GO term
+    go_id: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        index=True,
+        comment="GO identifier"
+    )
+    
+    # Evidence
+    evidence_code: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        index=True,
+        comment="Evidence code (IEA, IDA, IMP, etc.)"
+    )
+    
+    # Annotation source and quality
+    source_db: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="UniProt",
+        comment="Source database (UniProt, MGI, etc.)"
+    )
+    
+    qualifier: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+        comment="Qualifier (NOT, contributes_to, etc.)"
+    )
+    
+    # Organism
+    organism: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        default="Homo sapiens",
+        index=True,
+        comment="Organism"
+    )
+    
+    # Additional metadata
+    annotation_metadata: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        comment="Additional annotation details (references, date, etc.)"
+    )
+    
+    # Relationships
+    go_term: Mapped["GOTerm"] = relationship(
+        foreign_keys=[go_id],
+        primaryjoin="GOAnnotation.go_id == foreign(GOTerm.go_id)",
+        viewonly=True
+    )
+    
+    # Indexes for fast queries
+    __table_args__ = (
+        Index("ix_go_annotations_gene_organism", "gene_symbol", "organism"),
+        Index("ix_go_annotations_go_organism", "go_id", "organism"),
+        Index("ix_go_annotations_gene_go", "gene_symbol", "go_id", unique=True),
+        Index("ix_go_annotations_evidence", "evidence_code"),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<GOAnnotation(gene={self.gene_symbol}, go_id={self.go_id}, evidence={self.evidence_code})>"
+
+
+class GeneBookmark(Base, TimestampMixin):
+    """
+    GeneBookmark: User's bookmarked/favorited genes with notes and tags.
+    Allows users to mark genes of interest within a project context.
+    """
+    __tablename__ = "gene_bookmarks"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    
+    # User and project context
+    user_id: Mapped[UUID] = mapped_column(
+        nullable=False,
+        index=True,
+        comment="User who created bookmark (Supabase Auth ID)"
+    )
+    
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Project context for bookmark"
+    )
+    
+    # Gene identification
+    gene_symbol: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        index=True,
+        comment="Gene symbol (e.g., TP53)"
+    )
+    
+    gene_id: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        comment="Gene ID (Entrez, Ensembl)"
+    )
+    
+    # User annotations
+    notes: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="User notes about this gene"
+    )
+    
+    tags: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="Custom tags for categorization"
+    )
+    
+    color: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="Custom color for visualization (hex)"
+    )
+    
+    is_favorite: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=True,
+        index=True,
+        comment="Quick favorite flag"
+    )
+    
+    extra_data: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        comment="Additional metadata"
+    )
+    
+    # Relationships
+    project: Mapped["Project"] = relationship()
+    
+    # Indexes
+    __table_args__ = (
+        Index("ix_gene_bookmarks_user_project", "user_id", "project_id"),
+        Index("ix_gene_bookmarks_project_gene", "project_id", "gene_symbol", unique=True),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<GeneBookmark(gene={self.gene_symbol}, project={self.project_id}, user={self.user_id})>"
+
+
+class GeneList(Base, TimestampMixin):
+    """
+    GeneList: Custom lists of genes created by users.
+    Allows grouping genes thematically (e.g., "Cancer markers", "Immune genes").
+    """
+    __tablename__ = "gene_lists"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    
+    # List identification
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="List name"
+    )
+    
+    description: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="List description"
+    )
+    
+    # Ownership
+    user_id: Mapped[UUID] = mapped_column(
+        nullable=False,
+        index=True,
+        comment="Owner user ID (Supabase Auth)"
+    )
+    
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Associated project"
+    )
+    
+    # Gene data
+    genes: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="Array of gene symbols"
+    )
+    
+    gene_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        index=True,
+        comment="Number of genes in list"
+    )
+    
+    # Display properties
+    color: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="Display color (hex)"
+    )
+    
+    is_public: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        index=True,
+        comment="Visible to project members"
+    )
+    
+    tags: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="Tags for categorization"
+    )
+    
+    extra_data: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        comment="Additional metadata (source, date, etc.)"
+    )
+    
+    # Relationships
+    project: Mapped["Project"] = relationship()
+    
+    # Indexes
+    __table_args__ = (
+        Index("ix_gene_lists_user_project", "user_id", "project_id"),
+    )
+    
+    def __repr__(self) -> str:
+        return f"<GeneList(name={self.name}, genes={self.gene_count}, project={self.project_id})>"
+
+
+class CommentType(str, enum.Enum):
+    """Types of comments in the system."""
+    GENERAL = "GENERAL"  # General project comment
+    GENE = "GENE"  # Comment on a specific gene
+    COMPARISON = "COMPARISON"  # Comment on a comparison
+    PATHWAY = "PATHWAY"  # Comment on a pathway
+
+
+class ProjectComment(Base, TimestampMixin):
+    """
+    ProjectComment: Comments and annotations on projects, genes, comparisons, etc.
+    Enables collaboration and knowledge sharing.
+    user_id references Supabase Auth user UUID (no FK to local table).
+    """
+    __tablename__ = "project_comments"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Project this comment belongs to"
+    )
+    # Supabase Auth user ID - no foreign key as users are in Supabase
+    user_id: Mapped[UUID] = mapped_column(
+        nullable=False,
+        index=True,
+        comment="Supabase Auth user UUID who created the comment"
+    )
+    comment_type: Mapped[CommentType] = mapped_column(
+        SQLEnum(CommentType, name="comment_type_enum"),
+        nullable=False,
+        default=CommentType.GENERAL,
+        comment="Type of comment (general, gene, comparison, pathway)"
+    )
+    target_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        index=True,
+        comment="ID of the target entity (gene_symbol, comparison_name, pathway_id)"
+    )
+    content: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="Comment content in markdown format"
+    )
+    parent_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("project_comments.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="Parent comment ID for threaded discussions"
+    )
+    is_resolved: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        comment="Whether this comment thread is resolved"
+    )
+    extra_metadata: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        comment="Additional metadata (mentions, tags, etc.)"
+    )
+
+    # Relationships
+    project: Mapped["Project"] = relationship()
+    parent: Mapped[Optional["ProjectComment"]] = relationship(
+        remote_side=[id],
+        back_populates="replies"
+    )
+    replies: Mapped[list["ProjectComment"]] = relationship(
+        back_populates="parent",
+        cascade="all, delete-orphan"
+    )
+
+    # Indexes
+    __table_args__ = (
+        Index("ix_project_comments_project_type", "project_id", "comment_type"),
+        Index("ix_project_comments_target", "project_id", "target_id"),
+        Index("ix_project_comments_user", "user_id"),
+        Index("ix_project_comments_parent", "parent_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ProjectComment(project={self.project_id}, type={self.comment_type}, user={self.user_id})>"
+
+
+# ============================================================================
+# Project Activity Log
+# ============================================================================
+
+class ActivityEventType(str, enum.Enum):
+    """Types of activity events tracked in the audit log."""
+    DATASET_UPLOADED = "dataset_uploaded"
+    DATASET_DELETED = "dataset_deleted"
+    COMPARISON_CREATED = "comparison_created"
+    ENRICHMENT_RUN = "enrichment_run"
+    CLUSTERING_RUN = "clustering_run"
+    GSEA_RUN = "gsea_run"
+    GO_ENRICHMENT_RUN = "go_enrichment_run"
+    BOOKMARK_CREATED = "bookmark_created"
+    BOOKMARK_BATCH_CREATED = "bookmark_batch_created"
+    BOOKMARK_DELETED = "bookmark_deleted"
+    GENE_LIST_CREATED = "gene_list_created"
+    COMMENT_ADDED = "comment_added"
+    PROJECT_SHARED = "project_shared"
+
+
+class ProjectActivityLog(Base):
+    """
+    ProjectActivityLog: Immutable audit trail of actions performed within a project.
+    Records who did what and when, enabling a complete history/timeline view.
+    user_id references Supabase Auth user UUID (no FK to local table).
+    """
+    __tablename__ = "project_activity_log"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Project this event belongs to"
+    )
+
+    user_id: Mapped[UUID] = mapped_column(
+        nullable=False,
+        index=True,
+        comment="Supabase Auth user UUID who triggered the event"
+    )
+
+    event_type: Mapped[ActivityEventType] = mapped_column(
+        SQLEnum(ActivityEventType, name="activity_event_type_enum"),
+        nullable=False,
+        index=True,
+        comment="Type of activity event"
+    )
+
+    entity_type: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        comment="Type of affected entity (dataset, comparison, bookmark, etc.)"
+    )
+
+    entity_id: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="ID of the affected entity"
+    )
+
+    entity_name: Mapped[Optional[str]] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Human-readable name of the affected entity"
+    )
+
+    extra_metadata: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        comment="Additional context for the event (gene count, method, etc.)"
+    )
+
+    # No updated_at — activity log entries are immutable
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+        comment="When the event occurred"
+    )
+
+    # Relationships
+    project: Mapped["Project"] = relationship()
+
+    # Indexes
+    __table_args__ = (
+        Index("ix_activity_log_project_created", "project_id", "created_at"),
+        Index("ix_activity_log_project_event", "project_id", "event_type"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ProjectActivityLog(project={self.project_id}, event={self.event_type}, user={self.user_id})>"

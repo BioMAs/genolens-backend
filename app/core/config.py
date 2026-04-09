@@ -88,6 +88,22 @@ class Settings(BaseSettings):
         description="Chunk size for processing large files"
     )
 
+    # Application URL (used in email links)
+    APP_URL: str = Field(
+        default="http://localhost:3000",
+        description="Public URL of the frontend application (used in email links)"
+    )
+
+    # Email / SMTP
+    SMTP_HOST: Optional[str] = Field(None, description="SMTP host (e.g. smtp.sendgrid.net)")
+    SMTP_PORT: int = Field(default=587, description="SMTP port")
+    SMTP_USER: Optional[str] = Field(None, description="SMTP username / API key")
+    SMTP_PASSWORD: Optional[str] = Field(None, description="SMTP password")
+    SMTP_TLS: bool = Field(default=False, description="Use TLS directly (port 465)")
+    SMTP_STARTTLS: bool = Field(default=True, description="Use STARTTLS (port 587)")
+    EMAIL_FROM_ADDRESS: Optional[str] = Field(None, description="From address for outgoing emails")
+    EMAIL_FROM_NAME: str = Field(default="GenoLens", description="Display name for outgoing emails")
+
     @property
     def celery_broker(self) -> str:
         """Get Celery broker URL, defaulting to Redis URL."""

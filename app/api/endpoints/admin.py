@@ -209,7 +209,7 @@ async def list_users(
             
             return result
     except Exception as e:
-        print(f"Error fetching users: {e}")
+        logger.error(f"Error fetching users: {e}")
         # In case of error (e.g. Supabase connection), try to return local users at least
         return []
 
@@ -299,7 +299,7 @@ async def get_user_details(
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error fetching user details: {e}")
+        logger.error(f"Error fetching user details: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -762,7 +762,7 @@ async def delete_user(
                 await db.execute(text("DELETE FROM sequencing_projects WHERE user_id = :uid"), {"uid": user_id})
         except Exception as e:
             # Table might not exist or other error, log and continue
-            print(f"Warning cleaning legacy projects: {e}")
+            logger.warning(f"Warning cleaning legacy projects: {e}")
 
         # 2. Delete modern 'projects' owned by user
         # This will cascade to datasets, samples, members
@@ -790,7 +790,7 @@ async def delete_user(
                     params={"user_id": f"eq.{user_id}"}
                 )
             except Exception as e:
-                print(f"Warning: Failed to clean up remote sequencing_projects: {e}")
+                logger.warning(f"Warning: Failed to clean up remote sequencing_projects: {e}")
 
             # 4.2 Delete user via Supabase Admin API
             response = await client.delete(
@@ -975,7 +975,7 @@ async def update_project(
                             db.add(user)
                             # We don't commit here, we'll commit with the project update
                 except Exception as e:
-                    print(f"Error fetching user from Supabase: {e}")
+                    logger.warning(f"Error fetching user from Supabase: {e}")
 
             if not user:
                 raise HTTPException(

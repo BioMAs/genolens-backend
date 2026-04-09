@@ -49,11 +49,14 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+asyncio_mode = "auto"
 addopts = "-v --tb=short --strict-markers"
+pythonpath = ["."]
 markers = [
     "unit: Unit tests",
     "integration: Integration tests",
-    "slow: Slow running tests"
+    "slow: Slow running tests",
+    "benchmark: Performance benchmark tests (requires pytest-benchmark)"
 ]
 
 [tool.coverage.run]

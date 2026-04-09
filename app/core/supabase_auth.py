@@ -127,3 +127,72 @@ async def verify_supabase_token(token: str) -> Optional[SupabaseUser]:
         return None
     except (ValueError, KeyError):
         return None
+
+
+async def lookup_user_by_email(email: str) -> Optional[dict]:
+    """
+    Look up a Supabase Auth user by email address using the Admin API.
+
+    Requires SUPABASE_SERVICE_ROLE_KEY to be set.
+
+    Returns a dict with at least ``id`` and ``email`` keys, or None if not found.
+    """
+    if not settings.SUPABASE_SERVICE_ROLE_KEY:
+        return None
+
+    headers = {
+        "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{settings.SUPABASE_URL}/auth/v1/admin/users",
+                headers=headers,
+                params={"email": email},
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                users = data.get("users", [])
+                return users[0] if users else None
+
+            return None
+    except Exception as exc:
+        print(f"Error looking up user by email {email}: {repr(exc)}")
+        return None
+
+
+async def lookup_user_by_id(user_id: UUID) -> Optional[dict]:
+    """
+    Look up a Supabase Auth user by UUID using the Admin API.
+
+    Requires SUPABASE_SERVICE_ROLE_KEY to be set.
+
+    Returns a dict with at least ``id`` and ``email`` keys, or None if not found.
+    """
+    if not settings.SUPABASE_SERVICE_ROLE_KEY:
+        return None
+
+    headers = {
+        "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(
+                f"{settings.SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                headers=headers,
+            )
+
+            if response.status_code == 200:
+                return response.json()
+
+            return None
+    except Exception as exc:
+        print(f"Error looking up user by id {user_id}: {repr(exc)}")
+        return None

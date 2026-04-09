@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 
 async def main():
     print("Initialize DB connection...")
-    engine = create_async_engine(settings.database_url, echo=False)
+    engine = create_async_engine(settings.DATABASE_URL, echo=False)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_session() as session:

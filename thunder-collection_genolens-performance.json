@@ -1,0 +1,284 @@
+{
+  "client": "Thunder Client",
+  "collectionName": "GeneLens v2 - Performance Tests",
+  "dateExported": "2026-02-25",
+  "version": "1.1",
+  "folders": [
+    {
+      "name": "1. Health & Monitoring",
+      "requests": [
+        {
+          "name": "API Health",
+          "method": "GET",
+          "url": "http://localhost:8001/health",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            },
+            {
+              "type": "res-time",
+              "value": 100
+            }
+          ]
+        },
+        {
+          "name": "Performance Stats (Admin)",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets/admin/performance-stats",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            }
+          ]
+        },
+        {
+          "name": "Cache Stats (Admin)",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets/admin/cache-stats",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            }
+          ]
+        },
+        {
+          "name": "Cache Cleanup (Admin)",
+          "method": "POST",
+          "url": "http://localhost:8001/api/datasets/admin/cache-cleanup",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2. Optimized Endpoints",
+      "requests": [
+        {
+          "name": "Get Columns (<10ms)",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/columns",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            },
+            {
+              "type": "res-time",
+              "value": 50
+            },
+            {
+              "type": "res-body",
+              "operator": "contains",
+              "value": "columns"
+            }
+          ]
+        },
+        {
+          "name": "Get Stats (<100ms)",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/stats",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            },
+            {
+              "type": "res-time",
+              "value": 200
+            },
+            {
+              "type": "res-body",
+              "operator": "contains",
+              "value": "deg_up_count"
+            }
+          ]
+        },
+        {
+          "name": "Get Genes List (<50ms)",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/genes/list",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            },
+            {
+              "type": "res-time",
+              "value": 100
+            },
+            {
+              "type": "res-body",
+              "operator": "contains",
+              "value": "genes"
+            }
+          ]
+        },
+        {
+          "name": "Get Filtered Data",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/data?padj_max=0.05&logfc_min=1.0&limit=1000",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            },
+            {
+              "type": "res-time",
+              "value": 500
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3. Clustering (Cache Test)",
+      "requests": [
+        {
+          "name": "Clustering - First Call (MISS)",
+          "method": "POST",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/cluster",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "type": "json",
+            "raw": "{\n  \"top_n_genes\": 500,\n  \"cluster_rows\": true,\n  \"cluster_cols\": true,\n  \"method\": \"ward\",\n  \"metric\": \"euclidean\"\n}"
+          },
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            },
+            {
+              "type": "res-body",
+              "operator": "contains",
+              "value": "row_labels"
+            }
+          ]
+        },
+        {
+          "name": "Clustering - Second Call (HIT - Should be 10x faster)",
+          "method": "POST",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/cluster",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "type": "json",
+            "raw": "{\n  \"top_n_genes\": 500,\n  \"cluster_rows\": true,\n  \"cluster_cols\": true,\n  \"method\": \"ward\",\n  \"metric\": \"euclidean\"\n}"
+          },
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            },
+            {
+              "type": "res-time",
+              "value": 100
+            }
+          ]
+        },
+        {
+          "name": "Clustering - Sorted Mode (Fast)",
+          "method": "POST",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/cluster",
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ],
+          "body": {
+            "type": "json",
+            "raw": "{\n  \"top_n_genes\": 1000,\n  \"cluster_rows\": false,\n  \"cluster_cols\": true,\n  \"sort_by\": \"logFC\"\n}"
+          },
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            }
+          ]
+        },
+        {
+          "name": "Precompute Sample Clustering",
+          "method": "POST",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/precompute-sample-clustering?method=ward&metric=euclidean&top_n_genes=2000",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            },
+            {
+              "type": "res-body",
+              "operator": "contains",
+              "value": "success"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4. Regression Tests",
+      "requests": [
+        {
+          "name": "List Datasets",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            }
+          ]
+        },
+        {
+          "name": "Get Dataset Detail",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            }
+          ]
+        },
+        {
+          "name": "Volcano Plot Data",
+          "method": "GET",
+          "url": "http://localhost:8001/api/datasets/{{datasetId}}/volcano?comparison_name={{comparisonName}}",
+          "tests": [
+            {
+              "type": "status-code",
+              "value": 200
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variables": [
+    {
+      "name": "datasetId",
+      "value": "your-dataset-uuid-here",
+      "description": "Replace with actual dataset UUID from your database"
+    },
+    {
+      "name": "comparisonName",
+      "value": "Condition_vs_Control",
+      "description": "Replace with actual comparison name"
+    }
+  ]
+}

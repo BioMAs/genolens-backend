@@ -18,6 +18,7 @@ except ImportError:
     UMAP_AVAILABLE = False
 
 from app.core.config import settings
+from app.core.monitoring import timing_decorator
 
 
 class DataProcessorService:
@@ -97,16 +98,25 @@ class DataProcessorService:
         else:
             raise ValueError(f"Unsupported file extension: {file_extension}")
 
+    @timing_decorator(name="query_parquet")
     async def query_parquet(
         self,
         parquet_data: bytes,
         gene_ids: Optional[list[str]] = None,
         sample_ids: Optional[list[str]] = None,
         limit: int = 100,
-        offset: int = 0
+        offset: int = 0,
+        padj_max: Optional[float] = None,
+        padj_min: Optional[float] = None,
+        logfc_min: Optional[float] = None,
+        logfc_max: Optional[float] = None,
+        columns: Optional[list[str]] = None,
+        sort_by: Optional[str] = None,
+        sort_desc: bool = True
     ) -> dict[str, Any]:
         """
         Query a Parquet file with filters.
+        OPTIMIZED: Uses PyArrow for efficient column selection and native filtering.
 
         Args:
             parquet_data: Parquet file bytes
@@ -114,24 +124,89 @@ class DataProcessorService:
             sample_ids: Filter by sample IDs (column names)
             limit: Maximum rows to return
             offset: Number of rows to skip
+            padj_max: Filter rows where padj <= this value
+            padj_min: Filter rows where padj >= this value
+            logfc_min: Filter rows where |logFC| >= this value (absolute)
+            logfc_max: Filter rows where |logFC| <= this value (absolute)
+            columns: Select specific columns to return
+            sort_by: Column name to sort by
+            sort_desc: Sort in descending order
 
         Returns:
             dict: Query results with columns and data
         """
         parquet_buffer = io.BytesIO(parquet_data)
-        df = pd.read_parquet(parquet_buffer)
+        
+        # OPTIMIZATION: Use PyArrow for selective column reading
+        parquet_file = pq.ParquetFile(parquet_buffer)
+        schema = parquet_file.schema_arrow
+        all_columns = schema.names
+        
+        # Determine columns to read
+        columns_to_read = None
+        if columns:
+            # User specified columns
+            columns_to_read = [c for c in columns if c in all_columns]
+        elif sample_ids:
+            # Sample IDs (matrix queries)
+            columns_to_read = []
+            if "gene_id" in all_columns:
+                columns_to_read.append("gene_id")
+            columns_to_read.extend([s for s in sample_ids if s in all_columns])
+        
+        # If no specific columns, but we have filters, we need to read filter columns
+        if columns_to_read is None and (padj_max is not None or padj_min is not None or logfc_min is not None or logfc_max is not None):
+            # Need to read at least the filter columns
+            columns_to_read = []
+            for col in all_columns:
+                if any(x in col.lower() for x in ["gene_id", "gene", "padj", "logfc", "log2foldchange"]):
+                    columns_to_read.append(col)
+        
+        # Read with PyArrow (column pruning)
+        parquet_buffer.seek(0)
+        if columns_to_read:
+            table = pq.read_table(parquet_buffer, columns=columns_to_read)
+        else:
+            # Read all columns if no specific selection
+            table = pq.read_table(parquet_buffer)
+        
+        # Convert to pandas for filtering and manipulation
+        df = table.to_pandas()
 
-        # Apply filters
+        # Apply row filters
         if gene_ids:
             if "gene_id" in df.columns:
                 df = df[df["gene_id"].isin(gene_ids)]
 
-        if sample_ids:
-            # Filter columns to include gene_id + requested samples
-            available_samples = [s for s in sample_ids if s in df.columns]
-            columns_to_keep = ["gene_id"] if "gene_id" in df.columns else []
-            columns_to_keep.extend(available_samples)
-            df = df[columns_to_keep]
+        # Performance optimization: DEG filtering on backend
+        if padj_max is not None and "padj" in df.columns:
+            df = df[df["padj"] <= padj_max]
+        
+        if padj_min is not None and "padj" in df.columns:
+            df = df[df["padj"] >= padj_min]
+        
+        if logfc_min is not None:
+            # Check for logFC or log2FoldChange column
+            logfc_col = None
+            for col in ["logFC", "log2FoldChange", "log2fc"]:
+                if col in df.columns:
+                    logfc_col = col
+                    break
+            if logfc_col:
+                df = df[df[logfc_col].abs() >= logfc_min]
+        
+        if logfc_max is not None:
+            logfc_col = None
+            for col in ["logFC", "log2FoldChange", "log2fc"]:
+                if col in df.columns:
+                    logfc_col = col
+                    break
+            if logfc_col:
+                df = df[df[logfc_col].abs() <= logfc_max]
+
+        # Sorting (before pagination for correct results)
+        if sort_by and sort_by in df.columns:
+            df = df.sort_values(by=sort_by, ascending=not sort_desc)
 
         # Get total before pagination
         total_rows = len(df)
@@ -159,7 +234,69 @@ class DataProcessorService:
             "total_rows": total_rows,
             "returned_rows": len(df)
         }
+    
+    async def query_matrix_subset(
+        self,
+        parquet_data: bytes,
+        gene_list: list[str],
+        sample_columns: Optional[list[str]] = None
+    ) -> pd.DataFrame:
+        """
+        Optimized method to extract a subset of matrix data.
+        Uses PyArrow to read only required genes and samples.
+        
+        Args:
+            parquet_data: Parquet file bytes
+            gene_list: List of gene IDs to extract
+            sample_columns: Optional list of sample column names (if None, reads all numeric columns)
+            
+        Returns:
+            pd.DataFrame: Subset of matrix with requested genes and samples
+        """
+        parquet_buffer = io.BytesIO(parquet_data)
+        
+        # Read schema to determine available columns
+        parquet_file = pq.ParquetFile(parquet_buffer)
+        all_columns = parquet_file.schema_arrow.names
+        
+        # Determine which columns to read
+        columns_to_read = []
+        
+        # Always include gene_id if present
+        if "gene_id" in all_columns:
+            columns_to_read.append("gene_id")
+        elif "Unnamed: 0" in all_columns:
+            columns_to_read.append("Unnamed: 0")
+        
+        # Add sample columns
+        if sample_columns:
+            columns_to_read.extend([c for c in sample_columns if c in all_columns])
+        else:
+            # Read all columns if not specified
+            columns_to_read = None
+        
+        # Read with column selection
+        parquet_buffer.seek(0)
+        if columns_to_read:
+            table = pq.read_table(parquet_buffer, columns=columns_to_read)
+        else:
+            table = pq.read_table(parquet_buffer)
+        
+        df = table.to_pandas()
+        
+        # Set gene column as index
+        gene_col = "gene_id" if "gene_id" in df.columns else "Unnamed: 0" if "Unnamed: 0" in df.columns else df.columns[0]
+        if gene_col in df.columns:
+            df = df.set_index(gene_col)
+        
+        # Filter to requested genes
+        available_genes = [g for g in gene_list if g in df.index]
+        if available_genes:
+            df = df.loc[available_genes]
+        
+        return df
 
+    @timing_decorator(name="get_dataframe")
     async def get_dataframe(self, parquet_data: bytes) -> pd.DataFrame:
         """
         Get the full DataFrame from Parquet data.
@@ -209,6 +346,169 @@ class DataProcessorService:
             metadata["enrichment_comparisons"] = enrichment_comparisons
 
         return metadata
+
+    async def get_columns(self, parquet_data: bytes) -> dict[str, Any]:
+        """
+        Get column names from Parquet file without loading full data.
+        Uses PyArrow schema for ultra-fast access.
+        
+        Args:
+            parquet_data: Parquet file bytes
+            
+        Returns:
+            dict: Column names and count
+        """
+        parquet_buffer = io.BytesIO(parquet_data)
+        
+        # Use PyArrow to read schema only (no data loaded)
+        parquet_file = pq.ParquetFile(parquet_buffer)
+        schema = parquet_file.schema_arrow
+        
+        columns = schema.names
+        
+        return {
+            "columns": columns,
+            "total_columns": len(columns)
+        }
+
+    async def get_gene_list(
+        self,
+        parquet_data: bytes,
+        gene_column: str = "gene_id",
+        limit: Optional[int] = None
+    ) -> dict[str, Any]:
+        """
+        Get list of genes from Parquet file.
+        Uses PyArrow for efficient column reading.
+        
+        Args:
+            parquet_data: Parquet file bytes
+            gene_column: Name of the gene column (default: gene_id)
+            limit: Optional limit on number of genes to return
+            
+        Returns:
+            dict: Gene list and count
+        """
+        parquet_buffer = io.BytesIO(parquet_data)
+        
+        try:
+            # Use PyArrow to read only the gene column
+            table = pq.read_table(parquet_buffer, columns=[gene_column])
+            genes = table[gene_column].to_pylist()
+            
+            # Remove None/null values
+            genes = [g for g in genes if g is not None]
+            
+            total_genes = len(genes)
+            
+            # Apply limit if specified
+            if limit:
+                genes = genes[:limit]
+            
+            return {
+                "genes": genes,
+                "total_genes": total_genes
+            }
+        except Exception as e:
+            # Fallback: column might not exist or other error
+            raise ValueError(f"Failed to read gene column '{gene_column}': {str(e)}")
+
+    @timing_decorator(name="calculate_deg_stats")
+    async def calculate_deg_stats(
+        self,
+        parquet_data: bytes,
+        comparison_name: Optional[str] = None
+    ) -> dict[str, Any]:
+        """
+        Calculate DEG statistics from Parquet file.
+        Optimized to avoid loading full dataset when possible.
+        
+        Args:
+            parquet_data: Parquet file bytes
+            comparison_name: Optional comparison name for multi-comparison files
+            
+        Returns:
+            dict: Statistics (total_genes, up_genes, down_genes, significant_genes)
+        """
+        parquet_buffer = io.BytesIO(parquet_data)
+        
+        # Determine column names based on comparison
+        if comparison_name:
+            padj_col = f"padj:{comparison_name}"
+            logfc_col = f"log2FoldChange:{comparison_name}"
+        else:
+            # Single comparison or default
+            padj_col = "padj"
+            logfc_col = "logFC"
+        
+        try:
+            # Try to read only necessary columns
+            available_cols = pq.read_schema(parquet_buffer).names
+            parquet_buffer.seek(0)
+            
+            # Find the right column names
+            cols_to_read = []
+            for col in available_cols:
+                if "padj" in col.lower() or "logfc" in col.lower() or "log2foldchange" in col.lower():
+                    cols_to_read.append(col)
+            
+            # If no specific columns found, need to check the data
+            if not cols_to_read:
+                cols_to_read = None
+            
+            # Read minimal data
+            if cols_to_read:
+                table = pq.read_table(parquet_buffer, columns=cols_to_read)
+                df = table.to_pandas()
+            else:
+                df = pd.read_parquet(parquet_buffer)
+            
+            # Find actual column names
+            padj_column = None
+            logfc_column = None
+            
+            for col in df.columns:
+                if "padj" in col.lower() and not padj_column:
+                    if comparison_name:
+                        if comparison_name in col:
+                            padj_column = col
+                    else:
+                        padj_column = col
+                        
+                if ("logfc" in col.lower() or "log2foldchange" in col.lower()) and not logfc_column:
+                    if comparison_name:
+                        if comparison_name in col:
+                            logfc_column = col
+                    else:
+                        logfc_column = col
+            
+            total_genes = len(df)
+            
+            stats = {
+                "total_genes": total_genes,
+                "up_genes": None,
+                "down_genes": None,
+                "significant_genes": None
+            }
+            
+            # Calculate stats if columns are found
+            if padj_column and logfc_column:
+                # Significant genes: padj < 0.05
+                significant = df[df[padj_column] < 0.05]
+                stats["significant_genes"] = len(significant)
+                
+                # Up: padj < 0.05 AND logFC > 0
+                up = significant[significant[logfc_column] > 0]
+                stats["up_genes"] = len(up)
+                
+                # Down: padj < 0.05 AND logFC < 0
+                down = significant[significant[logfc_column] < 0]
+                stats["down_genes"] = len(down)
+            
+            return stats
+            
+        except Exception as e:
+            raise ValueError(f"Failed to calculate DEG stats: {str(e)}")
 
     def _detect_comparisons(self, columns: list[str]) -> dict[str, dict[str, str]]:
         """
@@ -301,9 +601,9 @@ class DataProcessorService:
             if comp_name in test_methods and test_methods[comp_name]:
                 valid_comparisons[comp_name]['test_methods'] = sorted(list(test_methods[comp_name]))
         
-        print(f"[DETECT] Found {len(valid_comparisons)} comparisons:")
+        logger.info(f"[DETECT] Found {len(valid_comparisons)} comparisons:")
         for comp_name, cols in valid_comparisons.items():
-            print(f"  - {comp_name}: logFC={cols.get('logFC')}, padj={cols.get('padj')}, tests={cols.get('test_methods', ['default'])}")
+            logger.info(f"  - {comp_name}: logFC={cols.get('logFC')}, padj={cols.get('padj')}, tests={cols.get('test_methods', ['default'])}")
         
         return valid_comparisons
 
@@ -533,18 +833,18 @@ class DataProcessorService:
         parquet_buffer = io.BytesIO(parquet_data)
         df = pd.read_parquet(parquet_buffer)
         
-        print(f"[VOLCANO] Processing {len(comparisons)} comparisons")
-        print(f"[VOLCANO] Available columns: {df.columns.tolist()}")
+        logger.info(f"[VOLCANO] Processing {len(comparisons)} comparisons")
+        logger.debug(f"[VOLCANO] Available columns: {df.columns.tolist()}")
         
         volcano_plots = {}
         for comp_name, cols in comparisons.items():
             logfc_col = cols.get('logFC')
             padj_col = cols.get('padj')
             
-            print(f"[VOLCANO] Comparison '{comp_name}': logFC={logfc_col}, padj={padj_col}")
+            logger.debug(f"[VOLCANO] Comparison '{comp_name}': logFC={logfc_col}, padj={padj_col}")
             
             if not logfc_col or not padj_col:
-                print(f"[VOLCANO] Skipping '{comp_name}': missing columns")
+                logger.warning(f"[VOLCANO] Skipping '{comp_name}': missing columns")
                 continue
                 
             # Extract data

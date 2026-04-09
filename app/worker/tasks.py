@@ -2,6 +2,8 @@
 Celery tasks for background data processing.
 """
 import asyncio
+import json
+import logging
 from pathlib import Path
 from uuid import UUID
 from celery import Task
@@ -14,6 +16,8 @@ from app.models.models import Dataset, DatasetStatus, DegGene, EnrichmentPathway
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseTask(Task):
@@ -96,12 +100,19 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                         pca_2d = await data_processor.calculate_pca(parquet_data, n_components=2)
                         pca_3d = await data_processor.calculate_pca(parquet_data, n_components=3)
 
-                        pca_results = {
-                            "pca_2d": pca_2d,
-                            "pca_3d": pca_3d
-                        }
+                        # Upload PCA results to storage
+                        if pca_2d:
+                            path = f"projects/{dataset.project_id}/datasets/{dataset_id}/plots/pca_2d.json"
+                            await storage_service.upload_file(path, json.dumps(pca_2d).encode('utf-8'), content_type="application/json")
+                            pca_results["pca_2d_path"] = path
+                        
+                        if pca_3d:
+                            path = f"projects/{dataset.project_id}/datasets/{dataset_id}/plots/pca_3d.json"
+                            await storage_service.upload_file(path, json.dumps(pca_3d).encode('utf-8'), content_type="application/json")
+                            pca_results["pca_3d_path"] = path
+
                     except Exception as e:
-                        print(f"PCA calculation failed: {e}")
+                        logger.warning(f"PCA calculation failed: {e}")
                         # Continue without PCA results
                         pass
 
@@ -112,7 +123,12 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                     self.update_state(state="PROGRESS", meta={"step": "calculating_volcano_plots"})
                     try:
                         volcano_plots = await data_processor.calculate_volcano_plots(parquet_data, metadata["comparisons"])
-                        plot_results["volcano_plots"] = volcano_plots
+                        
+                        # Upload volcano plots to storage
+                        volcano_path = f"projects/{dataset.project_id}/datasets/{dataset_id}/plots/volcano_plots.json"
+                        await storage_service.upload_file(volcano_path, json.dumps(volcano_plots).encode('utf-8'), content_type="application/json")
+                        
+                        plot_results["volcano_plots_path"] = volcano_path
                     except Exception as e:
                         plot_results["volcano_error"] = str(e)
 
@@ -127,22 +143,22 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                     # Extract and store DEG genes in database for fast querying
                     self.update_state(state="PROGRESS", meta={"step": "storing_deg_genes"})
                     try:
-                        print(f"[WORKER] Extracting DEG genes for DB...")
+                        logger.info(f"[WORKER] Extracting DEG genes for DB...")
                         deg_genes_data = await data_processor.extract_deg_genes_for_db(parquet_data, metadata["comparisons"])
-                        print(f"[WORKER] Extracted DEG genes for {len(deg_genes_data)} comparisons")
+                        logger.info(f"[WORKER] Extracted DEG genes for {len(deg_genes_data)} comparisons")
 
                         # Delete existing DEG genes for this dataset (in case of reprocessing)
                         try:
-                            print(f"[WORKER] Deleting existing DEG genes for dataset {dataset_id}")
+                            logger.info(f"[WORKER] Deleting existing DEG genes for dataset {dataset_id}")
                             await db.execute(delete(DegGene).where(DegGene.dataset_id == dataset_id))
                             await db.commit()
                         except Exception as e:
-                            print(f"[WORKER] Error deleting existing DEG genes: {e}")
+                            logger.warning(f"[WORKER] Error deleting existing DEG genes: {e}")
                             pass  # Table might not exist or no records to delete
 
                         # Insert new DEG genes
                         for comp_name, genes_list in deg_genes_data.items():
-                            print(f"[WORKER] Processing comparison '{comp_name}' with {len(genes_list)} genes")
+                            logger.info(f"[WORKER] Processing comparison '{comp_name}' with {len(genes_list)} genes")
                             if genes_list:
                                 # Prepare bulk insert data
                                 deg_records = [
@@ -167,13 +183,13 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                                     await db.commit()
                                     await asyncio.sleep(0.1)
                             
-                                print(f"[WORKER] Finished storing {len(genes_list)} DEG genes for comparison '{comp_name}'")
+                                logger.info(f"[WORKER] Finished storing {len(genes_list)} DEG genes for comparison '{comp_name}'")
                             else:
-                                print(f"[WORKER] No genes to store for comparison '{comp_name}'")
+                                logger.info(f"[WORKER] No genes to store for comparison '{comp_name}'")
 
                     except Exception as e:
                         await db.rollback()
-                        print(f"[WORKER] Error storing DEG genes: {str(e)}")
+                        logger.error(f"[WORKER] Error storing DEG genes: {str(e)}")
                         import traceback
                         traceback.print_exc()
                         # Don't fail the whole task if DEG storage fails
@@ -225,11 +241,11 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                                     await db.commit()
                                     await asyncio.sleep(0.1)
                             
-                                print(f"[WORKER] Stored {len(pathways_list)} enrichment pathways for comparison '{comp_name}'")
+                                logger.info(f"[WORKER] Stored {len(pathways_list)} enrichment pathways for comparison '{comp_name}'")
 
                     except Exception as e:
                         await db.rollback()
-                        print(f"[WORKER] Error storing enrichment pathways: {str(e)}")
+                        logger.error(f"[WORKER] Error storing enrichment pathways: {str(e)}")
                         import traceback
                         traceback.print_exc()
                         # Don't fail the whole task if enrichment storage fails
@@ -239,7 +255,12 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                     self.update_state(state="PROGRESS", meta={"step": "calculating_dotplots"})
                     try:
                         dotplots = await data_processor.calculate_enrichment_dotplots(parquet_data, metadata["enrichment_comparisons"])
-                        plot_results["enrichment_dotplots"] = dotplots
+                        
+                        # Upload dotplots to storage
+                        dotplots_path = f"projects/{dataset.project_id}/datasets/{dataset_id}/plots/enrichment_dotplots.json"
+                        await storage_service.upload_file(dotplots_path, json.dumps(dotplots).encode('utf-8'), content_type="application/json")
+                        
+                        plot_results["enrichment_dotplots_path"] = dotplots_path
                     except Exception as e:
                         plot_results["dotplot_error"] = str(e)
 
@@ -259,22 +280,27 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
 
                         if matrix_dataset and matrix_dataset.parquet_file_path:
                             matrix_path = matrix_dataset.parquet_file_path
-                            print(f"[WORKER] Found matrix dataset {matrix_dataset.id} with path: {matrix_path}")
+                            logger.info(f"[WORKER] Found matrix dataset {matrix_dataset.id} with path: {matrix_path}")
                         
                             # Fix path if it includes bucket name
                             if matrix_path.startswith(f"{settings.SUPABASE_STORAGE_BUCKET}/"):
                                 matrix_path = matrix_path.replace(f"{settings.SUPABASE_STORAGE_BUCKET}/", "", 1)
-                                print(f"[WORKER] Corrected matrix path to: {matrix_path}")
+                                logger.info(f"[WORKER] Corrected matrix path to: {matrix_path}")
                             
                             try:
                                 matrix_data = await storage_service.download_file(matrix_path)
                                 heatmaps = await data_processor.calculate_deg_heatmaps(parquet_data, matrix_data, metadata["comparisons"])
-                                plot_results["heatmaps"] = heatmaps
+                                
+                                # Upload heatmaps to storage
+                                heatmaps_path = f"projects/{dataset.project_id}/datasets/{dataset_id}/plots/heatmaps.json"
+                                await storage_service.upload_file(heatmaps_path, json.dumps(heatmaps).encode('utf-8'), content_type="application/json")
+
+                                plot_results["heatmaps_path"] = heatmaps_path
                             except Exception as download_error:
-                                print(f"[WORKER] Failed to download matrix file: {str(download_error)}")
+                                logger.error(f"[WORKER] Failed to download matrix file: {str(download_error)}")
                                 plot_results["heatmap_error"] = f"Matrix download failed: {str(download_error)}"
                     except Exception as e:
-                        print(f"[WORKER] Heatmap calculation failed: {str(e)}")
+                        logger.error(f"[WORKER] Heatmap calculation failed: {str(e)}")
                         plot_results["heatmap_error"] = str(e)
 
                 # Validate enrichment comparisons against project comparisons
@@ -311,7 +337,7 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                     if unlisted_comparisons:
                         warning_msg = f"Warning: The following comparisons from enrichment file are not listed in the project: {', '.join(unlisted_comparisons)}"
                         validation_warnings.append(warning_msg)
-                        print(warning_msg)  # Log to worker console
+                        logger.warning(warning_msg)  # Log to worker console
 
                 # Merge PCA results, plot results, DEG stats, metadata and warnings
                 final_metadata = {**metadata, **pca_results, **plot_results}
@@ -360,9 +386,9 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                 error_details = traceback.format_exc()
                 error_message = str(e) if str(e) else error_details[:500]  # Use traceback if error message is empty
 
-                print(f"[WORKER] Dataset processing failed for {dataset_id}")
-                print(f"[WORKER] Error: {error_message}")
-                print(f"[WORKER] Full traceback:\n{error_details}")
+                logger.error(f"[WORKER] Dataset processing failed for {dataset_id}")
+                logger.error(f"[WORKER] Error: {error_message}")
+                logger.error(f"[WORKER] Full traceback:\n{error_details}")
 
                 # Update status to FAILED
                 stmt = update(Dataset).where(Dataset.id == dataset_id).values(

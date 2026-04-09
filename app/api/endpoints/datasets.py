@@ -5,9 +5,11 @@ import logging
 import json
 import hashlib
 import numpy as np
+import pandas as pd
 from uuid import UUID
 from pathlib import Path
 from typing import Annotated, Optional
+from app.services.storage import storage_service
 from fastapi import (
     APIRouter,
     Depends,
@@ -39,20 +41,29 @@ from app.schemas.dataset import (
     DatasetUploadResponse,
     DatasetQueryParams,
     DatasetQueryResponse,
-    DatasetUpdate
+    DatasetUpdate,
+    DatasetColumnsResponse,
+    DatasetStatsResponse,
+    GeneListResponse
 )
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor
+from app.services.cache_service import cache_service
 from app.worker.tasks import process_dataset_upload
 from app.services.gsea_processor import GSEAProcessor, prepare_ranked_gene_list, GeneSetsLoader
 from app.services.gene_set_loader import GeneSetLoader
 from app.models.models import GeneSetDatabase
 from app.services.ai_interpreter import LocalAIInterpreter
 from app.services.clustering_service import ClusteringService
+from app.services.go_service import GOService
+from app.services import history_service
+from app.services.stats_service import CorrectionMethod, compute_correction_comparison
+from app.models.models import ActivityEventType
 from sqlalchemy import text
 from datetime import datetime
 
 clustering_service = ClusteringService()
+go_service = GOService()
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +143,15 @@ async def upload_dataset(
 
     # Trigger Celery task
     process_dataset_upload.delay(str(dataset.id), uploaded_path)
+
+    # Log activity
+    await history_service.log_activity(
+        db, project_id, current_user.user_id, ActivityEventType.DATASET_UPLOADED,
+        entity_type="dataset",
+        entity_id=str(dataset.id),
+        entity_name=name,
+        extra_metadata={"file_name": file.filename, "dataset_type": dataset_type.value},
+    )
 
     return {
         "dataset_id": dataset.id,
@@ -262,15 +282,26 @@ async def delete_dataset(
         except Exception as e:
             files_failed.append(f"parquet_file: {str(e)}")
 
+    # Save info before deletion for activity log
+    dataset_project_id = dataset.project_id
+    dataset_name = dataset.name
+
     # Delete the dataset itself (Cascade delete handles related tables)
     await db.delete(dataset)
     await db.commit()
 
     # Log the deletion
-    print(f"[DELETE] Dataset {dataset_id} deleted by user {current_user.user_id}")
-    print(f"[DELETE] Files deleted: {files_deleted}")
+    logger.info(f"[DELETE] Dataset {dataset_id} deleted by user {current_user.user_id}")
+    logger.info(f"[DELETE] Files deleted: {files_deleted}")
     if files_failed:
-        print(f"[DELETE] File deletion warnings: {files_failed}")
+        logger.warning(f"[DELETE] File deletion warnings: {files_failed}")
+
+    await history_service.log_activity(
+        db, dataset_project_id, current_user.user_id, ActivityEventType.DATASET_DELETED,
+        entity_type="dataset",
+        entity_id=str(dataset_id),
+        entity_name=dataset_name,
+    )
 
 
 @router.post("/{dataset_id}/reprocess")
@@ -393,9 +424,15 @@ async def query_dataset(
             parquet_data=parquet_data,
             gene_ids=query_params.gene_ids,
             sample_ids=query_params.sample_ids,
-
             limit=query_params.limit,
-            offset=query_params.offset
+            offset=query_params.offset,
+            padj_max=query_params.padj_max,
+            padj_min=query_params.padj_min,
+            logfc_min=query_params.logfc_min,
+            logfc_max=query_params.logfc_max,
+            columns=query_params.columns,
+            sort_by=query_params.sort_by,
+            sort_desc=query_params.sort_desc
         )
 
         return query_result
@@ -404,6 +441,234 @@ async def query_dataset(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to query dataset: {str(e)}"
+        )
+
+
+@router.get("/{dataset_id}/columns", response_model=DatasetColumnsResponse)
+async def get_dataset_columns(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+) -> dict:
+    """
+    Get column names from a dataset without loading data.
+    
+    Ultra-fast endpoint that uses PyArrow schema reading.
+    Replaces the need to download 100K+ rows just to see column names.
+    
+    **Performance:** <10ms vs 2-5s for full query
+    **Data transfer:** <1 KB vs 5-10 MB
+    """
+    # Get dataset with ownership check
+    query = select(Dataset).join(Project).where(
+        Dataset.id == dataset_id,
+        Project.owner_id == current_user.user_id
+    )
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+
+    if not dataset:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found"
+        )
+
+    if dataset.status != DatasetStatus.READY:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Dataset is not ready. Current status: {dataset.status}"
+        )
+
+    if not dataset.parquet_file_path:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Parquet file path not found"
+        )
+
+    try:
+        # Download Parquet file
+        parquet_data = await storage_service.download_file(dataset.parquet_file_path)
+
+        # Get columns using PyArrow (no data loaded)
+        result = await data_processor.get_columns(parquet_data)
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get columns: {str(e)}"
+        )
+
+
+@router.get("/{dataset_id}/stats", response_model=DatasetStatsResponse)
+async def get_dataset_stats(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    comparison_name: Optional[str] = Query(None, description="Comparison name for multi-comparison datasets")
+) -> dict:
+    """
+    Get pre-calculated or fast-computed statistics for a DEG dataset.
+    
+    Multi-level strategy:
+    1. Check database columns (fastest - direct query)
+    2. Check metadata cache
+    3. Calculate from Parquet file and save to DB
+    
+    **Performance:** <10ms (DB columns) or <50ms (metadata) or <500ms (calculated)
+    **Replaces:** Frontend fetching 100K rows + manual counting (5-15 MB + 1-2s JS)
+    """
+    # Get dataset with ownership check
+    query = select(Dataset).join(Project).where(
+        Dataset.id == dataset_id,
+        Project.owner_id == current_user.user_id
+    )
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+
+    if not dataset:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found"
+        )
+
+    if dataset.status != DatasetStatus.READY:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Dataset is not ready. Current status: {dataset.status}"
+        )
+
+    # Level 1: Check database columns (fastest - no JSON parsing)
+    if dataset.deg_up_count is not None and dataset.deg_down_count is not None:
+        logger.info(f"Stats from DB columns for dataset {dataset_id}")
+        return {
+            "total_genes": dataset.total_genes,
+            "up_genes": dataset.deg_up_count,
+            "down_genes": dataset.deg_down_count,
+            "significant_genes": dataset.deg_significant_count,
+            "cached": True
+        }
+
+    # Level 2: Check metadata cache
+    cached = False
+    if dataset.dataset_metadata and "statistics" in dataset.dataset_metadata:
+        stats = dataset.dataset_metadata["statistics"]
+        cached = True
+        
+        # If comparison_name specified, try to get comparison-specific stats
+        if comparison_name and isinstance(stats, dict) and comparison_name in stats:
+            stats = stats[comparison_name]
+        
+        logger.info(f"Stats from metadata for dataset {dataset_id}")
+        return {
+            **stats,
+            "cached": cached
+        }
+
+    # Level 3: Not in cache, calculate from Parquet file
+    if not dataset.parquet_file_path:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Parquet file path not found"
+        )
+
+    try:
+        # Download Parquet file
+        parquet_data = await storage_service.download_file(dataset.parquet_file_path)
+
+        # Calculate stats
+        stats = await data_processor.calculate_deg_stats(
+            parquet_data=parquet_data,
+            comparison_name=comparison_name
+        )
+
+        # Save stats to database columns for future fast access
+        dataset.total_genes = stats.get("total_genes")
+        dataset.deg_up_count = stats.get("up_genes")
+        dataset.deg_down_count = stats.get("down_genes")
+        dataset.deg_significant_count = stats.get("significant_genes")
+        
+        await db.commit()
+        logger.info(f"Calculated and saved stats to DB for dataset {dataset_id}")
+
+        return {
+            **stats,
+            "cached": False
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to calculate stats: {str(e)}"
+        )
+
+
+@router.get("/{dataset_id}/genes/list", response_model=GeneListResponse)
+async def get_gene_list(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    gene_column: str = Query("gene_id", description="Name of the gene column"),
+    limit: Optional[int] = Query(None, description="Limit number of genes returned")
+) -> dict:
+    """
+    Get list of gene IDs from a dataset.
+    
+    Uses PyArrow to read only the gene column, avoiding loading full dataset.
+    
+    **Performance:** <200ms vs 2-5s for full query
+    **Data transfer:** 20-50 KB vs 5-10 MB
+    **Use case:** Populate dropdowns, validate gene lists, etc.
+    """
+    # Get dataset with ownership check
+    query = select(Dataset).join(Project).where(
+        Dataset.id == dataset_id,
+        Project.owner_id == current_user.user_id
+    )
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+
+    if not dataset:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found"
+        )
+
+    if dataset.status != DatasetStatus.READY:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Dataset is not ready. Current status: {dataset.status}"
+        )
+
+    if not dataset.parquet_file_path:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Parquet file path not found"
+        )
+
+    try:
+        # Download Parquet file
+        parquet_data = await storage_service.download_file(dataset.parquet_file_path)
+
+        # Get gene list
+        result = await data_processor.get_gene_list(
+            parquet_data=parquet_data,
+            gene_column=gene_column,
+            limit=limit
+        )
+
+        return result
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get gene list: {str(e)}"
         )
 
 
@@ -492,6 +757,20 @@ async def get_dataset_pca(
     # Check if PCA is already stored in metadata
     pca_key = f"pca_{n_components}d"
     dataset_metadata = dataset.dataset_metadata or {}
+    
+    # Check external file path first (New Storage Logic)
+    pca_path_key = f"{pca_key}_path"
+    if pca_path_key in dataset_metadata:
+        try:
+            path = dataset_metadata[pca_path_key]
+            content = await storage_service.download_file(path)
+            if isinstance(content, bytes):
+                return json.loads(content.decode('utf-8'))
+            return json.loads(content)
+        except Exception as e:
+            logging.error(f"Failed to load PCA from storage: {e}")
+
+    # Check internal metadata (Backward Compatibility)
     if pca_key in dataset_metadata:
         return dataset_metadata[pca_key]
 
@@ -795,6 +1074,119 @@ async def get_dataset_comparisons_stats(
     }
 
 
+@router.get("/{dataset_id}/multiple-testing/{comparison_name}")
+async def get_multiple_testing_comparison(
+    dataset_id: UUID,
+    comparison_name: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    methods: str = Query(
+        default="bh,bonferroni,holm,by",
+        description="Comma-separated correction methods: bh, bonferroni, holm, by",
+    ),
+    threshold: float = Query(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description="Significance threshold for counting significant genes",
+    ),
+    include_genes: bool = Query(
+        default=False,
+        description="Include per-gene results (may be large). Use false for summary only.",
+    ),
+) -> dict:
+    """
+    Compare the results of multiple testing correction methods on the raw p-values
+    of a DEG comparison.
+
+    Re-applies BH, Bonferroni, Holm, and/or BY corrections to the nominal p-values
+    stored in deg_genes.pvalue and compares the number of significant genes against
+    the original padj stored from the analysis tool (e.g. DESeq2, edgeR).
+
+    This does NOT modify the stored data — results are computed on the fly.
+
+    **Query params**
+    - `methods`: comma-separated list of methods to compare (default: all four)
+    - `threshold`: significance cutoff (default 0.05)
+    - `include_genes`: if true, includes per-gene corrected values in the response
+    """
+    # ── Access check ──────────────────────────────────────────────────────
+    ds_query = select(Dataset).join(Project).where(
+        Dataset.id == dataset_id,
+        or_(
+            Project.owner_id == current_user.user_id,
+            Dataset.id.in_(
+                select(Dataset.id)
+                .join(Project)
+                .join(ProjectMember, ProjectMember.project_id == Project.id)
+                .where(ProjectMember.user_id == current_user.user_id)
+            ),
+        ),
+    )
+    ds_result = await db.execute(ds_query)
+    dataset = ds_result.scalar_one_or_none()
+
+    if not dataset:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Dataset not found",
+        )
+
+    # ── Parse requested methods ───────────────────────────────────────────
+    requested_methods: list[CorrectionMethod] = []
+    for m in methods.lower().split(","):
+        m = m.strip()
+        try:
+            requested_methods.append(CorrectionMethod(m))
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown correction method '{m}'. Valid: bh, bonferroni, holm, by",
+            )
+
+    if not requested_methods:
+        requested_methods = list(CorrectionMethod)
+
+    # ── Fetch raw p-values from deg_genes ─────────────────────────────────
+    stmt = (
+        select(DegGene.gene_id, DegGene.pvalue, DegGene.padj)
+        .where(
+            DegGene.dataset_id == dataset_id,
+            DegGene.comparison_name == comparison_name,
+        )
+        .order_by(DegGene.gene_id)
+    )
+    rows_result = await db.execute(stmt)
+    rows = rows_result.all()
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No DEG genes found for comparison '{comparison_name}'",
+        )
+
+    gene_ids = [r.gene_id for r in rows]
+    raw_pvalues = [r.pvalue for r in rows]
+    original_padj = [r.padj for r in rows]
+
+    # ── Compute corrections ───────────────────────────────────────────────
+    result = compute_correction_comparison(
+        gene_ids=gene_ids,
+        raw_pvalues=raw_pvalues,
+        original_padj=original_padj,
+        methods=requested_methods,
+        threshold=threshold,
+    )
+
+    if not include_genes:
+        result.pop("gene_results", None)
+
+    result["dataset_id"] = str(dataset_id)
+    result["comparison_name"] = comparison_name
+
+    return result
+
+
 @router.get("/{dataset_id}/diagnose-deg/{comparison_name}")
 async def diagnose_deg_filtering(
     dataset_id: UUID,
@@ -811,7 +1203,7 @@ async def diagnose_deg_filtering(
     import io
 
     # Get dataset with ownership check
-    print(f"DEBUG: Looking for dataset {dataset_id} for user {current_user.user_id}")
+    logger.debug(f"Looking for dataset {dataset_id} for user {current_user.user_id}")
     query = select(Dataset).join(Project).where(
         Dataset.id == dataset_id,
         Project.owner_id == current_user.user_id
@@ -820,16 +1212,16 @@ async def diagnose_deg_filtering(
     dataset = result.scalar_one_or_none()
 
     if not dataset:
-        print(f"DEBUG: Dataset not found for user {current_user.user_id}")
+        logger.debug(f"Dataset not found for user {current_user.user_id}")
         # Try to find dataset without user filter to see if it exists
         check_query = select(Dataset).where(Dataset.id == dataset_id)
         check_result = await db.execute(check_query)
         check_dataset = check_result.scalar_one_or_none()
         
         if check_dataset:
-            print(f"DEBUG: Dataset exists but belongs to different project")
+            logger.debug(f"Dataset exists but belongs to different project")
         else:
-            print(f"DEBUG: Dataset does not exist at all")
+            logger.debug(f"Dataset does not exist at all")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Dataset not found or not accessible"
@@ -1148,15 +1540,34 @@ async def get_volcano_plot_data(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     max_points: int = Query(5000, ge=100, le=20000, description="Maximum number of points to return"),
-    force_recalculate: bool = Query(False, description="Force recalculation from Parquet file")
+    force_recalculate: bool = Query(False, description="Force recalculation from Parquet file"),
+    padj_threshold: float = Query(0.05, ge=0.0, le=1.0, description="Adjusted p-value threshold for significance"),
+    logfc_threshold: float = Query(0.58, ge=0.0, le=10.0, description="Log fold change threshold for significance")
 ) -> dict:
     """
     Get volcano plot data for a comparison.
-    Returns cached pre-calculated data when available, or computes on-demand from Parquet.
+    Uses multi-level caching: in-memory > metadata > on-demand calculation.
     
     - **max_points**: Maximum number of points (significant genes always included)
     - **force_recalculate**: Bypass cache and recalculate from source data
     """
+    # Level 1: Check in-memory cache first (fastest)
+    if not force_recalculate:
+        cached_result = cache_service.get_volcano_data(
+            dataset_id=str(dataset_id),
+            comparison_name=comparison_name,
+            max_points=max_points,
+            padj_threshold=padj_threshold,
+            logfc_threshold=logfc_threshold
+        )
+        
+        if cached_result:
+            logger.info(
+                f"Returning in-memory cached volcano plot for {dataset_id}/{comparison_name} "
+                f"(thresholds: padj<{padj_threshold}, |logFC|>{logfc_threshold})"
+            )
+            return cached_result
+    
     # Check dataset ownership
     query = select(Dataset).join(Project).where(
         Dataset.id == dataset_id,
@@ -1171,20 +1582,45 @@ async def get_volcano_plot_data(
             detail="Dataset not found"
         )
     
-    # Try to use cached volcano plot data first (unless force_recalculate is True)
+    # Level 2: Try metadata/file cache (unless force_recalculate is True)
     if not force_recalculate:
         metadata = dataset.dataset_metadata or {}
-        volcano_plots = metadata.get("volcano_plots", {})
         
-        if comparison_name in volcano_plots:
-            cached_data = volcano_plots[comparison_name]
-            
+        # Check for external file path first (New Storage Logic)
+        volcano_path = metadata.get("volcano_plots_path")
+        cached_data = None
+        
+        if volcano_path:
+            try:
+                # Download JSON from storage
+                file_content = await storage_service.download_file(volcano_path)
+                if isinstance(file_content, bytes):
+                    plots_data = json.loads(file_content.decode('utf-8'))
+                else:
+                    plots_data = json.loads(file_content)
+                    
+                if comparison_name in plots_data:
+                    cached_data = plots_data[comparison_name]
+            except Exception as e:
+                logging.error(f"Failed to load volcano plots from storage: {e}")
+
+        # Fallback to metadata internal storage (Backward Compatibility)
+        if not cached_data:
+            volcano_plots = metadata.get("volcano_plots", {})
+            if comparison_name in volcano_plots:
+                cached_data = volcano_plots[comparison_name]
+
+        if cached_data:
             # Convert from cached format to API response format
+            # Re-calculate is_significant with current thresholds
             points = []
             sig_count = 0
             
             for point_data in cached_data:
-                is_sig = point_data.get('padj', 1.0) < 0.05 and abs(point_data.get('logFC', 0)) > 0.58
+                padj_val = point_data.get('padj', 1.0)
+                logfc_val = abs(point_data.get('logFC', 0))
+                is_sig = padj_val < padj_threshold and logfc_val > logfc_threshold
+                
                 if is_sig:
                     sig_count += 1
                     
@@ -1192,21 +1628,37 @@ async def get_volcano_plot_data(
                     "x": point_data.get("logFC", 0),
                     "y": point_data.get("negLogPadj", 0),
                     "gene": point_data.get("gene_id", "Unknown"),
-                    "padj": point_data.get("padj", 1.0),
+                    "padj": padj_val,
                     "is_significant": is_sig
                 })
             
-            return {
+            response = {
                 "dataset_id": str(dataset_id),
                 "comparison_name": comparison_name,
                 "points": points,
                 "total_genes": len(points),
                 "significant_genes": sig_count,
                 "downsampled": True,  # Pre-calculated data is always downsampled
-                "cached": True
+                "cached": True,
+                "thresholds": {
+                    "padj": padj_threshold,
+                    "logfc": logfc_threshold
+                }
             }
+            
+            # Cache in memory for next request
+            cache_service.set_volcano_data(
+                dataset_id=str(dataset_id),
+                comparison_name=comparison_name,
+                result=response,
+                max_points=max_points,
+                padj_threshold=padj_threshold,
+                logfc_threshold=logfc_threshold
+            )
+            
+            return response
     
-    # If no cache or force_recalculate, compute from Parquet file
+    # Level 3: If no cache or force_recalculate, compute from Parquet file
     # Check if we have parquet file path in metadata
     import math
     from pathlib import Path
@@ -1258,7 +1710,7 @@ async def get_volcano_plot_data(
         # Calculate -log10(padj)
         df_valid["y"] = -df_valid[padj_col].apply(lambda x: math.log10(x if x > 0 else 1e-300))
         df_valid["x"] = df_valid[logfc_col]
-        df_valid["is_significant"] = (df_valid[padj_col] < 0.05) & (df_valid[logfc_col].abs() > 0.58)
+        df_valid["is_significant"] = (df_valid[padj_col] < padj_threshold) & (df_valid[logfc_col].abs() > logfc_threshold)
         
         # Separate significant and non-significant
         sig_df = df_valid[df_valid["is_significant"]]
@@ -1289,21 +1741,117 @@ async def get_volcano_plot_data(
                 "is_significant": bool(row["is_significant"])
             })
         
-        return {
+        response = {
             "dataset_id": str(dataset_id),
             "comparison_name": comparison_name,
             "points": points,
             "total_genes": len(df_valid),
             "significant_genes": len(sig_df),
             "downsampled": len(df_valid) > max_points,
-            "cached": False
+            "cached": False,
+            "thresholds": {
+                "padj": padj_threshold,
+                "logfc": logfc_threshold
+            }
         }
+        
+        # Cache in memory for future requests
+        cache_service.set_volcano_data(
+            dataset_id=str(dataset_id),
+            comparison_name=comparison_name,
+            result=response,
+            max_points=max_points,
+            padj_threshold=padj_threshold,
+            logfc_threshold=logfc_threshold
+        )
+        logger.info(f"Cached volcano plot in memory for {dataset_id}/{comparison_name} (thresholds: padj<{padj_threshold}, |logFC|>{logfc_threshold})")
+        
+        return response
         
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load volcano plot data: {str(e)}"
         )
+
+
+
+@router.get("/{dataset_id}/heatmaps", response_model=dict)
+async def get_dataset_heatmaps(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+) -> dict:
+    """
+    Get pre-calculated heatmaps for a dataset.
+    """
+    query = select(Dataset).join(Project).where(
+        Dataset.id == dataset_id,
+        Project.owner_id == current_user.user_id
+    )
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+        
+    metadata = dataset.dataset_metadata or {}
+    
+    # 1. Check for file path
+    path = metadata.get("heatmaps_path")
+    if path:
+        try:
+            content = await storage_service.download_file(path)
+            if isinstance(content, bytes):
+                return json.loads(content.decode('utf-8'))
+            return json.loads(content)
+        except Exception as e:
+            logging.error(f"Failed to load heatmaps from storage: {e}")
+            
+    # 2. Backward compatibility (inline metadata)
+    if "heatmaps" in metadata:
+        return metadata["heatmaps"]
+        
+    return {}
+
+
+@router.get("/{dataset_id}/enrichment-dotplots", response_model=dict)
+async def get_dataset_dotplots(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+) -> dict:
+    """
+    Get pre-calculated enrichment dotplots for a dataset.
+    """
+    query = select(Dataset).join(Project).where(
+        Dataset.id == dataset_id,
+        Project.owner_id == current_user.user_id
+    )
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+        
+    metadata = dataset.dataset_metadata or {}
+    
+    # 1. Check for file path
+    path = metadata.get("enrichment_dotplots_path")
+    if path:
+        try:
+            content = await storage_service.download_file(path)
+            if isinstance(content, bytes):
+                return json.loads(content.decode('utf-8'))
+            return json.loads(content)
+        except Exception as e:
+            logging.error(f"Failed to load dotplots from storage: {e}")
+            
+    # 2. Backward compatibility (inline metadata)
+    if "enrichment_dotplots" in metadata:
+        return metadata["enrichment_dotplots"]
+        
+    return {}
 
 
 @router.get("/{dataset_id}/enrichment-pathways/{comparison_name}")
@@ -2489,7 +3037,7 @@ async def venn_analysis(
         genes = {row for row in result.scalars().all()}
         comparison_genes[comp_name] = genes
 
-        print(f"[Venn] {comp_name}: {len(genes)} genes")
+        logger.debug(f"[Venn] {comp_name}: {len(genes)} genes")
 
     # Calculate all possible intersections
     from itertools import combinations
@@ -2731,8 +3279,8 @@ async def apply_advanced_filter(
 
     except Exception as e:
         import traceback
-        print(f"Error in advanced filter: {str(e)}")
-        print(traceback.format_exc())
+        logger.error(f"Error in advanced filter: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Filter error: {str(e)}")
 
 
@@ -2746,7 +3294,8 @@ async def run_gsea_analysis(
     max_size: int = Body(500),
     n_permutations: int = Body(1000),
     fdr_threshold: float = Body(0.25),
-    db: Annotated[AsyncSession, Depends(get_db)] = None
+    db: Annotated[AsyncSession, Depends(get_db)] = None,
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)] = None
 ) -> dict:
     """
     Run Gene Set Enrichment Analysis (GSEA) on a comparison
@@ -2768,6 +3317,12 @@ async def run_gsea_analysis(
     from sqlalchemy import text
 
     try:
+        # Fetch dataset for auth check and activity logging
+        _gsea_ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+        gsea_dataset = _gsea_ds_result.scalar_one_or_none()
+        if not gsea_dataset:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+
         # Fetch all DEG genes for this comparison
         query = text("""
             SELECT gene_id, log_fc, padj, gene_name
@@ -2851,6 +3406,18 @@ async def run_gsea_analysis(
         # Calculate summary statistics
         n_enriched_positive = len([r for r in significant_results if r.normalized_enrichment_score > 0])
         n_enriched_negative = len([r for r in significant_results if r.normalized_enrichment_score < 0])
+
+        if current_user:
+            await history_service.log_activity(
+                db, gsea_dataset.project_id, current_user.user_id, ActivityEventType.GSEA_RUN,
+                entity_type="comparison",
+                entity_id=comparison_name,
+                entity_name=comparison_name,
+                extra_metadata={
+                    "gene_set_database": gene_set_database,
+                    "n_significant": len(significant_results),
+                },
+            )
 
         return {
             "dataset_id": str(dataset_id),
@@ -2974,13 +3541,16 @@ import json
 from typing import List
 
 class ClusteringRequest(BaseModel):
-    """Parameters for hierarchical clustering."""
+    """Parameters for hierarchical or K-means clustering."""
     top_n_genes: int = 2000
     gene_ids: Optional[List[str]] = None
     cluster_rows: bool = True
     cluster_cols: bool = True
-    method: str = "ward" # ward, average, complete, single
-    metric: str = "euclidean" # euclidean, correlation, cosine
+    method: str = "ward"  # ward, average, complete, single, kmeans
+    metric: str = "euclidean"  # euclidean, manhattan, correlation, cosine
+    sort_by: Optional[str] = None  # If cluster_rows=False, sort by this column
+    max_genes_for_clustering: int = 2000  # Intelligent downsampling threshold
+    n_clusters: Optional[int] = None  # Number of clusters for K-means (auto if None)
 
 @router.post("/{dataset_id}/cluster")
 async def cluster_dataset(
@@ -2991,6 +3561,7 @@ async def cluster_dataset(
 ):
     """
     Perform hierarchical clustering on a dataset (matrix type).
+    Uses in-memory caching for ultra-fast repeat requests.
     """
     # 1. Check permissions and get dataset
     query = select(Dataset).join(Project).filter(Dataset.id == dataset_id)
@@ -3001,25 +3572,21 @@ async def cluster_dataset(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found or access denied")
         
-    # Check cache
-    try:
-        # Create a stable cache key based on params
-        cache_key_dict = params.model_dump()
-        cache_key_str = json.dumps(cache_key_dict, sort_keys=True)
-        cache_hash = hashlib.md5(cache_key_str.encode()).hexdigest()
-        cache_path = f"projects/{dataset.project_id}/clustering/{dataset_id}_{cache_hash}.json"
-        
-        # Check if cache exists
-        try:
-            cached_data = await storage_service.download_file(cache_path)
-            logger.info(f"Returning cached clustering result for {dataset_id}")
-            return json.loads(cached_data)
-        except:
-            # Not found in cache
-            pass
-            
-    except Exception as e:
-        logger.warning(f"Cache check failed: {e}")
+    # Check in-memory cache first (much faster than file cache)
+    gene_list = params.gene_ids or []
+    cached_result = cache_service.get_clustering_result(
+        dataset_id=str(dataset_id),
+        gene_list=gene_list,
+        method=params.method,
+        metric=params.metric,
+        top_n_genes=params.top_n_genes,
+        cluster_rows=params.cluster_rows,
+        cluster_cols=params.cluster_cols
+    )
+    
+    if cached_result:
+        logger.info(f"Returning cached clustering result for {dataset_id} ({len(gene_list)} genes)")
+        return cached_result
 
     # Check if user is owner of project
     project_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
@@ -3042,30 +3609,104 @@ async def cluster_dataset(
     if dataset.status != DatasetStatus.READY:
         raise HTTPException(status_code=400, detail="Dataset is not ready for analysis")
 
-    # 3. Fetch data from Storage
+    # 3. Fetch data from Storage (optimized for subset queries)
     parquet_path = dataset.parquet_file_path or dataset.raw_file_path
     if not parquet_path:
-         raise HTTPException(status_code=500, detail="Dataset file path missing")
+         logger.error(f"Dataset {dataset_id} missing file path (parquet_file_path and raw_file_path are None)")
+         raise HTTPException(status_code=500, detail="Dataset file path missing. Contact support.")
 
     try:
-        file_data = await storage_service.download_file(parquet_path)
-        df = await data_processor.get_dataframe(file_data)
-        
-        # Determine gene ID column if present and set as index
-        if "gene_id" in df.columns:
-            df = df.set_index("gene_id")
-        elif "Unnamed: 0" in df.columns:
-             df = df.set_index("Unnamed: 0")
+        # OPTIMIZATION: If gene_ids specified, use subset query (much faster)
+        if params.gene_ids and len(params.gene_ids) > 0:
+            logger.info(f"Loading subset of {len(params.gene_ids)} genes for clustering from dataset {dataset_id}")
+            # Download file and extract subset
+            try:
+                file_data = await storage_service.download_file(parquet_path)
+            except Exception as storage_error:
+                logger.error(f"Failed to download file {parquet_path}: {storage_error}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Failed to access dataset file from storage. File may be missing or corrupted."
+                )
+            
+            df = await data_processor.query_matrix_subset(
+                parquet_data=file_data,
+                gene_list=params.gene_ids,
+                sample_columns=None  # Will read all sample columns
+            )
+            logger.info(f"Loaded subset: {len(df)} genes x {len(df.columns)} samples (PyArrow optimized)")
+        else:
+            # Full dataset or top_n_genes mode
+            # Check DataFrame cache for hot datasets
+            df = cache_service.get_dataframe(str(dataset_id))
+            
+            if df is None:
+                # Not in cache, download and parse
+                logger.info(f"Loading full dataset {dataset_id} from storage (not in cache)")
+                try:
+                    file_data = await storage_service.download_file(parquet_path)
+                except Exception as storage_error:
+                    logger.error(f"Failed to download file {parquet_path}: {storage_error}")
+                    raise HTTPException(
+                        status_code=500, 
+                        detail=f"Failed to access dataset file from storage. File may be missing or corrupted."
+                    )
+                
+                df = await data_processor.get_dataframe(file_data)
+                
+                # Set index if needed
+                if "gene_id" in df.columns:
+                    df = df.set_index("gene_id")
+                elif "Unnamed: 0" in df.columns:
+                     df = df.set_index("Unnamed: 0")
+                else:
+                    logger.warning(f"Dataset {dataset_id} has no gene_id or Unnamed: 0 column, using default index")
+                
+                # Cache for future requests (only if reasonable size)
+                if df.memory_usage(deep=True).sum() < 500 * 1024 * 1024:  # < 500 MB
+                    cache_service.set_dataframe(str(dataset_id), df)
+                    logger.info(f"Cached DataFrame for dataset {dataset_id} ({df.memory_usage(deep=True).sum() / 1024 / 1024:.1f} MB)")
+                else:
+                    logger.info(f"Dataset {dataset_id} too large to cache ({df.memory_usage(deep=True).sum() / 1024 / 1024:.0f} MB)")
+            else:
+                logger.info(f"Using cached DataFrame for dataset {dataset_id}")
         
         # Ensure all data is numeric for clustering
         # Filter out non-numeric columns just in case
         numeric_df = df.select_dtypes(include=[np.number])
         
         if numeric_df.empty:
-             raise HTTPException(status_code=400, detail="No numeric data found in dataset for clustering")
+             logger.error(f"Dataset {dataset_id} has no numeric columns. Columns: {df.columns.tolist()}")
+             raise HTTPException(
+                 status_code=400, 
+                 detail=f"No numeric data found in dataset for clustering. Dataset has only non-numeric columns."
+             )
+        
+        if len(numeric_df) == 0:
+            logger.error(f"Dataset {dataset_id} has no rows after filtering")
+            raise HTTPException(
+                status_code=400,
+                detail="Dataset has no genes/rows for clustering"
+            )
+        
+        logger.info(f"Prepared data for clustering: {len(numeric_df)} genes x {len(numeric_df.columns)} samples")
+        
+        # 3.5. Try to load pre-computed sample clustering (if exists and cluster_cols=True)
+        precomputed_col_clustering = None
+        if params.cluster_cols:
+            from app.services.persistent_cache_service import persistent_cache_service
+            precomputed_col_clustering = await persistent_cache_service.get_cached(
+                db=db,
+                computation_type="sample_clustering",
+                dataset_id=str(dataset_id),
+                params={"method": params.method, "metric": params.metric, "top_n_genes": params.top_n_genes}
+            )
+            if precomputed_col_clustering:
+                logger.info(f"⚡ Using pre-computed sample clustering for {dataset_id}")
         
         # 4. Perform Clustering
         try:
+            logger.info(f"Starting clustering with params: top_n={params.top_n_genes}, genes={len(params.gene_ids or [])}, method={params.method}, metric={params.metric}")
             result = clustering_service.perform_clustering(
                 numeric_df,
                 top_n_genes=params.top_n_genes,
@@ -3073,29 +3714,582 @@ async def cluster_dataset(
                 cluster_rows=params.cluster_rows,
                 cluster_cols=params.cluster_cols,
                 method=params.method,
-                metric=params.metric
+                metric=params.metric,
+                sort_by=params.sort_by,
+                max_genes_for_clustering=params.max_genes_for_clustering,
+                precomputed_col_clustering=precomputed_col_clustering,
+                n_clusters=params.n_clusters
             )
+            logger.info(f"Clustering completed successfully for dataset {dataset_id}")
 
-            # Save to cache
-            try:
-                cache_key_dict = params.model_dump()
-                cache_key_str = json.dumps(cache_key_dict, sort_keys=True)
-                cache_hash = hashlib.md5(cache_key_str.encode()).hexdigest()
-                cache_path = f"projects/{dataset.project_id}/clustering/{dataset_id}_{cache_hash}.json"
-                
-                await storage_service.upload_file(
-                    cache_path,
-                    json.dumps(result).encode('utf-8'),
-                    content_type="application/json"
-                )
-            except Exception as e:
-                logger.warning(f"Failed to save clustering cache: {e}")
+            # Save to in-memory cache (much faster than file I/O)
+            cache_service.set_clustering_result(
+                dataset_id=str(dataset_id),
+                gene_list=gene_list,
+                result=result,
+                method=params.method,
+                metric=params.metric,
+                top_n_genes=params.top_n_genes,
+                cluster_rows=params.cluster_rows,
+                cluster_cols=params.cluster_cols
+            )
+            logger.info(f"Cached clustering result for {dataset_id} ({len(gene_list)} genes)")
 
+            await history_service.log_activity(
+                db, project.id, current_user.user_id, ActivityEventType.CLUSTERING_RUN,
+                entity_type="dataset",
+                entity_id=str(dataset_id),
+                entity_name=dataset.name,
+                extra_metadata={
+                    "method": params.method,
+                    "metric": params.metric,
+                    "top_n_genes": params.top_n_genes,
+                    "n_genes": len(gene_list) if gene_list else None,
+                },
+            )
             return result
+        except ValueError as ve:
+            # User/data errors (400)
+            logger.warning(f"Clustering validation error for dataset {dataset_id}: {ve}")
+            raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Clustering failed: {str(e)}")
+            # Server errors (500)
+            logger.error(f"Clustering computation error for dataset {dataset_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Clustering computation failed: {str(e)}")
             
+    except HTTPException:
+        # Re-raise HTTP exceptions without wrapping
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error accessing dataset data: {str(e)}")
+
+# ============================================================================
+# Heatmap Optimization Endpoints
+# ============================================================================
+
+@router.get("/{dataset_id}/sample-correlations")
+async def get_sample_correlations(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    method: str = "ward",
+    metric: str = "euclidean",
+    top_n_genes: int = 2000
+):
+    """
+    Retrieve pre-computed sample correlations from database cache.
+    This enables instant heatmap rendering without recalculating.
+    
+    Returns correlation and distance matrices for all samples.
+    """
+    from app.services.sample_correlation_service import sample_correlation_service
+    
+    # 1. Check permissions
+    query = select(Dataset).join(Project).where(
+        Dataset.id == dataset_id,
+        Project.owner_id == current_user.user_id
+    )
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    
+    # 2. Try to get cached correlations
+    cached = await sample_correlation_service.get_cached_correlations(
+        db=db,
+        dataset_id=dataset_id,
+        method=method,
+        metric=metric,
+        top_n_genes=top_n_genes
+    )
+    
+    if cached:
+        return {
+            "status": "cached",
+            "dataset_id": str(dataset_id),
+            **cached
+        }
+    
+    # 3. Not cached - suggest precomputation
+    return {
+        "status": "not_cached",
+        "dataset_id": str(dataset_id),
+        "message": "Correlations not cached. Use POST /{dataset_id}/precompute-sample-clustering to cache.",
+        "method": method,
+        "metric": metric,
+        "top_n_genes": top_n_genes
+    }
+
+
+@router.post("/{dataset_id}/precompute-sample-clustering")
+async def precompute_sample_clustering(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    method: str = "ward",
+    metric: str = "euclidean",
+    top_n_genes: int = 2000
+):
+    """
+    Pre-compute sample (column) clustering for a dataset.
+    This is done once and cached for all future visualizations.
+    Significantly speeds up heatmap rendering.
+    
+    Now also caches pairwise sample correlations in the database
+    for even faster subsequent queries.
+    """
+    from app.services.persistent_cache_service import persistent_cache_service
+    from app.services.sample_correlation_service import sample_correlation_service
+    from scipy.spatial import distance as sp_distance
+    from scipy.stats import pearsonr
+    
+    # 1. Check permissions
+    query = select(Dataset).join(Project).filter(Dataset.id == dataset_id)
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+    
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    
+    # 2. Check if already cached
+    cache_key = f"sample_clustering_{dataset_id}_{method}_{metric}_{top_n_genes}"
+    cached = await persistent_cache_service.get_cached(
+        db=db,
+        computation_type="sample_clustering",
+        dataset_id=str(dataset_id),
+        params={"method": method, "metric": metric, "top_n_genes": top_n_genes}
+    )
+    
+    if cached:
+        logger.info(f"Sample clustering already cached for {dataset_id}")
+        return cached
+    
+    # 3. Load full dataset
+    try:
+        parquet_path = dataset.asset_path
+        file_data = await storage_service.download_file(parquet_path)
+        df = await data_processor.get_dataframe(file_data)
+        
+        if "gene_id" in df.columns:
+            df = df.set_index("gene_id")
+        elif "Unnamed: 0" in df.columns:
+            df = df.set_index("Unnamed: 0")
+        
+        numeric_df = df.select_dtypes(include=[np.number])
+        
+        # 4. Pre-compute sample clustering
+        result = clustering_service.precompute_sample_clustering(
+            numeric_df,
+            method=method,
+            metric=metric,
+            top_n_genes=top_n_genes
+        )
+        
+        # 5. Compute and cache pairwise correlations/distances
+        samples = result['col_labels']
+        n_samples = len(samples)
+        
+        # Select top variable genes
+        if len(numeric_df) > top_n_genes:
+            variances = numeric_df.var(axis=1)
+            top_indices = variances.nlargest(top_n_genes).index
+            df_subset = numeric_df.loc[top_indices]
+        else:
+            df_subset = numeric_df
+        
+        # Normalize data
+        data_values = df_subset.values.astype(float)
+        means = np.mean(data_values, axis=1, keepdims=True)
+        stds = np.std(data_values, axis=1, keepdims=True)
+        stds[stds == 0] = 1.0
+        normalized_values = (data_values - means) / stds
+        
+        # Compute correlation matrix (Pearson correlation between samples)
+        correlation_matrix = np.corrcoef(normalized_values.T)
+        
+        # Compute distance matrix based on metric
+        if metric == 'euclidean':
+            distance_matrix = sp_distance.squareform(sp_distance.pdist(normalized_values.T, metric='euclidean'))
+        elif metric in ['manhattan', 'cityblock']:
+            distance_matrix = sp_distance.squareform(sp_distance.pdist(normalized_values.T, metric='cityblock'))
+        elif metric == 'correlation':
+            # Convert correlation to distance: d = 1 - r
+            distance_matrix = 1.0 - correlation_matrix
+        elif metric == 'cosine':
+            distance_matrix = sp_distance.squareform(sp_distance.pdist(normalized_values.T, metric='cosine'))
+        else:
+            distance_matrix = correlation_matrix  # fallback
+        
+        # Cache correlations in database
+        cached_count = await sample_correlation_service.cache_correlations(
+            db=db,
+            dataset_id=dataset_id,
+            samples=samples,
+            correlation_matrix=correlation_matrix,
+            distance_matrix=distance_matrix,
+            method=method,
+            metric=metric,
+            top_n_genes=top_n_genes
+        )
+        
+        logger.info(f"✅ Cached {cached_count} sample correlations")
+        
+        # 6. Cache clustering result (expires in 30 days)
+        await persistent_cache_service.set_cached(
+            db=db,
+            computation_type="sample_clustering",
+            dataset_id=str(dataset_id),
+            params={"method": method, "metric": metric, "top_n_genes": top_n_genes},
+            result=result,
+            ttl_seconds=30 * 24 * 3600  # 30 days
+        )
+        
+        logger.info(f"✅ Pre-computed sample clustering for {dataset_id} ({result['genes_used']} genes)")
+        
+        return {
+            "status": "success",
+            "dataset_id": str(dataset_id),
+            "samples": len(result['col_labels']),
+            "genes_used": result['genes_used'],
+            "method": method,
+            "metric": metric,
+            "cached_correlations": cached_count
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to precompute clustering: {str(e)}")
+
+# ============================================================================
+# Gene Ontology (GO) Endpoints
+# ============================================================================
+
+@router.post("/{dataset_id}/comparisons/{comparison_name}/go-enrichment")
+async def run_go_enrichment_analysis(
+    dataset_id: UUID,
+    comparison_name: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    namespace: Optional[str] = Body(None, description="GO namespace: BP, MF, CC (None = all)"),
+    regulation: Optional[str] = Body(None, description="Filter by regulation: UP, DOWN (None = all)"),
+    padj_threshold: float = Body(0.05, description="Adjusted p-value threshold for DEGs"),
+    log_fc_threshold: float = Body(0.5, description="Absolute log fold-change threshold"),
+    min_term_size: int = Body(5, description="Minimum number of genes in GO term"),
+    max_term_size: int = Body(500, description="Maximum number of genes in GO term"),
+    pvalue_threshold: float = Body(0.05, description="P-value threshold for enrichment"),
+    fdr_method: str = Body("fdr_bh", description="FDR correction method"),
+    propagate_annotations: bool = Body(True, description="Propagate annotations to ancestors (true path rule)"),
+    organism: str = Body("Homo sapiens", description="Organism name")
+) -> dict:
+    """
+    Run Gene Ontology (GO) enrichment analysis on DEGs from a comparison.
+    
+    Uses hypergeometric test to find overrepresented GO terms in DEGs.
+    Supports the true path rule: genes annotated to a term are also annotated to ancestors.
+    
+    Returns enriched GO terms with p-values, FDR, gene lists, and hierarchy.
+    """
+    from sqlalchemy import text
+    import pandas as pd
+    
+    # 1. Verify dataset exists and user has access
+    query = select(Dataset).join(Project).where(
+        Dataset.id == dataset_id,
+        Project.owner_id == current_user.user_id
+    )
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+    
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    
+    # 2. Get DEGs for this comparison
+    deg_query = select(DegGene).where(
+        DegGene.dataset_id == dataset_id,
+        DegGene.comparison_name == comparison_name
+    )
+    
+    # Apply thresholds
+    deg_query = deg_query.where(
+        DegGene.padj <= padj_threshold,
+        func.abs(DegGene.log_fc) >= log_fc_threshold
+    )
+    
+    # Filter by regulation if specified
+    if regulation == "UP":
+        deg_query = deg_query.where(DegGene.log_fc > 0)
+    elif regulation == "DOWN":
+        deg_query = deg_query.where(DegGene.log_fc < 0)
+    
+    result = await db.execute(deg_query)
+    degs = result.scalars().all()
+    
+    if not degs:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No DEGs found for comparison {comparison_name} with specified thresholds"
+        )
+    
+    # Extract gene symbols
+    study_genes = [deg.gene_id for deg in degs]
+    logger.info(f"Found {len(study_genes)} DEGs for GO enrichment")
+    
+    # 3. Get background genes (all genes in dataset)
+    # Get all genes from dataset
+    all_genes_query = text("""
+        SELECT DISTINCT gene_id
+        FROM deg_genes
+        WHERE dataset_id = :dataset_id
+    """)
+    result = await db.execute(all_genes_query, {"dataset_id": str(dataset_id)})
+    background_genes = [row[0] for row in result.fetchall()]
+    logger.info(f"Background: {len(background_genes)} genes")
+    
+    # 4. Run GO enrichment analysis
+    try:
+        enrichment_results = await go_service.go_enrichment_analysis(
+            db=db,
+            study_genes=study_genes,
+            background_genes=background_genes,
+            namespace=namespace,
+            organism=organism,
+            min_term_size=min_term_size,
+            max_term_size=max_term_size,
+            pvalue_threshold=pvalue_threshold,
+            fdr_method=fdr_method,
+            propagate_annotations=propagate_annotations
+        )
+    except Exception as e:
+        logger.error(f"GO enrichment failed: {e}")
+        raise HTTPException(status_code=500, detail=f"GO enrichment analysis failed: {str(e)}")
+    
+    # 5. Add regulation info to results
+    for result in enrichment_results:
+        result["comparison_name"] = comparison_name
+        result["regulation"] = regulation or "ALL"
+    
+    logger.info(f"✅ GO enrichment complete: {len(enrichment_results)} terms found")
+
+    await history_service.log_activity(
+        db, dataset.project_id, current_user.user_id, ActivityEventType.GO_ENRICHMENT_RUN,
+        entity_type="comparison",
+        entity_id=comparison_name,
+        entity_name=comparison_name,
+        extra_metadata={
+            "namespace": namespace or "ALL",
+            "regulation": regulation or "ALL",
+            "n_terms": len(enrichment_results),
+        },
+    )
+
+    return {
+        "dataset_id": str(dataset_id),
+        "comparison_name": comparison_name,
+        "regulation": regulation or "ALL",
+        "namespace": namespace or "ALL",
+        "study_size": len(study_genes),
+        "background_size": len(background_genes),
+        "enriched_terms": enrichment_results,
+        "parameters": {
+            "padj_threshold": padj_threshold,
+            "log_fc_threshold": log_fc_threshold,
+            "min_term_size": min_term_size,
+            "max_term_size": max_term_size,
+            "pvalue_threshold": pvalue_threshold,
+            "fdr_method": fdr_method,
+            "propagate_annotations": propagate_annotations,
+            "organism": organism
+        }
+    }
+
+
+@router.get("/go-terms/search")
+async def search_go_terms(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    q: str = Query(..., description="Search query (GO ID or term name)"),
+    namespace: Optional[str] = Query(None, description="GO namespace: BP, MF, CC"),
+    limit: int = Query(20, ge=1, le=100, description="Maximum results")
+) -> dict:
+    """
+    Search GO terms by GO ID or name.
+    Supports fuzzy matching on term names.
+    """
+    try:
+        results = await go_service.search_go_terms(
+            db=db,
+            query=q,
+            namespace=namespace,
+            limit=limit
+        )
+        
+        return {
+            "query": q,
+            "namespace": namespace,
+            "results": results,
+            "count": len(results)
+        }
+    except Exception as e:
+        logger.error(f"GO term search failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@router.get("/go-terms/{go_id}")
+async def get_go_term_details(
+    go_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    include_ancestors: bool = Query(False, description="Include ancestor terms"),
+    include_descendants: bool = Query(False, description="Include descendant terms")
+) -> dict:
+    """
+    Get detailed information about a specific GO term including:
+    - Term metadata (name, definition, namespace)
+    - Hierarchical relationships (is_a, part_of, regulates)
+    - Gene count
+    - Optional: ancestors and descendants in the GO DAG
+    """
+    try:
+        term = await go_service.get_go_term(
+            db=db,
+            go_id=go_id,
+            include_ancestors=include_ancestors,
+            include_descendants=include_descendants
+        )
+        
+        if not term:
+            raise HTTPException(status_code=404, detail=f"GO term {go_id} not found")
+        
+        return term
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get GO term {go_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve term: {str(e)}")
+
+
+@router.get("/go-terms/{go_id}/genes")
+async def get_go_term_genes(
+    go_id: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    organism: str = Query("Homo sapiens", description="Organism name"),
+    evidence_codes: Optional[str] = Query(None, description="Comma-separated evidence codes"),
+    propagate: bool = Query(True, description="Include genes from child terms")
+) -> dict:
+    """
+    Get all genes annotated to a GO term.
+    
+    Parameters:
+    - organism: Filter by organism
+    - evidence_codes: Filter by evidence codes (e.g., "IEA,IDA,IMP")
+    - propagate: Include annotations from descendant terms (true path rule)
+    """
+    try:
+        # Parse evidence codes
+        evidence_list = None
+        if evidence_codes:
+            evidence_list = [e.strip() for e in evidence_codes.split(",")]
+        
+        annotations = await go_service.get_gene_annotations(
+            db=db,
+            go_id=go_id,
+            organism=organism,
+            evidence_codes=evidence_list,
+            propagate_from_children=propagate
+        )
+        
+        # Extract unique genes
+        unique_genes = list({a["gene_symbol"] for a in annotations})
+        
+        return {
+            "go_id": go_id,
+            "organism": organism,
+            "gene_count": len(unique_genes),
+            "genes": unique_genes,
+            "annotations": annotations,
+            "parameters": {
+                "evidence_codes": evidence_list,
+                "propagate": propagate
+            }
+        }
+    except Exception as e:
+        logger.error(f"Failed to get genes for GO term {go_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve genes: {str(e)}")
+
+
+# ============================================================================
+# Admin Endpoints - Performance & Cache Monitoring
+# ============================================================================
+
+@router.get("/admin/performance-stats")
+async def get_performance_statistics(
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+):
+    """
+    Get performance statistics for all monitored endpoints and functions.
+    Admin only endpoint for monitoring system performance.
+    """
+    from app.core.monitoring import get_performance_stats
+    import time
+    
+    stats = get_performance_stats()
+    
+    # Add cache statistics
+    cache_stats = cache_service.get_stats()
+    
+    return {
+        "performance": stats,
+        "cache": cache_stats,
+        "timestamp": time.time()
+    }
+
+
+@router.get("/admin/cache-stats")
+async def get_cache_statistics(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+):
+    """
+    Get detailed cache statistics including both in-memory and persistent caches.
+    """
+    from app.services.persistent_cache_service import persistent_cache_service
+    import time
+    
+    # In-memory cache stats
+    memory_cache = cache_service.get_stats()
+    
+    # Persistent cache stats
+    persistent_cache = await persistent_cache_service.get_cache_stats(db)
+    
+    return {
+        "memory_cache": memory_cache,
+        "persistent_cache": persistent_cache,
+        "timestamp": time.time()
+    }
+
+
+@router.post("/admin/cache-cleanup")
+async def cleanup_expired_cache(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+):
+    """
+    Manually trigger cleanup of expired cache entries.
+    """
+    from app.services.persistent_cache_service import persistent_cache_service
+    import time
+    
+    deleted_count = await persistent_cache_service.cleanup_expired(db)
+    
+    return {
+        "status": "success",
+        "deleted_entries": deleted_count,
+        "timestamp": time.time()
+    }

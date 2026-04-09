@@ -2,15 +2,20 @@
 GenoLens Next - FastAPI Application Entry Point
 A flexible, data-centric bioinformatics SaaS platform for transcriptomics analysis.
 """
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
+from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
 from app.db.session import close_db
-from app.api.endpoints import projects, datasets, admin, users, ontology, enrichment
+from app.api.endpoints import projects, datasets, admin, users, ontology, enrichment, bookmarks, genes, comments, history, integrations
+from app.middleware import SecurityHeadersMiddleware, limiter
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -20,18 +25,18 @@ async def lifespan(app: FastAPI):
     Manages startup and shutdown events.
     """
     # Startup
-    print(f"🚀 Starting {settings.APP_NAME} v{settings.APP_VERSION}")
-    print(f"🌍 Environment: {settings.ENVIRONMENT}")
-    print(f"� CORS Origins: {settings.CORS_ORIGINS}")
-    print(f"�📊 Database: Connected")
-    print(f"🔄 Celery: Worker configured")
+    logger.info(f"🚀 Starting {settings.APP_NAME} v{settings.APP_VERSION}")
+    logger.info(f"🌍 Environment: {settings.ENVIRONMENT}")
+    logger.info(f"🌐 CORS Origins: {settings.CORS_ORIGINS}")
+    logger.info(f"📊 Database: Connected")
+    logger.info(f"🔄 Celery: Worker configured")
 
     yield
 
     # Shutdown
-    print("🛑 Shutting down...")
+    logger.info("🛑 Shutting down...")
     await close_db()
-    print("✅ Database connections closed")
+    logger.info("✅ Database connections closed")
 
 
 # Create FastAPI app
@@ -71,16 +76,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Security Headers Middleware
+app.add_middleware(SecurityHeadersMiddleware)
+
+# Rate Limiter State (required by slowapi)
+app.state.limiter = limiter
+
 
 # Exception Handlers
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Handle rate limit exceeded errors."""
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "detail": "Rate limit exceeded. Please try again later.",
+            "retry_after": exc.detail
+        }
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle validation errors with detailed messages."""
+    # Convert Pydantic errors to JSON-serializable format
+    errors = []
+    for error in exc.errors():
+        error_dict = {
+            "loc": list(error.get("loc", [])),
+            "msg": str(error.get("msg", "")),
+            "type": str(error.get("type", ""))
+        }
+        # Handle ValueError context if present
+        if "ctx" in error:
+            error_dict["ctx"] = {k: str(v) for k, v in error["ctx"].items()}
+        errors.append(error_dict)
+    
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
-            "detail": exc.errors(),
-            "body": exc.body
+            "detail": errors,
+            "body": str(exc.body) if exc.body else None
+        },
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
         }
     )
 
@@ -88,21 +128,27 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Handle unexpected errors gracefully."""
+    response_content = {}
+    
     if settings.is_development:
         # In development, return full error details
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "detail": str(exc),
-                "type": type(exc).__name__
-            }
-        )
+        response_content = {
+            "detail": str(exc),
+            "type": type(exc).__name__
+        }
     else:
         # In production, return generic error
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": "Internal server error"}
-        )
+        response_content = {"detail": "Internal server error"}
+    
+    # Always include CORS headers on errors
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=response_content,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    )
 
 
 # Root Endpoint
@@ -189,6 +235,32 @@ app.include_router(
     prefix=settings.API_V1_PREFIX,
 )
 
+app.include_router(
+    bookmarks.router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    genes.router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    comments.router,
+    prefix=settings.API_V1_PREFIX,
+    tags=["comments"]
+)
+
+app.include_router(
+    history.router,
+    prefix=settings.API_V1_PREFIX,
+    tags=["history"]
+)
+
+app.include_router(
+    integrations.router,
+    prefix=settings.API_V1_PREFIX,
+)
 
 
 if __name__ == "__main__":
