@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://api-v2.genolens.com/api}
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+    restart: always
+    networks:
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.genolens-front.rule=Host(`app.genolens.com`)"
+      - "traefik.http.routers.genolens-front.entrypoints=websecure"
+      - "traefik.http.routers.genolens-front.tls.certresolver=letsencrypt"
+      - "traefik.http.services.genolens-front.loadbalancer.server.port=3000"
+
+networks:
+  web:
+    external: true
