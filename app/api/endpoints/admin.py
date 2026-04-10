@@ -2,12 +2,15 @@
 Admin endpoints for user and system management.
 Requires ADMIN role.
 """
+import logging
 from typing import List, Optional
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from app.api.deps import get_db, require_admin
 from app.core.supabase_auth import SupabaseUser
@@ -1208,3 +1211,106 @@ async def remove_project_member(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error removing project member: {str(e)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Demo data assignment
+# ---------------------------------------------------------------------------
+
+
+class DemoAssignRequest(BaseModel):
+    """Optional overrides for the demo project (currently unused, reserved for future use)."""
+    pass
+
+
+class DemoDatasetInfo(BaseModel):
+    """Minimal dataset info returned by assign-demo."""
+    id: UUID
+    name: str
+    comparison_name: str
+    deg_up_count: Optional[int] = None
+    deg_down_count: Optional[int] = None
+    deg_significant_count: Optional[int] = None
+    total_genes: Optional[int] = None
+
+
+class DemoAssignResponse(BaseModel):
+    """Response after assigning demo data."""
+    project_id: UUID
+    project_name: str
+    datasets: List[DemoDatasetInfo]
+    message: str
+
+
+@router.post("/users/{user_id}/assign-demo", response_model=DemoAssignResponse)
+async def assign_demo_data(
+    user_id: UUID,
+    _body: DemoAssignRequest = DemoAssignRequest(),
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a synthetic demo project with 2 DEG comparisons for a user.
+
+    The project is populated with realistic human gene data and enrichment
+    pathways so the user can immediately explore all platform features.
+
+    Returns HTTP 409 if a demo project already exists for that user.
+    Admin only.
+    """
+    from app.services.demo_seed_service import (
+        DEMO_PROJECT_NAME,
+        DemoAlreadyExistsError,
+        create_demo_data,
+    )
+
+    try:
+        project = await create_demo_data(db, user_id)
+    except DemoAlreadyExistsError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"User {user_id} already has a demo project "
+                f"named '{DEMO_PROJECT_NAME}'. "
+                "Delete it first before re-assigning."
+            ),
+        )
+    except Exception as exc:
+        logger.exception("[admin] assign-demo failed for user %s", user_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create demo data: {exc}",
+        )
+
+    # Eager-load datasets to build the response
+    result = await db.execute(
+        select(Dataset).where(Dataset.project_id == project.id)
+    )
+    datasets = result.scalars().all()
+
+    dataset_infos = [
+        DemoDatasetInfo(
+            id=ds.id,
+            name=ds.name,
+            comparison_name=(
+                ds.dataset_metadata.get("comparisons", ["unknown"])[0]
+                if ds.dataset_metadata
+                else "unknown"
+            ),
+            deg_up_count=ds.deg_up_count,
+            deg_down_count=ds.deg_down_count,
+            deg_significant_count=ds.deg_significant_count,
+            total_genes=ds.total_genes,
+        )
+        for ds in datasets
+    ]
+
+    return DemoAssignResponse(
+        project_id=project.id,
+        project_name=project.name,
+        datasets=dataset_infos,
+        message=(
+            f"Demo project '{project.name}' created successfully "
+            f"with {len(dataset_infos)} comparisons."
+        ),
+    )
