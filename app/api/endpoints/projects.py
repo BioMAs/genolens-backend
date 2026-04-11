@@ -4,13 +4,13 @@ Project API endpoints using SQLAlchemy.
 from uuid import UUID
 from typing import Optional, Annotated
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 
 from app.api.deps import get_db, get_current_user
 from app.core.supabase_auth import SupabaseUser, lookup_user_by_email
-from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog
+from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, UserRole
 from app.services import email_service, history_service
 from app.schemas.project import (
     ProjectCreate,
@@ -32,6 +32,21 @@ from app.schemas.project import (
 
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+async def _check_project_admin(project: Project, current_user_id: UUID, db: AsyncSession) -> bool:
+    """
+    Returns True if current_user_id is the project owner OR a member with access_level == ADMIN.
+    """
+    if project.owner_id == current_user_id:
+        return True
+    member_query = select(ProjectMember).where(
+        ProjectMember.project_id == project.id,
+        ProjectMember.user_id == current_user_id,
+        ProjectMember.access_level == UserRole.ADMIN,
+    )
+    result = await db.execute(member_query)
+    return result.scalar_one_or_none() is not None
 
 
 @router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -68,15 +83,18 @@ async def list_projects(
     page_size: int = Query(default=20, ge=1, le=100, description="Items per page")
 ) -> dict:
     """
-    List all projects owned by the current user (paginated).
+    List all projects owned by or shared with the current user (paginated).
     """
+    member_subquery = select(ProjectMember.project_id).where(ProjectMember.user_id == current_user.user_id)
+    access_filter = or_(Project.owner_id == current_user.user_id, Project.id.in_(member_subquery))
+
     # Get total count
-    count_query = select(func.count()).select_from(Project).where(Project.owner_id == current_user.user_id)
+    count_query = select(func.count()).select_from(Project).where(access_filter)
     total = await db.scalar(count_query)
 
     # Get paginated projects
     offset = (page - 1) * page_size
-    query = select(Project).where(Project.owner_id == current_user.user_id)\
+    query = select(Project).where(access_filter)\
         .order_by(Project.created_at.desc())\
         .offset(offset).limit(page_size)
     
@@ -100,10 +118,7 @@ async def get_project(
     """
     Get a specific project by ID.
     """
-    query = select(Project).where(
-        Project.id == project_id,
-        Project.owner_id == current_user.user_id
-    )
+    query = select(Project).where(Project.id == project_id)
     result = await db.execute(query)
     project = result.scalar_one_or_none()
 
@@ -112,7 +127,21 @@ async def get_project(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
         )
-    
+
+    # Vérifier que l'utilisateur est propriétaire ou membre du projet
+    if project.owner_id != current_user.user_id:
+        member_query = select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == current_user.user_id
+        )
+        member_result = await db.execute(member_query)
+        member = member_result.scalar_one_or_none()
+        if not member:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found"
+            )
+
     return project
 
 
@@ -126,11 +155,8 @@ async def update_project(
     """
     Update a project.
     """
-    # Check if project exists and belongs to user
-    query = select(Project).where(
-        Project.id == project_id,
-        Project.owner_id == current_user.user_id
-    )
+    # Check if project exists
+    query = select(Project).where(Project.id == project_id)
     result = await db.execute(query)
     project = result.scalar_one_or_none()
 
@@ -138,6 +164,12 @@ async def update_project(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
+        )
+
+    if not await _check_project_admin(project, current_user.user_id, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only project admins can update this project"
         )
 
     # Update project
@@ -165,10 +197,16 @@ def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
 
         # Single file per comparison (old way)
         if d.type == "DEG":
-            comp_name = metadata.get('comparison_name', d.name) if metadata else d.name
-            deg_up = metadata.get('deg_up', 0) if metadata else 0
-            deg_down = metadata.get('deg_down', 0) if metadata else 0
-            deg_total = metadata.get('deg_total', deg_up + deg_down) if metadata else 0
+            # Prefer explicit comparison_name; fall back to first item in list; then dataset name
+            comp_name = metadata.get('comparison_name') if metadata else None
+            if not comp_name and isinstance(metadata.get('comparisons'), list) and metadata['comparisons']:
+                comp_name = metadata['comparisons'][0]
+            if not comp_name:
+                comp_name = d.name
+            # Use pre-calculated DB counts as primary source, metadata as fallback
+            deg_up = d.deg_up_count or (metadata.get('deg_up', 0) if metadata else 0)
+            deg_down = d.deg_down_count or (metadata.get('deg_down', 0) if metadata else 0)
+            deg_total = d.deg_significant_count or (metadata.get('deg_total', deg_up + deg_down) if metadata else deg_up + deg_down)
             comparisons_dict[comp_name] = ComparisonSummary(
                 name=comp_name,
                 deg_up=deg_up,
@@ -180,7 +218,7 @@ def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
             )
 
         # Global DEG file (new way)
-        if metadata and 'comparisons' in metadata:
+        if metadata and 'comparisons' in metadata and isinstance(metadata['comparisons'], dict):
             for comp_name, comp_info in metadata['comparisons'].items():
                 deg_up = comp_info.get('deg_up', 0)
                 deg_down = comp_info.get('deg_down', 0)
@@ -195,10 +233,10 @@ def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
                     dataset_type='GLOBAL'
                 )
 
-    # Mark comparisons with enrichment
+    # Mark comparisons with enrichment (check both ENRICHMENT datasets and DEG datasets)
     for d in datasets:
         metadata = d.dataset_metadata or {}
-        if d.type == "ENRICHMENT" and metadata:
+        if metadata:
             enrichment_comparisons = metadata.get('enrichment_comparisons', [])
             for comp_name in enrichment_comparisons:
                 if comp_name in comparisons_dict:
@@ -218,10 +256,7 @@ async def list_project_comparisons(
     """
     Get paginated comparisons for a project.
     """
-    query = select(Project).where(
-        Project.id == project_id,
-        Project.owner_id == current_user.user_id
-    )
+    query = select(Project).where(Project.id == project_id)
     result = await db.execute(query)
     project = result.scalar_one_or_none()
 
@@ -230,6 +265,18 @@ async def list_project_comparisons(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
         )
+
+    if project.owner_id != current_user.user_id:
+        member_query = select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == current_user.user_id
+        )
+        member_result = await db.execute(member_query)
+        if not member_result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found"
+            )
 
     datasets_query = select(Dataset).where(Dataset.project_id == project_id).order_by(Dataset.created_at.desc())
     result = await db.execute(datasets_query)
@@ -260,10 +307,7 @@ async def get_project_summary(
     Get optimized project summary with pre-computed statistics.
     """
     # Get project
-    query = select(Project).where(
-        Project.id == project_id,
-        Project.owner_id == current_user.user_id
-    )
+    query = select(Project).where(Project.id == project_id)
     result = await db.execute(query)
     project = result.scalar_one_or_none()
 
@@ -272,6 +316,18 @@ async def get_project_summary(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
         )
+
+    if project.owner_id != current_user.user_id:
+        member_query = select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == current_user.user_id
+        )
+        member_result = await db.execute(member_query)
+        if not member_result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found"
+            )
 
     # Get all datasets for this project
     datasets_query = select(Dataset).where(Dataset.project_id == project_id).order_by(Dataset.created_at.desc())
@@ -510,11 +566,8 @@ async def delete_project(
     """
     Delete a project (and all associated data via cascade).
     """
-    # Check if project exists and belongs to user
-    query = select(Project).where(
-        Project.id == project_id,
-        Project.owner_id == current_user.user_id
-    )
+    # Check if project exists
+    query = select(Project).where(Project.id == project_id)
     result = await db.execute(query)
     project = result.scalar_one_or_none()
 
@@ -522,6 +575,12 @@ async def delete_project(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
+        )
+
+    if not await _check_project_admin(project, current_user.user_id, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only project admins can delete this project"
         )
 
     # Delete project (cascade will handle datasets)
@@ -559,10 +618,10 @@ async def invite_project_member(
             detail="Project not found"
         )
     
-    if project.owner_id != current_user.user_id:
+    if not await _check_project_admin(project, current_user.user_id, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only project owner can invite members"
+            detail="Only project admins can invite members"
         )
 
     # ── Step 1: resolve email → Supabase user_id ──────────────────────────
@@ -714,10 +773,10 @@ async def update_project_member(
             detail="Project not found"
         )
     
-    if project.owner_id != current_user.user_id:
+    if not await _check_project_admin(project, current_user.user_id, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only project owner can update member roles"
+            detail="Only project admins can update member roles"
         )
     
     # Get the member
@@ -767,12 +826,12 @@ async def remove_project_member(
             detail="Project not found"
         )
     
-    if project.owner_id != current_user.user_id:
+    if not await _check_project_admin(project, current_user.user_id, db):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only project owner can remove members"
+            detail="Only project admins can remove members"
         )
-    
+
     # Prevent owner from removing themselves
     if member_user_id == current_user.user_id:
         raise HTTPException(

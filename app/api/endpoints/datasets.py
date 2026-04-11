@@ -34,7 +34,7 @@ from app.api.deps.subscription import (
 # from app.db.session import get_db  <-- Removed
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
-from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User
+from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, UserRole
 from sqlalchemy import select, func, delete, text, or_, desc, asc, and_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,6 +68,43 @@ clustering_service = ClusteringService()
 go_service = GOService()
 
 logger = logging.getLogger(__name__)
+
+
+async def _check_project_admin(project: Project, current_user_id: UUID, db: AsyncSession) -> bool:
+    """
+    Returns True if current_user_id is the project owner OR a member with access_level == ADMIN.
+    """
+    if project.owner_id == current_user_id:
+        return True
+    member_query = select(ProjectMember).where(
+        ProjectMember.project_id == project.id,
+        ProjectMember.user_id == current_user_id,
+        ProjectMember.access_level == UserRole.ADMIN,
+    )
+    result = await db.execute(member_query)
+    return result.scalar_one_or_none() is not None
+
+
+
+async def _check_project_read_access(project_id: UUID, current_user_id: UUID, db: AsyncSession) -> Project:
+    """
+    Returns the project if current_user_id is the owner or any member.
+    Raises HTTP 404 otherwise.
+    """
+    result = await db.execute(select(Project).where(Project.id == project_id))
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    if project.owner_id != current_user_id:
+        member_result = await db.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == current_user_id,
+            )
+        )
+        if not member_result.scalar_one_or_none():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    return project
 
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
@@ -172,19 +209,12 @@ async def get_dataset(
     """
     Get dataset metadata by ID.
     """
-    # Get dataset with project join to verify ownership
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     return dataset
 
@@ -199,11 +229,8 @@ async def update_dataset(
     """
     Update dataset metadata.
     """
-    # Check dataset exists and user has access
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
+    # Check dataset exists and user has admin access
+    query = select(Dataset).where(Dataset.id == dataset_id)
     result = await db.execute(query)
     dataset = result.scalar_one_or_none()
 
@@ -211,6 +238,15 @@ async def update_dataset(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Dataset not found"
+        )
+
+    proj_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
+    project = proj_result.scalar_one_or_none()
+
+    if not project or not await _check_project_admin(project, current_user.user_id, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only project admins can update datasets"
         )
 
     update_data = dataset_in.model_dump(exclude_unset=True)
@@ -252,11 +288,8 @@ async def delete_dataset(
 
     Requires project ownership.
     """
-    # Get dataset with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
+    # Get dataset and verify admin access
+    query = select(Dataset).where(Dataset.id == dataset_id)
     result = await db.execute(query)
     dataset = result.scalar_one_or_none()
 
@@ -266,7 +299,14 @@ async def delete_dataset(
             detail="Dataset not found"
         )
 
-    # Delete files from storage
+    proj_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
+    project = proj_result.scalar_one_or_none()
+
+    if not project or not await _check_project_admin(project, current_user.user_id, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only project admins can delete datasets"
+        )
     files_deleted = []
     files_failed = []
 
@@ -316,11 +356,8 @@ async def reprocess_dataset(
     Reprocess an existing dataset (recalculate metadata, PCA, etc.).
     Useful when a dataset file exists but needs to be reanalyzed.
     """
-    # Get dataset with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
+    # Get dataset and verify admin access
+    query = select(Dataset).where(Dataset.id == dataset_id)
     result = await db.execute(query)
     dataset = result.scalar_one_or_none()
 
@@ -328,6 +365,15 @@ async def reprocess_dataset(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Dataset not found"
+        )
+
+    proj_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
+    project = proj_result.scalar_one_or_none()
+
+    if not project or not await _check_project_admin(project, current_user.user_id, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only project admins can reprocess datasets"
         )
 
     if not dataset.raw_file_path:
@@ -376,19 +422,12 @@ async def query_dataset(
     - **limit**: Maximum rows to return (default: 100, max: 100000)
     - **offset**: Number of rows to skip (default: 0)
     """
-    # Get dataset metadata with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     # Check if dataset is ready
     if dataset.status != DatasetStatus.READY:
@@ -461,19 +500,12 @@ async def get_dataset_columns(
     **Performance:** <10ms vs 2-5s for full query
     **Data transfer:** <1 KB vs 5-10 MB
     """
-    # Get dataset with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if dataset.status != DatasetStatus.READY:
         raise HTTPException(
@@ -521,19 +553,12 @@ async def get_dataset_stats(
     **Performance:** <10ms (DB columns) or <50ms (metadata) or <500ms (calculated)
     **Replaces:** Frontend fetching 100K rows + manual counting (5-15 MB + 1-2s JS)
     """
-    # Get dataset with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if dataset.status != DatasetStatus.READY:
         raise HTTPException(
@@ -623,19 +648,12 @@ async def get_gene_list(
     **Data transfer:** 20-50 KB vs 5-10 MB
     **Use case:** Populate dropdowns, validate gene lists, etc.
     """
-    # Get dataset with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if dataset.status != DatasetStatus.READY:
         raise HTTPException(
@@ -692,11 +710,8 @@ async def list_project_datasets(
     - **page**: Page number (starts at 1)
     - **page_size**: Number of items per page (max 500)
     """
-    # Check project ownership
-    query = select(Project).where(
-        Project.id == project_id,
-        Project.owner_id == current_user.user_id
-    )
+    # Check project ownership or membership
+    query = select(Project).where(Project.id == project_id)
     result = await db.execute(query)
     project = result.scalar_one_or_none()
     
@@ -705,6 +720,18 @@ async def list_project_datasets(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
         )
+
+    if project.owner_id != current_user.user_id:
+        member_query = select(ProjectMember).where(
+            ProjectMember.project_id == project_id,
+            ProjectMember.user_id == current_user.user_id
+        )
+        member_result = await db.execute(member_query)
+        if not member_result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found"
+            )
 
     # Query datasets
     query = select(Dataset).where(Dataset.project_id == project_id)
@@ -735,14 +762,12 @@ async def get_dataset_pca(
     """
     Calculate PCA for an expression matrix dataset.
     """
-    # Fetch dataset with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Dataset.status == DatasetStatus.READY,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(
@@ -825,14 +850,12 @@ async def get_dataset_umap(
     """
     Calculate UMAP for an expression matrix dataset.
     """
-    # Fetch dataset with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Dataset.status == DatasetStatus.READY,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(
@@ -903,14 +926,12 @@ async def get_dataset_library_size(
     """
     Calculate library size for an expression matrix dataset.
     """
-    # Fetch dataset with ownership check
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Dataset.status == DatasetStatus.READY,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(
@@ -961,12 +982,11 @@ async def list_dataset_comparisons(
     """
     Debug endpoint: List all comparisons available in a dataset's metadata.
     """
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(
@@ -995,19 +1015,12 @@ async def get_dataset_comparisons_stats(
     """
     Get statistics (UP/DOWN counts) for all comparisons in the dataset.
     """
-    # Check dataset ownership
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     # Check if stats are available in metadata
     metadata = dataset.dataset_metadata or {}
@@ -1204,14 +1217,12 @@ async def diagnose_deg_filtering(
     import pandas as pd
     import io
 
-    # Get dataset with ownership check
-    logger.debug(f"Looking for dataset {dataset_id} for user {current_user.user_id}")
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         logger.debug(f"Dataset not found for user {current_user.user_id}")
@@ -1434,19 +1445,12 @@ async def get_deg_genes(
     - **sort_by**: Column to sort by (padj, log_fc, gene_id)
     - **sort_order**: Sort direction (asc or desc)
     """
-    # Check dataset ownership
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     # Build query for DegGene
     stmt = select(DegGene).where(
@@ -1570,19 +1574,12 @@ async def get_volcano_plot_data(
             )
             return cached_result
     
-    # Check dataset ownership
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
     
     # Level 2: Try metadata/file cache (unless force_recalculate is True)
     if not force_recalculate:
@@ -1686,10 +1683,21 @@ async def get_volcano_plot_data(
         
         # Get column info from metadata
         metadata = dataset.dataset_metadata or {}
-        comp_meta = metadata.get("comparisons", {}).get(comparison_name, {})
+        comparisons_meta = metadata.get("comparisons")
+        comp_meta = {}
+        if isinstance(comparisons_meta, dict):
+            comp_meta = comparisons_meta.get(comparison_name, {})
         
         logfc_col = comp_meta.get("logFC")
         padj_col = comp_meta.get("padj")
+        
+        # Fallback to dataset column_mapping (for single-comparison datasets)
+        if not logfc_col or not padj_col:
+            cm = dataset.column_mapping or {}
+            if not logfc_col:
+                logfc_col = cm.get("log_fc") or cm.get("log2FoldChange")
+            if not padj_col:
+                padj_col = cm.get("padj")
         
         if not logfc_col or not padj_col:
             # Try to auto-detect
@@ -1787,12 +1795,11 @@ async def get_dataset_heatmaps(
     """
     Get pre-calculated heatmaps for a dataset.
     """
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -1826,12 +1833,11 @@ async def get_dataset_dotplots(
     """
     Get pre-calculated enrichment dotplots for a dataset.
     """
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -1878,13 +1884,12 @@ async def get_enrichment_pathways(
 
     Performance: <100ms (vs 2-5 seconds loading Parquet)
     """
-    # Verify dataset exists and user has access
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -2006,13 +2011,12 @@ async def ai_select_enrichment_terms(
     Returns:
         List of selected pathway IDs and terms
     """
-    # Verify dataset exists and user has access
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -2176,13 +2180,12 @@ async def interpret_comparison(
             }
         }
     """
-    # Verify dataset exists and user has access
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -3121,19 +3124,12 @@ async def apply_advanced_filter(
         "groupOperator": "AND" | "OR"
     }
     """
-    # Check ownership
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
-
+    # Get dataset and verify read access (owner or member)
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
     if not dataset:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     try:
         groups = filter_data.get("groups", [])
@@ -3993,12 +3989,11 @@ async def get_sample_correlations(
     from app.services.sample_correlation_service import sample_correlation_service
     
     # 1. Check permissions
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -4203,12 +4198,11 @@ async def run_go_enrichment_analysis(
     import pandas as pd
     
     # 1. Verify dataset exists and user has access
-    query = select(Dataset).join(Project).where(
-        Dataset.id == dataset_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
-    dataset = result.scalar_one_or_none()
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
     
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")

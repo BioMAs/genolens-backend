@@ -259,6 +259,24 @@ _TREATMENT_VS_CONTROL_PATHWAYS: list[dict] = [
     },
 ]
 
+# ---------------------------------------------------------------------------
+# Synthetic expression matrix — 16 samples × all DEG genes
+# ---------------------------------------------------------------------------
+
+_MATRIX_SAMPLES: list[str] = [
+    "KO_rep1",        "KO_rep2",        "KO_rep3",        "KO_rep4",
+    "WT_rep1",        "WT_rep2",        "WT_rep3",        "WT_rep4",
+    "Treatment_rep1", "Treatment_rep2", "Treatment_rep3", "Treatment_rep4",
+    "Control_rep1",   "Control_rep2",   "Control_rep3",   "Control_rep4",
+]
+
+_MATRIX_SAMPLE_GROUPS: dict[str, list[str]] = {
+    "KO":        ["KO_rep1",        "KO_rep2",        "KO_rep3",        "KO_rep4"],
+    "WT":        ["WT_rep1",        "WT_rep2",        "WT_rep3",        "WT_rep4"],
+    "Treatment": ["Treatment_rep1", "Treatment_rep2", "Treatment_rep3", "Treatment_rep4"],
+    "Control":   ["Control_rep1",   "Control_rep2",   "Control_rep3",   "Control_rep4"],
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -308,6 +326,68 @@ def _build_column_mapping() -> dict:
         "pvalue": "pvalue",
         "padj": "padj",
     }
+
+
+def _build_matrix_dataframe() -> pd.DataFrame:
+    """Build a 16-sample expression matrix from the union of all DEG genes.
+
+    Expression values are biologically coherent:
+    - KO/WT separation driven by KO_vs_WT log2FC
+    - Treatment/Control separation driven by Treatment_vs_Control log2FC
+    - 12 % CV gaussian noise per replicate (seed=42 for reproducibility)
+    """
+    rng = np.random.default_rng(42)
+    ko_lut: dict[str, tuple[float, float]] = {g[0]: (g[2], g[3]) for g in _KO_VS_WT_GENES}
+    trt_lut: dict[str, tuple[float, float]] = {g[0]: (g[2], g[3]) for g in _TREATMENT_VS_CONTROL_GENES}
+    all_ids = sorted(set(ko_lut) | set(trt_lut))
+
+    rows = []
+    for gene_id in all_ids:
+        ko_info = ko_lut.get(gene_id)
+        trt_info = trt_lut.get(gene_id)
+        ko_lfc = ko_info[1] if ko_info else 0.0
+        trt_lfc = trt_info[1] if trt_info else 0.0
+        if ko_info and trt_info:
+            base = (ko_info[0] + trt_info[0]) / 2.0
+        elif ko_info:
+            base = ko_info[0]
+        else:
+            base = trt_info[0]  # type: ignore[union-attr]
+
+        group_means = (
+              [base * (2.0 ** ( ko_lfc  / 2.0))] * 4   # KO
+            + [base * (2.0 ** (-ko_lfc  / 2.0))] * 4   # WT
+            + [base * (2.0 ** ( trt_lfc / 2.0))] * 4   # Treatment
+            + [base * (2.0 ** (-trt_lfc / 2.0))] * 4   # Control
+        )
+        values = [
+            max(1.0, m * (1.0 + float(rng.normal(0.0, 0.12))))
+            for m in group_means
+        ]
+        row: dict = {"gene_id": gene_id}
+        for sample, val in zip(_MATRIX_SAMPLES, values):
+            row[sample] = round(val, 3)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _build_metadata_sample_dataframe() -> pd.DataFrame:
+    """Build a 16-row sample sheet for the demo METADATA_SAMPLE dataset.
+
+    Columns: sample_id, condition, comparison
+    Used by PCAPlot and QC visualizations to colour samples by group.
+    """
+    rows = []
+    for group, samples in _MATRIX_SAMPLE_GROUPS.items():
+        comparison = "KO_vs_WT" if group in ("KO", "WT") else "Treatment_vs_Control"
+        for sample in samples:
+            rows.append({
+                "sample_id": sample,
+                "condition": group,
+                "comparison": comparison,
+            })
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -409,11 +489,16 @@ async def create_demo_data(
             parquet_file_path=parquet_path,
             column_mapping=_build_column_mapping(),
             dataset_metadata={
+                "comparison_name": comp_name,
                 "comparisons": [comp_name],
                 "original_filename": f"{comp_name}_demo.parquet",
                 "is_normalized": True,
                 "contains_all_genes": True,
                 "demo": True,
+                "deg_up": deg_up,
+                "deg_down": deg_down,
+                "deg_total": deg_sig,
+                "enrichment_comparisons": [comp_name],
             },
             deg_up_count=deg_up,
             deg_down_count=deg_down,
@@ -476,8 +561,174 @@ async def create_demo_data(
             "[demo_seed] Inserted %d pathways for %s", len(pathway_records), comp_name
         )
 
+    # ------------------------------------------------------------------ #
+    # 3. Create MATRIX dataset (PCA / QC / Heatmap)
+    # ------------------------------------------------------------------ #
+    matrix_id = uuid4()
+    matrix_df = _build_matrix_dataframe()
+    matrix_bytes = _dataframe_to_parquet_bytes(matrix_df)
+    matrix_path = f"projects/{project.id}/processed/{matrix_id}.parquet"
+    await storage_service.upload_file(matrix_path, matrix_bytes)
+
+    matrix_dataset = Dataset(
+        id=matrix_id,
+        project_id=project.id,
+        name="Expression Matrix — Demo RNAseq",
+        description=(
+            "Normalized expression matrix (rlog) for 16 samples across 2 experimental "
+            "comparisons (KO_vs_WT, Treatment_vs_Control). Used for PCA, QC, and heatmap."
+        ),
+        type=DatasetType.MATRIX,
+        status=DatasetStatus.READY,
+        raw_file_path=None,
+        parquet_file_path=matrix_path,
+        column_mapping={"gene_id": "gene_id"},
+        dataset_metadata={
+            "demo": True,
+            "n_samples": len(_MATRIX_SAMPLES),
+            "n_genes": len(matrix_df),
+            "samples": _MATRIX_SAMPLES,
+            "sample_groups": _MATRIX_SAMPLE_GROUPS,
+            "comparisons": ["KO_vs_WT", "Treatment_vs_Control"],
+            "is_normalized": True,
+            "normalization_method": "rlog",
+        },
+        total_genes=len(matrix_df),
+    )
+    db.add(matrix_dataset)
+    await db.flush()
+    logger.info(
+        "[demo_seed] MATRIX dataset created: %s (%d genes × %d samples)",
+        matrix_id, len(matrix_df), len(_MATRIX_SAMPLES),
+    )
+    # ------------------------------------------------------------------ #
+    # 4. Create METADATA_SAMPLE dataset (conditions for PCA / QC)
+    # ------------------------------------------------------------------ #
+    meta_id = uuid4()
+    meta_df = _build_metadata_sample_dataframe()
+    meta_bytes = _dataframe_to_parquet_bytes(meta_df)
+    meta_path = f"projects/{project.id}/processed/{meta_id}.parquet"
+    await storage_service.upload_file(meta_path, meta_bytes)
+
+    meta_dataset = Dataset(
+        id=meta_id,
+        project_id=project.id,
+        name="Sample Metadata \u2014 Demo RNAseq",
+        description="Sample sheet with condition and comparison labels for 16 demo samples.",
+        type=DatasetType.METADATA_SAMPLE,
+        status=DatasetStatus.READY,
+        raw_file_path=None,
+        parquet_file_path=meta_path,
+        column_mapping={"sample_id": "sample_id", "condition": "condition", "comparison": "comparison"},
+        dataset_metadata={
+            "demo": True,
+            "n_samples": len(meta_df),
+            "conditions": list(_MATRIX_SAMPLE_GROUPS.keys()),
+            "comparisons": ["KO_vs_WT", "Treatment_vs_Control"],
+        },
+        total_genes=len(meta_df),
+    )
+    db.add(meta_dataset)
+    await db.flush()
+    logger.info("[demo_seed] METADATA_SAMPLE dataset created: %s", meta_id)
     await db.commit()
     await db.refresh(project)
 
     logger.info("[demo_seed] Done. Project: %s", project.id)
     return project
+
+
+async def add_matrix_to_existing_demo_project(
+    db: AsyncSession,
+    project_id: UUID,
+) -> Dataset:
+    """Patch an existing demo project with a MATRIX dataset (idempotent)."""
+    result = await db.execute(
+        select(Dataset).where(
+            Dataset.project_id == project_id,
+            Dataset.type == DatasetType.MATRIX,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing is not None:
+        logger.info("[demo_seed] MATRIX already exists for project %s", project_id)
+        return existing
+
+    matrix_id = uuid4()
+    matrix_df = _build_matrix_dataframe()
+    matrix_bytes = _dataframe_to_parquet_bytes(matrix_df)
+    matrix_path = f"projects/{project_id}/processed/{matrix_id}.parquet"
+    await storage_service.upload_file(matrix_path, matrix_bytes)
+
+    matrix_dataset = Dataset(
+        id=matrix_id,
+        project_id=project_id,
+        name="Expression Matrix — Demo RNAseq",
+        description="Normalized expression matrix (rlog) for 16 samples. Used for PCA, QC, and heatmap.",
+        type=DatasetType.MATRIX,
+        status=DatasetStatus.READY,
+        raw_file_path=None,
+        parquet_file_path=matrix_path,
+        column_mapping={"gene_id": "gene_id"},
+        dataset_metadata={
+            "demo": True,
+            "n_samples": len(_MATRIX_SAMPLES),
+            "n_genes": len(matrix_df),
+            "samples": _MATRIX_SAMPLES,
+            "sample_groups": _MATRIX_SAMPLE_GROUPS,
+            "comparisons": ["KO_vs_WT", "Treatment_vs_Control"],
+            "is_normalized": True,
+            "normalization_method": "rlog",
+        },
+        total_genes=len(matrix_df),
+    )
+    db.add(matrix_dataset)
+    await db.commit()
+    logger.info("[demo_seed] MATRIX dataset added to existing project %s", project_id)
+    return matrix_dataset
+
+
+async def add_sample_metadata_to_existing_demo_project(
+    db: AsyncSession,
+    project_id: UUID,
+) -> Dataset:
+    """Patch an existing demo project with a METADATA_SAMPLE dataset (idempotent)."""
+    result = await db.execute(
+        select(Dataset).where(
+            Dataset.project_id == project_id,
+            Dataset.type == DatasetType.METADATA_SAMPLE,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing is not None:
+        logger.info("[demo_seed] METADATA_SAMPLE already exists for project %s", project_id)
+        return existing
+
+    meta_id = uuid4()
+    meta_df = _build_metadata_sample_dataframe()
+    meta_bytes = _dataframe_to_parquet_bytes(meta_df)
+    meta_path = f"projects/{project_id}/processed/{meta_id}.parquet"
+    await storage_service.upload_file(meta_path, meta_bytes)
+
+    meta_dataset = Dataset(
+        id=meta_id,
+        project_id=project_id,
+        name="Sample Metadata \u2014 Demo RNAseq",
+        description="Sample sheet with condition and comparison labels for 16 demo samples.",
+        type=DatasetType.METADATA_SAMPLE,
+        status=DatasetStatus.READY,
+        raw_file_path=None,
+        parquet_file_path=meta_path,
+        column_mapping={"sample_id": "sample_id", "condition": "condition", "comparison": "comparison"},
+        dataset_metadata={
+            "demo": True,
+            "n_samples": len(meta_df),
+            "conditions": list(_MATRIX_SAMPLE_GROUPS.keys()),
+            "comparisons": ["KO_vs_WT", "Treatment_vs_Control"],
+        },
+        total_genes=len(meta_df),
+    )
+    db.add(meta_dataset)
+    await db.commit()
+    logger.info("[demo_seed] METADATA_SAMPLE dataset added to existing project %s", project_id)
+    return meta_dataset

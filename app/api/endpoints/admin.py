@@ -587,16 +587,16 @@ async def get_system_stats(
 @router.post("/users", response_model=UserProfile)
 async def create_user(
     user_data: UserCreate,
-    current_user: SupabaseUser = Depends(require_admin)
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
 ):
     """
-    Create a new user in Supabase.
+    Create a new user in Supabase Auth and local DB.
     Admin only.
     """
-    # Validate role
     from app.models.models import UserRole
     try:
-        UserRole(user_data.role.upper())
+        role_enum = UserRole(user_data.role.upper())
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -632,31 +632,45 @@ async def create_user(
                 )
 
             user_response = response.json()
-            user_id = user_response.get("id")
+            user_id = UUID(user_response.get("id"))
 
-            # Create profile entry
-            profile_response = await client.post(
-                f"{settings.SUPABASE_URL}/rest/v1/profiles",
-                headers={**headers, "Prefer": "return=representation"},
-                json={
-                    "id": user_id,
-                    "full_name": user_data.full_name,
-                    "role": user_data.role.lower()
-                }
+        # Create profile in local DB
+        try:
+            local_user = User(
+                id=user_id,
+                email=user_data.email,
+                full_name=user_data.full_name,
+                role=role_enum,
+                subscription_plan=SubscriptionPlan.BASIC
             )
-
-            if profile_response.status_code not in [200, 201]:
-                # Try to rollback user creation
+            db.add(local_user)
+            await db.commit()
+            await db.refresh(local_user)
+        except Exception as db_err:
+            # Rollback Supabase user creation
+            async with httpx.AsyncClient() as client:
                 await client.delete(
                     f"{settings.SUPABASE_URL}/auth/v1/admin/users/{user_id}",
                     headers=headers
                 )
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to create user profile"
-                )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to create user profile: {str(db_err)}"
+            )
 
-            return profile_response.json()[0] if isinstance(profile_response.json(), list) else profile_response.json()
+        return UserProfile(
+            id=local_user.id,
+            email=local_user.email,
+            full_name=local_user.full_name,
+            role=local_user.role.value,
+            subscription_plan=local_user.subscription_plan.value,
+            ai_interpretations_used=local_user.ai_interpretations_used,
+            ai_tokens_purchased=local_user.ai_tokens_purchased,
+            ai_tokens_used=local_user.ai_tokens_used,
+            ai_interpretations_remaining=local_user.ai_interpretations_remaining,
+            created_at=local_user.created_at.isoformat(),
+            updated_at=local_user.updated_at.isoformat(),
+        )
 
     except HTTPException:
         raise
