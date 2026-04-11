@@ -3877,15 +3877,19 @@ async def cluster_heatmap(
 
         precomputed_col_clustering = None
         if params.cluster_cols:
-            from app.services.persistent_cache_service import persistent_cache_service
-            precomputed_col_clustering = await persistent_cache_service.get_cached(
-                db=db,
-                computation_type="sample_clustering",
-                dataset_id=str(dataset_id),
-                params={"method": params.method, "metric": params.metric, "top_n_genes": 2000},
-            )
-            if precomputed_col_clustering:
-                logger.info(f"[cluster-heatmap] Using pre-computed sample clustering for {dataset_id}")
+            try:
+                from app.services.persistent_cache_service import persistent_cache_service
+                precomputed_col_clustering = await persistent_cache_service.get_cached(
+                    db=db,
+                    computation_type="sample_clustering",
+                    dataset_id=str(dataset_id),
+                    params={"method": params.method, "metric": params.metric, "top_n_genes": 2000},
+                )
+                if precomputed_col_clustering:
+                    logger.info(f"[cluster-heatmap] Using pre-computed sample clustering for {dataset_id}")
+            except Exception as cache_err:
+                logger.warning(f"[cluster-heatmap] Persistent cache unavailable, skipping: {cache_err}")
+                precomputed_col_clustering = None
 
         if precomputed_col_clustering is None and params.cluster_cols:
             # Compute column clustering once on all requested genes

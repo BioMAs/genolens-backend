@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps.db import get_db
 from app.api.deps.auth import get_current_user
+from app.core.supabase_auth import SupabaseUser
 from app.schemas.bookmark import (
     GeneBookmarkCreate,
     GeneBookmarkUpdate,
@@ -39,11 +40,11 @@ async def get_bookmarks(
     project_id: UUID,
     gene_symbol: Optional[str] = Query(None, description="Filter by gene symbol"),
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Get user's gene bookmarks for a project."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         bookmarks = await bookmarks_service.get_bookmarks(
             db,
             user_id=user_id,
@@ -61,11 +62,11 @@ async def check_bookmark(
     project_id: UUID,
     gene_symbol: str,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Check if a gene is bookmarked."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         is_bookmarked = await bookmarks_service.is_bookmarked(
             db,
             user_id=user_id,
@@ -83,11 +84,11 @@ async def create_bookmark(
     project_id: UUID,
     bookmark: GeneBookmarkCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Create a gene bookmark."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         new_bookmark = await bookmarks_service.create_bookmark(
             db,
             user_id=user_id,
@@ -118,11 +119,11 @@ async def create_bookmarks_batch(
     project_id: UUID,
     batch: BookmarkBatchCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Create multiple bookmarks at once."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         created = []
         skipped = 0
         
@@ -164,11 +165,11 @@ async def update_bookmark(
     bookmark_id: UUID,
     bookmark: GeneBookmarkUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Update a bookmark."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         updated = await bookmarks_service.update_bookmark(
             db,
             bookmark_id=bookmark_id,
@@ -190,11 +191,11 @@ async def update_bookmark(
 async def delete_bookmark(
     bookmark_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Delete a bookmark."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         await bookmarks_service.delete_bookmark(
             db,
             bookmark_id=bookmark_id,
@@ -216,11 +217,11 @@ async def get_gene_lists(
     project_id: UUID,
     include_public: bool = Query(True, description="Include public lists from other users"),
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Get user's gene lists for a project."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         gene_lists = await bookmarks_service.get_gene_lists(
             db,
             user_id=user_id,
@@ -238,11 +239,11 @@ async def create_gene_list(
     project_id: UUID,
     gene_list: GeneListCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Create a gene list."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         new_list = await bookmarks_service.create_gene_list(
             db,
             user_id=user_id,
@@ -265,11 +266,11 @@ async def update_gene_list(
     list_id: UUID,
     gene_list: GeneListUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Update a gene list."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         updated = await bookmarks_service.update_gene_list(
             db,
             list_id=list_id,
@@ -294,11 +295,11 @@ async def add_genes_to_list(
     list_id: UUID,
     request: GeneListAddGenes,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Add genes to a list."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         updated = await bookmarks_service.add_genes_to_list(
             db,
             list_id=list_id,
@@ -318,11 +319,11 @@ async def remove_genes_from_list(
     list_id: UUID,
     request: GeneListRemoveGenes,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Remove genes from a list."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         updated = await bookmarks_service.remove_genes_from_list(
             db,
             list_id=list_id,
@@ -341,11 +342,11 @@ async def remove_genes_from_list(
 async def delete_gene_list(
     list_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: SupabaseUser = Depends(get_current_user)
 ):
     """Delete a gene list."""
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = UUID(str(current_user.user_id))
         await bookmarks_service.delete_gene_list(
             db,
             list_id=list_id,
