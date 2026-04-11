@@ -66,7 +66,7 @@ async def get_term_details(
     if not term:
         raise HTTPException(status_code=404, detail="Term not found")
     
-    meta = term.gene_set_metadata
+    meta = term.gene_set_metadata or {}
     
     # We might want to fetch parent/child names instead of just IDs
     # But for MVP, IDs might suffice, or the frontend can fetch them.

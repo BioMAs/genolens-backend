@@ -66,7 +66,7 @@ class GoLoaderService:
                 metadata = {
                     "go_id": go_id,
                     "definition": term.name, # Term name e.g. "mitochondrion"
-                    "description": term.defn, # Long textual definition
+                    "description": term.defn or "", # Long textual definition
                     "parents": [p.id for p in term.parents],
                     "children": [c.id for c in term.children],
                     "level": term.level,

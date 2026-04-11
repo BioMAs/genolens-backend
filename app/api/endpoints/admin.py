@@ -5,7 +5,7 @@ Requires ADMIN role.
 import logging
 from typing import List, Optional
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 import httpx
@@ -1328,3 +1328,49 @@ async def assign_demo_data(
             f"with {len(dataset_infos)} comparisons."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Gene Ontology data management
+# ---------------------------------------------------------------------------
+
+
+async def _run_go_loader(db_session_factory):
+    """Background task: download and load the GO OBO file into gene_sets."""
+    from app.services.go_loader import GoLoaderService
+
+    async with db_session_factory() as session:
+        loader = GoLoaderService(session)
+        await loader.load_obo(url="http://purl.obolibrary.org/obo/go/go-basic.obo")
+
+
+@router.post("/ontology/reload")
+async def reload_go_ontology(
+    background_tasks: BackgroundTasks,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Trigger a full re-download and re-import of the Gene Ontology (go-basic.obo)
+    into the gene_sets table.  This makes /tools/ontology searchable.
+
+    The import runs in the background (~17 000 terms, can take a few minutes).
+    Admin only.
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession as _AS
+    from sqlalchemy.orm import sessionmaker
+
+    # Obtain the underlying engine from the current session to build an
+    # independent session factory for the background task.
+    engine = db.get_bind()
+
+    # sessionmaker produces a factory that background_tasks can call safely
+    # (the request-scoped session will be closed before the task runs).
+    factory = sessionmaker(engine, class_=_AS, expire_on_commit=False)
+
+    background_tasks.add_task(_run_go_loader, factory)
+
+    return {
+        "message": "GO ontology import started in background. ~17 000 terms will be loaded.",
+        "status": "running",
+    }
