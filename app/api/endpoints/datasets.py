@@ -3769,6 +3769,7 @@ class HeatmapClusteringRequest(BaseModel):
     """Combined clustering request for UP and DOWN gene groups."""
     up_gene_ids: List[str] = []
     down_gene_ids: List[str] = []
+    sample_ids: Optional[List[str]] = None
     method: str = "ward"
     metric: str = "euclidean"
     cluster_rows: bool = True
@@ -3859,6 +3860,13 @@ async def cluster_heatmap(
         numeric_df = df.select_dtypes(include=[np.number])
         if numeric_df.empty:
             raise HTTPException(status_code=400, detail="No numeric data found in dataset.")
+
+        # Filter to requested samples if provided
+        if params.sample_ids:
+            valid_sample_cols = [s for s in params.sample_ids if s in numeric_df.columns]
+            if valid_sample_cols:
+                numeric_df = numeric_df[valid_sample_cols]
+                logger.info(f"[cluster-heatmap] Filtered to {len(valid_sample_cols)}/{len(params.sample_ids)} requested samples")
 
         # 3. Compute column (sample) clustering ONCE using all requested genes
         valid_all = [g for g in all_gene_ids if g in numeric_df.index]

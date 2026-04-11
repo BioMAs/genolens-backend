@@ -93,13 +93,15 @@ class ClusteringService:
         # We cluster on normalized data so genes with similar *shapes* are grouped, ignoring magnitude.
         data_values = df.values.astype(float)
         
-        # Validate data before normalization
-        if np.any(np.isnan(data_values)):
-            nan_count = np.sum(np.isnan(data_values))
-            raise ValueError(f"Dataset contains {nan_count} NaN values. Please clean data before clustering.")
-        if np.any(np.isinf(data_values)):
-            inf_count = np.sum(np.isinf(data_values))
-            raise ValueError(f"Dataset contains {inf_count} infinite values. Please clean data before clustering.")
+        # Handle NaN and Inf values by imputing with gene mean (per row)
+        if np.any(np.isnan(data_values)) or np.any(np.isinf(data_values)):
+            nan_count = np.sum(np.isnan(data_values)) + np.sum(np.isinf(data_values))
+            logger.warning(f"⚠️ Found {nan_count} NaN/Inf values in expression data, imputing with gene mean")
+            data_values = np.where(np.isinf(data_values), np.nan, data_values)
+            row_means = np.nanmean(data_values, axis=1, keepdims=True)
+            row_means = np.where(np.isnan(row_means), 0.0, row_means)
+            nan_mask = np.isnan(data_values)
+            data_values[nan_mask] = np.take(row_means.flatten(), np.where(nan_mask)[0])
         
         means = np.mean(data_values, axis=1, keepdims=True)
         stds = np.std(data_values, axis=1, keepdims=True)
@@ -108,7 +110,8 @@ class ClusteringService:
         
         # Validate normalized data
         if np.any(np.isnan(normalized_values)) or np.any(np.isinf(normalized_values)):
-            raise ValueError("Normalization produced invalid values (NaN/Inf). Check input data quality.")
+            logger.warning("Normalization produced NaN/Inf values, replacing with zeros")
+            normalized_values = np.nan_to_num(normalized_values, nan=0.0, posinf=0.0, neginf=0.0)
 
         # 2. Cluster Rows (Genes) with hierarchical or K-means
         if cluster_rows and len(df) > 1:
