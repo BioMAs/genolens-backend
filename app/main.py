@@ -13,7 +13,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.config import settings
 from app.db.session import close_db
 from app.api.endpoints import projects, datasets, admin, users, ontology, enrichment, bookmarks, genes, comments, history, integrations
-from app.middleware import SecurityHeadersMiddleware, limiter
+from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,9 @@ app.add_middleware(
 
 # Security Headers Middleware
 app.add_middleware(SecurityHeadersMiddleware)
+
+# Login Tracking Middleware (deduplicated, non-blocking)
+app.add_middleware(LoginTrackingMiddleware)
 
 # Rate Limiter State (required by slowapi)
 app.state.limiter = limiter

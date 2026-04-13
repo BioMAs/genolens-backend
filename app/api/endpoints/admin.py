@@ -3,6 +3,7 @@ Admin endpoints for user and system management.
 Requires ADMIN role.
 """
 import logging
+from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 from app.api.deps import get_db, require_admin
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
-from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog
+from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent
 from pydantic import BaseModel
 
 
@@ -1374,3 +1375,118 @@ async def reload_go_ontology(
         "message": "GO ontology import started in background. ~17 000 terms will be loaded.",
         "status": "running",
     }
+
+
+# ---------------------------------------------------------------------------
+# Login Statistics — Schemas
+# ---------------------------------------------------------------------------
+
+class DailyLoginCount(BaseModel):
+    date: str
+    count: int
+
+
+class RecentLoginEvent(BaseModel):
+    user_id: str
+    email: Optional[str] = None
+    full_name: Optional[str] = None
+    created_at: str
+
+
+class LoginStatsResponse(BaseModel):
+    daily_counts: list[DailyLoginCount]
+    active_today: int
+    active_7_days: int
+    active_30_days: int
+    recent_events: list[RecentLoginEvent]
+
+
+# ---------------------------------------------------------------------------
+# Login Statistics — Endpoint
+# ---------------------------------------------------------------------------
+
+@router.get("/login-stats", response_model=LoginStatsResponse)
+async def get_login_stats(
+    days: int = 30,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return login activity statistics for admin dashboard.
+    - daily_counts: number of login events per day for the last <days> days (1–90)
+    - active_today / active_7_days / active_30_days: distinct user counts
+    - recent_events: last 50 login events with user info
+    Admin only.
+    """
+    from sqlalchemy import text as sa_text, distinct
+    from datetime import date, timedelta, timezone
+
+    days = max(1, min(days, 90))
+    now = datetime.now(timezone.utc)
+
+    # ---------- KPI counts (distinct users) ----------
+    async def _count_distinct(since_delta_days: int) -> int:
+        cutoff = now - timedelta(days=since_delta_days)
+        result = await db.execute(
+            select(func.count(distinct(UserLoginEvent.user_id)))
+            .where(UserLoginEvent.created_at >= cutoff)
+        )
+        return result.scalar() or 0
+
+    active_today = await _count_distinct(1)
+    active_7_days = await _count_distinct(7)
+    active_30_days = await _count_distinct(30)
+
+    # ---------- Daily event counts (0-filled) ----------
+    period_start = now - timedelta(days=days)
+    result = await db.execute(
+        select(
+            func.date_trunc("day", UserLoginEvent.created_at).label("day"),
+            func.count().label("cnt"),
+        )
+        .where(UserLoginEvent.created_at >= period_start)
+        .group_by(func.date_trunc("day", UserLoginEvent.created_at))
+        .order_by(func.date_trunc("day", UserLoginEvent.created_at))
+    )
+    rows = result.all()
+
+    # Build a zero-filled date range
+    daily_map: dict[str, int] = {r.day.strftime("%Y-%m-%d"): r.cnt for r in rows}
+    daily_counts: list[DailyLoginCount] = []
+    for i in range(days):
+        d = (now - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d")
+        daily_counts.append(DailyLoginCount(date=d, count=daily_map.get(d, 0)))
+
+    # ---------- Recent events (50, newest first) ----------
+    result = await db.execute(
+        select(UserLoginEvent)
+        .order_by(UserLoginEvent.created_at.desc())
+        .limit(50)
+    )
+    events = result.scalars().all()
+
+    # Enrich with user email / full_name from local users table
+    user_ids = list({e.user_id for e in events})
+    user_query = select(User.id, User.email, User.full_name).where(
+        User.id.in_(user_ids)
+    )
+    user_result = await db.execute(user_query)
+    user_map = {str(u.id): {"email": u.email, "full_name": u.full_name} for u in user_result.all()}
+
+    recent_events = [
+        RecentLoginEvent(
+            user_id=str(e.user_id),
+            email=user_map.get(str(e.user_id), {}).get("email"),
+            full_name=user_map.get(str(e.user_id), {}).get("full_name"),
+            created_at=e.created_at.isoformat(),
+        )
+        for e in events
+    ]
+
+    return LoginStatsResponse(
+        daily_counts=daily_counts,
+        active_today=active_today,
+        active_7_days=active_7_days,
+        active_30_days=active_30_days,
+        recent_events=recent_events,
+    )

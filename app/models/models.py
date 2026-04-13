@@ -1323,3 +1323,36 @@ class ProjectActivityLog(Base):
 
     def __repr__(self) -> str:
         return f"<ProjectActivityLog(project={self.project_id}, event={self.event_type}, user={self.user_id})>"
+
+
+class UserLoginEvent(Base):
+    """
+    UserLoginEvent: Deduplicated login event (one per 30-minute window per user).
+    Used to track active users over time for admin analytics.
+    user_id references Supabase Auth user UUID (no FK to local table).
+    """
+    __tablename__ = "user_login_events"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+
+    user_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Supabase Auth user UUID who authenticated"
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+        comment="When the login event was recorded"
+    )
+
+    __table_args__ = (
+        Index("ix_user_login_events_user_created", "user_id", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<UserLoginEvent(user={self.user_id}, created_at={self.created_at})>"
