@@ -10,6 +10,7 @@ import logging
 import hashlib
 import json
 from typing import Any, Optional
+from urllib.parse import urlparse
 from cachetools import LRUCache
 
 import redis.asyncio
@@ -55,13 +56,24 @@ class CacheService:
 
     async def initialize(self, redis_url: str) -> None:
         """
-        Create the Redis connection.
+        Create the Redis connection and verify connectivity.
 
         Args:
             redis_url: Redis connection URL, e.g. ``redis://redis:6379/0``.
         """
-        self._redis = redis.asyncio.from_url(redis_url, decode_responses=True)
-        logger.info(f"CacheService connected to Redis at {redis_url}")
+        parsed = urlparse(redis_url)
+        safe_url = parsed._replace(netloc=f"{parsed.hostname}:{parsed.port}").geturl()
+
+        client = redis.asyncio.from_url(redis_url, decode_responses=True)
+        try:
+            await client.ping()
+            self._redis = client
+            logger.info("CacheService connected to Redis at %s", safe_url)
+        except redis.asyncio.RedisError as exc:
+            logger.error(
+                "CacheService could not reach Redis at %s: %s — cache disabled", safe_url, exc
+            )
+            await client.aclose()
 
     async def close(self) -> None:
         """Close the Redis connection if it is open."""
@@ -97,21 +109,32 @@ class CacheService:
         return f"genolens:{cache_type}:{hash_}"
 
     async def _redis_get(self, key: str) -> Optional[dict]:
-        """Fetch and JSON-decode a value from Redis; returns None on miss or if Redis is unavailable."""
+        """Fetch and JSON-decode a value from Redis; returns None on miss, error, or if Redis is unavailable."""
         if self._redis is None:
             logger.warning("Redis not initialized — cache get skipped for key: %s", key)
             return None
-        raw = await self._redis.get(key)
+        try:
+            raw = await self._redis.get(key)
+        except redis.asyncio.RedisError as exc:
+            logger.warning("Redis get failed for key %s: %s", key, exc)
+            return None
         if raw is None:
             return None
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning("Cache value for key %s is not valid JSON: %s", key, exc)
+            return None
 
     async def _redis_set(self, key: str, value: dict, ttl: int) -> None:
-        """JSON-encode and store a value in Redis with the given TTL; silently skips if Redis is unavailable."""
+        """JSON-encode and store a value in Redis with the given TTL; silently skips on error or if unavailable."""
         if self._redis is None:
             logger.warning("Redis not initialized — cache set skipped for key: %s", key)
             return
-        await self._redis.setex(key, ttl, json.dumps(value))
+        try:
+            await self._redis.setex(key, ttl, json.dumps(value))
+        except redis.asyncio.RedisError as exc:
+            logger.warning("Redis set failed for key %s: %s", key, exc)
 
     # ===== Clustering Cache =====
 
