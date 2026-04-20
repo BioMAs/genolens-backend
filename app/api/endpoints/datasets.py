@@ -1559,7 +1559,7 @@ async def get_volcano_plot_data(
     """
     # Level 1: Check in-memory cache first (fastest)
     if not force_recalculate:
-        cached_result = cache_service.get_volcano_data(
+        cached_result = await cache_service.get_volcano_data(
             dataset_id=str(dataset_id),
             comparison_name=comparison_name,
             max_points=max_points,
@@ -1646,7 +1646,7 @@ async def get_volcano_plot_data(
             }
             
             # Cache in memory for next request
-            cache_service.set_volcano_data(
+            await cache_service.set_volcano_data(
                 dataset_id=str(dataset_id),
                 comparison_name=comparison_name,
                 result=response,
@@ -1766,7 +1766,7 @@ async def get_volcano_plot_data(
         }
         
         # Cache in memory for future requests
-        cache_service.set_volcano_data(
+        await cache_service.set_volcano_data(
             dataset_id=str(dataset_id),
             comparison_name=comparison_name,
             result=response,
@@ -3572,7 +3572,7 @@ async def cluster_dataset(
         
     # Check in-memory cache first (much faster than file cache)
     gene_list = params.gene_ids or []
-    cached_result = cache_service.get_clustering_result(
+    cached_result = await cache_service.get_clustering_result(
         dataset_id=str(dataset_id),
         gene_list=gene_list,
         method=params.method,
@@ -3717,7 +3717,7 @@ async def cluster_dataset(
             logger.info(f"Clustering completed successfully for dataset {dataset_id}")
 
             # Save to in-memory cache (much faster than file I/O)
-            cache_service.set_clustering_result(
+            await cache_service.set_clustering_result(
                 dataset_id=str(dataset_id),
                 gene_list=gene_list,
                 result=result,
@@ -4452,7 +4452,7 @@ async def get_performance_statistics(
     stats = get_performance_stats()
     
     # Add cache statistics
-    cache_stats = cache_service.get_stats()
+    cache_stats = await cache_service.get_stats_info()
     
     return {
         "performance": stats,
@@ -4473,7 +4473,7 @@ async def get_cache_statistics(
     import time
     
     # In-memory cache stats
-    memory_cache = cache_service.get_stats()
+    memory_cache = await cache_service.get_stats_info()
     
     # Persistent cache stats
     persistent_cache = await persistent_cache_service.get_cache_stats(db)
