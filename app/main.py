@@ -275,7 +275,7 @@ app.include_router(
 
 app.include_router(
     stripe_webhooks.router,
-    prefix="/api/v1/stripe",
+    prefix=f"{settings.API_V1_PREFIX}/stripe",
     tags=["billing"],
 )
 

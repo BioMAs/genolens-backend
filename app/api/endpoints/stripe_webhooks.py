@@ -10,6 +10,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Annotated
+from uuid import UUID
 
 import stripe
 from fastapi import APIRouter, Depends, Header, Request, status
@@ -34,7 +35,6 @@ router = APIRouter()
 
 async def _get_user_by_id(db: AsyncSession, user_id: str) -> User | None:
     """Look up a user by their primary key (Supabase Auth UUID)."""
-    from uuid import UUID
     try:
         uid = UUID(user_id)
     except ValueError:
@@ -57,9 +57,10 @@ def _price_id_to_plan(price_id: str) -> SubscriptionPlan:
         return SubscriptionPlan.PREMIUM
     if price_id == settings.stripe_price_advanced_monthly:
         return SubscriptionPlan.ADVANCED
-    # Unknown price — default to PREMIUM rather than silently ignoring
-    logger.warning("Unknown Stripe price ID %s — defaulting to PREMIUM", price_id)
-    return SubscriptionPlan.PREMIUM
+    raise ValueError(
+        f"Unknown Stripe price_id '{price_id}'. "
+        "Configure STRIPE_PRICE_PREMIUM_MONTHLY and STRIPE_PRICE_ADVANCED_MONTHLY."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +93,13 @@ async def _handle_checkout_completed(
         )
         return
 
+    # Idempotency guard — skip if already processed
+    if user.stripe_subscription_id == subscription_id:
+        logger.info(
+            "checkout.session.completed: already processed for user=%s, skipping", user_id
+        )
+        return
+
     # Determine the plan by fetching subscription items from Stripe
     plan = SubscriptionPlan.PREMIUM  # safe default
     if subscription_id:
@@ -120,17 +128,23 @@ async def _handle_checkout_completed(
     user.is_active = True
 
     db.add(user)
-    await db.flush()
+    await db.commit()
 
     logger.info(
         "checkout.session.completed: activated user=%s plan=%s customer=%s sub=%s",
         user_id, plan, customer_id, subscription_id,
     )
 
-    # Send welcome email (non-blocking; failure should not fail the webhook)
-    await email_service.send_subscription_welcome_email(
-        to_email=user.email, plan=plan.value
-    )
+    # Send welcome email — isolated so email failures don't cause Stripe retries
+    try:
+        await email_service.send_subscription_welcome_email(
+            to_email=user.email, plan=plan.value
+        )
+    except Exception as email_exc:
+        logger.warning(
+            "checkout.session.completed: welcome email failed for user=%s: %s",
+            user_id, email_exc,
+        )
 
 
 async def _handle_subscription_updated(
@@ -139,7 +153,7 @@ async def _handle_subscription_updated(
 ) -> None:
     """
     Fired when a Stripe subscription is modified (plan change, renewal, past_due, etc.).
-    Syncs status and period-end date to the database.
+    Syncs status, plan, and period-end date to the database.
     """
     customer_id: str | None = subscription.get("customer")
     if not customer_id:
@@ -167,8 +181,19 @@ async def _handle_subscription_updated(
         user.is_active = False
         user.subscription_plan = SubscriptionPlan.BASIC
 
+    # Detect plan change from price_id
+    try:
+        items = subscription.get("items", {}).get("data", [])
+        if items:
+            price_id = items[0].get("price", {}).get("id")
+            if price_id:
+                new_plan = _price_id_to_plan(price_id)
+                user.subscription_plan = new_plan
+    except ValueError:
+        logger.warning("subscription.updated: unknown price_id, keeping current plan")
+
     db.add(user)
-    await db.flush()
+    await db.commit()
 
     logger.info(
         "customer.subscription.updated: user=%s status=%s period_end=%s",
@@ -201,13 +226,20 @@ async def _handle_subscription_deleted(
     user.stripe_subscription_id = None
 
     db.add(user)
-    await db.flush()
+    await db.commit()
 
     logger.info(
         "customer.subscription.deleted: downgraded user=%s to BASIC", user.id
     )
 
-    await email_service.send_subscription_cancelled_email(to_email=user.email)
+    # Send cancellation email — isolated so email failures don't cause Stripe retries
+    try:
+        await email_service.send_subscription_cancelled_email(to_email=user.email)
+    except Exception as email_exc:
+        logger.warning(
+            "customer.subscription.deleted: cancellation email failed for user=%s: %s",
+            user.id, email_exc,
+        )
 
 
 # ---------------------------------------------------------------------------
