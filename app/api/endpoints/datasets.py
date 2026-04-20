@@ -1775,7 +1775,33 @@ async def get_volcano_plot_data(
             logfc_threshold=logfc_threshold
         )
         logger.info(f"Cached volcano plot in memory for {dataset_id}/{comparison_name} (thresholds: padj<{padj_threshold}, |logFC|>{logfc_threshold})")
-        
+
+        # ── Provenance capture ──────────────────────────────────────────────────────
+        try:
+            from app.models.models import AnalysisRun
+            from app.services.version_service import get_algorithm_versions
+            _prov = AnalysisRun(
+                dataset_id=dataset_id,
+                user_id=current_user.user_id,
+                analysis_type="VOLCANO",
+                comparison_name=comparison_name,
+                parameters={
+                    "padj_threshold": padj_threshold,
+                    "logfc_threshold": logfc_threshold,
+                    "max_points": max_points,
+                },
+                algorithm_versions=get_algorithm_versions(),
+                reference_db_versions=None,
+                result_summary={
+                    "total_genes": response.get("total_genes"),
+                    "significant_genes": response.get("significant_genes"),
+                },
+            )
+            db.add(_prov)
+            await db.flush()
+        except Exception as _prov_exc:
+            logger.warning("Volcano provenance save failed (non-fatal): %s", _prov_exc)
+
         return response
         
     except Exception as e:
@@ -3417,6 +3443,36 @@ async def run_gsea_analysis(
                 },
             )
 
+        # ── Provenance capture ──────────────────────────────────────────────────────
+        try:
+            from app.models.models import AnalysisRun
+            from app.services.version_service import get_algorithm_versions
+            _prov = AnalysisRun(
+                dataset_id=dataset_id,
+                user_id=current_user.user_id,
+                analysis_type="GSEA",
+                comparison_name=comparison_name,
+                parameters={
+                    "gene_set_database": gene_set_database,
+                    "ranking_metric": ranking_metric,
+                    "min_size": min_size,
+                    "max_size": max_size,
+                    "n_permutations": n_permutations,
+                    "fdr_threshold": fdr_threshold,
+                },
+                algorithm_versions=get_algorithm_versions(),
+                reference_db_versions={"gene_set_database": gene_set_database},
+                result_summary={
+                    "total_genes_ranked": len(ranked_genes),
+                    "total_gene_sets_tested": len(gene_sets),
+                    "significant_gene_sets": len(significant_results),
+                },
+            )
+            db.add(_prov)
+            await db.flush()
+        except Exception as _prov_exc:
+            logger.warning("GSEA provenance save failed (non-fatal): %s", _prov_exc)
+
         return {
             "dataset_id": str(dataset_id),
             "comparison_name": comparison_name,
@@ -4161,7 +4217,33 @@ async def precompute_sample_clustering(
         )
         
         logger.info(f"✅ Pre-computed sample clustering for {dataset_id} ({result['genes_used']} genes)")
-        
+
+        # ── Provenance capture ──────────────────────────────────────────────────────
+        try:
+            from app.models.models import AnalysisRun
+            from app.services.version_service import get_algorithm_versions
+            _prov = AnalysisRun(
+                dataset_id=dataset_id,
+                user_id=current_user.user_id,
+                analysis_type="SAMPLE_CLUSTERING",
+                comparison_name=None,
+                parameters={
+                    "method": method,
+                    "metric": metric,
+                    "top_n_genes": top_n_genes,
+                },
+                algorithm_versions=get_algorithm_versions(),
+                reference_db_versions=None,
+                result_summary={
+                    "n_samples": len(result["col_labels"]),
+                    "genes_used": result["genes_used"],
+                },
+            )
+            db.add(_prov)
+            await db.flush()
+        except Exception as _prov_exc:
+            logger.warning("Sample clustering provenance save failed (non-fatal): %s", _prov_exc)
+
         return {
             "status": "success",
             "dataset_id": str(dataset_id),
@@ -4297,6 +4379,41 @@ async def run_go_enrichment_analysis(
             "n_terms": len(enrichment_results),
         },
     )
+
+    # ── Provenance capture ──────────────────────────────────────────────────────
+    try:
+        from app.models.models import AnalysisRun
+        from app.services.version_service import get_algorithm_versions
+        _prov = AnalysisRun(
+            dataset_id=dataset_id,
+            user_id=current_user.user_id,
+            analysis_type="GO_ENRICHMENT",
+            comparison_name=comparison_name,
+            parameters={
+                "namespace": namespace,
+                "regulation": regulation,
+                "padj_threshold": padj_threshold,
+                "log_fc_threshold": log_fc_threshold,
+                "min_term_size": min_term_size,
+                "max_term_size": max_term_size,
+                "pvalue_threshold": pvalue_threshold,
+                "fdr_method": fdr_method,
+                "propagate_annotations": propagate_annotations,
+                "organism": organism,
+            },
+            algorithm_versions=get_algorithm_versions(),
+            reference_db_versions={"organism": organism},
+            result_summary={
+                "study_size": len(study_genes),
+                "background_size": len(background_genes),
+                "enriched_terms": len(enrichment_results),
+                "namespace": namespace or "ALL",
+            },
+        )
+        db.add(_prov)
+        await db.flush()
+    except Exception as _prov_exc:
+        logger.warning("GO enrichment provenance save failed (non-fatal): %s", _prov_exc)
 
     return {
         "dataset_id": str(dataset_id),
@@ -4435,6 +4552,89 @@ async def get_go_term_genes(
 
 
 # ============================================================================
+# ============================================================================
+# Provenance — Analysis Runs
+# ============================================================================
+
+@router.get("/{dataset_id}/analysis-runs")
+async def get_analysis_runs(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    analysis_type: Optional[str] = Query(None, description="Filter by analysis type: VOLCANO, GO_ENRICHMENT, GSEA, SAMPLE_CLUSTERING, PCA"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """
+    List provenance records for a dataset.
+
+    Returns analysis runs ordered by most recent first.
+    Each record captures the exact parameters, algorithm versions, and result summary.
+    """
+    from app.models.models import AnalysisRun
+
+    # 1. Verify dataset exists
+    _ds = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    # 2. Check that user is owner or member of the project
+    project_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
+    project = project_result.scalar_one()
+
+    if project.owner_id != current_user.user_id:
+        member_query = select(ProjectMember).where(
+            ProjectMember.project_id == project.id,
+            ProjectMember.user_id == current_user.user_id
+        )
+        member = (await db.execute(member_query)).scalar_one_or_none()
+        if not member:
+            raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+
+    # 3. Query analysis runs
+    q = (
+        select(AnalysisRun)
+        .where(AnalysisRun.dataset_id == dataset_id)
+        .order_by(AnalysisRun.created_at.desc())
+    )
+    if analysis_type:
+        q = q.where(AnalysisRun.analysis_type == analysis_type.upper())
+    q = q.offset(offset).limit(limit)
+
+    result = await db.execute(q)
+    runs = result.scalars().all()
+
+    # 4. Count total (for pagination)
+    count_q = select(func.count()).select_from(AnalysisRun).where(AnalysisRun.dataset_id == dataset_id)
+    if analysis_type:
+        count_q = count_q.where(AnalysisRun.analysis_type == analysis_type.upper())
+    total_result = await db.execute(count_q)
+    total = total_result.scalar_one()
+
+    # 5. Return
+    return {
+        "dataset_id": str(dataset_id),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "runs": [
+            {
+                "id": str(r.id),
+                "analysis_type": r.analysis_type,
+                "comparison_name": r.comparison_name,
+                "parameters": r.parameters,
+                "algorithm_versions": r.algorithm_versions,
+                "reference_db_versions": r.reference_db_versions,
+                "result_summary": r.result_summary,
+                "user_id": r.user_id,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in runs
+        ],
+    }
+
+
 # Admin Endpoints - Performance & Cache Monitoring
 # ============================================================================
 

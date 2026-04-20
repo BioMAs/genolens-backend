@@ -7,7 +7,8 @@ from app.models.models import (
     DatasetType,
     DatasetStatus,
     ProjectComment,
-    CommentType
+    CommentType,
+    AnalysisRun,
 )
 
 __all__ = [
@@ -19,5 +20,6 @@ __all__ = [
     "DatasetType",
     "DatasetStatus",
     "ProjectComment",
-    "CommentType"
+    "CommentType",
+    "AnalysisRun",
 ]
