@@ -94,6 +94,13 @@ class Settings(BaseSettings):
         description="Public URL of the frontend application (used in email links)"
     )
 
+    # Stripe
+    stripe_secret_key: str = Field(default="", description="Stripe secret key (sk_live_* or sk_test_*)")
+    stripe_publishable_key: str = Field(default="", description="Stripe publishable key (pk_live_* or pk_test_*)")
+    stripe_webhook_secret: str = Field(default="", description="Stripe webhook signing secret (whsec_*)")
+    stripe_price_premium_monthly: str = Field(default="", description="Stripe Price ID for PREMIUM monthly plan")
+    stripe_price_advanced_monthly: str = Field(default="", description="Stripe Price ID for ADVANCED monthly plan")
+
     # Email / SMTP
     SMTP_HOST: Optional[str] = Field(None, description="SMTP host (e.g. smtp.sendgrid.net)")
     SMTP_PORT: int = Field(default=587, description="SMTP port")

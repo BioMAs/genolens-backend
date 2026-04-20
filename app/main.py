@@ -12,7 +12,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
 from app.db.session import close_db
-from app.api.endpoints import projects, datasets, admin, users, ontology, enrichment, bookmarks, genes, comments, history, integrations
+from app.api.endpoints import projects, datasets, admin, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, stripe_webhooks, billing
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -271,6 +271,18 @@ app.include_router(
 app.include_router(
     integrations.router,
     prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    stripe_webhooks.router,
+    prefix=f"{settings.API_V1_PREFIX}/stripe",
+    tags=["billing"],
+)
+
+app.include_router(
+    billing.router,
+    prefix=f"{settings.API_V1_PREFIX}/billing",
+    tags=["billing"],
 )
 
 
