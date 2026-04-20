@@ -4552,6 +4552,90 @@ async def get_go_term_genes(
 
 
 # ============================================================================
+# ============================================================================
+# Provenance — Analysis Runs
+# ============================================================================
+
+@router.get("/{dataset_id}/analysis-runs")
+async def get_analysis_runs(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    analysis_type: Optional[str] = Query(None, description="Filter by analysis type: VOLCANO, GO_ENRICHMENT, GSEA, SAMPLE_CLUSTERING, PCA"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """
+    List provenance records for a dataset.
+
+    Returns analysis runs ordered by most recent first.
+    Each record captures the exact parameters, algorithm versions, and result summary.
+    """
+    from app.models.models import AnalysisRun
+
+    # 1. Verify dataset exists
+    _ds = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    # 2. Check that user is owner or member of the project
+    project_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
+    project = project_result.scalar_one()
+
+    if str(project.owner_id) != str(current_user.user_id):
+        member_query = select(ProjectMember).where(
+            ProjectMember.project_id == project.id,
+            ProjectMember.user_id == current_user.user_id
+        )
+        member = (await db.execute(member_query)).scalar_one_or_none()
+        if not member:
+            raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+
+    # 3. Query analysis runs
+    q = (
+        select(AnalysisRun)
+        .where(AnalysisRun.dataset_id == dataset_id)
+        .order_by(AnalysisRun.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    if analysis_type:
+        q = q.where(AnalysisRun.analysis_type == analysis_type.upper())
+
+    result = await db.execute(q)
+    runs = result.scalars().all()
+
+    # 4. Count total (for pagination)
+    count_q = select(func.count()).select_from(AnalysisRun).where(AnalysisRun.dataset_id == dataset_id)
+    if analysis_type:
+        count_q = count_q.where(AnalysisRun.analysis_type == analysis_type.upper())
+    total_result = await db.execute(count_q)
+    total = total_result.scalar_one()
+
+    # 5. Return
+    return {
+        "dataset_id": str(dataset_id),
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "runs": [
+            {
+                "id": str(r.id),
+                "analysis_type": r.analysis_type,
+                "comparison_name": r.comparison_name,
+                "parameters": r.parameters,
+                "algorithm_versions": r.algorithm_versions,
+                "reference_db_versions": r.reference_db_versions,
+                "result_summary": r.result_summary,
+                "user_id": r.user_id,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in runs
+        ],
+    }
+
+
 # Admin Endpoints - Performance & Cache Monitoring
 # ============================================================================
 
