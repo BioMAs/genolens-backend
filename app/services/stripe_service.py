@@ -8,6 +8,7 @@ Exposes:
 - construct_webhook_event()     — verify and parse an incoming Stripe webhook payload
 """
 import asyncio
+import functools
 import logging
 
 import stripe
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 # Client factory
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=1)
 def get_stripe_client() -> stripe.StripeClient:
     """
     Initialise and return the Stripe SDK client (v8+ style).
@@ -30,7 +32,8 @@ def get_stripe_client() -> stripe.StripeClient:
     """
     if not settings.stripe_secret_key:
         raise RuntimeError(
-            "Stripe is not configured. Set STRIPE_SECRET_KEY in your environment."
+            "Stripe secret key is not configured. "
+            "Set STRIPE_SECRET_KEY in your environment."
         )
     return stripe.StripeClient(api_key=settings.stripe_secret_key)
 
@@ -87,7 +90,7 @@ async def create_checkout_session(
 
     session = await asyncio.to_thread(
         client.v1.checkout.sessions.create,
-        {
+        params={
             "mode": "subscription",
             "line_items": [{"price": price_id, "quantity": 1}],
             "customer_email": user_email,
@@ -134,7 +137,7 @@ async def create_billing_portal_session(
 
     portal_session = await asyncio.to_thread(
         client.v1.billing_portal.sessions.create,
-        {
+        params={
             "customer": stripe_customer_id,
             "return_url": return_url,
         },
