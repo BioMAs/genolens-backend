@@ -1356,3 +1356,79 @@ class UserLoginEvent(Base):
 
     def __repr__(self) -> str:
         return f"<UserLoginEvent(user={self.user_id}, created_at={self.created_at})>"
+
+
+class AnalysisRun(Base, TimestampMixin):
+    """
+    AnalysisRun: Permanent audit trail for analysis computations.
+    Records which parameters were used, which package versions ran the
+    computation, and which reference databases were consulted.
+    Not a cache — never invalidated or expired.
+    """
+    __tablename__ = "analysis_runs"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+
+    dataset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Dataset this analysis was run on"
+    )
+
+    # Supabase Auth user ID — stored as str to match Supabase UUID string format
+    user_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        comment="Supabase Auth user UUID who triggered the analysis"
+    )
+
+    analysis_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        comment="Analysis type: VOLCANO, GO_ENRICHMENT, GSEA, SAMPLE_CLUSTERING, PCA, UMAP, HEATMAP"
+    )
+
+    comparison_name: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Comparison name for DEG-linked analyses (volcano, enrichment)"
+    )
+
+    parameters: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        comment="Exact parameters used for the analysis"
+    )
+
+    algorithm_versions: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        comment="Package/algorithm versions used (e.g. {\"scipy\": \"1.12.0\"})"
+    )
+
+    reference_db_versions: Mapped[Optional[dict]] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Reference database versions consulted (e.g. {\"go_release\": \"2024-01\"})"
+    )
+
+    result_summary: Mapped[Optional[dict]] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="High-level summary of results (e.g. {\"gene_count\": 42, \"pathway_count\": 15})"
+    )
+
+    # Relationships
+    dataset: Mapped["Dataset"] = relationship()
+
+    # Indexes
+    __table_args__ = (
+        Index("ix_analysis_runs_dataset_id", "dataset_id"),
+        Index("ix_analysis_runs_user_id", "user_id"),
+        Index("ix_analysis_runs_dataset_type", "dataset_id", "analysis_type"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AnalysisRun(id={self.id}, dataset_id={self.dataset_id}, type={self.analysis_type}, user={self.user_id})>"
