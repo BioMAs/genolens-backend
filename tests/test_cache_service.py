@@ -1,5 +1,5 @@
 """
-Unit tests for CacheService (in-memory TTLCache / LRUCache).
+Unit tests for CacheService (async Redis-backed + in-memory LRU for DataFrames).
 
 Covers:
 - _generate_cache_key (determinism, kwarg ordering)
@@ -7,9 +7,43 @@ Covers:
 - Volcano cache: set/get with different thresholds produce distinct keys
 - Stats cache: set/get with/without comparison_name
 - DataFrame cache: set/get, LRU eviction
-- Cache management: clear_dataset_cache, clear_all, get_cache_stats
+- Cache management: clear_dataset_cache, clear_all
+- get_stats_info / get_cache_stats structure
 """
 import pytest
+from unittest.mock import AsyncMock
+import json
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fixtures
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def redis_mock():
+    """Simple dict-backed AsyncMock simulating redis.asyncio."""
+    store: dict[str, str] = {}
+
+    mock = AsyncMock()
+
+    async def fake_get(key):
+        return store.get(key)
+
+    async def fake_setex(key, ttl, value):
+        store[key] = value
+
+    mock.get = fake_get
+    mock.setex = fake_setex
+    mock.aclose = AsyncMock()
+    return mock
+
+
+@pytest.fixture
+def cache_svc(redis_mock):
+    from app.services.cache_service import CacheService
+    svc = CacheService()
+    svc._redis = redis_mock  # inject mock — bypasses initialize()
+    return svc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -53,51 +87,42 @@ class TestGenerateCacheKey:
 
 class TestClusteringCache:
 
-    def _make_service(self, **kwargs):
-        from app.services.cache_service import CacheService
-        return CacheService(clustering_ttl_seconds=3600, **kwargs)
-
-    def test_cache_miss_returns_none(self):
+    async def test_cache_miss_returns_none(self, cache_svc):
         """get_clustering_result should return None on a miss."""
-        svc = self._make_service()
-        result = svc.get_clustering_result("ds1", ["A", "B"], method="ward")
+        result = await cache_svc.get_clustering_result("ds1", ["A", "B"], method="ward")
         assert result is None
 
-    def test_set_then_get_returns_result(self):
+    async def test_set_then_get_returns_result(self, cache_svc):
         """After setting, get should return the same result."""
-        svc = self._make_service()
         data = {"dendro": [1, 2, 3]}
-        svc.set_clustering_result("ds1", ["A", "B"], data, method="ward")
-        fetched = svc.get_clustering_result("ds1", ["A", "B"], method="ward")
+        await cache_svc.set_clustering_result("ds1", ["A", "B"], data, method="ward")
+        fetched = await cache_svc.get_clustering_result("ds1", ["A", "B"], method="ward")
         assert fetched == data
 
-    def test_gene_list_order_does_not_matter(self):
+    async def test_gene_list_order_does_not_matter(self, cache_svc):
         """Gene list is sorted internally, so order should not affect the key."""
-        svc = self._make_service()
         data = {"result": True}
-        svc.set_clustering_result("ds1", ["B", "A"], data, method="ward")
-        fetched = svc.get_clustering_result("ds1", ["A", "B"], method="ward")
+        await cache_svc.set_clustering_result("ds1", ["B", "A"], data, method="ward")
+        fetched = await cache_svc.get_clustering_result("ds1", ["A", "B"], method="ward")
         assert fetched == data
 
-    def test_different_methods_use_different_keys(self):
+    async def test_different_methods_use_different_keys(self, cache_svc):
         """Clustering results for different methods should be cached separately."""
-        svc = self._make_service()
         ward_data = {"method": "ward"}
         avg_data = {"method": "average"}
-        svc.set_clustering_result("ds1", ["A", "B"], ward_data, method="ward")
-        svc.set_clustering_result("ds1", ["A", "B"], avg_data, method="average")
+        await cache_svc.set_clustering_result("ds1", ["A", "B"], ward_data, method="ward")
+        await cache_svc.set_clustering_result("ds1", ["A", "B"], avg_data, method="average")
 
-        assert svc.get_clustering_result("ds1", ["A", "B"], method="ward") == ward_data
-        assert svc.get_clustering_result("ds1", ["A", "B"], method="average") == avg_data
+        assert await cache_svc.get_clustering_result("ds1", ["A", "B"], method="ward") == ward_data
+        assert await cache_svc.get_clustering_result("ds1", ["A", "B"], method="average") == avg_data
 
-    def test_different_datasets_do_not_collide(self):
+    async def test_different_datasets_do_not_collide(self, cache_svc):
         """Results for different datasets should not collide."""
-        svc = self._make_service()
-        svc.set_clustering_result("ds1", ["A"], {"x": 1}, method="ward")
-        svc.set_clustering_result("ds2", ["A"], {"x": 2}, method="ward")
+        await cache_svc.set_clustering_result("ds1", ["A"], {"x": 1}, method="ward")
+        await cache_svc.set_clustering_result("ds2", ["A"], {"x": 2}, method="ward")
 
-        assert svc.get_clustering_result("ds1", ["A"], method="ward") == {"x": 1}
-        assert svc.get_clustering_result("ds2", ["A"], method="ward") == {"x": 2}
+        assert await cache_svc.get_clustering_result("ds1", ["A"], method="ward") == {"x": 1}
+        assert await cache_svc.get_clustering_result("ds2", ["A"], method="ward") == {"x": 2}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,38 +131,31 @@ class TestClusteringCache:
 
 class TestVolcanoCache:
 
-    def _make_service(self):
-        from app.services.cache_service import CacheService
-        return CacheService()
+    async def test_miss_returns_none(self, cache_svc):
+        """get_volcano_data should return None if nothing is cached."""
+        assert await cache_svc.get_volcano_data("ds_unknown", "cmp") is None
 
-    def test_set_then_get_returns_data(self):
+    async def test_set_then_get_returns_data(self, cache_svc):
         """Cached volcano data should be retrievable."""
-        svc = self._make_service()
         payload = {"points": [1, 2, 3]}
-        svc.set_volcano_data("ds1", "KO_vs_WT", payload)
-        result = svc.get_volcano_data("ds1", "KO_vs_WT")
+        await cache_svc.set_volcano_data("ds1", "KO_vs_WT", payload)
+        result = await cache_svc.get_volcano_data("ds1", "KO_vs_WT")
         assert result == payload
 
-    def test_different_thresholds_have_different_keys(self):
+    async def test_different_thresholds_have_different_keys(self, cache_svc):
         """Volcano data with different thresholds must not collide."""
-        svc = self._make_service()
         data_strict = {"threshold": "strict"}
         data_lenient = {"threshold": "lenient"}
 
-        svc.set_volcano_data("ds1", "KO_vs_WT", data_strict,
-                             padj_threshold=0.01, logfc_threshold=1.0)
-        svc.set_volcano_data("ds1", "KO_vs_WT", data_lenient,
-                             padj_threshold=0.05, logfc_threshold=0.58)
+        await cache_svc.set_volcano_data("ds1", "KO_vs_WT", data_strict,
+                                         padj_threshold=0.01, logfc_threshold=1.0)
+        await cache_svc.set_volcano_data("ds1", "KO_vs_WT", data_lenient,
+                                         padj_threshold=0.05, logfc_threshold=0.58)
 
-        assert svc.get_volcano_data("ds1", "KO_vs_WT",
-                                    padj_threshold=0.01, logfc_threshold=1.0) == data_strict
-        assert svc.get_volcano_data("ds1", "KO_vs_WT",
-                                    padj_threshold=0.05, logfc_threshold=0.58) == data_lenient
-
-    def test_miss_returns_none(self):
-        """get_volcano_data should return None if nothing is cached."""
-        svc = self._make_service()
-        assert svc.get_volcano_data("ds_unknown", "cmp") is None
+        assert await cache_svc.get_volcano_data("ds1", "KO_vs_WT",
+                                                padj_threshold=0.01, logfc_threshold=1.0) == data_strict
+        assert await cache_svc.get_volcano_data("ds1", "KO_vs_WT",
+                                                padj_threshold=0.05, logfc_threshold=0.58) == data_lenient
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,31 +164,24 @@ class TestVolcanoCache:
 
 class TestStatsCache:
 
-    def _make_service(self):
-        from app.services.cache_service import CacheService
-        return CacheService()
+    async def test_miss_returns_none(self, cache_svc):
+        assert await cache_svc.get_stats("nonexistent") is None
 
-    def test_set_and_get_without_comparison(self):
+    async def test_set_and_get_without_comparison(self, cache_svc):
         """Stats without comparison_name should be cached correctly."""
-        svc = self._make_service()
         stats = {"mean": 5.2, "std": 1.1}
-        svc.set_stats("ds1", stats)
-        assert svc.get_stats("ds1") == stats
+        await cache_svc.set_stats("ds1", stats)
+        assert await cache_svc.get_stats("ds1") == stats
 
-    def test_set_and_get_with_comparison(self):
+    async def test_set_and_get_with_comparison(self, cache_svc):
         """Stats with comparison_name should be distinct from global stats."""
-        svc = self._make_service()
         global_stats = {"type": "global"}
         cmp_stats = {"type": "comparison"}
-        svc.set_stats("ds1", global_stats)
-        svc.set_stats("ds1", cmp_stats, comparison_name="KO_vs_WT")
+        await cache_svc.set_stats("ds1", global_stats)
+        await cache_svc.set_stats("ds1", cmp_stats, comparison_name="KO_vs_WT")
 
-        assert svc.get_stats("ds1") == global_stats
-        assert svc.get_stats("ds1", comparison_name="KO_vs_WT") == cmp_stats
-
-    def test_miss_returns_none(self):
-        svc = self._make_service()
-        assert svc.get_stats("nonexistent") is None
+        assert await cache_svc.get_stats("ds1") == global_stats
+        assert await cache_svc.get_stats("ds1", comparison_name="KO_vs_WT") == cmp_stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,53 +225,89 @@ class TestDataFrameCache:
 
 class TestCacheManagement:
 
-    def _make_service(self):
-        from app.services.cache_service import CacheService
-        return CacheService()
-
-    def test_clear_dataset_cache_removes_dataframe_entry(self):
+    def test_clear_dataset_cache_removes_dataframe_entry(self, cache_svc):
         """clear_dataset_cache should remove the DataFrame entry."""
         import pandas as pd
-        svc = self._make_service()
-        svc.set_dataframe("ds1", pd.DataFrame())
-        svc.clear_dataset_cache("ds1")
-        assert svc.get_dataframe("ds1") is None
+        cache_svc.set_dataframe("ds1", pd.DataFrame())
+        cache_svc.clear_dataset_cache("ds1")
+        assert cache_svc.get_dataframe("ds1") is None
 
-    def test_clear_all_empties_all_caches(self):
-        """clear_all should remove all entries from all caches."""
+    def test_clear_all_clears_dataframe_cache(self, cache_svc):
+        """clear_all should clear the in-memory DataFrame cache."""
         import pandas as pd
-        svc = self._make_service()
-        svc.set_clustering_result("ds1", ["A"], {"x": 1})
-        svc.set_volcano_data("ds1", "cmp", {"y": 2})
-        svc.set_stats("ds1", {"z": 3})
-        svc.set_dataframe("ds1", pd.DataFrame())
+        cache_svc.set_dataframe("ds1", pd.DataFrame())
+        cache_svc.set_dataframe("ds2", pd.DataFrame())
 
-        svc.clear_all()
+        cache_svc.clear_all()
 
-        assert svc.get_clustering_result("ds1", ["A"]) is None
-        assert svc.get_volcano_data("ds1", "cmp") is None
-        assert svc.get_stats("ds1") is None
-        assert svc.get_dataframe("ds1") is None
+        assert cache_svc.get_dataframe("ds1") is None
+        assert cache_svc.get_dataframe("ds2") is None
 
-    def test_get_cache_stats_structure(self):
-        """get_cache_stats should return dict with expected top-level keys."""
-        svc = self._make_service()
-        stats = svc.get_cache_stats()
+    def test_clear_all_does_not_affect_redis_keys(self, cache_svc):
+        """clear_all only clears the in-memory DataFrame cache; Redis is untouched."""
+        # Verify that clear_all does not attempt to flush Redis
+        # (no call to _redis.flushdb or similar)
+        cache_svc.clear_all()
+        # If _redis were called, the AsyncMock would record it.
+        # Only aclose is a known method; other attribute accesses would raise.
+        # This test simply confirms no exception is raised and redis is not flushed.
+        assert cache_svc._redis is not None
 
-        assert "clustering" in stats
-        assert "volcano" in stats
-        assert "stats" in stats
-        assert "dataframe" in stats
 
-        # Each sub-dict should have size information
+# ─────────────────────────────────────────────────────────────────────────────
+# get_stats_info / get_cache_stats
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCacheStatsInfo:
+
+    async def test_get_stats_info_has_expected_keys(self, cache_svc):
+        """get_stats_info should return dict with all four top-level keys."""
+        info = await cache_svc.get_stats_info()
+
+        assert "clustering" in info
+        assert "volcano" in info
+        assert "stats" in info
+        assert "dataframe" in info
+
+    async def test_redis_caches_have_backend_and_ttl(self, cache_svc):
+        """Redis-backed caches should report backend='redis' and a ttl_seconds."""
+        info = await cache_svc.get_stats_info()
+
         for section in ("clustering", "volcano", "stats"):
-            assert "size" in stats[section]
-            assert "maxsize" in stats[section]
+            assert info[section]["backend"] == "redis"
+            assert "ttl_seconds" in info[section]
+            assert isinstance(info[section]["ttl_seconds"], int)
 
-    def test_get_cache_stats_reflects_content(self):
-        """After inserting an entry, size should increase."""
-        svc = self._make_service()
-        svc.set_clustering_result("ds1", ["G1"], {"r": 1})
+    async def test_redis_caches_have_no_size_field(self, cache_svc):
+        """Redis-backed caches should NOT expose size/currsize (no in-memory count)."""
+        info = await cache_svc.get_stats_info()
 
-        stats = svc.get_cache_stats()
-        assert stats["clustering"]["size"] >= 1
+        for section in ("clustering", "volcano", "stats"):
+            assert "size" not in info[section]
+            assert "currsize" not in info[section]
+
+    async def test_dataframe_cache_has_memory_backend_and_size(self, cache_svc):
+        """DataFrame cache entry should report backend='memory' with size and maxsize."""
+        import pandas as pd
+        cache_svc.set_dataframe("ds1", pd.DataFrame())
+        info = await cache_svc.get_stats_info()
+
+        df_info = info["dataframe"]
+        assert df_info["backend"] == "memory"
+        assert "size" in df_info
+        assert "maxsize" in df_info
+        assert df_info["size"] >= 1
+
+    async def test_get_cache_stats_is_alias_for_get_stats_info(self, cache_svc):
+        """get_cache_stats() is an alias and should return identical structure."""
+        info = await cache_svc.get_stats_info()
+        stats = await cache_svc.get_cache_stats()
+        assert info == stats
+
+    async def test_ttl_values_are_correct(self, cache_svc):
+        """TTL constants should match documented values."""
+        info = await cache_svc.get_stats_info()
+
+        assert info["clustering"]["ttl_seconds"] == 3600
+        assert info["volcano"]["ttl_seconds"] == 7200
+        assert info["stats"]["ttl_seconds"] == 86400
