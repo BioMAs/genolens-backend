@@ -411,6 +411,96 @@ async def send_reply_notification(
 
 
 # ---------------------------------------------------------------------------
+# Subscription email templates
+# ---------------------------------------------------------------------------
+
+def _subscription_welcome_html(plan: str) -> str:
+    plan_label = plan.capitalize()
+    content = f"""
+      <p>Bonjour,</p>
+      <p>
+        Votre abonnement <strong>{plan_label}</strong> est maintenant actif.
+        Merci de faire confiance à GenoLens pour vos analyses génomiques.
+      </p>
+      <p>
+        Vous pouvez dès à présent profiter de toutes les fonctionnalités incluses dans votre plan.
+      </p>
+      <a href="{settings.APP_URL}" class="btn">Accéder à GenoLens →</a>
+      <div class="meta">
+        <p>
+          Si vous avez des questions, contactez-nous à tout moment.
+          Nous sommes là pour vous aider.
+        </p>
+      </div>
+    """
+    return _base_layout(f"Bienvenue sur GenoLens {plan_label} !", content)
+
+
+def _subscription_welcome_text(plan: str) -> str:
+    plan_label = plan.capitalize()
+    return (
+        f"Bonjour,\n\n"
+        f"Votre abonnement {plan_label} est maintenant actif.\n"
+        f"Merci de faire confiance à GenoLens pour vos analyses génomiques.\n\n"
+        f"Accédez à la plateforme ici : {settings.APP_URL}\n\n"
+        f"— L'équipe GenoLens"
+    )
+
+
+def _subscription_cancelled_html() -> str:
+    content = f"""
+      <p>Bonjour,</p>
+      <p>
+        Votre abonnement GenoLens a été annulé. Votre compte a été rétrogradé vers le plan
+        <strong>Basic</strong>.
+      </p>
+      <p>
+        Vous conservez l'accès à vos projets en lecture et visualisation.
+        Si vous souhaitez retrouver toutes vos fonctionnalités, vous pouvez souscrire à nouveau
+        à tout moment.
+      </p>
+      <a href="{settings.APP_URL}" class="btn">Gérer mon compte →</a>
+      <div class="meta">
+        <p>
+          Si cette annulation est une erreur ou si vous avez des questions,
+          contactez-nous et nous ferons le nécessaire.
+        </p>
+      </div>
+    """
+    return _base_layout("Votre abonnement GenoLens a été annulé", content)
+
+
+def _subscription_cancelled_text() -> str:
+    return (
+        f"Bonjour,\n\n"
+        f"Votre abonnement GenoLens a été annulé.\n"
+        f"Votre compte a été rétrogradé vers le plan Basic.\n\n"
+        f"Vous pouvez souscrire à nouveau à tout moment sur : {settings.APP_URL}\n\n"
+        f"— L'équipe GenoLens"
+    )
+
+
+async def send_subscription_welcome_email(to_email: str, plan: str) -> bool:
+    """Send a welcome email after a successful subscription checkout."""
+    return await send_email(
+        to=to_email,
+        subject=f"Bienvenue sur GenoLens {plan.capitalize()} !",
+        html_body=_subscription_welcome_html(plan),
+        text_body=_subscription_welcome_text(plan),
+    )
+
+
+async def send_subscription_cancelled_email(to_email: str) -> bool:
+    """Send a cancellation notification email when a subscription is deleted."""
+    return await send_email(
+        to=to_email,
+        subject="Votre abonnement GenoLens a été annulé",
+        html_body=_subscription_cancelled_html(),
+        text_body=_subscription_cancelled_text(),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Mention parsing helper
 # ---------------------------------------------------------------------------
 
