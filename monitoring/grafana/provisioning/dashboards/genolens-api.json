@@ -71,10 +71,10 @@
       "targets": [
         {
           "expr": "http_requests_total - http_requests_total offset 1m",
-          "legendFormat": "Active Requests {{handler}}"
+          "legendFormat": "Requests/min {{handler}}"
         }
       ],
-      "title": "Active Requests (in-flight)",
+      "title": "Requests per Minute (1m window)",
       "type": "timeseries"
     }
   ],
