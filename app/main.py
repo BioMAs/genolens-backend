@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from slowapi.errors import RateLimitExceeded
+import sentry_sdk
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.core.config import settings
 from app.db.session import close_db
@@ -16,6 +18,15 @@ from app.api.endpoints import projects, datasets, admin, users, ontology, enrich
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
+
+# Sentry — only initialise when DSN is configured
+if settings.sentry_dsn:
+    sentry_sdk.init(
+        dsn=settings.sentry_dsn,
+        environment=settings.sentry_environment,
+        traces_sample_rate=settings.sentry_traces_sample_rate,
+        send_default_pii=False,
+    )
 
 
 @asynccontextmanager
@@ -66,6 +77,16 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url=f"{settings.API_V1_PREFIX}/openapi.json"
 )
+
+# Prometheus metrics — exposed at GET /metrics in Prometheus text format.
+# NOTE: In production, /metrics should be firewalled or protected at the
+# reverse-proxy level (e.g. nginx allow/deny, or a network policy) so it
+# is not publicly accessible.
+Instrumentator(
+    should_group_status_codes=True,
+    should_ignore_untemplated=True,
+    excluded_handlers=["/health", "/metrics"],
+).instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 # CORS Configuration
 app.add_middleware(

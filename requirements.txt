@@ -56,3 +56,7 @@ aiosmtplib>=3.0.0
 
 # Payments
 stripe>=8.0.0
+
+# Monitoring
+sentry-sdk[fastapi]>=2.0.0
+prometheus-fastapi-instrumentator>=7.0.0
