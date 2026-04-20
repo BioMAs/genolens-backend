@@ -55,6 +55,8 @@ jobs:
           EOF
 
       - name: Build and start services (postgres, redis, api only)
+        # NOTE: prometheus and grafana are NOT started in CI — they are
+        # observability tools only and are not required for running tests.
         run: |
           docker compose up -d --build postgres redis api
         env:
