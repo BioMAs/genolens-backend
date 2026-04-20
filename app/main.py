@@ -14,6 +14,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.core.config import settings
 from app.db.session import close_db
+from app.services.cache_service import cache_service
 from app.api.endpoints import projects, datasets, admin, users, ontology, enrichment, bookmarks, genes, comments, history, integrations
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
@@ -41,11 +42,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"🌐 CORS Origins: {settings.CORS_ORIGINS}")
     logger.info(f"📊 Database: Connected")
     logger.info(f"🔄 Celery: Worker configured")
+    await cache_service.initialize(settings.REDIS_URL)
 
     yield
 
     # Shutdown
     logger.info("🛑 Shutting down...")
+    await cache_service.close()
     await close_db()
     logger.info("✅ Database connections closed")
 
