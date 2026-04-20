@@ -7,6 +7,7 @@ Exposes:
 - create_billing_portal_session() — create a Stripe Billing Portal session
 - construct_webhook_event()     — verify and parse an incoming Stripe webhook payload
 """
+import asyncio
 import logging
 
 import stripe
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Client factory
 # ---------------------------------------------------------------------------
 
-def get_stripe_client() -> stripe.Stripe:
+def get_stripe_client() -> stripe.StripeClient:
     """
     Initialise and return the Stripe SDK client (v8+ style).
 
@@ -31,7 +32,7 @@ def get_stripe_client() -> stripe.Stripe:
         raise RuntimeError(
             "Stripe is not configured. Set STRIPE_SECRET_KEY in your environment."
         )
-    return stripe.Stripe(api_key=settings.stripe_secret_key)
+    return stripe.StripeClient(api_key=settings.stripe_secret_key)
 
 
 # ---------------------------------------------------------------------------
@@ -84,13 +85,16 @@ async def create_checkout_session(
 
     client = get_stripe_client()
 
-    session = client.checkout.sessions.create(
-        mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
-        customer_email=user_email,
-        client_reference_id=user_id,
-        success_url=success_url,
-        cancel_url=cancel_url,
+    session = await asyncio.to_thread(
+        client.v1.checkout.sessions.create,
+        {
+            "mode": "subscription",
+            "line_items": [{"price": price_id, "quantity": 1}],
+            "customer_email": user_email,
+            "client_reference_id": user_id,
+            "success_url": success_url,
+            "cancel_url": cancel_url,
+        },
     )
 
     logger.info(
@@ -99,6 +103,9 @@ async def create_checkout_session(
         user_id,
         plan_upper,
     )
+
+    if not session.url:
+        raise RuntimeError("Stripe returned a checkout session with no URL")
     return session.url
 
 
@@ -125,14 +132,20 @@ async def create_billing_portal_session(
     """
     client = get_stripe_client()
 
-    portal_session = client.billing_portal.sessions.create(
-        customer=stripe_customer_id,
-        return_url=return_url,
+    portal_session = await asyncio.to_thread(
+        client.v1.billing_portal.sessions.create,
+        {
+            "customer": stripe_customer_id,
+            "return_url": return_url,
+        },
     )
 
     logger.info(
         "Billing portal session created: customer_id=%s", stripe_customer_id
     )
+
+    if not portal_session.url:
+        raise RuntimeError("Stripe returned a billing portal session with no URL")
     return portal_session.url
 
 
@@ -152,7 +165,7 @@ def construct_webhook_event(payload: bytes, sig_header: str) -> stripe.Event:
         A verified :class:`stripe.Event` instance.
 
     Raises:
-        stripe.error.SignatureVerificationError: if the signature is invalid.
+        stripe.SignatureVerificationError: if the signature is invalid.
         RuntimeError: if STRIPE_WEBHOOK_SECRET is not configured.
     """
     if not settings.stripe_webhook_secret:
@@ -160,9 +173,5 @@ def construct_webhook_event(payload: bytes, sig_header: str) -> stripe.Event:
             "Stripe webhook secret is not configured. "
             "Set STRIPE_WEBHOOK_SECRET in your environment."
         )
-
-    return stripe.Webhook.construct_event(
-        payload=payload,
-        sig_header=sig_header,
-        secret=settings.stripe_webhook_secret,
-    )
+    client = get_stripe_client()
+    return client.construct_event(payload, sig_header, settings.stripe_webhook_secret)
