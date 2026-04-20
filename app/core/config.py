@@ -104,6 +104,11 @@ class Settings(BaseSettings):
     EMAIL_FROM_ADDRESS: Optional[str] = Field(None, description="From address for outgoing emails")
     EMAIL_FROM_NAME: str = Field(default="GenoLens", description="Display name for outgoing emails")
 
+    # Monitoring
+    sentry_dsn: str = Field(default="", description="Sentry DSN for error tracking (leave empty to disable)")
+    sentry_environment: str = Field(default="development", description="Sentry environment tag (development/staging/production)")
+    sentry_traces_sample_rate: float = Field(default=0.1, description="Sentry performance traces sample rate (0.0–1.0)")
+
     @property
     def celery_broker(self) -> str:
         """Get Celery broker URL, defaulting to Redis URL."""

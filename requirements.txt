@@ -53,3 +53,7 @@ goatools>=1.3.1
 
 # Email notifications
 aiosmtplib>=3.0.0
+
+# Monitoring
+sentry-sdk[fastapi]>=2.0.0
+prometheus-fastapi-instrumentator>=7.0.0
