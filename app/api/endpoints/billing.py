@@ -38,7 +38,9 @@ async def create_checkout(
     Returns a redirect URL to the Stripe-hosted checkout page.
     Returns 409 if the user already has an active Stripe customer (use portal).
     """
-    if body.plan.upper() not in VALID_PLANS:
+    plan = body.plan.upper()
+
+    if plan not in VALID_PLANS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid plan '{body.plan}'. Valid options are: {', '.join(sorted(VALID_PLANS))}",
@@ -56,13 +58,24 @@ async def create_checkout(
     success_url = f"{settings.APP_URL}/profile?payment=success"
     cancel_url = f"{settings.APP_URL}/pricing"
 
-    checkout_url = await stripe_service.create_checkout_session(
-        user_id=str(current_user.id),
-        user_email=current_user.email,
-        plan=body.plan,
-        success_url=success_url,
-        cancel_url=cancel_url,
-    )
+    try:
+        checkout_url = await stripe_service.create_checkout_session(
+            user_id=str(current_user.id),
+            user_email=current_user.email,
+            plan=plan,
+            success_url=success_url,
+            cancel_url=cancel_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment provider error. Please try again later.",
+        )
 
     return {"checkout_url": checkout_url}
 
@@ -89,10 +102,21 @@ async def create_portal(
 
     return_url = f"{settings.APP_URL}/profile"
 
-    portal_url = await stripe_service.create_billing_portal_session(
-        stripe_customer_id=current_user.stripe_customer_id,
-        return_url=return_url,
-    )
+    try:
+        portal_url = await stripe_service.create_billing_portal_session(
+            stripe_customer_id=current_user.stripe_customer_id,
+            return_url=return_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment provider error. Please try again later.",
+        )
 
     return {"portal_url": portal_url}
 
