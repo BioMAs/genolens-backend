@@ -4583,7 +4583,7 @@ async def get_analysis_runs(
     project_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
     project = project_result.scalar_one()
 
-    if str(project.owner_id) != str(current_user.user_id):
+    if project.owner_id != current_user.user_id:
         member_query = select(ProjectMember).where(
             ProjectMember.project_id == project.id,
             ProjectMember.user_id == current_user.user_id
@@ -4597,11 +4597,10 @@ async def get_analysis_runs(
         select(AnalysisRun)
         .where(AnalysisRun.dataset_id == dataset_id)
         .order_by(AnalysisRun.created_at.desc())
-        .offset(offset)
-        .limit(limit)
     )
     if analysis_type:
         q = q.where(AnalysisRun.analysis_type == analysis_type.upper())
+    q = q.offset(offset).limit(limit)
 
     result = await db.execute(q)
     runs = result.scalars().all()

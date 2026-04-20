@@ -310,3 +310,49 @@ class TestGetAnalysisRuns:
 
         assert response.status_code == 404
         assert response.json()["detail"] == "Dataset not found"
+
+    # ── 6. Returns 403 when user is not owner and not a member ───────────────
+
+    @pytest.mark.asyncio
+    async def test_returns_403_when_user_not_authorized(self):
+        from app.main import app
+        from app.api.deps import get_current_user, get_db
+
+        fake_user = make_fake_supabase_user()
+
+        # Build a project owned by a *different* user
+        project = make_project()
+        project.owner_id = uuid4()  # not TEST_USER_ID
+
+        dataset = _make_dataset()
+
+        # DB: dataset found → project found → member query returns None (not a member)
+        ds_result = MagicMock()
+        ds_result.scalar_one_or_none.return_value = dataset
+
+        proj_result = MagicMock()
+        proj_result.scalar_one.return_value = project
+
+        member_result = MagicMock()
+        member_result.scalar_one_or_none.return_value = None  # not a member
+
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=[ds_result, proj_result, member_result])
+
+        async def _override_user():
+            return fake_user
+
+        async def _override_db():
+            yield db
+
+        app.dependency_overrides[get_current_user] = _override_user
+        app.dependency_overrides[get_db] = _override_db
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.get(f"/api/v1/datasets/{TEST_DATASET_ID}/analysis-runs")
+
+        app.dependency_overrides.clear()
+
+        assert response.status_code == 403
+        assert "Not authorized" in response.json()["detail"]
