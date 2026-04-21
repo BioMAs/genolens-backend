@@ -501,6 +501,160 @@ async def send_subscription_cancelled_email(to_email: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Dataset job-completion email templates
+# ---------------------------------------------------------------------------
+
+def _dataset_ready_html(
+    dataset_name: str,
+    dataset_type: str,
+    project_name: str,
+    project_url: str,
+) -> str:
+    type_label = {
+        "MATRIX": "Matrice d'expression",
+        "DEG": "Gènes différentiellement exprimés",
+        "ENRICHMENT": "Enrichissement fonctionnel",
+        "COUNTS": "Comptages bruts",
+    }.get(dataset_type.upper(), dataset_type)
+
+    content = f"""
+      <p>Bonjour,</p>
+      <p>
+        Votre dataset <strong>« {dataset_name} »</strong> ({type_label}) a été traité avec succès
+        dans le projet <strong>« {project_name} »</strong>.
+      </p>
+      <p>
+        Il est maintenant disponible pour l'analyse : volcano plots, heatmaps, enrichissement
+        et bien plus encore.
+      </p>
+      <a href="{project_url}" class="btn">Accéder au projet →</a>
+      <div class="meta">
+        <p>Lien direct : <a href="{project_url}">{project_url}</a></p>
+      </div>
+    """
+    return _base_layout(f"Dataset prêt — « {dataset_name} »", content)
+
+
+def _dataset_ready_text(
+    dataset_name: str,
+    dataset_type: str,
+    project_name: str,
+    project_url: str,
+) -> str:
+    return (
+        f"Bonjour,\n\n"
+        f"Votre dataset « {dataset_name} » ({dataset_type}) a été traité avec succès "
+        f"dans le projet « {project_name} ».\n\n"
+        f"Accédez au projet ici : {project_url}\n\n"
+        f"— L'équipe GenoLens"
+    )
+
+
+def _dataset_failed_html(
+    dataset_name: str,
+    error_message: str,
+    project_name: str,
+    project_url: str,
+) -> str:
+    # Truncate long technical errors for display
+    display_error = (error_message[:300] + "…") if len(error_message) > 300 else error_message
+    escaped = display_error.replace("<", "&lt;").replace(">", "&gt;")
+
+    content = f"""
+      <p>Bonjour,</p>
+      <p>
+        Le traitement de votre dataset <strong>« {dataset_name} »</strong>
+        dans le projet <strong>« {project_name} »</strong> a échoué.
+      </p>
+      <div class="highlight-box" style="border-color:#ef4444; background:#fef2f2;">
+        <p style="color:#991b1b; font-size:13px; font-family:monospace;">{escaped}</p>
+      </div>
+      <p>
+        Vérifiez que votre fichier respecte le format attendu et réessayez.
+        Si le problème persiste, contactez notre support.
+      </p>
+      <a href="{project_url}" class="btn" style="background:linear-gradient(135deg,#ef4444 0%,#dc2626 100%);">
+        Voir le projet →
+      </a>
+      <div class="meta">
+        <p>Lien direct : <a href="{project_url}">{project_url}</a></p>
+      </div>
+    """
+    return _base_layout(f"Échec du traitement — « {dataset_name} »", content)
+
+
+def _dataset_failed_text(
+    dataset_name: str,
+    error_message: str,
+    project_name: str,
+    project_url: str,
+) -> str:
+    display_error = (error_message[:300] + "…") if len(error_message) > 300 else error_message
+    return (
+        f"Bonjour,\n\n"
+        f"Le traitement de votre dataset « {dataset_name} » dans le projet "
+        f"« {project_name} » a échoué.\n\n"
+        f"Erreur : {display_error}\n\n"
+        f"Vérifiez votre fichier et réessayez. Lien projet : {project_url}\n\n"
+        f"— L'équipe GenoLens"
+    )
+
+
+async def send_dataset_ready_email(
+    to_email: str,
+    dataset_name: str,
+    dataset_type: str,
+    project_id: str,
+    project_name: str,
+) -> bool:
+    """Send a job-completion email when a dataset finishes processing successfully."""
+    project_url = f"{settings.APP_URL}/projects/{project_id}"
+    return await send_email(
+        to=to_email,
+        subject=f"Dataset prêt : « {dataset_name} » — GenoLens",
+        html_body=_dataset_ready_html(
+            dataset_name=dataset_name,
+            dataset_type=dataset_type,
+            project_name=project_name,
+            project_url=project_url,
+        ),
+        text_body=_dataset_ready_text(
+            dataset_name=dataset_name,
+            dataset_type=dataset_type,
+            project_name=project_name,
+            project_url=project_url,
+        ),
+    )
+
+
+async def send_dataset_failed_email(
+    to_email: str,
+    dataset_name: str,
+    error_message: str,
+    project_id: str,
+    project_name: str,
+) -> bool:
+    """Send a failure notification email when dataset processing fails."""
+    project_url = f"{settings.APP_URL}/projects/{project_id}"
+    return await send_email(
+        to=to_email,
+        subject=f"Échec du traitement : « {dataset_name} » — GenoLens",
+        html_body=_dataset_failed_html(
+            dataset_name=dataset_name,
+            error_message=error_message,
+            project_name=project_name,
+            project_url=project_url,
+        ),
+        text_body=_dataset_failed_text(
+            dataset_name=dataset_name,
+            error_message=error_message,
+            project_name=project_name,
+            project_url=project_url,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Mention parsing helper
 # ---------------------------------------------------------------------------
 
