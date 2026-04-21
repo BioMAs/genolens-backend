@@ -8,6 +8,8 @@ Tests:
 - send_project_invitation helper
 - send_mention_notification helper
 - send_reply_notification helper
+- send_dataset_ready_email helper
+- send_dataset_failed_email helper
 """
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -18,6 +20,8 @@ from app.services.email_service import (
     send_project_invitation,
     send_mention_notification,
     send_reply_notification,
+    send_dataset_ready_email,
+    send_dataset_failed_email,
 )
 
 
@@ -217,3 +221,177 @@ async def test_send_reply_notification_calls_send_email():
     call_kwargs = mock_send.call_args
     assert call_kwargs[1]["to"] == "alice@example.com"
     assert "Réponse" in call_kwargs[1]["subject"]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dataset job-completion helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_send_dataset_ready_email_calls_send_email():
+    """send_dataset_ready_email should call send_email with the right recipient and subject."""
+    with patch("app.services.email_service.send_email", new_callable=AsyncMock) as mock_send, \
+         patch("app.services.email_service.settings") as mock_settings:
+
+        mock_settings.APP_URL = "http://localhost:3000"
+        mock_send.return_value = True
+
+        result = await send_dataset_ready_email(
+            to_email="researcher@lab.com",
+            dataset_name="GSE12345_DEG",
+            dataset_type="DEG",
+            project_id="proj-abc",
+            project_name="RNA-seq Experiment",
+        )
+
+    assert result is True
+    mock_send.assert_called_once()
+    call_kwargs = mock_send.call_args[1]
+    assert call_kwargs["to"] == "researcher@lab.com"
+    assert "GSE12345_DEG" in call_kwargs["subject"]
+    # HTML body should mention both dataset and project names
+    assert "GSE12345_DEG" in call_kwargs["html_body"]
+    assert "RNA-seq Experiment" in call_kwargs["html_body"]
+    # Project URL should be embedded
+    assert "proj-abc" in call_kwargs["html_body"]
+
+
+@pytest.mark.asyncio
+async def test_send_dataset_ready_email_subject_contains_ready_keyword():
+    """Subject must signal success (contains 'prêt')."""
+    with patch("app.services.email_service.send_email", new_callable=AsyncMock) as mock_send, \
+         patch("app.services.email_service.settings") as mock_settings:
+
+        mock_settings.APP_URL = "http://localhost:3000"
+        mock_send.return_value = True
+
+        await send_dataset_ready_email(
+            to_email="user@example.com",
+            dataset_name="counts_matrix.csv",
+            dataset_type="MATRIX",
+            project_id="p1",
+            project_name="Project A",
+        )
+
+    subject = mock_send.call_args[1]["subject"]
+    assert "prêt" in subject.lower()
+
+
+@pytest.mark.asyncio
+async def test_send_dataset_failed_email_calls_send_email():
+    """send_dataset_failed_email should call send_email with the right recipient and subject."""
+    with patch("app.services.email_service.send_email", new_callable=AsyncMock) as mock_send, \
+         patch("app.services.email_service.settings") as mock_settings:
+
+        mock_settings.APP_URL = "http://localhost:3000"
+        mock_send.return_value = True
+
+        result = await send_dataset_failed_email(
+            to_email="researcher@lab.com",
+            dataset_name="bad_file.csv",
+            error_message="Column 'gene_id' not found in file headers",
+            project_id="proj-xyz",
+            project_name="My Project",
+        )
+
+    assert result is True
+    mock_send.assert_called_once()
+    call_kwargs = mock_send.call_args[1]
+    assert call_kwargs["to"] == "researcher@lab.com"
+    assert "bad_file.csv" in call_kwargs["subject"]
+    # HTML body should contain error details
+    assert "gene_id" in call_kwargs["html_body"]
+    assert "My Project" in call_kwargs["html_body"]
+
+
+@pytest.mark.asyncio
+async def test_send_dataset_failed_email_subject_contains_failure_keyword():
+    """Subject must clearly signal failure (contains 'échec')."""
+    with patch("app.services.email_service.send_email", new_callable=AsyncMock) as mock_send, \
+         patch("app.services.email_service.settings") as mock_settings:
+
+        mock_settings.APP_URL = "http://localhost:3000"
+        mock_send.return_value = True
+
+        await send_dataset_failed_email(
+            to_email="user@example.com",
+            dataset_name="corrupt.xlsx",
+            error_message="File is not a valid Excel document",
+            project_id="p2",
+            project_name="Project B",
+        )
+
+    subject = mock_send.call_args[1]["subject"]
+    assert "échec" in subject.lower()
+
+
+@pytest.mark.asyncio
+async def test_send_dataset_failed_email_truncates_long_error():
+    """Error messages longer than 300 chars should be truncated in the HTML body."""
+    long_error = "X" * 500
+
+    with patch("app.services.email_service.send_email", new_callable=AsyncMock) as mock_send, \
+         patch("app.services.email_service.settings") as mock_settings:
+
+        mock_settings.APP_URL = "http://localhost:3000"
+        mock_send.return_value = True
+
+        await send_dataset_failed_email(
+            to_email="user@example.com",
+            dataset_name="huge_error.tsv",
+            error_message=long_error,
+            project_id="p3",
+            project_name="Project C",
+        )
+
+    html = mock_send.call_args[1]["html_body"]
+    text = mock_send.call_args[1]["text_body"]
+    # Neither body should contain the full 500-char string
+    assert "X" * 500 not in html
+    assert "X" * 500 not in text
+    # But they should contain at least a portion
+    assert "X" * 50 in html
+
+
+@pytest.mark.asyncio
+async def test_send_dataset_ready_email_returns_false_when_unconfigured():
+    """send_dataset_ready_email must return False (not raise) when SMTP is not set."""
+    with patch("app.services.email_service.settings") as mock_settings:
+        mock_settings.SMTP_HOST = ""
+        mock_settings.SMTP_USER = ""
+        mock_settings.SMTP_PASSWORD = ""
+        mock_settings.EMAIL_FROM_ADDRESS = ""
+        mock_settings.APP_URL = "http://localhost:3000"
+        mock_settings.EMAIL_FROM_NAME = "GenoLens"
+
+        result = await send_dataset_ready_email(
+            to_email="user@example.com",
+            dataset_name="my_dataset",
+            dataset_type="DEG",
+            project_id="proj-1",
+            project_name="Proj",
+        )
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_send_dataset_failed_email_returns_false_when_unconfigured():
+    """send_dataset_failed_email must return False (not raise) when SMTP is not set."""
+    with patch("app.services.email_service.settings") as mock_settings:
+        mock_settings.SMTP_HOST = ""
+        mock_settings.SMTP_USER = ""
+        mock_settings.SMTP_PASSWORD = ""
+        mock_settings.EMAIL_FROM_ADDRESS = ""
+        mock_settings.APP_URL = "http://localhost:3000"
+        mock_settings.EMAIL_FROM_NAME = "GenoLens"
+
+        result = await send_dataset_failed_email(
+            to_email="user@example.com",
+            dataset_name="my_dataset",
+            error_message="Something went wrong",
+            project_id="proj-1",
+            project_name="Proj",
+        )
+
+    assert result is False

@@ -12,9 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.worker.celery_app import celery_app
 from app.db.session import AsyncSessionLocal
-from app.models.models import Dataset, DatasetStatus, DegGene, EnrichmentPathway
+from app.models.models import Dataset, DatasetStatus, DegGene, EnrichmentPathway, Project
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor
+from app.services.email_service import send_dataset_ready_email, send_dataset_failed_email
+from app.core.supabase_auth import lookup_user_by_id
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -370,6 +372,28 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                 await db.execute(stmt)
                 await db.commit()
 
+                # Send job-completion email (fire-and-forget — never blocks the task)
+                try:
+                    proj_result = await db.execute(
+                        select(Project).where(Project.id == dataset.project_id)
+                    )
+                    project = proj_result.scalar_one_or_none()
+                    if project:
+                        owner_info = await lookup_user_by_id(project.owner_id)
+                        if owner_info and owner_info.get("email"):
+                            await send_dataset_ready_email(
+                                to_email=owner_info["email"],
+                                dataset_name=dataset.name,
+                                dataset_type=dataset.type.value,
+                                project_id=str(dataset.project_id),
+                                project_name=project.name,
+                            )
+                except Exception as email_exc:
+                    logger.warning(
+                        "[WORKER] Could not send dataset-ready email for %s: %s",
+                        dataset_id, email_exc,
+                    )
+
                 return {
                     "status": "success",
                     "dataset_id": dataset_id,
@@ -397,6 +421,33 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                 )
             await db.execute(stmt)
             await db.commit()
+
+            # Send failure email (fire-and-forget — never blocks the task)
+            try:
+                failed_ds_result = await db.execute(
+                    select(Dataset).where(Dataset.id == dataset_id)
+                )
+                failed_ds = failed_ds_result.scalar_one_or_none()
+                if failed_ds:
+                    proj_result = await db.execute(
+                        select(Project).where(Project.id == failed_ds.project_id)
+                    )
+                    project = proj_result.scalar_one_or_none()
+                    if project:
+                        owner_info = await lookup_user_by_id(project.owner_id)
+                        if owner_info and owner_info.get("email"):
+                            await send_dataset_failed_email(
+                                to_email=owner_info["email"],
+                                dataset_name=failed_ds.name,
+                                error_message=error_message,
+                                project_id=str(failed_ds.project_id),
+                                project_name=project.name,
+                            )
+            except Exception as email_exc:
+                logger.warning(
+                    "[WORKER] Could not send dataset-failed email for %s: %s",
+                    dataset_id, email_exc,
+                )
 
             return {
                 "status": "failed",
