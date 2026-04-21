@@ -10,6 +10,10 @@ Backend API for the Genolens bioinformatics platform, built with FastAPI, SQLAlc
 - **AI Integration**: Integration with Ollama for localized LLM biological interpretation.
 - **Security**: Supabase Auth integration.
 - **Storage**: Hybrid storage approach using PostgreSQL for metadata/relational data and Parquet files for large biological datasets.
+- **Payments**: Stripe subscription management (Checkout, Customer Portal, webhook plan enforcement) — see [STRIPE_BILLING.md](../docs/STRIPE_BILLING.md).
+- **Monitoring**: Sentry error tracking, Prometheus `/metrics` endpoint, Grafana dashboard — see [MONITORING.md](../docs/MONITORING.md).
+- **Shared Cache**: Redis-backed async TTL caches (clustering, volcano, stats) replace in-memory TTLCache for horizontal scaling.
+- **Analysis Provenance**: Every GSEA, GO enrichment, clustering, and volcano computation saves an `AnalysisRun` record with parameters and package versions — see [ANALYSIS_PROVENANCE.md](../docs/ANALYSIS_PROVENANCE.md).
 
 ## 🛠 Prerequisites
 
