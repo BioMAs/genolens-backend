@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from slowapi.errors import RateLimitExceeded
 import sentry_sdk
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -15,7 +15,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from app.core.config import settings
 from app.db.session import close_db
 from app.services.cache_service import cache_service
-from app.api.endpoints import projects, datasets, admin, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, stripe_webhooks, billing
+from app.api.endpoints import projects, datasets, admin, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, stripe_webhooks, billing, analyses, ai as ai_charts
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -152,6 +152,38 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+@app.exception_handler(ResponseValidationError)
+async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
+    """Handle response validation errors with proper CORS headers and useful logging."""
+    # Safely extract errors without including non-serializable input values
+    safe_errors = []
+    try:
+        for err in exc.errors():
+            safe_err = {k: v for k, v in err.items() if k != "input"}
+            try:
+                import json as _json
+                _json.dumps(safe_err)
+                safe_errors.append(safe_err)
+            except (TypeError, ValueError):
+                safe_errors.append({"loc": err.get("loc"), "msg": err.get("msg"), "type": err.get("type")})
+    except Exception:
+        pass
+    logger.error(
+        "ResponseValidationError on %s %s: %s",
+        request.method,
+        request.url.path,
+        safe_errors,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Response serialization error", "errors": safe_errors if settings.is_development else []},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Handle unexpected errors gracefully."""
@@ -164,11 +196,15 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
     response_content = {}
-    
+
     if settings.is_development:
+        try:
+            detail = str(exc)
+        except Exception:
+            detail = type(exc).__name__
         # In development, return full error details
         response_content = {
-            "detail": str(exc),
+            "detail": detail,
             "type": type(exc).__name__
         }
     else:
@@ -307,6 +343,17 @@ app.include_router(
     billing.router,
     prefix=f"{settings.API_V1_PREFIX}/billing",
     tags=["billing"],
+)
+
+app.include_router(
+    analyses.router,
+    prefix=settings.API_V1_PREFIX,
+    tags=["analyses"],
+)
+
+app.include_router(
+    ai_charts.router,
+    prefix=settings.API_V1_PREFIX,
 )
 
 
