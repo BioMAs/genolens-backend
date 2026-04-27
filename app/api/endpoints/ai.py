@@ -184,10 +184,12 @@ async def ask_chart_question(
 @router.get("/{dataset_id}/ai/conversations")
 async def get_chart_conversations(
     dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    user: Annotated[User, Depends(require_ai_access)],
+    quota_check: Annotated[User, Depends(check_ai_quota)],
     chart_type: str = Query(...),
     context_key: str = Query(...),
-    db: Annotated[AsyncSession, Depends(get_db)] = None,
-    current_user: Annotated[SupabaseUser, Depends(get_current_user)] = None,
 ) -> dict:
     """
     Load conversation history for a specific chart (ordered oldest-first).
