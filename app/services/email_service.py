@@ -655,6 +655,93 @@ async def send_dataset_failed_email(
 
 
 # ---------------------------------------------------------------------------
+# Account lifecycle emails
+# ---------------------------------------------------------------------------
+
+def _expiration_warning_html(days_remaining: int) -> str:
+    day_word = "jour" if days_remaining == 1 else "jours"
+    content = f"""
+      <p>Bonjour,</p>
+      <p>
+        Votre abonnement GenoLens expire dans <strong>{days_remaining} {day_word}</strong>.
+      </p>
+      <p>
+        Pour continuer à profiter de toutes les fonctionnalités de la plateforme,
+        renouvelez votre abonnement dès maintenant.
+      </p>
+      <a href="{settings.APP_URL}/pricing" class="btn">Renouveler mon abonnement →</a>
+      <div class="meta">
+        <p>
+          Si vous avez des questions, contactez-nous à support@genolens.com.
+        </p>
+      </div>
+    """
+    return _base_layout(f"Votre abonnement expire dans {days_remaining} {day_word}", content)
+
+
+def _expiration_warning_text(days_remaining: int) -> str:
+    day_word = "jour" if days_remaining == 1 else "jours"
+    return (
+        f"Bonjour,\n\n"
+        f"Votre abonnement GenoLens expire dans {days_remaining} {day_word}.\n\n"
+        f"Renouvelez votre abonnement ici : {settings.APP_URL}/pricing\n\n"
+        f"— L'équipe GenoLens"
+    )
+
+
+async def send_expiration_warning_email(to_email: str, days_remaining: int) -> bool:
+    """Send a subscription expiry warning email at D-7, D-3, or D-1."""
+    day_word = "jour" if days_remaining == 1 else "jours"
+    return await send_email(
+        to=to_email,
+        subject=f"Votre abonnement GenoLens expire dans {days_remaining} {day_word}",
+        html_body=_expiration_warning_html(days_remaining),
+        text_body=_expiration_warning_text(days_remaining),
+    )
+
+
+def _invitation_html(full_name: str) -> str:
+    greeting = f"Bonjour {full_name}" if full_name else "Bonjour"
+    content = f"""
+      <p>{greeting},</p>
+      <p>
+        Un administrateur vous a créé un compte GenoLens.
+        La plateforme GenoLens vous permet d'analyser et d'interpréter vos données
+        de transcriptomique avec une interface intuitive et des outils d'IA intégrés.
+      </p>
+      <a href="{settings.APP_URL}/login" class="btn">Activer mon compte →</a>
+      <div class="meta">
+        <p>
+          Si vous n'attendiez pas ce message, ignorez cet email ou contactez-nous
+          à support@genolens.com.
+        </p>
+      </div>
+    """
+    return _base_layout("Votre invitation GenoLens", content)
+
+
+def _invitation_text(full_name: str) -> str:
+    greeting = f"Bonjour {full_name}" if full_name else "Bonjour"
+    return (
+        f"{greeting},\n\n"
+        f"Un administrateur vous a créé un compte GenoLens.\n\n"
+        f"Activez votre compte ici : {settings.APP_URL}/login\n\n"
+        f"Si vous avez des questions, contactez-nous à support@genolens.com.\n\n"
+        f"— L'équipe GenoLens"
+    )
+
+
+async def send_invitation_email(to_email: str, full_name: str) -> bool:
+    """Send an invitation email to a user created by an admin."""
+    return await send_email(
+        to=to_email,
+        subject="Vous avez été invité sur GenoLens",
+        html_body=_invitation_html(full_name),
+        text_body=_invitation_text(full_name),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Mention parsing helper
 # ---------------------------------------------------------------------------
 
