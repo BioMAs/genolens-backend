@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.core.config import settings
-from app.models.models import SubscriptionPlan, User
+from app.models.models import SubscriptionPlan, User, UserStatus
 from app.services import email_service
 from app.services.stripe_service import construct_webhook_event, get_stripe_client
 
@@ -125,7 +125,7 @@ async def _handle_checkout_completed(
     user.stripe_subscription_id = subscription_id
     user.subscription_plan = plan
     user.subscription_starts_at = datetime.now(timezone.utc).isoformat()
-    user.is_active = True
+    user.status = UserStatus.ACTIVE
 
     db.add(user)
     await db.commit()
@@ -176,9 +176,9 @@ async def _handle_subscription_updated(
         ).isoformat()
 
     if sub_status == "active":
-        user.is_active = True
+        user.status = UserStatus.ACTIVE
     elif sub_status in ("past_due", "canceled", "unpaid"):
-        user.is_active = False
+        user.status = UserStatus.CANCELLED
         user.subscription_plan = SubscriptionPlan.BASIC
 
     # Detect plan change from price_id
@@ -222,7 +222,7 @@ async def _handle_subscription_deleted(
         return
 
     user.subscription_plan = SubscriptionPlan.BASIC
-    user.is_active = False
+    user.status = UserStatus.CANCELLED
     user.stripe_subscription_id = None
 
     db.add(user)
