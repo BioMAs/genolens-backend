@@ -33,7 +33,11 @@ def _get_users_to_cancel(users: List[User], now: datetime) -> List[User]:
     for user in users:
         if not user.subscription_ends_at:
             continue
-        ends_at = _parse_dt(user.subscription_ends_at)
+        try:
+            ends_at = _parse_dt(user.subscription_ends_at)
+        except (ValueError, TypeError):
+            logger.error("Malformed subscription_ends_at for user %s: %r", getattr(user, "email", "?"), user.subscription_ends_at)
+            continue
         if now >= ends_at + timedelta(days=GRACE_PERIOD_DAYS):
             result.append(user)
     return result
@@ -45,7 +49,11 @@ def _get_users_to_warn(users: List[User], now: datetime) -> List[User]:
     for user in users:
         if not user.subscription_ends_at:
             continue
-        ends_at = _parse_dt(user.subscription_ends_at)
+        try:
+            ends_at = _parse_dt(user.subscription_ends_at)
+        except (ValueError, TypeError):
+            logger.error("Malformed subscription_ends_at for user %s: %r", getattr(user, "email", "?"), user.subscription_ends_at)
+            continue
         days_remaining = (ends_at - now).days
         if days_remaining in WARNING_DAYS:
             result.append(user)
@@ -76,8 +84,10 @@ async def _async_check_account_expirations() -> dict:
         active_users = result.scalars().all()
 
         to_cancel = _get_users_to_cancel(active_users, now)
+        cancel_ids = set()
         for user in to_cancel:
             user.status = UserStatus.CANCELLED
+            cancel_ids.add(user.id)
             try:
                 await email_service.send_subscription_cancelled_email(to_email=user.email)
             except Exception as exc:
@@ -85,16 +95,18 @@ async def _async_check_account_expirations() -> dict:
             cancelled_count += 1
             logger.info("Auto-cancelled account: %s", user.email)
 
-        to_warn = _get_users_to_warn(active_users, now)
+        # Exclude just-cancelled users from the warning list
+        to_warn = [u for u in _get_users_to_warn(active_users, now) if u.id not in cancel_ids]
         for user in to_warn:
-            ends_at = _parse_dt(user.subscription_ends_at)
-            days_left = (ends_at - now).days
             try:
+                ends_at = _parse_dt(user.subscription_ends_at)
+                days_left = (ends_at - now).days
                 await email_service.send_expiration_warning_email(
                     to_email=user.email, days_remaining=days_left
                 )
             except Exception as exc:
                 logger.warning("Warning email failed for %s: %s", user.email, exc)
+                continue
             warned_count += 1
 
         await db.commit()

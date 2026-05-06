@@ -36,6 +36,7 @@ celery_app.conf.update(
 celery_app.conf.task_routes = {
     "app.worker.tasks.process_dataset_upload": {"queue": "data_processing"},
     "app.worker.tasks.run_self_service_analysis": {"queue": "r_analysis"},
+    "app.worker.account_tasks.*": {"queue": "default"},
     "app.worker.tasks.*": {"queue": "default"},
 }
 

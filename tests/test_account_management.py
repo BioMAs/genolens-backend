@@ -137,7 +137,29 @@ def test_expiration_task_warns_users_at_warning_days():
     no_warning_user = MagicMock()
     no_warning_user.subscription_ends_at = (now + timedelta(days=10)).isoformat()
 
-    warned = _get_users_to_warn([warning_user_7, warning_user_3, no_warning_user], now)
+    warning_user_1 = MagicMock()
+    warning_user_1.subscription_ends_at = (now + timedelta(days=1)).isoformat()
+
+    warned = _get_users_to_warn([warning_user_7, warning_user_3, warning_user_1, no_warning_user], now)
     assert warning_user_7 in warned
     assert warning_user_3 in warned
+    assert warning_user_1 in warned
     assert no_warning_user not in warned
+
+
+@pytest.mark.unit
+def test_expiration_task_cancels_at_exactly_grace_boundary():
+    """_get_users_to_cancel must include users at exactly 7 days past expiry (inclusive)."""
+    from app.worker.account_tasks import _get_users_to_cancel
+
+    now = datetime.now(timezone.utc)
+
+    exactly_7_days = MagicMock()
+    exactly_7_days.subscription_ends_at = (now - timedelta(days=7)).isoformat()
+
+    just_under = MagicMock()
+    just_under.subscription_ends_at = (now - timedelta(days=6, hours=23)).isoformat()
+
+    result = _get_users_to_cancel([exactly_7_days, just_under], now)
+    assert exactly_7_days in result
+    assert just_under not in result
