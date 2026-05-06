@@ -16,7 +16,8 @@ logger = logging.getLogger(__name__)
 from app.api.deps import get_db, require_admin
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
-from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent
+from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent, UserStatus
+from app.services.account_service import AccountService
 from pydantic import BaseModel
 
 
@@ -115,6 +116,17 @@ class ProjectMemberResponse(BaseModel):
     updated_at: str
     user_email: Optional[str] = None
     user_full_name: Optional[str] = None
+
+
+class InviteUserRequest(BaseModel):
+    email: str
+    full_name: Optional[str] = None
+    plan: SubscriptionPlan = SubscriptionPlan.BASIC
+    subscription_ends_at: Optional[datetime] = None
+
+
+class UserStatusUpdate(BaseModel):
+    status: str  # "active" | "suspended" | "cancelled"
 
 
 # Admin Endpoints
@@ -216,6 +228,64 @@ async def list_users(
         logger.error(f"Error fetching users: {e}")
         # In case of error (e.g. Supabase connection), try to return local users at least
         return []
+
+
+@router.post("/users/invite", status_code=status.HTTP_201_CREATED)
+async def invite_user(
+    body: InviteUserRequest,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: create a pending account and send an invitation email."""
+    service = AccountService(db)
+    try:
+        user = await service.invite_user(
+            email=body.email,
+            full_name=body.full_name,
+            plan=body.plan,
+            invited_by_admin_id=current_user.user_id,
+            subscription_ends_at=body.subscription_ends_at,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return {"id": str(user.id), "email": user.email, "status": user.status.value}
+
+
+@router.patch("/users/{user_id}/status")
+async def update_user_status(
+    user_id: UUID,
+    body: UserStatusUpdate,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: change a user's account status (activate, suspend, cancel)."""
+    try:
+        target_status = UserStatus(body.status)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status '{body.status}'. Must be one of: active, suspended, cancelled",
+        )
+
+    service = AccountService(db)
+    action_map = {
+        UserStatus.ACTIVE: service.activate_user,
+        UserStatus.SUSPENDED: service.suspend_user,
+        UserStatus.CANCELLED: service.cancel_user,
+    }
+    action = action_map.get(target_status)
+    if not action:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot set status to 'pending' manually",
+        )
+
+    try:
+        user = await action(user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    return {"id": str(user.id), "email": user.email, "status": user.status.value}
 
 
 @router.get("/users/{user_id}", response_model=UserProfile)
