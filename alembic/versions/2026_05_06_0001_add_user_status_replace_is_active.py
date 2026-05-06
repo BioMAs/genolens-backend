@@ -33,7 +33,6 @@ def upgrade() -> None:
     op.execute("UPDATE users SET status = 'active' WHERE is_active = TRUE")
     op.execute("UPDATE users SET status = 'cancelled' WHERE is_active = FALSE")
 
-    op.alter_column("users", "status", server_default=None)
     op.drop_column("users", "is_active")
     op.create_index("ix_users_status", "users", ["status"])
 
