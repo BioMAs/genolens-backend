@@ -4,7 +4,7 @@ Requires ADMIN role.
 """
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from uuid import UUID
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,7 +18,7 @@ from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
 from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent, UserStatus
 from app.services.account_service import AccountService
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
@@ -119,14 +119,14 @@ class ProjectMemberResponse(BaseModel):
 
 
 class InviteUserRequest(BaseModel):
-    email: str
+    email: EmailStr
     full_name: Optional[str] = None
     plan: SubscriptionPlan = SubscriptionPlan.BASIC
     subscription_ends_at: Optional[datetime] = None
 
 
 class UserStatusUpdate(BaseModel):
-    status: str  # "active" | "suspended" | "cancelled"
+    status: Literal["active", "suspended", "cancelled"]
 
 
 # Admin Endpoints
