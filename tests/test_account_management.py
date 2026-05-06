@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone, timedelta
+from uuid import UUID
 from app.models.models import UserStatus, User, SubscriptionPlan
 from app.services.account_service import AccountService
 from sqlalchemy import inspect
@@ -52,7 +53,7 @@ async def test_invite_user_creates_pending_account():
     mock_db.execute.return_value = mock_execute_result
 
     service = AccountService(mock_db)
-    with patch.object(service, "_send_invitation_email", return_value=None):
+    with patch.object(service, "_send_invitation_email", new_callable=AsyncMock):
         user = await service.invite_user(
             email="new@example.com",
             full_name="New User",
@@ -76,7 +77,7 @@ async def test_activate_user_sets_status_active():
     mock_db.execute.return_value = mock_execute_result
 
     service = AccountService(mock_db)
-    await service.activate_user("00000000-0000-0000-0000-000000000001")
+    await service.activate_user(UUID("00000000-0000-0000-0000-000000000001"))
 
     assert mock_user.status == UserStatus.ACTIVE
     mock_db.commit.assert_called_once()
@@ -93,7 +94,7 @@ async def test_suspend_user_sets_status_suspended():
     mock_db.execute.return_value = mock_execute_result
 
     service = AccountService(mock_db)
-    await service.suspend_user("00000000-0000-0000-0000-000000000001")
+    await service.suspend_user(UUID("00000000-0000-0000-0000-000000000001"))
 
     assert mock_user.status == UserStatus.SUSPENDED
     mock_db.commit.assert_called_once()
