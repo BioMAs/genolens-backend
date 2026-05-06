@@ -1,7 +1,9 @@
 import pytest
 from app.models.models import UserStatus, User
+from sqlalchemy import inspect
 
 
+@pytest.mark.unit
 def test_user_status_enum_values():
     assert UserStatus.PENDING == "pending"
     assert UserStatus.ACTIVE == "active"
@@ -9,7 +11,10 @@ def test_user_status_enum_values():
     assert UserStatus.CANCELLED == "cancelled"
 
 
+@pytest.mark.unit
 def test_user_has_status_field():
-    # Verify the column exists on the mapped class
     assert hasattr(User, "status")
-    assert not hasattr(User, "is_active")  # old field must be gone
+    assert not hasattr(User, "is_active")
+    col = inspect(User).columns["status"]
+    assert col.nullable is False
+    assert col.index is True
