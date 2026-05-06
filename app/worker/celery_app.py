@@ -2,6 +2,7 @@
 Celery application configuration for background task processing.
 """
 from celery import Celery
+from celery.schedules import crontab
 
 from app.core.config import settings
 
@@ -11,7 +12,7 @@ celery_app = Celery(
     "genolens_worker",
     broker=settings.celery_broker,
     backend=settings.celery_backend,
-    include=["app.worker.tasks"]
+    include=["app.worker.tasks", "app.worker.account_tasks"]
 )
 
 # Celery configuration
@@ -34,5 +35,14 @@ celery_app.conf.update(
 # Task routing (optional - for multiple queues)
 celery_app.conf.task_routes = {
     "app.worker.tasks.process_dataset_upload": {"queue": "data_processing"},
+    "app.worker.tasks.run_self_service_analysis": {"queue": "r_analysis"},
     "app.worker.tasks.*": {"queue": "default"},
+}
+
+# Beat schedule — periodic tasks
+celery_app.conf.beat_schedule = {
+    "check-account-expirations-daily": {
+        "task": "app.worker.account_tasks.check_account_expirations",
+        "schedule": crontab(hour=8, minute=0),  # 08:00 UTC every day
+    },
 }

@@ -98,3 +98,46 @@ async def test_suspend_user_sets_status_suspended():
 
     assert mock_user.status == UserStatus.SUSPENDED
     mock_db.commit.assert_called_once()
+
+
+# --- Task 6: Celery Beat expiration task ---
+
+@pytest.mark.unit
+def test_expiration_task_cancels_overdue_users():
+    """_get_users_to_cancel must return users 7+ days past subscription_ends_at."""
+    from app.worker.account_tasks import _get_users_to_cancel
+
+    now = datetime.now(timezone.utc)
+    overdue_user = MagicMock()
+    overdue_user.subscription_ends_at = (now - timedelta(days=8)).isoformat()
+    overdue_user.status = UserStatus.ACTIVE
+
+    not_overdue = MagicMock()
+    not_overdue.subscription_ends_at = (now + timedelta(days=1)).isoformat()
+    not_overdue.status = UserStatus.ACTIVE
+
+    result = _get_users_to_cancel([overdue_user, not_overdue], now)
+    assert overdue_user in result
+    assert not_overdue not in result
+
+
+@pytest.mark.unit
+def test_expiration_task_warns_users_at_warning_days():
+    """_get_users_to_warn must include users expiring in exactly 7, 3, or 1 day."""
+    from app.worker.account_tasks import _get_users_to_warn
+
+    now = datetime.now(timezone.utc)
+
+    warning_user_7 = MagicMock()
+    warning_user_7.subscription_ends_at = (now + timedelta(days=7)).isoformat()
+
+    warning_user_3 = MagicMock()
+    warning_user_3.subscription_ends_at = (now + timedelta(days=3)).isoformat()
+
+    no_warning_user = MagicMock()
+    no_warning_user.subscription_ends_at = (now + timedelta(days=10)).isoformat()
+
+    warned = _get_users_to_warn([warning_user_7, warning_user_3, no_warning_user], now)
+    assert warning_user_7 in warned
+    assert warning_user_3 in warned
+    assert no_warning_user not in warned
