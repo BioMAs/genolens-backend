@@ -90,25 +90,28 @@ async def require_subscriber(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)]
 ) -> SupabaseUser:
     """
-    Dependency to require at least SUBSCRIBER role.
-    
+    Dependency to require at least USER role (any authenticated, non-viewer user).
+
+    Subscriber/analyst distinctions are now handled via subscription plan rather
+    than role. Any USER or ADMIN passes this check.
+
     Args:
         current_user: Current authenticated user
-        
+
     Returns:
-        SupabaseUser if user is subscriber or above
-        
+        SupabaseUser if user has USER or ADMIN role
+
     Raises:
-        HTTPException: 403 Forbidden if user is only viewer
+        HTTPException: 403 Forbidden if role is not recognised
     """
     from app.models.models import UserRole
-    
-    allowed_roles = {UserRole.ADMIN, UserRole.SUBSCRIBER, UserRole.ANALYST}
-    
+
+    allowed_roles = {UserRole.ADMIN, UserRole.USER}
+
     if current_user.role not in allowed_roles:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Subscriber access required"
         )
-    
+
     return current_user

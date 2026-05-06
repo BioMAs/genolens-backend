@@ -1,12 +1,12 @@
 from uuid import UUID
 from typing import Optional
 from pydantic import BaseModel, EmailStr
-from app.models.models import UserRole, SubscriptionPlan
+from app.models.models import UserRole, SubscriptionPlan, UserStatus
 
 class UserBase(BaseModel):
     email: Optional[EmailStr] = None
     full_name: Optional[str] = None
-    status: Optional[str] = "active"
+    status: Optional[UserStatus] = UserStatus.ACTIVE
 
 class UserCreate(UserBase):
     email: EmailStr
