@@ -27,6 +27,14 @@ class SubscriptionPlan(str, enum.Enum):
     ADVANCED = "ADVANCED"  # + Launch analyses + unlimited AI (coming soon)
 
 
+class UserStatus(str, enum.Enum):
+    """Account lifecycle status."""
+    PENDING = "pending"      # Created via invite, not yet confirmed
+    ACTIVE = "active"        # Normal access
+    SUSPENDED = "suspended"  # Manually blocked by admin
+    CANCELLED = "cancelled"  # Subscription expired after grace period
+
+
 class DatasetType(str, enum.Enum):
     """Types of datasets that can be stored."""
     MATRIX = "MATRIX"  # Count/Expression matrices
@@ -102,6 +110,12 @@ class Project(Base, TimestampMixin):
         nullable=False,
         index=True,
         comment="Supabase Auth user UUID of project owner"
+    )
+    species: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        default="human",
+        comment="Organism species used for functional enrichment (human, mouse, rat, zebrafish, pig)"
     )
 
     # Relationships
@@ -418,12 +432,17 @@ class EnrichmentPathway(Base, TimestampMixin):
     genes: Mapped[list] = mapped_column(JSON, nullable=True) # List of gene IDs/Symbols
     regulation: Mapped[str] = mapped_column(String(10), nullable=False, default="ALL", index=True) # ALL, UP, DOWN
 
+    enrichment_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    level: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    parameters_hash: Mapped[Optional[str]] = mapped_column(String(16), nullable=True, index=True)
+
     # Relationships
     dataset: Mapped["Dataset"] = relationship()
 
     # Indexes
     __table_args__ = (
         Index("ix_enrichment_pathways_dataset_comparison", "dataset_id", "comparison_name"),
+        Index("ix_enrichment_pathways_params_hash", "dataset_id", "comparison_name", "parameters_hash"),
     )
 
     def __repr__(self) -> str:
@@ -432,8 +451,9 @@ class EnrichmentPathway(Base, TimestampMixin):
 
 class AIConversation(Base, TimestampMixin):
     """
-    AIConversation: Stores Q&A conversations with AI for each comparison.
-    Enables persistence of chat history across page refreshes.
+    AIConversation: Stores Q&A conversations with AI.
+    Supports both comparison-level and chart-level conversations.
+    The comparison_name field stores the context_key for non-comparison chart types.
     """
     __tablename__ = "ai_conversations"
 
@@ -443,36 +463,35 @@ class AIConversation(Base, TimestampMixin):
         nullable=False,
         index=True
     )
+    chart_type: Mapped[str] = mapped_column(String(50), nullable=False, server_default='comparison')
     comparison_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    
+
     question: Mapped[str] = mapped_column(Text, nullable=False)
     answer: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
-    
-    # User who asked the question (Supabase Auth user UUID)
+
     user_id: Mapped[UUID] = mapped_column(
         nullable=False,
         index=True,
         comment="Supabase Auth user UUID"
     )
 
-    # Relationships
     dataset: Mapped["Dataset"] = relationship()
 
-    # Indexes
     __table_args__ = (
-        Index("ix_ai_conversations_dataset_comparison", "dataset_id", "comparison_name"),
+        Index("ix_ai_conversations_dataset_chart", "dataset_id", "chart_type", "comparison_name"),
         Index("ix_ai_conversations_user", "user_id"),
     )
 
     def __repr__(self) -> str:
-        return f"<AIConversation(dataset_id={self.dataset_id}, comparison={self.comparison_name}, user={self.user_id})>"
+        return f"<AIConversation(dataset_id={self.dataset_id}, chart_type={self.chart_type}, comparison={self.comparison_name})>"
 
 
 class AIInterpretation(Base, TimestampMixin):
     """
-    AIInterpretation: Stores the main AI interpretation for each comparison.
-    One interpretation per comparison - cannot be regenerated.
+    AIInterpretation: Stores the AI interpretation for each dataset + chart type.
+    One interpretation per (dataset_id, chart_type, comparison_name).
+    The comparison_name field stores the context_key for non-comparison chart types.
     """
     __tablename__ = "ai_interpretations"
 
@@ -482,27 +501,63 @@ class AIInterpretation(Base, TimestampMixin):
         nullable=False,
         index=True
     )
+    chart_type: Mapped[str] = mapped_column(String(50), nullable=False, server_default='comparison')
     comparison_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    
+
     interpretation: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
-    
-    # Summary statistics at the time of generation
-    deg_up: Mapped[int] = mapped_column(Integer, nullable=False)
-    deg_down: Mapped[int] = mapped_column(Integer, nullable=False)
-    pathways_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    genes_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
-    # Relationships
+    # DEG-specific stats (nullable for non-comparison chart types)
+    deg_up: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    deg_down: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pathways_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    genes_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     dataset: Mapped["Dataset"] = relationship()
 
-    # Indexes - ensure one interpretation per comparison
     __table_args__ = (
-        Index("ix_ai_interpretations_dataset_comparison", "dataset_id", "comparison_name", unique=True),
+        Index(
+            "ix_ai_interpretations_dataset_chart_comparison",
+            "dataset_id", "chart_type", "comparison_name",
+            unique=True
+        ),
     )
 
     def __repr__(self) -> str:
-        return f"<AIInterpretation(dataset_id={self.dataset_id}, comparison={self.comparison_name})>"
+        return f"<AIInterpretation(dataset_id={self.dataset_id}, chart_type={self.chart_type}, comparison={self.comparison_name})>"
+
+
+class GSEAResult(Base, TimestampMixin):
+    """
+    GSEAResult: Persists the last GSEA run for a dataset/comparison combo.
+    One row per (dataset_id, comparison_name) — upserted on each successful run.
+    """
+    __tablename__ = "gsea_results"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    dataset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    comparison_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    parameters_hash: Mapped[Optional[str]] = mapped_column(String(16), nullable=True, index=True)
+    parameters_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    results_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    summary_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    dataset: Mapped["Dataset"] = relationship()
+
+    __table_args__ = (
+        Index(
+            "ix_gsea_results_dataset_comparison",
+            "dataset_id", "comparison_name",
+            unique=True,
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GSEAResult(dataset_id={self.dataset_id}, comparison={self.comparison_name})>"
 
 
 class User(Base, TimestampMixin):
@@ -536,7 +591,12 @@ class User(Base, TimestampMixin):
     # Subscription management
     subscription_starts_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     subscription_ends_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    status: Mapped[UserStatus] = mapped_column(
+        SQLEnum(UserStatus, name="user_status_enum"),
+        nullable=False,
+        default=UserStatus.ACTIVE,
+        index=True,
+    )
     
     # Stripe integration (for future)
     stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True)
@@ -1272,7 +1332,7 @@ class ProjectActivityLog(Base):
     )
 
     event_type: Mapped[ActivityEventType] = mapped_column(
-        SQLEnum(ActivityEventType, name="activity_event_type_enum"),
+        SQLEnum(ActivityEventType, name="activity_event_type_enum", values_callable=lambda obj: [e.value for e in obj]),
         nullable=False,
         index=True,
         comment="Type of activity event"
@@ -1356,6 +1416,123 @@ class UserLoginEvent(Base):
 
     def __repr__(self) -> str:
         return f"<UserLoginEvent(user={self.user_id}, created_at={self.created_at})>"
+
+
+class SelfServiceAnalysisStatus(str, enum.Enum):
+    """Status of a self-service DE analysis job."""
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    DONE = "DONE"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class SelfServiceAnalysis(Base, TimestampMixin):
+    """
+    SelfServiceAnalysis: Tracks async DESeq2 analysis jobs launched by users.
+    Users provide a count matrix, sample metadata, and comparison definitions.
+    The backend runs DESeq2 via a dedicated R/Bioconductor worker container.
+    Results are stored as regular DEG datasets in the project.
+    """
+    __tablename__ = "self_service_analyses"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Project this analysis belongs to"
+    )
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    status: Mapped[SelfServiceAnalysisStatus] = mapped_column(
+        SQLEnum(SelfServiceAnalysisStatus, name="self_service_analysis_status"),
+        nullable=False,
+        default=SelfServiceAnalysisStatus.PENDING,
+        index=True
+    )
+
+    # Source dataset IDs (nullable because datasets can be deleted independently)
+    matrix_dataset_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="MATRIX dataset (raw count matrix)"
+    )
+    samples_dataset_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="METADATA_SAMPLE dataset (sample_id, condition, batch, sex)"
+    )
+    comparisons_dataset_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="METADATA_CONTRAST dataset (comparison_id, condition1, condition2)"
+    )
+
+    # Analysis parameters (method, QC thresholds, DE thresholds)
+    params: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        comment="Analysis params: method, fdr, min_log2fc, min_reads, min_genes, min_count, design"
+    )
+
+    # Generated dataset IDs (populated when DONE)
+    result_dataset_ids: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="UUIDs of generated DEG datasets (one per comparison)"
+    )
+
+    # Intermediate dataset IDs (VST, normalized counts) — populated when DONE
+    intermediate_dataset_ids: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        comment="Keys: 'vst', 'normalized'. Values: dataset UUIDs uploaded alongside DEG results"
+    )
+
+    # Celery task tracking
+    celery_task_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, comment="Celery task ID for progress polling"
+    )
+
+    # Step-level progress tracking
+    current_step: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+        comment="Current pipeline step: filtering, normalizing, de_analysis, uploading"
+    )
+    progress_log: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        comment="Chronological list of {step, message, timestamp} progress entries"
+    )
+
+    # Error information
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Ownership
+    user_id: Mapped[UUID] = mapped_column(
+        nullable=False,
+        index=True,
+        comment="Supabase Auth user UUID who launched the analysis"
+    )
+
+    # Relationships
+    project: Mapped["Project"] = relationship()
+
+    __table_args__ = (
+        Index("ix_self_service_analyses_project_status", "project_id", "status"),
+        Index("ix_self_service_analyses_user", "user_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SelfServiceAnalysis(id={self.id}, name={self.name}, status={self.status})>"
 
 
 class AnalysisRun(Base, TimestampMixin):
