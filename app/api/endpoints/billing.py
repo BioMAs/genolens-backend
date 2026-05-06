@@ -60,7 +60,7 @@ async def create_checkout(
 
     try:
         checkout_url = await stripe_service.create_checkout_session(
-            user_id=str(current_user.id),
+            user_id=str(current_user.user_id),
             user_email=current_user.email,
             plan=plan,
             success_url=success_url,
@@ -136,7 +136,7 @@ async def get_subscription(
     """
     return {
         "plan": current_user.subscription_plan.value,
-        "is_active": current_user.is_active,
+        "status": current_user.status.value,
         "subscription_starts_at": current_user.subscription_starts_at,
         "subscription_ends_at": current_user.subscription_ends_at,
         "stripe_customer_id": current_user.stripe_customer_id,

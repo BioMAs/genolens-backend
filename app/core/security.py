@@ -37,6 +37,11 @@ class CurrentUser(BaseModel):
     features_access: dict
     is_active: bool
 
+    @property
+    def user_id(self) -> UUID:
+        """Alias for id for backward compatibility."""
+        return self.id
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against a hash."""

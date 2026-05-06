@@ -6,7 +6,7 @@ from app.models.models import UserRole, SubscriptionPlan
 class UserBase(BaseModel):
     email: Optional[EmailStr] = None
     full_name: Optional[str] = None
-    is_active: Optional[bool] = True
+    status: Optional[str] = "active"
 
 class UserCreate(UserBase):
     email: EmailStr
