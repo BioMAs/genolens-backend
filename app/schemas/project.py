@@ -18,6 +18,10 @@ class ProjectBase(BaseModel):
     """Base project schema."""
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
+    species: Optional[str] = Field(
+        None,
+        description="Organism species for functional enrichment (human, mouse, rat, zebrafish, pig)"
+    )
 
 
 class ProjectCreate(ProjectBase):
@@ -29,12 +33,14 @@ class ProjectUpdate(BaseModel):
     """Schema for updating a project."""
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
+    species: Optional[str] = None
 
 
 class ProjectResponse(ProjectBase):
     """Schema for project response."""
     id: UUID
     owner_id: UUID
+    species: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

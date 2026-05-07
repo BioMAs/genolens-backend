@@ -156,3 +156,10 @@ class GeneListResponse(BaseModel):
     """Schema for gene list response."""
     genes: list[str]
     total_genes: int
+
+
+class GeneMapResponse(BaseModel):
+    """Schema for gene map response (primary_column → secondary_column)."""
+    gene_map: dict[str, str]
+    total: int
+

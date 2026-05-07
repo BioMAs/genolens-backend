@@ -9,6 +9,8 @@ from app.models.models import (
     ProjectComment,
     CommentType,
     AnalysisRun,
+    SelfServiceAnalysis,
+    SelfServiceAnalysisStatus,
 )
 
 __all__ = [
@@ -22,4 +24,6 @@ __all__ = [
     "ProjectComment",
     "CommentType",
     "AnalysisRun",
+    "SelfServiceAnalysis",
+    "SelfServiceAnalysisStatus",
 ]
