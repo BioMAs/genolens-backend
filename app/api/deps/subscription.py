@@ -4,13 +4,13 @@ Subscription and quota dependencies for API endpoints.
 from typing import Annotated
 from uuid import UUID
 from fastapi import Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps.supabase_deps import get_current_user
 from app.core.supabase_auth import SupabaseUser
 from app.db.session import get_db
-from app.models.models import User, UserRole, SubscriptionPlan
+from app.models.models import User, UserRole, UserStatus, SubscriptionPlan
 
 
 async def get_or_create_user(
@@ -19,20 +19,47 @@ async def get_or_create_user(
 ) -> User:
     """
     Get or create User profile from Supabase auth user.
-    Creates a BASIC user by default if not exists.
+    If a pending invited user with the same email exists, claim that record
+    (update its id to the Supabase UUID and activate it) instead of inserting.
     """
-    query = select(User).where(User.id == current_user.user_id)
-    result = await db.execute(query)
+    result = await db.execute(select(User).where(User.id == current_user.user_id))
     user = result.scalar_one_or_none()
-    
+
     if not user:
-        # Create new user, respecting role from Supabase (if available)
+        # Check for a pending invitation with the same email
+        result = await db.execute(
+            select(User).where(
+                User.email == current_user.email,
+                User.status == UserStatus.PENDING,
+            )
+        )
+        pending = result.scalar_one_or_none()
+
+        if pending:
+            # Claim the invited record: swap UUID to the real Supabase one and activate.
+            # Must use raw UPDATE because SQLAlchemy cannot mutate a primary key via ORM.
+            full_name = current_user.user_metadata.get("full_name") or pending.full_name
+            await db.execute(
+                update(User)
+                .where(User.email == current_user.email, User.status == UserStatus.PENDING)
+                .values(
+                    id=current_user.user_id,
+                    status=UserStatus.ACTIVE,
+                    full_name=full_name,
+                    role=current_user.role,
+                )
+            )
+            await db.commit()
+            result = await db.execute(select(User).where(User.id == current_user.user_id))
+            return result.scalar_one()
+
+        # Brand-new user (not invited) — create with BASIC plan
         user = User(
             id=current_user.user_id,
             email=current_user.email,
             full_name=current_user.user_metadata.get("full_name"),
             role=current_user.role,
-            subscription_plan=SubscriptionPlan.BASIC
+            subscription_plan=SubscriptionPlan.BASIC,
         )
         db.add(user)
         await db.commit()
@@ -44,7 +71,7 @@ async def get_or_create_user(
             db.add(user)
             await db.commit()
             await db.refresh(user)
-    
+
     return user
 
 
