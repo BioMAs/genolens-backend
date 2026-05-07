@@ -48,3 +48,37 @@ FROM base as worker
 
 # Run Celery worker
 CMD ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "-Q", "default,data_processing"]
+
+# ================================
+# R Worker Target (DESeq2 self-service analysis)
+# Adds R + Bioconductor on top of the Python base.
+# Listens exclusively on the "r_analysis" queue.
+# ================================
+FROM base as r-worker
+
+# Install R runtime and system libraries needed by R packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    r-base \
+    r-base-dev \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    libxml2-dev \
+    libfontconfig1-dev \
+    libharfbuzz-dev \
+    libfribidi-dev \
+    libfreetype6-dev \
+    libpng-dev \
+    libtiff5-dev \
+    libjpeg-dev \
+    libuv1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-install R packages (cached layer — only rebuilds when install_packages.R changes)
+COPY r_scripts/install_packages.R /tmp/install_packages.R
+RUN Rscript /tmp/install_packages.R
+
+# Copy R analysis scripts into the image
+COPY r_scripts/ /app/r_scripts/
+
+# Run Celery worker on the dedicated r_analysis queue (single concurrency for memory safety)
+CMD ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "-Q", "r_analysis", "--concurrency=1"]

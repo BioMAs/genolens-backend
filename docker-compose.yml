@@ -37,14 +37,11 @@ services:
       target: api
     ports:
       - "8001:8000"
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/genolens
       - REDIS_URL=redis://redis:6379/0
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_KEY=${SUPABASE_KEY}
-      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
-      - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
       - ENVIRONMENT=development
       - LOCAL_STORAGE_PATH=/app/data
       - OLLAMA_BASE_URL=http://ollama:11434
@@ -70,14 +67,11 @@ services:
       context: .
       dockerfile: Dockerfile
       target: worker
+    env_file:
+      - .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/genolens
       - REDIS_URL=redis://redis:6379/0
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_KEY=${SUPABASE_KEY}
-      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
-      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
-      - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
       - ENVIRONMENT=development
       - LOCAL_STORAGE_PATH=/app/data
     volumes:
@@ -89,6 +83,42 @@ services:
       postgres:
         condition: service_healthy
     command: celery -A app.worker.celery_app worker --loglevel=info -Q celery,default,data_processing
+    restart: unless-stopped
+
+  # R Worker — DESeq2 self-service analyses (dedicated r_analysis queue)
+  r-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: r-worker
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/genolens
+      - REDIS_URL=redis://redis:6379/0
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
+      - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
+      - ENVIRONMENT=development
+      - LOCAL_STORAGE_PATH=/app/data
+      - R_SCRIPTS_PATH=/app/r_scripts
+      - ANNO_DB_PATH=/app/anno_db
+    volumes:
+      - ./app:/app/app
+      - genolens_storage:/app/data
+      - ../pipe_scilicium/resources/anno.db:/app/anno_db:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: celery -A app.worker.celery_app worker --loglevel=info -Q r_analysis --concurrency=1
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+        reservations:
+          memory: 6G
     restart: unless-stopped
 
   # Ollama - Local AI for biological interpretation
