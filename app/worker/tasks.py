@@ -419,8 +419,8 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                     status=DatasetStatus.FAILED,
                     error_message=error_message
                 )
-            await db.execute(stmt)
-            await db.commit()
+                await db.execute(stmt)
+                await db.commit()
 
             # Send failure email (fire-and-forget — never blocks the task)
             try:
@@ -467,3 +467,95 @@ def health_check() -> dict:
         dict: Health status
     """
     return {"status": "healthy", "message": "Celery worker is running"}
+
+
+# ---------------------------------------------------------------------------
+# Self-service DESeq2 analysis task
+# Runs in the dedicated r-worker container (queue: r_analysis).
+# ---------------------------------------------------------------------------
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.worker.tasks.run_self_service_analysis",
+    soft_time_limit=3300,
+    time_limit=3600,
+)
+def run_self_service_analysis(self, analysis_id: str) -> dict:
+    """
+    Execute a self-service DESeq2 analysis pipeline.
+
+    Updates SelfServiceAnalysis status in the database at each step and
+    stores result_dataset_ids on successful completion.
+
+    Args:
+        analysis_id: UUID string of the SelfServiceAnalysis record.
+
+    Returns:
+        dict: {status: "success"|"failed", result_dataset_ids: [...], error: ...}
+    """
+    from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus
+    from app.services.analysis_service import analysis_service
+
+    async def _run():
+        analysis_uuid = UUID(analysis_id)
+        async with AsyncSessionLocal() as db:
+            # Mark as RUNNING
+            await db.execute(
+                update(SelfServiceAnalysis)
+                .where(SelfServiceAnalysis.id == analysis_uuid)
+                .values(
+                    status=SelfServiceAnalysisStatus.RUNNING,
+                    celery_task_id=self.request.id,
+                    current_step="starting",
+                )
+            )
+            await db.commit()
+
+            try:
+                result_ids = await analysis_service.run(analysis_uuid, db)
+
+                await db.execute(
+                    update(SelfServiceAnalysis)
+                    .where(SelfServiceAnalysis.id == analysis_uuid)
+                    .values(
+                        status=SelfServiceAnalysisStatus.DONE,
+                        current_step="done",
+                        result_dataset_ids=[str(r) for r in result_ids],
+                    )
+                )
+                await db.commit()
+                logger.info(f"[r-worker] Analysis {analysis_id} completed: {result_ids}")
+                return {
+                    "status": "success",
+                    "analysis_id": analysis_id,
+                    "result_dataset_ids": [str(r) for r in result_ids],
+                }
+
+            except Exception as exc:
+                import traceback
+                error_msg = str(exc) or traceback.format_exc()[:1000]
+                logger.error(f"[r-worker] Analysis {analysis_id} FAILED: {error_msg}")
+                logger.error(traceback.format_exc())
+
+                try:
+                    await db.execute(
+                        update(SelfServiceAnalysis)
+                        .where(SelfServiceAnalysis.id == analysis_uuid)
+                        .values(
+                            status=SelfServiceAnalysisStatus.FAILED,
+                            current_step="failed",
+                            error_message=error_msg,
+                        )
+                    )
+                    await db.commit()
+                except Exception:
+                    pass  # best-effort status update
+
+                return {
+                    "status": "failed",
+                    "analysis_id": analysis_id,
+                    "error": error_msg,
+                }
+
+    return run_async(_run())
