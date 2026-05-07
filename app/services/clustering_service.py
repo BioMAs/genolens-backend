@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from scipy.cluster import hierarchy
 from scipy.spatial import distance
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 import fastcluster
 from app.core.monitoring import timing_decorator
 
@@ -296,4 +297,54 @@ class ClusteringService:
             "method": method,
             "metric": metric,
             "genes_used": len(df_subset)
+        }
+
+    def compute_silhouette_profile(
+        self,
+        df: pd.DataFrame,
+        top_n_genes: int = 500,
+        metric: str = "euclidean",
+        k_min: int = 2,
+        k_max: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Compute silhouette scores for k in [k_min..k_max] to help choose optimal k.
+
+        Returns profile list and the recommended k (highest silhouette score).
+        """
+        # Select top variable genes
+        if top_n_genes > 0 and len(df) > top_n_genes:
+            variances = df.var(axis=1)
+            df = df.loc[variances.nlargest(top_n_genes).index]
+
+        n_genes = len(df)
+        if n_genes < 20:
+            raise ValueError(f"Not enough genes for silhouette analysis ({n_genes} < 20)")
+
+        # Z-score normalize
+        data = df.values.astype(float)
+        means = np.mean(data, axis=1, keepdims=True)
+        stds = np.std(data, axis=1, keepdims=True)
+        stds[stds == 0] = 1.0
+        normalized = (data - means) / stds
+        normalized = np.nan_to_num(normalized, nan=0.0)
+
+        k_max_effective = min(k_max, n_genes - 1)
+        profile = []
+        for k in range(k_min, k_max_effective + 1):
+            km = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = km.fit_predict(normalized)
+            score = float(silhouette_score(normalized, labels, metric=metric))
+            profile.append({
+                "k": k,
+                "silhouette_score": round(score, 4),
+                "inertia": round(float(km.inertia_), 2),
+            })
+            logger.info(f"Silhouette k={k}: {score:.4f}")
+
+        recommended = max(profile, key=lambda x: x["silhouette_score"])
+        return {
+            "profile": profile,
+            "recommended_k": recommended["k"],
+            "recommended_score": recommended["silhouette_score"],
         }

@@ -232,9 +232,10 @@ class GOService:
         Returns:
             List of enriched GO terms with statistics
         """
-        # Get annotations for gene list
+        # Get annotations for gene list (no propagation — direct GOA annotations are sufficient
+        # for hypergeometric enrichment and propagation via recursive BFS is too slow at scale)
         gene_annots = await self.get_gene_annotations(
-            db, gene_list, namespace, organism, propagate=True
+            db, gene_list, namespace, organism, propagate=False
         )
         
         # Get background annotations
@@ -257,7 +258,7 @@ class GOService:
             background = [row[0] for row in bg_result.all()]
         
         bg_annots = await self.get_gene_annotations(
-            db, background, namespace, organism, propagate=True
+            db, background, namespace, organism, propagate=False
         )
         
         N = len(background)  # Total genes in background
@@ -309,7 +310,7 @@ class GOService:
             for result in enrichment_results:
                 term = terms.get(result["go_id"])
                 if term:
-                    result["term_name"] = term.name
+                    result["go_name"] = term.name
                     result["namespace"] = term.namespace
                     result["definition"] = term.definition
                     result["level"] = term.level

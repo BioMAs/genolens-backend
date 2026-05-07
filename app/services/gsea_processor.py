@@ -138,10 +138,11 @@ class GSEAProcessor:
             nes = es / mean_null if mean_null != 0 else 0
 
             # Calculate p-value
+            null_arr = np.array(null_dist)
             if es >= 0:
-                p_value = np.sum(null_dist >= es) / len(null_dist)
+                p_value = np.sum(null_arr >= es) / len(null_arr)
             else:
-                p_value = np.sum(null_dist <= es) / len(null_dist)
+                p_value = np.sum(null_arr <= es) / len(null_arr)
 
             # Extract leading edge genes
             details = es_details[gene_set_name]

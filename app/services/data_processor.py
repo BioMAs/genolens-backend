@@ -2,8 +2,11 @@
 Data processing service for converting files to Parquet and querying.
 """
 import io
+import logging
 from typing import Any, Optional
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -326,8 +329,8 @@ class DataProcessorService:
         metadata = {
             "rows": len(df),
             "columns": len(df.columns),
-            "column_names": df.columns.tolist(),
-            "dtypes": df.dtypes.astype(str).to_dict(),
+            "column_names": [str(c) for c in df.columns.tolist()],
+            "dtypes": {str(k): v for k, v in df.dtypes.astype(str).to_dict().items()},
             "memory_usage_bytes": int(df.memory_usage(deep=True).sum()),
         }
 
@@ -412,6 +415,51 @@ class DataProcessorService:
         except Exception as e:
             # Fallback: column might not exist or other error
             raise ValueError(f"Failed to read gene column '{gene_column}': {str(e)}")
+
+    async def get_gene_map(
+        self,
+        parquet_data: bytes,
+        primary_column: str = "gene_id",
+        secondary_column: str = "gene_name",
+    ) -> dict[str, Any]:
+        """
+        Get mapping from primary gene column to secondary gene column (e.g. Ensembl ID → symbol).
+
+        Unlike get_gene_list, this preserves row alignment and builds the mapping by position,
+        so nulls in either column simply produce no entry in the map.
+
+        Args:
+            parquet_data: Parquet file bytes
+            primary_column: Column to use as map key (default: gene_id)
+            secondary_column: Column to use as map value (default: gene_name)
+
+        Returns:
+            dict with keys ``gene_map`` (dict[str, str]) and ``total`` (int)
+        """
+        parquet_buffer = io.BytesIO(parquet_data)
+        try:
+            schema = pq.read_schema(parquet_buffer)
+            available = schema.names
+            parquet_buffer.seek(0)
+
+            missing = [c for c in [primary_column, secondary_column] if c not in available]
+            if missing:
+                raise ValueError(f"Columns not found in Parquet schema: {missing}")
+
+            table = pq.read_table(parquet_buffer, columns=[primary_column, secondary_column])
+            primary_list = table[primary_column].to_pylist()
+            secondary_list = table[secondary_column].to_pylist()
+
+            gene_map: dict[str, str] = {}
+            for pk, sk in zip(primary_list, secondary_list):
+                if pk is not None and sk is not None:
+                    gene_map[str(pk)] = str(sk)
+
+            return {"gene_map": gene_map, "total": len(primary_list)}
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Failed to build gene map '{primary_column}' → '{secondary_column}': {str(e)}")
 
     @timing_decorator(name="calculate_deg_stats")
     async def calculate_deg_stats(

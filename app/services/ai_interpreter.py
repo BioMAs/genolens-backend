@@ -4,10 +4,17 @@ Uses local AI models (Ollama) to interpret RNA-seq comparison results.
 No data is exported to external services - fully private and offline.
 """
 import asyncio
+import time
+import json
 import httpx
 import os
 from typing import Dict, Any, Optional, List, AsyncGenerator
 import logging
+
+# Module-level availability cache (TTL = 30 s) to avoid 2 HTTP calls per request
+_availability_cache: Optional[Dict[str, Any]] = None
+_availability_cache_ts: float = 0.0
+_AVAILABILITY_TTL: float = 30.0
 
 logger = logging.getLogger(__name__)
 
@@ -290,22 +297,88 @@ class LocalAIInterpreter:
                         "stream": False,
                         "options": {
                             "num_predict": max_tokens,
-                            "temperature": 0.3,  # Lower temperature for more focused responses
-                            "top_p": 0.9
-                        }
-                    }
+                            "num_ctx": 4096,
+                            "temperature": 0.3,
+                            "top_p": 0.9,
+                        },
+                    },
                 )
-                
+
                 if response.status_code != 200:
                     logger.error(f"Ollama API error: {response.status_code} - {response.text}")
                     raise Exception(f"Ollama API returned status {response.status_code}")
-                
+
                 result = response.json()
                 return result.get("response", "")
-                
+
         except Exception as e:
             logger.error(f"Ollama raw call error: {str(e)}")
             raise
+
+    async def _call_ollama_raw_stream(
+        self, prompt: str, max_tokens: int = 2000
+    ) -> AsyncGenerator[str, None]:
+        """
+        Like _call_ollama_raw but streams tokens as they are generated.
+        Yields text chunks. Raises on connection or HTTP errors.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "stream": True,
+                        "options": {
+                            "num_predict": max_tokens,
+                            "num_ctx": 4096,
+                            "temperature": 0.3,
+                            "top_p": 0.9,
+                        },
+                    },
+                ) as response:
+                    if response.status_code != 200:
+                        raise Exception(f"Ollama API returned status {response.status_code}")
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                            token = chunk.get("response", "")
+                            if token:
+                                yield token
+                            if chunk.get("done", False):
+                                break
+                        except json.JSONDecodeError:
+                            continue
+        except httpx.ConnectError:
+            raise Exception("Impossible de se connecter à Ollama pour le streaming")
+        except Exception as e:
+            logger.error(f"Ollama stream error: {str(e)}")
+            raise
+
+    async def interpret_chart_stream(
+        self, chart_type: str, context: dict
+    ) -> AsyncGenerator[str, None]:
+        """
+        Streaming version of interpret_chart.
+        Yields token chunks as they arrive from Ollama.
+        """
+        builders = {
+            "volcano": self._build_volcano_prompt,
+            "pca": self._build_pca_prompt,
+            "umap": self._build_umap_prompt,
+            "heatmap": self._build_heatmap_prompt,
+            "enrichment": self._build_enrichment_prompt,
+        }
+        builder = builders.get(chart_type)
+        if not builder:
+            raise ValueError(f"Unknown chart_type: {chart_type!r}. Must be one of {list(builders)}")
+        prompt = f"{self._CHART_SYSTEM}\n\n{builder(context)}"
+        async for chunk in self._call_ollama_raw_stream(prompt, max_tokens=400):
+            yield chunk
     
     def _build_prompt(self, context: Dict[str, Any], language: str = "fr") -> str:
         """
@@ -417,51 +490,51 @@ Answer DIRECTLY without repeating raw data."""
     async def check_availability(self) -> Dict[str, Any]:
         """
         Check if Ollama is available and which models are installed.
-        
-        Returns:
-            {
-                "available": bool,
-                "models": List[str],
-                "current_model": str,
-                "version": str
-            }
+        Result is cached for 30 s to avoid repeated HTTP roundtrips.
         """
+        global _availability_cache, _availability_cache_ts
+        now = time.monotonic()
+        if _availability_cache is not None and (now - _availability_cache_ts) < _AVAILABILITY_TTL:
+            return _availability_cache
+
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                # Check version
                 version_response = await client.get(f"{self.base_url}/api/version")
                 version = version_response.json().get("version", "unknown")
-                
-                # List models
+
                 models_response = await client.get(f"{self.base_url}/api/tags")
                 models_data = models_response.json()
                 models = [m["name"] for m in models_data.get("models", [])]
-                
-                return {
+
+                result: Dict[str, Any] = {
                     "available": True,
                     "models": models,
                     "current_model": self.model,
                     "model_available": self.model in models,
                     "version": version,
-                    "base_url": self.base_url
+                    "base_url": self.base_url,
                 }
         except Exception as e:
             logger.warning(f"Ollama not available: {str(e)}")
-            return {
+            result = {
                 "available": False,
                 "models": [],
                 "current_model": self.model,
                 "model_available": False,
-                "error": str(e)
+                "error": str(e),
             }
+
+        _availability_cache = result
+        _availability_cache_ts = now
+        return result
     
     async def generate_simple_answer(self, prompt: str) -> str:
         """
         Generate a simple answer to a user question.
-        
+
         Args:
             prompt: The question prompt with context
-            
+
         Returns:
             str: The AI's answer
         """
@@ -480,14 +553,127 @@ Answer DIRECTLY without repeating raw data."""
                         }
                     }
                 )
-                
+
                 if response.status_code != 200:
                     raise Exception(f"Ollama API error: {response.status_code}")
-                
+
                 result = response.json()
                 return result.get("response", "").strip()
-                
+
         except Exception as e:
             logger.error(f"Error generating answer: {str(e)}")
             raise
+
+    # ── Chart-type system instruction ───────────────────────────────────────
+
+    _CHART_SYSTEM = (
+        "You are a scientific assistant helping non-scientists understand genomics results. "
+        "Use plain, everyday language. Avoid technical jargon — if you must use a term, "
+        "explain it in parentheses with a simple analogy. "
+        "Keep responses to 3–5 sentences. Be warm and direct."
+    )
+
+    # ── Public dispatch method ───────────────────────────────────────────────
+
+    async def interpret_chart(self, chart_type: str, context: dict) -> str:
+        """
+        Generate a plain-English interpretation of a chart.
+
+        Args:
+            chart_type: One of "volcano", "pca", "umap", "heatmap", "enrichment"
+            context: Chart-specific data dict
+
+        Returns:
+            AI-generated plain-English text (3-5 sentences)
+        """
+        builders = {
+            "volcano": self._build_volcano_prompt,
+            "pca": self._build_pca_prompt,
+            "umap": self._build_umap_prompt,
+            "heatmap": self._build_heatmap_prompt,
+            "enrichment": self._build_enrichment_prompt,
+        }
+        builder = builders.get(chart_type)
+        if not builder:
+            raise ValueError(f"Unknown chart_type: {chart_type!r}. Must be one of {list(builders)}")
+        prompt = f"{self._CHART_SYSTEM}\n\n{builder(context)}"
+        return await self._call_ollama_raw(prompt, max_tokens=400)
+
+    # ── Per-chart prompt builders ────────────────────────────────────────────
+
+    def _build_volcano_prompt(self, ctx: dict) -> str:
+        up = ctx.get("up_count", 0)
+        down = ctx.get("down_count", 0)
+        name = ctx.get("comparison_name", "the experiment")
+        top_up = ctx.get("top_up_genes", [])[:5]
+        top_down = ctx.get("top_down_genes", [])[:5]
+        up_names = ", ".join(g["gene_id"] for g in top_up) or "none"
+        down_names = ", ".join(g["gene_id"] for g in top_down) or "none"
+        return (
+            f"I am looking at a volcano plot for the comparison '{name}'. "
+            f"In this experiment, {up} genes became more active and {down} became less active "
+            f"in the treated group compared to controls. "
+            f"The most increased genes include: {up_names}. "
+            f"The most decreased genes include: {down_names}. "
+            f"Explain in plain language what this pattern means for someone without a biology background."
+        )
+
+    def _build_pca_prompt(self, ctx: dict) -> str:
+        pc1 = ctx.get("variance_pc1", 0)
+        pc2 = ctx.get("variance_pc2", 0)
+        n_samples = ctx.get("n_samples", 0)
+        groups = ", ".join(ctx.get("sample_groups", [])) or "unknown groups"
+        separation = ctx.get("group_separation", False)
+        sep_text = "The sample groups separate clearly on the plot." if separation else "The sample groups overlap on the plot."
+        return (
+            f"I am looking at a PCA (Principal Component Analysis) plot with {n_samples} samples. "
+            f"The first axis explains {pc1:.1f}% of the variation, and the second explains {pc2:.1f}%. "
+            f"The sample groups are: {groups}. {sep_text} "
+            f"Explain in plain language what this means for someone without a biology background."
+        )
+
+    def _build_umap_prompt(self, ctx: dict) -> str:
+        n_clusters = ctx.get("n_clusters", 0)
+        sizes = ctx.get("cluster_sizes", [])
+        n_samples = ctx.get("n_samples", 0)
+        groups = ", ".join(ctx.get("sample_groups", [])) or "unknown groups"
+        sizes_text = ", ".join(str(s) for s in sizes[:5]) if sizes else "unknown"
+        return (
+            f"I am looking at a UMAP plot that groups {n_samples} samples into {n_clusters} clusters. "
+            f"Cluster sizes are: {sizes_text} samples each. "
+            f"The sample groups present are: {groups}. "
+            f"Explain in plain language what these groupings might tell us biologically."
+        )
+
+    def _build_heatmap_prompt(self, ctx: dict) -> str:
+        n_genes = ctx.get("n_genes", 0)
+        n_samples = ctx.get("n_samples", 0)
+        n_clusters = ctx.get("n_clusters")
+        top_genes = ctx.get("top_varying_genes", [])[:5]
+        groups = ", ".join(ctx.get("sample_groups", [])) or "unknown groups"
+        genes_text = ", ".join(top_genes) if top_genes else "various genes"
+        cluster_text = f" The samples are grouped into {n_clusters} clusters." if n_clusters else ""
+        return (
+            f"I am looking at a heatmap showing expression levels of {n_genes} genes "
+            f"across {n_samples} samples from groups: {groups}.{cluster_text} "
+            f"The most variable genes include: {genes_text}. "
+            f"Explain in plain language what this pattern of gene activity tells us."
+        )
+
+    def _build_enrichment_prompt(self, ctx: dict) -> str:
+        category = ctx.get("category", "GO")
+        name = ctx.get("comparison_name", "the experiment")
+        regulation = ctx.get("regulation", "ALL")
+        top_terms = ctx.get("top_terms", [])[:8]
+        direction = {"UP": "more active", "DOWN": "less active", "ALL": "changed"}.get(regulation, "changed")
+        terms_text = "; ".join(
+            f"{t['name']} ({t.get('gene_count', '?')} genes)"
+            for t in top_terms
+        ) or "none found"
+        return (
+            f"I am looking at a {category} enrichment plot for the comparison '{name}'. "
+            f"It shows biological processes that are {direction} in the treated group. "
+            f"The top enriched processes are: {terms_text}. "
+            f"Explain in plain language what these biological processes tell us about the experiment."
+        )
 

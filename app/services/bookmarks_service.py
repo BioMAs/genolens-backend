@@ -46,7 +46,7 @@ class BookmarksService:
                 GeneBookmark.user_id == user_id,
                 GeneBookmark.project_id == project_id
             )
-        ).options(joinedload(GeneBookmark.project))
+        )
         
         if gene_symbol:
             query = query.where(GeneBookmark.gene_symbol == gene_symbol)
@@ -118,7 +118,7 @@ class BookmarksService:
             tags=tags or [],
             color=color,
             is_favorite=is_favorite,
-            metadata={}
+            extra_data={}
         )
         
         db.add(bookmark)
