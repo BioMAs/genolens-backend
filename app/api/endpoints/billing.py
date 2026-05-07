@@ -4,14 +4,18 @@ Billing endpoints for GenoLens.
 Provides authenticated routes for Stripe Checkout, Billing Portal, and
 subscription status.
 """
-from typing import Any, Annotated
+from typing import Any, Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
+from sqlalchemy import select, func, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_db
 from app.api.deps.subscription import get_or_create_user
 from app.core.config import settings
-from app.models.models import User
+from app.core.plan_config import get_plan_limits
+from app.models.models import User, Project, Dataset, DatasetStatus
 from app.services import stripe_service
 
 router = APIRouter()
@@ -128,12 +132,35 @@ async def create_portal(
 @router.get("/subscription")
 async def get_subscription(
     current_user: Annotated[User, Depends(get_or_create_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Any:
     """
     Return the current user's subscription state from the database.
 
     No Stripe API call is made — data is read directly from our DB.
+    Includes real-time project count and storage usage metrics.
     """
+    # Count owned projects
+    project_count_result = await db.execute(
+        select(func.count()).select_from(Project).where(Project.owner_id == current_user.id)
+    )
+    project_count: int = project_count_result.scalar_one() or 0
+
+    # Sum storage used across all non-archived datasets from owned projects
+    storage_result = await db.execute(
+        text("""
+            SELECT COALESCE(SUM((d.dataset_metadata->>'file_size')::bigint), 0)
+            FROM datasets d
+            JOIN projects p ON d.project_id = p.id
+            WHERE p.owner_id = :owner_id
+            AND d.status != 'ARCHIVED'
+        """),
+        {"owner_id": str(current_user.id)},
+    )
+    storage_used_bytes: int = storage_result.scalar_one() or 0
+
+    limits = get_plan_limits(current_user.subscription_plan, current_user.role)
+
     return {
         "plan": current_user.subscription_plan.value,
         "status": current_user.status.value,
@@ -143,4 +170,9 @@ async def get_subscription(
         "ai_interpretations_used": current_user.ai_interpretations_used,
         "ai_tokens_purchased": current_user.ai_tokens_purchased,
         "ai_tokens_used": current_user.ai_tokens_used,
+        # Usage metrics
+        "project_count": project_count,
+        "max_projects": limits["max_projects"],
+        "storage_used_bytes": storage_used_bytes,
+        "max_storage_bytes": limits["max_storage_bytes"],
     }

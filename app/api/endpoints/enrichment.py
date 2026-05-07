@@ -66,11 +66,11 @@ async def get_enrichment_results(
         raise HTTPException(status_code=404, detail="Project not found")
 
     # If not owner, check membership
-    if project.owner_id != current_user.id:
+    if project.owner_id != current_user.user_id:
         query_member = select(ProjectMember).where(
             and_(
                 ProjectMember.project_id == project.id,
-                ProjectMember.user_id == current_user.id
+                ProjectMember.user_id == current_user.user_id
             )
         )
         result_member = await db.execute(query_member)

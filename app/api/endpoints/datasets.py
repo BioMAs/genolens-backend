@@ -34,7 +34,8 @@ from app.api.deps.subscription import (
 # from app.db.session import get_db  <-- Removed
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
-from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, UserRole
+from app.core.plan_config import get_max_storage_bytes
+from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, UserRole, GOAnnotation, GSEAResult
 from sqlalchemy import select, func, delete, text, or_, desc, asc, and_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,7 +47,8 @@ from app.schemas.dataset import (
     DatasetUpdate,
     DatasetColumnsResponse,
     DatasetStatsResponse,
-    GeneListResponse
+    GeneListResponse,
+    GeneMapResponse
 )
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor
@@ -114,6 +116,7 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 async def upload_dataset(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    db_user: Annotated[User, Depends(get_or_create_user)],
     project_id: UUID = Form(...),
     name: str = Form(...),
     dataset_type: DatasetType = Form(...),
@@ -149,7 +152,35 @@ async def upload_dataset(
             detail="Project not found"
         )
 
-    # Create dataset entry
+    # Enforce plan storage quota
+    max_storage = get_max_storage_bytes(db_user.subscription_plan, db_user.role)
+    if max_storage is not None and file.size is not None:
+        storage_result = await db.execute(
+            text("""
+                SELECT COALESCE(SUM((d.dataset_metadata->>'file_size')::bigint), 0)
+                FROM datasets d
+                JOIN projects p ON d.project_id = p.id
+                WHERE p.owner_id = :owner_id
+                AND d.status != 'ARCHIVED'
+            """),
+            {"owner_id": str(current_user.user_id)},
+        )
+        storage_used: int = storage_result.scalar_one() or 0
+        if storage_used + file.size > max_storage:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail={
+                    "error": "storage_quota_exceeded",
+                    "storage_used_bytes": storage_used,
+                    "file_size_bytes": file.size,
+                    "max_storage_bytes": max_storage,
+                    "message": (
+                        f"Storage quota exceeded. "
+                        f"Used {storage_used / (1024**2):.1f} MB of {max_storage / (1024**2):.0f} MB. "
+                        "Upgrade your plan for more storage."
+                    ),
+                },
+            )
     metadata = {
         "original_filename": file.filename,
         "file_size": file.size,
@@ -689,6 +720,58 @@ async def get_gene_list(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get gene list: {str(e)}"
+        )
+
+
+@router.get("/{dataset_id}/genes/map", response_model=GeneMapResponse)
+async def get_gene_map(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    primary_column: str = Query("gene_id", description="Column to use as map key"),
+    secondary_column: str = Query("gene_name", description="Column to use as map value"),
+) -> dict:
+    """
+    Get a mapping from one gene column to another (e.g. Ensembl ID → gene symbol).
+
+    Reads only the two specified columns from the Parquet file.
+    Rows where either column is null are skipped.
+
+    **Performance:** similar to /genes/list — far faster than a full /query
+    **Use case:** populate symbol-aware autocomplete in the frontend
+    """
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+
+    if dataset.status != DatasetStatus.READY:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Dataset is not ready. Current status: {dataset.status}",
+        )
+
+    if not dataset.parquet_file_path:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Parquet file path not found",
+        )
+
+    try:
+        parquet_data = await storage_service.download_file(dataset.parquet_file_path)
+        result = await data_processor.get_gene_map(
+            parquet_data=parquet_data,
+            primary_column=primary_column,
+            secondary_column=secondary_column,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to build gene map: {str(e)}",
         )
 
 
@@ -1429,7 +1512,7 @@ async def get_deg_genes(
     padj_max: Optional[float] = Query(None, description="Maximum p-adjusted value"),
     logfc_min: Optional[float] = Query(None, description="Minimum absolute log fold change"),
     page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(50, ge=1, le=1000, description="Items per page"),
+    page_size: int = Query(50, ge=1, le=5000, description="Items per page"),
     sort_by: str = Query("padj", description="Sort by: padj, log_fc, gene_id"),
     sort_order: str = Query("asc", description="Sort order: asc or desc")
 ) -> dict:
@@ -1984,7 +2067,9 @@ async def get_enrichment_pathways(
             "genes": row.genes,
             "category": row.category,
             "description": row.description,
-            "regulation": row.regulation
+            "regulation": row.regulation,
+            "enrichment_ratio": row.enrichment_ratio,
+            "level": row.level,
         }
         pathways.append(pathway_dict)
 
@@ -3172,6 +3257,24 @@ async def apply_advanced_filter(
                 }
             }
 
+        # Pre-fetch gene lists for pathway conditions (avoid await inside loop)
+        pathway_gene_cache: dict[str, list[str]] = {}
+        for group in groups:
+            for condition in group.get("conditions", []):
+                if condition.get("field") == "pathway":
+                    pathway_id = condition.get("value")
+                    if pathway_id and pathway_id not in pathway_gene_cache:
+                        pw_result = await db.execute(
+                            select(EnrichmentPathway.genes).where(
+                                and_(
+                                    EnrichmentPathway.dataset_id == dataset_id,
+                                    EnrichmentPathway.comparison_name == comparison_name,
+                                    EnrichmentPathway.pathway_id == pathway_id
+                                )
+                            )
+                        )
+                        pathway_gene_cache[pathway_id] = pw_result.scalar() or []
+
         # Base query
         stmt = select(DegGene).where(
             DegGene.dataset_id == dataset_id,
@@ -3180,7 +3283,7 @@ async def apply_advanced_filter(
 
         # Build filter conditions
         group_conditions = []
-        
+
         for group in groups:
             conditions = group.get("conditions", [])
             condition_operator = group.get("operator", "AND")
@@ -3195,6 +3298,13 @@ async def apply_advanced_filter(
                 operator = condition.get("operator")
                 value = condition.get("value")
                 
+                # Handle pathway filter separately (uses pre-fetched gene list)
+                if field == "pathway":
+                    genes_in_pathway = pathway_gene_cache.get(value, [])
+                    if genes_in_pathway:
+                        current_group_exprs.append(DegGene.gene_id.in_(genes_in_pathway))
+                    continue
+
                 # Map field to model column
                 column = None
                 if field == "logFC":
@@ -3207,7 +3317,7 @@ async def apply_advanced_filter(
                     column = DegGene.gene_name
                 elif field == "regulation":
                     column = DegGene.regulation
-                
+
                 if column is None:
                     continue
                     
@@ -3371,6 +3481,20 @@ async def run_gsea_analysis(
         # Convert to DataFrame
         deg_data = pd.DataFrame(rows, columns=["gene_id", "log_fc", "padj", "gene_name"])
 
+        # GSEA gene sets are usually defined with gene symbols.
+        # Prefer gene_name when present, and fall back to gene_id otherwise.
+        deg_data["gene_identifier"] = deg_data["gene_name"].fillna("").astype(str).str.strip()
+        missing_identifier = deg_data["gene_identifier"] == ""
+        deg_data.loc[missing_identifier, "gene_identifier"] = (
+            deg_data.loc[missing_identifier, "gene_id"].fillna("").astype(str).str.strip()
+        )
+        deg_data = deg_data[deg_data["gene_identifier"] != ""].copy()
+        deg_data["gene_id"] = deg_data["gene_identifier"]
+
+        identifier_source = "gene_name"
+        if (deg_data["gene_identifier"] == deg_data["gene_name"].fillna("").astype(str).str.strip()).sum() == 0:
+            identifier_source = "gene_id"
+
         # Prepare ranked gene list
         ranked_genes = prepare_ranked_gene_list(deg_data, ranking_metric=ranking_metric)
 
@@ -3388,22 +3512,50 @@ async def run_gsea_analysis(
                        f"Valid options: {[e.value for e in GeneSetDatabase]}"
             )
 
-        # Retrieve gene sets from database
+        # Retrieve gene sets from database (fallback to "All" for legacy loaded sets)
+        selected_gene_set_organism = "Homo sapiens"
         gene_sets_db = await gene_set_loader.get_gene_sets(
             database=database_enum,
-            organism="Homo sapiens",
+            organism=selected_gene_set_organism,
             min_size=min_size,
             max_size=max_size
         )
+        if not gene_sets_db:
+            selected_gene_set_organism = "All"
+            gene_sets_db = await gene_set_loader.get_gene_sets(
+                database=database_enum,
+                organism=selected_gene_set_organism,
+                min_size=min_size,
+                max_size=max_size
+            )
 
         # Convert to dictionary format expected by GSEA processor
         if not gene_sets_db:
             # Fallback to placeholder if no gene sets in database
             logger.warning(f"No gene sets found for {gene_set_database}, using placeholders")
             gene_sets = GeneSetsLoader.get_default_gene_sets()
+            selected_gene_set_organism = "placeholder"
         else:
             gene_sets = {gs.name: gs.genes for gs in gene_sets_db}
-            logger.info(f"Loaded {len(gene_sets)} gene sets from database")
+            logger.info(
+                "Loaded %s gene sets from database (%s/%s)",
+                len(gene_sets),
+                gene_set_database,
+                selected_gene_set_organism,
+            )
+
+        ranked_gene_set = set(ranked_genes.index)
+        gene_set_union = {g for gs in gene_sets.values() for g in gs}
+        overlap_genes = len(ranked_gene_set.intersection(gene_set_union))
+        if overlap_genes == 0:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No overlap between ranked genes and selected gene sets. "
+                    "Try using gene symbols, loading matching organism gene sets, "
+                    "or choosing another database."
+                )
+            )
 
         # Initialize GSEA processor
         gsea_processor = GSEAProcessor(
@@ -3449,7 +3601,7 @@ async def run_gsea_analysis(
             from app.services.version_service import get_algorithm_versions
             _prov = AnalysisRun(
                 dataset_id=dataset_id,
-                user_id=current_user.user_id,
+                user_id=str(current_user.user_id),
                 analysis_type="GSEA",
                 comparison_name=comparison_name,
                 parameters={
@@ -3466,6 +3618,9 @@ async def run_gsea_analysis(
                     "total_genes_ranked": len(ranked_genes),
                     "total_gene_sets_tested": len(gene_sets),
                     "significant_gene_sets": len(significant_results),
+                    "ranked_identifier_source": identifier_source,
+                    "gene_set_organism": selected_gene_set_organism,
+                    "overlap_genes": overlap_genes,
                 },
             )
             db.add(_prov)
@@ -3473,7 +3628,7 @@ async def run_gsea_analysis(
         except Exception as _prov_exc:
             logger.warning("GSEA provenance save failed (non-fatal): %s", _prov_exc)
 
-        return {
+        response_payload = {
             "dataset_id": str(dataset_id),
             "comparison_name": comparison_name,
             "parameters": {
@@ -3489,16 +3644,83 @@ async def run_gsea_analysis(
                 "total_gene_sets_tested": len(gene_sets),
                 "significant_gene_sets": len(significant_results),
                 "enriched_in_phenotype_pos": n_enriched_positive,
-                "enriched_in_phenotype_neg": n_enriched_negative
+                "enriched_in_phenotype_neg": n_enriched_negative,
+                "overlap_genes": overlap_genes,
+                "ranked_identifier_source": identifier_source,
+                "gene_set_organism": selected_gene_set_organism,
             },
             "results": results_dict
         }
+
+        # ── Persist GSEA results (upsert) ──────────────────────────────────────
+        try:
+            params_hash = hashlib.md5(
+                json.dumps(response_payload["parameters"], sort_keys=True).encode()
+            ).hexdigest()[:16]
+            existing = await db.execute(
+                select(GSEAResult).where(
+                    GSEAResult.dataset_id == dataset_id,
+                    GSEAResult.comparison_name == comparison_name,
+                )
+            )
+            gsea_row = existing.scalar_one_or_none()
+            if gsea_row:
+                gsea_row.parameters_hash = params_hash
+                gsea_row.parameters_json = response_payload["parameters"]
+                gsea_row.results_json = results_dict
+                gsea_row.summary_json = response_payload["summary"]
+            else:
+                gsea_row = GSEAResult(
+                    dataset_id=dataset_id,
+                    comparison_name=comparison_name,
+                    parameters_hash=params_hash,
+                    parameters_json=response_payload["parameters"],
+                    results_json=results_dict,
+                    summary_json=response_payload["summary"],
+                )
+                db.add(gsea_row)
+            await db.commit()
+        except Exception as _save_exc:
+            logger.warning("GSEA result save failed (non-fatal): %s", _save_exc)
+
+        return response_payload
 
     except Exception as e:
         import traceback
         logger.error(f"GSEA error: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"GSEA analysis failed: {str(e)}")
+
+
+@router.get("/{dataset_id}/comparisons/{comparison_name}/gsea-results")
+async def get_gsea_results(
+    dataset_id: UUID,
+    comparison_name: str,
+    db: Annotated[AsyncSession, Depends(get_db)] = None,
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)] = None,
+) -> dict:
+    """
+    Retrieve the last persisted GSEA results for a dataset/comparison.
+    Returns 404 if no results have been saved yet.
+    """
+    result = await db.execute(
+        select(GSEAResult).where(
+            GSEAResult.dataset_id == dataset_id,
+            GSEAResult.comparison_name == comparison_name,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        raise HTTPException(status_code=404, detail="No GSEA results found for this comparison")
+    return {
+        "dataset_id": str(dataset_id),
+        "comparison_name": comparison_name,
+        "cached": True,
+        "parameters": row.parameters_json,
+        "summary": row.summary_json,
+        "results": row.results_json,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
 
 
 @router.get("/{dataset_id}/gsea/{gene_set_name}/enrichment-plot")
@@ -3816,6 +4038,65 @@ async def cluster_dataset(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error accessing dataset data: {str(e)}")
+
+# ============================================================================
+# Silhouette Profile Endpoint — K-means quality guide
+# ============================================================================
+
+@router.get("/{dataset_id}/clustering-quality")
+async def get_clustering_quality(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    top_n_genes: int = Query(default=500, ge=20, le=5000),
+    metric: str = Query(default="euclidean"),
+    k_min: int = Query(default=2, ge=2),
+    k_max: int = Query(default=10, le=20),
+):
+    """
+    Compute silhouette scores for k in [k_min..k_max] to help the user pick
+    an optimal number of K-means clusters.
+    """
+    query = select(Dataset).join(Project).filter(Dataset.id == dataset_id)
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found or access denied")
+
+    if dataset.type != DatasetType.MATRIX:
+        raise HTTPException(status_code=400, detail="Silhouette analysis only supported for expression matrices")
+    if dataset.status != DatasetStatus.READY:
+        raise HTTPException(status_code=400, detail="Dataset is not ready for analysis")
+
+    # Load DataFrame (cache-first)
+    df = cache_service.get_dataframe(str(dataset_id))
+    if df is None:
+        parquet_path = dataset.parquet_file_path or dataset.raw_file_path
+        if not parquet_path:
+            raise HTTPException(status_code=500, detail="Dataset file path missing")
+        try:
+            from app.services.storage_service import StorageService
+            storage = StorageService()
+            df = await storage.load_parquet_as_dataframe(parquet_path)
+            cache_service.cache_dataframe(str(dataset_id), df)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error loading dataset: {str(e)}")
+
+    try:
+        profile_result = clustering_service.compute_silhouette_profile(
+            df=df,
+            top_n_genes=top_n_genes,
+            metric=metric,
+            k_min=k_min,
+            k_max=k_max,
+        )
+        return profile_result
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.error(f"Silhouette analysis failed for {dataset_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Silhouette analysis failed: {str(e)}")
+
 
 # ============================================================================
 # Combined Heatmap Clustering Endpoint (fast path for heatmap component)
@@ -4263,6 +4544,19 @@ async def precompute_sample_clustering(
 # Gene Ontology (GO) Endpoints
 # ============================================================================
 
+def _compute_go_params_hash(
+    namespace, regulation, padj_threshold, log_fc_threshold,
+    min_term_size, max_term_size, pvalue_threshold,
+    fdr_method, propagate_annotations, organism
+) -> str:
+    key = json.dumps([
+        namespace, regulation, padj_threshold, log_fc_threshold,
+        min_term_size, max_term_size, pvalue_threshold,
+        fdr_method, propagate_annotations, organism,
+    ])
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
 @router.post("/{dataset_id}/comparisons/{comparison_name}/go-enrichment")
 async def run_go_enrichment_analysis(
     dataset_id: UUID,
@@ -4300,7 +4594,60 @@ async def run_go_enrichment_analysis(
     
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    
+
+    # 1b. Cache check — return stored results if params match
+    params_hash = _compute_go_params_hash(
+        namespace, regulation, padj_threshold, log_fc_threshold,
+        min_term_size, max_term_size, pvalue_threshold,
+        fdr_method, propagate_annotations, organism,
+    )
+    cached_stmt = select(EnrichmentPathway).where(
+        EnrichmentPathway.dataset_id == dataset_id,
+        EnrichmentPathway.comparison_name == comparison_name,
+        EnrichmentPathway.parameters_hash == params_hash,
+    )
+    cached_result = await db.execute(cached_stmt)
+    cached_rows = cached_result.scalars().all()
+    if cached_rows:
+        logger.info(f"GO enrichment cache hit: {len(cached_rows)} terms for {comparison_name}")
+        enriched_terms = [
+            {
+                "go_id": r.pathway_id,
+                "go_name": r.pathway_name,
+                "namespace": r.category,
+                "definition": r.description,
+                "study_count": r.gene_count,
+                "pvalue": r.pvalue,
+                "fdr": r.padj,
+                "gene_ratio": r.gene_ratio,
+                "bg_ratio": r.bg_ratio,
+                "study_genes": r.genes or [],
+                "regulation": r.regulation,
+                "enrichment_ratio": r.enrichment_ratio,
+                "level": r.level,
+                "comparison_name": comparison_name,
+            }
+            for r in cached_rows
+        ]
+        return {
+            "dataset_id": str(dataset_id),
+            "comparison_name": comparison_name,
+            "regulation": regulation or "ALL",
+            "namespace": namespace or "ALL",
+            "enriched_terms": enriched_terms,
+            "cached": True,
+            "parameters": {
+                "padj_threshold": padj_threshold,
+                "log_fc_threshold": log_fc_threshold,
+                "min_term_size": min_term_size,
+                "max_term_size": max_term_size,
+                "pvalue_threshold": pvalue_threshold,
+                "fdr_method": fdr_method,
+                "propagate_annotations": propagate_annotations,
+                "organism": organism,
+            },
+        }
+
     # 2. Get DEGs for this comparison
     deg_query = select(DegGene).where(
         DegGene.dataset_id == dataset_id,
@@ -4328,34 +4675,50 @@ async def run_go_enrichment_analysis(
             detail=f"No DEGs found for comparison {comparison_name} with specified thresholds"
         )
     
-    # Extract gene symbols
-    study_genes = [deg.gene_id for deg in degs]
+    # Prefer gene symbols for GO annotations; fallback to gene_id when gene_name is missing.
+    study_genes = [
+        (deg.gene_name.strip() if deg.gene_name and deg.gene_name.strip() else deg.gene_id)
+        for deg in degs
+        if (deg.gene_name and deg.gene_name.strip()) or deg.gene_id
+    ]
     logger.info(f"Found {len(study_genes)} DEGs for GO enrichment")
     
-    # 3. Get background genes (all genes in dataset)
-    # Get all genes from dataset
-    all_genes_query = text("""
-        SELECT DISTINCT gene_id
-        FROM deg_genes
-        WHERE dataset_id = :dataset_id
-    """)
-    result = await db.execute(all_genes_query, {"dataset_id": str(dataset_id)})
-    background_genes = [row[0] for row in result.fetchall()]
-    logger.info(f"Background: {len(background_genes)} genes")
+    # 3. Background: use all GO-annotated genes for this organism as the universe.
+    # deg_genes only stores significant DEGs (not the full expression matrix),
+    # so using it as background makes study ≈ background → hypergeometric p-values ≈ 1 → zero enrichment.
+    bg_query = select(GOAnnotation.gene_symbol).distinct().where(
+        GOAnnotation.organism == organism
+    )
+    bg_result = await db.execute(bg_query)
+    background_genes = [row[0] for row in bg_result.all()]
+    logger.info(f"Background: {len(background_genes)} GO-annotated genes for {organism}")
+
+    # Fast precheck: if none of the selected study genes exist in GO annotations, enrichment will be empty.
+    study_annotated_query = select(func.count(func.distinct(GOAnnotation.gene_symbol))).where(
+        GOAnnotation.organism == organism,
+        GOAnnotation.gene_symbol.in_(study_genes),
+    )
+    study_annotated_count = (await db.execute(study_annotated_query)).scalar() or 0
+    if study_annotated_count == 0:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No overlap between selected DEGs and GO annotations for this organism. "
+                "Load GO annotations for matching symbols/organism or adjust DEG identifiers."
+            ),
+        )
     
     # 4. Run GO enrichment analysis
     try:
         enrichment_results = await go_service.go_enrichment_analysis(
             db=db,
-            study_genes=study_genes,
-            background_genes=background_genes,
+            gene_list=study_genes,
+            background=background_genes,
             namespace=namespace,
             organism=organism,
-            min_term_size=min_term_size,
-            max_term_size=max_term_size,
+            min_gene_count=min_term_size,
+            max_gene_count=max_term_size,
             pvalue_threshold=pvalue_threshold,
-            fdr_method=fdr_method,
-            propagate_annotations=propagate_annotations
         )
     except Exception as e:
         logger.error(f"GO enrichment failed: {e}")
@@ -4367,6 +4730,61 @@ async def run_go_enrichment_analysis(
         result["regulation"] = regulation or "ALL"
     
     logger.info(f"✅ GO enrichment complete: {len(enrichment_results)} terms found")
+
+    # 6. Auto-save results to EnrichmentPathway table
+    try:
+        # namespace short-code (BP/MF/CC) → stored category
+        _ns_short_map = {
+            "BP": "GO:BP",
+            "MF": "GO:MF",
+            "CC": "GO:CC",
+        }
+        # namespace long-form (returned by GO service) → stored category
+        _ns_long_map = {
+            "biological_process": "GO:BP",
+            "molecular_function": "GO:MF",
+            "cellular_component": "GO:CC",
+        }
+        _regulation_val = regulation or "ALL"
+
+        # Delete ALL previous GO rows for this comparison to avoid mixing results
+        # from different parameter sets (different namespace/regulation/thresholds).
+        await db.execute(
+            delete(EnrichmentPathway).where(
+                EnrichmentPathway.dataset_id == dataset_id,
+                EnrichmentPathway.comparison_name == comparison_name,
+                EnrichmentPathway.category.like("GO:%"),
+            )
+        )
+
+        _study_size = len(study_genes)
+        _bg_size = len(background_genes)
+        _new_rows = [
+            EnrichmentPathway(
+                dataset_id=dataset_id,
+                comparison_name=comparison_name,
+                pathway_id=r["go_id"],
+                pathway_name=r["go_name"],
+                category=_ns_long_map.get(r.get("namespace", ""), _ns_short_map.get(namespace or "", "GO:ALL")),
+                description=r.get("definition"),
+                gene_count=r.get("study_count", 0),
+                pvalue=r["pvalue"],
+                padj=r["fdr"],
+                gene_ratio=f"{r.get('study_count', 0)}/{_study_size}",
+                bg_ratio=f"{r.get('background_count', 0)}/{_bg_size}",
+                genes=r.get("study_genes", []),
+                regulation=_regulation_val,
+                enrichment_ratio=r.get("enrichment_ratio"),
+                level=r.get("level"),
+                parameters_hash=params_hash,
+            )
+            for r in enrichment_results
+        ]
+        db.add_all(_new_rows)
+        await db.flush()
+        logger.info(f"Auto-saved {len(_new_rows)} GO enrichment rows")
+    except Exception as _save_exc:
+        logger.warning("GO enrichment auto-save failed (non-fatal): %s", _save_exc)
 
     await history_service.log_activity(
         db, dataset.project_id, current_user.user_id, ActivityEventType.GO_ENRICHMENT_RUN,
@@ -4386,7 +4804,7 @@ async def run_go_enrichment_analysis(
         from app.services.version_service import get_algorithm_versions
         _prov = AnalysisRun(
             dataset_id=dataset_id,
-            user_id=current_user.user_id,
+            user_id=str(current_user.user_id),
             analysis_type="GO_ENRICHMENT",
             comparison_name=comparison_name,
             parameters={
@@ -4408,6 +4826,7 @@ async def run_go_enrichment_analysis(
                 "background_size": len(background_genes),
                 "enriched_terms": len(enrichment_results),
                 "namespace": namespace or "ALL",
+                "study_annotated_count": study_annotated_count,
             },
         )
         db.add(_prov)
@@ -4423,6 +4842,7 @@ async def run_go_enrichment_analysis(
         "study_size": len(study_genes),
         "background_size": len(background_genes),
         "enriched_terms": enrichment_results,
+        "cached": False,
         "parameters": {
             "padj_threshold": padj_threshold,
             "log_fc_threshold": log_fc_threshold,
@@ -4434,6 +4854,122 @@ async def run_go_enrichment_analysis(
             "organism": organism
         }
     }
+
+
+@router.get("/{dataset_id}/comparisons/{comparison_name}/go-hierarchy")
+async def get_go_hierarchy(
+    dataset_id: UUID,
+    comparison_name: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    namespace: Optional[str] = Query(None, description="Filter by namespace: BP, MF, CC"),
+    regulation: Optional[str] = Query(None, description="Filter by regulation: UP, DOWN, ALL"),
+) -> dict:
+    """
+    Return enriched GO terms as a hierarchy forest (parent→child tree) for display.
+    Non-enriched ancestor terms are included as context nodes (is_enriched=False).
+    Grouped by namespace: biological_process, molecular_function, cellular_component.
+    """
+    from app.models.models import GOTerm
+
+    _ns_full_map = {"BP": "biological_process", "MF": "molecular_function", "CC": "cellular_component"}
+    _ns_category_map = {"BP": "GO:BP", "MF": "GO:MF", "CC": "GO:CC"}
+
+    # 1. Load enriched pathways for this dataset/comparison
+    enriched_stmt = select(EnrichmentPathway).where(
+        EnrichmentPathway.dataset_id == dataset_id,
+        EnrichmentPathway.comparison_name == comparison_name,
+        or_(
+            EnrichmentPathway.category == "GO:BP",
+            EnrichmentPathway.category == "GO:MF",
+            EnrichmentPathway.category == "GO:CC",
+        ),
+    )
+    if regulation:
+        enriched_stmt = enriched_stmt.where(EnrichmentPathway.regulation == regulation)
+    if namespace:
+        cat = _ns_category_map.get(namespace)
+        if cat:
+            enriched_stmt = enriched_stmt.where(EnrichmentPathway.category == cat)
+
+    enriched_result = await db.execute(enriched_stmt)
+    enriched_rows = enriched_result.scalars().all()
+
+    if not enriched_rows:
+        return {"biological_process": [], "molecular_function": [], "cellular_component": []}
+
+    # Build lookup: go_id → pathway row
+    enriched_lookup: dict = {r.pathway_id: r for r in enriched_rows}
+    enriched_ids = set(enriched_lookup.keys())
+
+    # 2. Collect ancestor GO IDs for all enriched terms
+    ancestor_ids: set = set()
+    for go_id in enriched_ids:
+        ancestors = await go_service._get_ancestors(db, go_id)
+        ancestor_ids.update(ancestors)
+    all_ids = enriched_ids | ancestor_ids
+
+    # 3. Fetch all relevant GOTerm records in one query
+    terms_result = await db.execute(
+        select(GOTerm).where(GOTerm.go_id.in_(list(all_ids)))
+    )
+    terms_by_id: dict = {t.go_id: t for t in terms_result.scalars().all()}
+
+    # 4. Build tree nodes recursively
+    def _build_node(go_id: str, visited: set) -> dict | None:
+        if go_id in visited or go_id not in terms_by_id:
+            return None
+        visited.add(go_id)
+        term = terms_by_id[go_id]
+        ep = enriched_lookup.get(go_id)
+        children_ids = [
+            t.go_id for t in terms_by_id.values()
+            if go_id in (t.is_a or []) or go_id in (t.part_of or [])
+        ]
+        children = [
+            n for cid in children_ids
+            if (n := _build_node(cid, visited)) is not None
+        ]
+        return {
+            "go_id": go_id,
+            "go_name": term.name,
+            "namespace": term.namespace,
+            "level": term.level,
+            "is_enriched": ep is not None,
+            "pvalue": ep.pvalue if ep else None,
+            "fdr": ep.padj if ep else None,
+            "enrichment_ratio": ep.enrichment_ratio if ep else None,
+            "gene_count": ep.gene_count if ep else None,
+            "genes": ep.genes if ep else [],
+            "children": children,
+        }
+
+    # 5. Find root nodes (those with no parents inside our node set)
+    def _has_parent_in_set(go_id: str) -> bool:
+        term = terms_by_id.get(go_id)
+        if not term:
+            return False
+        parents = (term.is_a or []) + (term.part_of or [])
+        return any(p in all_ids for p in parents)
+
+    root_ids = [gid for gid in all_ids if not _has_parent_in_set(gid)]
+
+    # 6. Build forest and group by namespace
+    _ns_key_map = {
+        "biological_process": "biological_process",
+        "molecular_function": "molecular_function",
+        "cellular_component": "cellular_component",
+    }
+    result_tree: dict = {"biological_process": [], "molecular_function": [], "cellular_component": []}
+    visited: set = set()
+    for root_id in sorted(root_ids):
+        node = _build_node(root_id, visited)
+        if node:
+            ns_key = _ns_key_map.get(node["namespace"])
+            if ns_key:
+                result_tree[ns_key].append(node)
+
+    return result_tree
 
 
 @router.get("/go-terms/search")

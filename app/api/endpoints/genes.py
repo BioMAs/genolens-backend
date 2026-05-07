@@ -1,23 +1,23 @@
 """
 Gene Search API endpoints.
-Search for genes across projects and return their locations.
+Search for genes across projects by querying DegGene records directly.
 """
 from uuid import UUID
 from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select, or_, and_, func
+from sqlalchemy import select, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from app.api.deps import get_db, get_current_user
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import Project, Dataset, DatasetType, DatasetStatus
+from app.models.models import Project, Dataset, DatasetType, DatasetStatus, DegGene, ProjectMember
 
 router = APIRouter(prefix="/genes", tags=["genes"])
 
 
 class GeneSearchResult(BaseModel):
-    """Single gene search result."""
+    """Single gene search result with DEG context and stats."""
     gene_symbol: str
     gene_id: Optional[str] = None
     project_id: str
@@ -26,6 +26,10 @@ class GeneSearchResult(BaseModel):
     dataset_name: str
     dataset_type: str
     comparison_name: Optional[str] = None
+    log_fc: Optional[float] = None
+    padj: Optional[float] = None
+    regulation: Optional[str] = None
+    base_mean: Optional[float] = None
 
 
 class GeneSearchResponse(BaseModel):
@@ -44,125 +48,78 @@ async def search_genes(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)] = None
 ) -> GeneSearchResponse:
     """
-    Search for genes across all user's projects.
-    
-    Searches in:
-    - DEG comparison names (from metadata)
-    - Dataset names
-    - Dataset descriptions
-    
-    Returns list of matching locations where the gene might be found.
-    
+    Search for genes across all user's DEG datasets.
+
+    Searches the DegGene table by gene_name (symbol) or gene_id (Ensembl/Entrez).
+    Returns matching genes with their DEG statistics and project/comparison context.
+
     **Parameters:**
     - **q**: Gene symbol or ID (e.g., "TP53", "ENSG00000141510")
     - **project_id**: Optional project ID to limit search scope
     - **limit**: Maximum number of results (default 20, max 100)
-    
+
     **Example:**
     ```
     GET /genes/search?q=TP53&limit=10
     GET /genes/search?q=BCL2&project_id=uuid-here
     ```
     """
-    results = []
-    
-    # Build base query for user's projects and datasets
-    query_builder = (
-        select(Project, Dataset)
-        .join(Dataset, Dataset.project_id == Project.id)
-        .where(
-            Project.owner_id == current_user.user_id,
-            Dataset.status == DatasetStatus.READY,
-        )
-    )
-    
-    # Optionally filter by project
-    if project_id:
-        query_builder = query_builder.where(Project.id == project_id)
-    
-    # Execute query
-    result = await db.execute(query_builder)
-    rows = result.all()
-    
-    # Search pattern (case-insensitive)
     search_term = q.lower()
-    
-    # Process each dataset
-    for project, dataset in rows:
-        # Check dataset name and description
-        dataset_matches = (
-            search_term in dataset.name.lower() or
-            (dataset.description and search_term in dataset.description.lower())
+
+    # Get IDs of projects shared with the user (as member)
+    member_stmt = select(ProjectMember.project_id).where(
+        ProjectMember.user_id == current_user.user_id
+    )
+    member_result = await db.execute(member_stmt)
+    member_project_ids = [row[0] for row in member_result.all()]
+
+    # Build main query: DegGene → Dataset → Project
+    stmt = (
+        select(DegGene, Dataset, Project)
+        .join(Dataset, DegGene.dataset_id == Dataset.id)
+        .join(Project, Dataset.project_id == Project.id)
+        .where(
+            or_(
+                func.lower(DegGene.gene_name).contains(search_term),
+                func.lower(DegGene.gene_id).contains(search_term),
+            ),
+            Dataset.status == DatasetStatus.READY,
+            Dataset.type == DatasetType.DEG,
+            or_(
+                Project.owner_id == current_user.user_id,
+                Project.id.in_(member_project_ids),
+            ),
         )
-        
-        # For DEG datasets, check comparison names in metadata
-        if dataset.type == DatasetType.DEG and dataset.dataset_metadata:
-            metadata = dataset.dataset_metadata
-            
-            # Check for single comparison name
-            if isinstance(metadata.get("comparison_name"), str):
-                comp_name = metadata["comparison_name"]
-                if search_term in comp_name.lower():
-                    results.append(
-                        GeneSearchResult(
-                            gene_symbol=q.upper(),
-                            project_id=str(project.id),
-                            project_name=project.name,
-                            dataset_id=str(dataset.id),
-                            dataset_name=dataset.name,
-                            dataset_type=dataset.type,
-                            comparison_name=comp_name
-                        )
-                    )
-            
-            # Check for multiple comparisons
-            elif isinstance(metadata.get("comparisons"), (list, dict)):
-                comparisons = metadata["comparisons"]
-                comp_names = comparisons if isinstance(comparisons, list) else list(comparisons.keys())
-                
-                for comp_name in comp_names:
-                    if search_term in str(comp_name).lower():
-                        results.append(
-                            GeneSearchResult(
-                                gene_symbol=q.upper(),
-                                project_id=str(project.id),
-                                project_name=project.name,
-                                dataset_id=str(dataset.id),
-                                dataset_name=dataset.name,
-                                dataset_type=dataset.type,
-                                comparison_name=comp_name
-                            )
-                        )
-        
-        # Add dataset-level match if found
-        if dataset_matches:
-            results.append(
-                GeneSearchResult(
-                    gene_symbol=q.upper(),
-                    project_id=str(project.id),
-                    project_name=project.name,
-                    dataset_id=str(dataset.id),
-                    dataset_name=dataset.name,
-                    dataset_type=dataset.type,
-                    comparison_name=None
-                )
-            )
-    
-    # Remove duplicates and limit results
-    unique_results = []
-    seen = set()
-    
-    for result in results:
-        key = (result.project_id, result.dataset_id, result.comparison_name)
-        if key not in seen:
-            seen.add(key)
-            unique_results.append(result)
-            
-            if len(unique_results) >= limit:
-                break
-    
+        .order_by(DegGene.padj.asc().nulls_last())
+        .limit(limit)
+    )
+
+    if project_id:
+        stmt = stmt.where(Project.id == project_id)
+
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    results = [
+        GeneSearchResult(
+            gene_symbol=deg_gene.gene_name or deg_gene.gene_id,
+            gene_id=deg_gene.gene_id,
+            project_id=str(project.id),
+            project_name=project.name,
+            dataset_id=str(dataset.id),
+            dataset_name=dataset.name,
+            dataset_type=dataset.type,
+            comparison_name=deg_gene.comparison_name,
+            log_fc=deg_gene.log_fc,
+            padj=deg_gene.padj,
+            regulation=deg_gene.regulation,
+            base_mean=deg_gene.base_mean,
+        )
+        for deg_gene, dataset, project in rows
+    ]
+
     return GeneSearchResponse(
-        results=unique_results,
-        total=len(unique_results),
-        query=q
+        results=results,
+        total=len(results),
+        query=q,
     )

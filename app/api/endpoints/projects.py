@@ -9,8 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 
 from app.api.deps import get_db, get_current_user
+from app.api.deps.subscription import get_or_create_user
 from app.core.supabase_auth import SupabaseUser, lookup_user_by_email
-from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, UserRole
+from app.core.plan_config import get_max_projects
+from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, UserRole, User
 from app.services import email_service, history_service
 from app.schemas.project import (
     ProjectCreate,
@@ -53,7 +55,8 @@ async def _check_project_admin(project: Project, current_user_id: UUID, db: Asyn
 async def create_project(
     project_in: ProjectCreate,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    db_user: Annotated[User, Depends(get_or_create_user)],
 ) -> Project:
     """
     Create a new project.
@@ -61,6 +64,24 @@ async def create_project(
     - **name**: Project name (required)
     - **description**: Optional project description
     """
+    # Enforce plan project limit
+    max_projects = get_max_projects(db_user.subscription_plan, db_user.role)
+    if max_projects is not None:
+        count_result = await db.execute(
+            select(func.count()).select_from(Project).where(Project.owner_id == current_user.user_id)
+        )
+        current_count = count_result.scalar_one()
+        if current_count >= max_projects:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "project_limit_reached",
+                    "max_projects": max_projects,
+                    "current_count": current_count,
+                    "message": f"Project limit reached ({current_count}/{max_projects}). Upgrade your plan to create more projects.",
+                },
+            )
+
     project = Project(
         name=project_in.name,
         description=project_in.description,
@@ -207,22 +228,9 @@ def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
             deg_up = d.deg_up_count or (metadata.get('deg_up', 0) if metadata else 0)
             deg_down = d.deg_down_count or (metadata.get('deg_down', 0) if metadata else 0)
             deg_total = d.deg_significant_count or (metadata.get('deg_total', deg_up + deg_down) if metadata else deg_up + deg_down)
-            comparisons_dict[comp_name] = ComparisonSummary(
-                name=comp_name,
-                deg_up=deg_up,
-                deg_down=deg_down,
-                deg_total=deg_total,
-                has_enrichment=False,
-                dataset_id=d.id,
-                dataset_type='SINGLE'
-            )
-
-        # Global DEG file (new way)
-        if metadata and 'comparisons' in metadata and isinstance(metadata['comparisons'], dict):
-            for comp_name, comp_info in metadata['comparisons'].items():
-                deg_up = comp_info.get('deg_up', 0)
-                deg_down = comp_info.get('deg_down', 0)
-                deg_total = comp_info.get('deg_total', deg_up + deg_down)
+            # Only set if not already present — datasets are ordered by created_at DESC,
+            # so the first occurrence is the newest and should take precedence.
+            if comp_name not in comparisons_dict:
                 comparisons_dict[comp_name] = ComparisonSummary(
                     name=comp_name,
                     deg_up=deg_up,
@@ -230,8 +238,25 @@ def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
                     deg_total=deg_total,
                     has_enrichment=False,
                     dataset_id=d.id,
-                    dataset_type='GLOBAL'
+                    dataset_type='SINGLE'
                 )
+
+        # Global DEG file (new way)
+        if metadata and 'comparisons' in metadata and isinstance(metadata['comparisons'], dict):
+            for comp_name, comp_info in metadata['comparisons'].items():
+                deg_up = comp_info.get('deg_up', 0)
+                deg_down = comp_info.get('deg_down', 0)
+                deg_total = comp_info.get('deg_total', deg_up + deg_down)
+                if comp_name not in comparisons_dict:
+                    comparisons_dict[comp_name] = ComparisonSummary(
+                        name=comp_name,
+                        deg_up=deg_up,
+                        deg_down=deg_down,
+                        deg_total=deg_total,
+                        has_enrichment=False,
+                        dataset_id=d.id,
+                        dataset_type='GLOBAL'
+                    )
 
     # Mark comparisons with enrichment (check both ENRICHMENT datasets and DEG datasets)
     for d in datasets:
@@ -358,7 +383,7 @@ async def get_project_summary(
             failed_count=failed_count,
             original_files_count=original_files_count
         ),
-        "comparisons": [],
+        "comparisons": all_comparisons,
         "original_files": original_files
     }
 

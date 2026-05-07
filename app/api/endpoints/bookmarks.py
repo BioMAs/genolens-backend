@@ -106,7 +106,7 @@ async def create_bookmark(
             entity_id=str(new_bookmark.id),
             entity_name=new_bookmark.gene_symbol,
         )
-        return new_bookmark
+        return GeneBookmarkResponse.model_validate(new_bookmark, from_attributes=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -179,7 +179,7 @@ async def update_bookmark(
             color=bookmark.color,
             is_favorite=bookmark.is_favorite
         )
-        return updated
+        return GeneBookmarkResponse.model_validate(updated, from_attributes=True)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

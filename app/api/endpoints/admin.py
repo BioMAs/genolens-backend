@@ -33,6 +33,7 @@ class UserProfile(BaseModel):
     avatar_url: Optional[str] = None
     role: str
     subscription_plan: str
+    status: str = "active"
     ai_interpretations_used: int = 0
     ai_tokens_purchased: int = 0
     ai_tokens_used: int = 0
@@ -220,9 +221,32 @@ async def list_users(
                     created_at=profile.get("created_at"),
                     updated_at=profile.get("updated_at"),
                     last_sign_in_at=auth_info.get("last_sign_in_at"),
-                    confirmed_at=auth_info.get("confirmed_at")
+                    confirmed_at=auth_info.get("confirmed_at"),
+                    status=local_user.status.value if local_user else "active",
                 ))
-            
+
+            # Append invited users who only exist in the local DB (no Supabase profile yet)
+            seen_ids = {profile["id"] for profile in profiles}
+            for local_user in local_users.values():
+                if local_user.status == UserStatus.PENDING and str(local_user.id) not in seen_ids:
+                    result.append(UserProfile(
+                        id=local_user.id,
+                        email=local_user.email,
+                        full_name=local_user.full_name,
+                        avatar_url=None,
+                        role="USER",
+                        subscription_plan=local_user.subscription_plan.value,
+                        ai_interpretations_used=local_user.ai_interpretations_used,
+                        ai_interpretations_remaining=local_user.ai_interpretations_remaining,
+                        ai_tokens_purchased=local_user.ai_tokens_purchased,
+                        ai_tokens_used=local_user.ai_tokens_used,
+                        created_at=str(local_user.created_at) if local_user.created_at else None,
+                        updated_at=str(local_user.updated_at) if local_user.updated_at else None,
+                        last_sign_in_at=None,
+                        confirmed_at=None,
+                        status="pending",
+                    ))
+
             return result
     except Exception as e:
         logger.error(f"Error fetching users: {e}")
@@ -249,6 +273,27 @@ async def invite_user(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return {"id": str(user.id), "email": user.email, "status": user.status.value}
+
+
+@router.post("/users/{user_id}/resend-invite", status_code=status.HTTP_200_OK)
+async def resend_invite(
+    user_id: UUID,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin: resend the invitation email to a pending user."""
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if user.status != UserStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only pending users can receive an invitation resend",
+        )
+    from app.services.email_service import send_invitation_email
+    await send_invitation_email(to_email=user.email, full_name=user.full_name)
+    return {"detail": "Invitation email resent", "email": user.email}
 
 
 @router.patch("/users/{user_id}/status")
