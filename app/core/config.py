@@ -94,6 +94,16 @@ class Settings(BaseSettings):
         description="Public URL of the frontend application (used in email links)"
     )
 
+    # License service
+    LICENSE_SERVER_URL: Optional[str] = Field(
+        None,
+        description="Base URL of the license microservice (e.g. https://licences.genolens.com)"
+    )
+    LICENSE_ADMIN_API_KEY: Optional[str] = Field(
+        None,
+        description="Admin API key for the license service (matches ADMIN_API_KEY in license .env)"
+    )
+
     # Stripe
     stripe_secret_key: str = Field(default="", description="Stripe secret key (sk_live_* or sk_test_*)")
     stripe_publishable_key: str = Field(default="", description="Stripe publishable key (pk_live_* or pk_test_*)")
