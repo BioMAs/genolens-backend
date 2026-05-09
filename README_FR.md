@@ -20,16 +20,16 @@ GenoLens Next est une plateforme backend **"Bring Your Own Data"** qui permet au
 - Docker & Docker Compose installés
 - Compte Supabase (gratuit)
 
-### Étape 1: Configuration Supabase ✅ **TERMINÉE**
+### Étape 1: Configuration Supabase
 
-Vos informations ont déjà été configurées:
-- Project ID: `isgftccberaycrthevod`
-- URL: `https://isgftccberaycrthevod.supabase.co`
-- Clés API: Configurées dans `.env`
+Copiez `.env.example` vers `.env` et renseignez vos informations Supabase:
+- `SUPABASE_URL` — URL de votre projet Supabase
+- `SUPABASE_KEY` — Clé anon publique
+- `SUPABASE_JWT_SECRET` — Secret JWT (onglet API Settings)
 
 ### Étape 2: Créer le Bucket Storage (2 minutes)
 
-1. Allez sur: https://supabase.com/dashboard/project/isgftccberaycrthevod/storage/buckets
+1. Allez sur: https://supabase.com/dashboard/project/<votre-project-ref>/storage/buckets
 2. Cliquez sur **"New bucket"**
 3. Nom: `genolens-data`
 4. Type: **Private** ✓
@@ -111,15 +111,15 @@ make help       # Voir toutes les commandes
 ### 1. Créer un Utilisateur
 
 **Via l'interface Supabase:**
-1. https://supabase.com/dashboard/project/isgftccberaycrthevod/auth/users
+1. https://supabase.com/dashboard/project/<votre-project-ref>/auth/users
 2. Cliquez sur "Add user" → "Create new user"
 3. Email: `test@genolens.com`
 4. Password: `TestPassword123!`
 
 **Via l'API:**
 ```bash
-curl -X POST 'https://isgftccberaycrthevod.supabase.co/auth/v1/signup' \
-  -H "apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzZ2Z0Y2NiZXJheWNydGhldm9kIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ2MTc1MzIsImV4cCI6MjA2MDE5MzUzMn0.qwZDM6CYKzs5AYw3CwfkbDPPA5m4fIgHZbqXV7TOFig" \
+curl -X POST 'https://<votre-project-ref>.supabase.co/auth/v1/signup' \
+  -H "apikey: <votre-anon-key>" \
   -H "Content-Type: application/json" \
   -d '{"email":"test@genolens.com","password":"TestPassword123!"}'
 ```
@@ -127,8 +127,8 @@ curl -X POST 'https://isgftccberaycrthevod.supabase.co/auth/v1/signup' \
 ### 2. Obtenir un Token
 
 ```bash
-curl -X POST 'https://isgftccberaycrthevod.supabase.co/auth/v1/token?grant_type=password' \
-  -H "apikey: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzZ2Z0Y2NiZXJheWNydGhldm9kIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ2MTc1MzIsImV4cCI6MjA2MDE5MzUzMn0.qwZDM6CYKzs5AYw3CwfkbDPPA5m4fIgHZbqXV7TOFig" \
+curl -X POST 'https://<votre-project-ref>.supabase.co/auth/v1/token?grant_type=password' \
+  -H "apikey: <votre-anon-key>" \
   -H "Content-Type: application/json" \
   -d '{"email":"test@genolens.com","password":"TestPassword123!"}'
 ```
@@ -278,7 +278,7 @@ docker-compose restart worker
 
 - **Documentation**: Voir [START_HERE.md](START_HERE.md)
 - **Issues**: GitHub Issues
-- **Supabase Dashboard**: https://supabase.com/dashboard/project/isgftccberaycrthevod
+- **Supabase Dashboard**: https://supabase.com/dashboard/project/<votre-project-ref>
 
 ## 🎓 Ressources
 
@@ -290,9 +290,9 @@ docker-compose restart worker
 ```
 
 ### Liens Rapides
-- **Dashboard Supabase**: https://supabase.com/dashboard/project/isgftccberaycrthevod
-- **Storage**: https://supabase.com/dashboard/project/isgftccberaycrthevod/storage/buckets
-- **Auth**: https://supabase.com/dashboard/project/isgftccberaycrthevod/auth/users
+- **Dashboard Supabase**: https://supabase.com/dashboard/project/<votre-project-ref>
+- **Storage**: https://supabase.com/dashboard/project/<votre-project-ref>/storage/buckets
+- **Auth**: https://supabase.com/dashboard/project/<votre-project-ref>/auth/users
 
 ## ✅ Checklist de Démarrage
 
