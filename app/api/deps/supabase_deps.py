@@ -77,7 +77,7 @@ async def require_admin(
     """
     from app.models.models import UserRole
     
-    if current_user.role != UserRole.ADMIN:
+    if current_user.role not in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin access required"

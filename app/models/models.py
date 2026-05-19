@@ -17,6 +17,7 @@ from app.models.base import Base, TimestampMixin
 class UserRole(str, enum.Enum):
     """User roles in the system."""
     ADMIN = "ADMIN"  # Full access: manage users, projects, subscriptions, upload analyses
+    SCILICIUM_ADMIN = "SCILICIUM_ADMIN"  # Scilicium internal admin (same access as ADMIN + license management)
     USER = "USER"  # Standard user with subscription-based access
 
 
