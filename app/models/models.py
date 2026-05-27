@@ -23,9 +23,9 @@ class UserRole(str, enum.Enum):
 
 class SubscriptionPlan(str, enum.Enum):
     """Subscription plans with different feature access."""
-    BASIC = "BASIC"  # Access own projects for visualization and sharing only
-    PREMIUM = "PREMIUM"  # + AI interpretation (15 free, then purchase tokens)
-    ADVANCED = "ADVANCED"  # + Launch analyses + unlimited AI (coming soon)
+    STARTER = "STARTER"     # 3 users, 15 projects, 30 comparisons/month
+    TEAM = "TEAM"           # 10 users, unlimited projects, 150 comparisons/month + AI
+    ON_PREMISE = "ON_PREMISE"  # Self-hosted, unlimited everything
 
 
 class DatasetType(str, enum.Enum):
@@ -526,45 +526,111 @@ class User(Base, TimestampMixin):
     subscription_plan: Mapped[SubscriptionPlan] = mapped_column(
         SQLEnum(SubscriptionPlan, name="subscription_plan_enum"),
         nullable=False,
-        default=SubscriptionPlan.BASIC
+        default=SubscriptionPlan.STARTER
     )
-    
-    # AI interpretation quotas (for PREMIUM users)
+
+    # AI interpretation quotas (for TEAM users)
     ai_interpretations_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     ai_tokens_purchased: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     ai_tokens_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    
+
     # Subscription management
     subscription_starts_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     subscription_ends_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
-    
+
     # Stripe integration (for future)
     stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True)
     stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
+    # Comparison quota (resets monthly)
+    comparisons_used_this_month: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0,
+        comment="Counter reset on the 1st of each month"
+    )
+    quota_reset_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Timestamp of last monthly quota reset"
+    )
+
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email}, role={self.role}, plan={self.subscription_plan})>"
-    
+
     @property
     def can_use_ai(self) -> bool:
-        """Check if user can use AI features."""
-        return self.role == UserRole.ADMIN or self.subscription_plan in [SubscriptionPlan.PREMIUM, SubscriptionPlan.ADVANCED]
-    
-    @property
-    def ai_interpretations_remaining(self) -> int:
-        """Calculate remaining AI interpretations for PREMIUM users."""
-        if self.subscription_plan != SubscriptionPlan.PREMIUM:
-            return -1  # Unlimited or not applicable
-        
-        free_limit = 15
-        purchased = self.ai_tokens_purchased - self.ai_tokens_used
-        return max(0, (free_limit - self.ai_interpretations_used) + purchased)
-    
+        """TEAM and ON_PREMISE only. ADMIN always yes."""
+        return self.role == UserRole.ADMIN or self.subscription_plan in (
+            SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
+        )
+
     @property
     def can_launch_analyses(self) -> bool:
-        """Check if user can launch new analyses."""
-        return self.role == UserRole.ADMIN or self.subscription_plan == SubscriptionPlan.ADVANCED
+        """All paid plans can launch analyses (subject to comparison quota)."""
+        return self.role == UserRole.ADMIN or self.subscription_plan in (
+            SubscriptionPlan.STARTER, SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
+        )
+
+    @property
+    def can_use_multi_comparison(self) -> bool:
+        """Multi-comparison reserved for TEAM and ON_PREMISE."""
+        return self.role == UserRole.ADMIN or self.subscription_plan in (
+            SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
+        )
+
+    @property
+    def can_export_advanced(self) -> bool:
+        """PDF/Excel export reserved for TEAM and ON_PREMISE."""
+        return self.role == UserRole.ADMIN or self.subscription_plan in (
+            SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
+        )
+
+    @property
+    def comparisons_quota(self) -> Optional[int]:
+        """Monthly comparison quota. None = unlimited."""
+        if self.role == UserRole.ADMIN:
+            return None
+        return {
+            SubscriptionPlan.STARTER: 30,
+            SubscriptionPlan.TEAM: 150,
+            SubscriptionPlan.ON_PREMISE: None,
+        }.get(self.subscription_plan, 30)
+
+    @property
+    def comparisons_remaining(self) -> Optional[int]:
+        """Remaining comparisons this month. None = unlimited."""
+        quota = self.comparisons_quota
+        if quota is None:
+            return None
+        return max(0, quota - self.comparisons_used_this_month)
+
+    @property
+    def max_projects(self) -> Optional[int]:
+        """Max number of projects. None = unlimited."""
+        if self.role == UserRole.ADMIN:
+            return None
+        return {
+            SubscriptionPlan.STARTER: 15,
+            SubscriptionPlan.TEAM: None,
+            SubscriptionPlan.ON_PREMISE: None,
+        }.get(self.subscription_plan, 15)
+
+    @property
+    def max_datasets_per_project(self) -> Optional[int]:
+        """Max datasets per project. None = unlimited."""
+        if self.role == UserRole.ADMIN:
+            return None
+        return {
+            SubscriptionPlan.STARTER: 5,
+            SubscriptionPlan.TEAM: None,
+            SubscriptionPlan.ON_PREMISE: None,
+        }.get(self.subscription_plan, 5)
+
+    @property
+    def ai_interpretations_remaining(self) -> Optional[int]:
+        """TEAM: 1 per comparison (enforced at endpoint). ON_PREMISE: unlimited."""
+        if self.subscription_plan == SubscriptionPlan.ON_PREMISE or self.role == UserRole.ADMIN:
+            return None
+        return -1  # STARTER: no access
 
 
 class AIUsageLog(Base, TimestampMixin):
@@ -1324,6 +1390,138 @@ class ProjectActivityLog(Base):
 
     def __repr__(self) -> str:
         return f"<ProjectActivityLog(project={self.project_id}, event={self.event_type}, user={self.user_id})>"
+
+
+class LicenseRecord(Base, TimestampMixin):
+    """
+    Issued application licenses for on-premise GenoLens deployments.
+    Each record holds the signed license key and its metadata.
+    """
+    __tablename__ = "license_records"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    client_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    plan: Mapped[str] = mapped_column(String(50), nullable=False)
+    product: Mapped[str] = mapped_column(String(100), nullable=False, default="genolens")
+    expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    license_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_revoked: Mapped[bool] = mapped_column(default=False, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    __table_args__ = (
+        Index("ix_license_records_client_id", "client_id"),
+        Index("ix_license_records_expires_at", "expires_at"),
+    )
+
+    @property
+    def is_expired(self) -> bool:
+        import time
+        return time.time() > self.expires_at
+
+    @property
+    def days_until_expiry(self) -> Optional[int]:
+        import time
+        seconds_left = self.expires_at - time.time()
+        if seconds_left < 0:
+            return None
+        return int(seconds_left // 86400)
+
+    def __repr__(self) -> str:
+        return f"<LicenseRecord(client={self.client_id}, plan={self.plan}, expires={self.expires_at})>"
+
+
+class DeploymentStatus(str, enum.Enum):
+    """Status values for a deployment job."""
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class ServerConfig(Base, TimestampMixin):
+    """
+    ServerConfig: Connection details for an on-premise deployment target.
+    SSH private key is stored encrypted (Fernet) using DEPLOYMENT_ENCRYPTION_KEY.
+    """
+    __tablename__ = "server_configs"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, comment="Human-readable label (e.g. 'Client Acme – prod')")
+    host: Mapped[str] = mapped_column(String(255), nullable=False, comment="IP or hostname of the target server")
+    ssh_port: Mapped[int] = mapped_column(Integer, nullable=False, default=22)
+    ssh_user: Mapped[str] = mapped_column(String(100), nullable=False, default="ubuntu")
+    ssh_key_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="Fernet-encrypted SSH private key PEM")
+    repo_path: Mapped[str] = mapped_column(String(500), nullable=False, default="/opt/genolens", comment="Absolute path to the repo on the remote server")
+    health_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True, comment="URL polled for health check after deployment")
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Relationships
+    secrets: Mapped[list["DeploymentSecret"]] = relationship(back_populates="server", cascade="all, delete-orphan")
+    jobs: Mapped[list["DeploymentJob"]] = relationship(back_populates="server", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("ix_server_configs_host", "host"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ServerConfig(id={self.id}, name={self.name}, host={self.host})>"
+
+
+class DeploymentSecret(Base, TimestampMixin):
+    """
+    DeploymentSecret: A single key/value pair for a server's .env.deploy file.
+    The value is stored encrypted (Fernet). Keys are stored in plain text.
+    """
+    __tablename__ = "deployment_secrets"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    server_id: Mapped[UUID] = mapped_column(ForeignKey("server_configs.id", ondelete="CASCADE"), nullable=False, index=True)
+    key: Mapped[str] = mapped_column(String(255), nullable=False, comment="Environment variable name (e.g. POSTGRES_PASSWORD)")
+    value_encrypted: Mapped[str] = mapped_column(Text, nullable=False, comment="Fernet-encrypted value")
+
+    # Relationship
+    server: Mapped["ServerConfig"] = relationship(back_populates="secrets")
+
+    __table_args__ = (
+        Index("ix_deployment_secrets_server_key", "server_id", "key", unique=True),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DeploymentSecret(server_id={self.server_id}, key={self.key})>"
+
+
+class DeploymentJob(Base, TimestampMixin):
+    """
+    DeploymentJob: Tracks a single deployment run triggered from the admin UI.
+    Logs are appended line-by-line; secrets are never written to logs.
+    """
+    __tablename__ = "deployment_jobs"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    server_id: Mapped[UUID] = mapped_column(ForeignKey("server_configs.id", ondelete="SET NULL"), nullable=True, index=True)
+    services: Mapped[list] = mapped_column(JSON, nullable=False, default=list, comment="List of service names deployed: backend, license, ai")
+    skip_build: Mapped[bool] = mapped_column(nullable=False, default=False)
+    status: Mapped[DeploymentStatus] = mapped_column(
+        SQLEnum(DeploymentStatus, name="deployment_status_enum"),
+        nullable=False,
+        default=DeploymentStatus.PENDING,
+        index=True,
+    )
+    logs: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="Append-only deployment log (no secrets)")
+    triggered_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, comment="User ID who triggered the deployment")
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Relationship
+    server: Mapped[Optional["ServerConfig"]] = relationship(back_populates="jobs")
+
+    __table_args__ = (
+        Index("ix_deployment_jobs_status_created", "status", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DeploymentJob(id={self.id}, server_id={self.server_id}, status={self.status})>"
 
 
 class UserLoginEvent(Base):
