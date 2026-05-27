@@ -410,6 +410,82 @@ async def send_reply_notification(
     )
 
 
+def _quota_warning_html(
+    to: str,
+    used: int,
+    quota: int,
+    plan: str,
+    pricing_url: str,
+) -> str:
+    remaining = quota - used
+    content = f"""
+      <p>Bonjour,</p>
+      <p>
+        Vous avez utilisé <strong>{used} comparaisons</strong> sur <strong>{quota}</strong>
+        ce mois-ci (forfait <strong>{plan}</strong>).
+      </p>
+      <div class="highlight-box">
+        <p>Il vous reste <strong>{remaining} comparaison{'s' if remaining > 1 else ''}</strong> pour ce mois.</p>
+      </div>
+      <p>
+        Pour continuer vos analyses sans interruption, vous pouvez passer à un forfait supérieur
+        depuis votre espace tarifaire.
+      </p>
+      <a href="{pricing_url}" class="btn">Voir les forfaits →</a>
+      <div class="meta">
+        <p>Lien direct : <a href="{pricing_url}">{pricing_url}</a></p>
+      </div>
+    """
+    return _base_layout(f"GenoLens — {remaining} comparaisons restantes ce mois", content)
+
+
+def _quota_warning_text(
+    to: str,
+    used: int,
+    quota: int,
+    plan: str,
+    pricing_url: str,
+) -> str:
+    remaining = quota - used
+    return (
+        f"Bonjour,\n\n"
+        f"Vous avez utilisé {used} comparaisons sur {quota} ce mois-ci (forfait {plan}).\n\n"
+        f"Il vous reste {remaining} comparaison{'s' if remaining > 1 else ''} pour ce mois.\n\n"
+        f"Pour continuer vos analyses sans interruption, consultez nos forfaits :\n"
+        f"{pricing_url}\n\n"
+        f"— L'équipe GenoLens"
+    )
+
+
+async def send_quota_warning_email(
+    to: str,
+    used: int,
+    quota: int,
+    plan: str,
+) -> bool:
+    """Send a quota warning email when usage approaches the monthly limit."""
+    remaining = quota - used
+    pricing_url = f"{settings.APP_URL}/pricing"
+    return await send_email(
+        to=to,
+        subject=f"GenoLens — {remaining} comparaisons restantes ce mois",
+        html_body=_quota_warning_html(
+            to=to,
+            used=used,
+            quota=quota,
+            plan=plan,
+            pricing_url=pricing_url,
+        ),
+        text_body=_quota_warning_text(
+            to=to,
+            used=used,
+            quota=quota,
+            plan=plan,
+            pricing_url=pricing_url,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Mention parsing helper
 # ---------------------------------------------------------------------------
