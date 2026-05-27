@@ -27,5 +27,14 @@ class User(UserInDBBase):
     pass
 
 class UserSelf(User):
-    """Schema for returning the user's own profile with subscription details"""
-    pass
+    """Schema for returning the user's own profile with quota details."""
+    # Monthly quota tracking (column on User model)
+    comparisons_used_this_month: int = 0
+    # Computed from @property methods on User model
+    comparisons_quota: Optional[int] = None       # None = unlimited
+    comparisons_remaining: Optional[int] = None   # None = unlimited
+    max_projects: Optional[int] = None
+    max_datasets_per_project: Optional[int] = None
+    can_use_ai: bool = False
+    can_use_multi_comparison: bool = False
+    can_export_advanced: bool = False
