@@ -558,36 +558,36 @@ class User(Base, TimestampMixin):
 
     @property
     def can_use_ai(self) -> bool:
-        """TEAM and ON_PREMISE only. ADMIN always yes."""
-        return self.role == UserRole.ADMIN or self.subscription_plan in (
+        """TEAM and ON_PREMISE only. ADMIN/SCILICIUM_ADMIN always yes."""
+        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.subscription_plan in (
             SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
         )
 
     @property
     def can_launch_analyses(self) -> bool:
         """All paid plans can launch analyses (subject to comparison quota)."""
-        return self.role == UserRole.ADMIN or self.subscription_plan in (
+        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.subscription_plan in (
             SubscriptionPlan.STARTER, SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
         )
 
     @property
     def can_use_multi_comparison(self) -> bool:
         """Multi-comparison reserved for TEAM and ON_PREMISE."""
-        return self.role == UserRole.ADMIN or self.subscription_plan in (
+        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.subscription_plan in (
             SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
         )
 
     @property
     def can_export_advanced(self) -> bool:
         """PDF/Excel export reserved for TEAM and ON_PREMISE."""
-        return self.role == UserRole.ADMIN or self.subscription_plan in (
+        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.subscription_plan in (
             SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
         )
 
     @property
     def comparisons_quota(self) -> Optional[int]:
         """Monthly comparison quota. None = unlimited."""
-        if self.role == UserRole.ADMIN:
+        if self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
         return {
             SubscriptionPlan.STARTER: 30,
@@ -606,7 +606,7 @@ class User(Base, TimestampMixin):
     @property
     def max_projects(self) -> Optional[int]:
         """Max number of projects. None = unlimited."""
-        if self.role == UserRole.ADMIN:
+        if self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
         return {
             SubscriptionPlan.STARTER: 15,
@@ -617,7 +617,7 @@ class User(Base, TimestampMixin):
     @property
     def max_datasets_per_project(self) -> Optional[int]:
         """Max datasets per project. None = unlimited."""
-        if self.role == UserRole.ADMIN:
+        if self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
         return {
             SubscriptionPlan.STARTER: 5,
@@ -627,8 +627,8 @@ class User(Base, TimestampMixin):
 
     @property
     def ai_interpretations_remaining(self) -> Optional[int]:
-        """TEAM: 1 per comparison (enforced at endpoint). ON_PREMISE: unlimited."""
-        if self.subscription_plan == SubscriptionPlan.ON_PREMISE or self.role == UserRole.ADMIN:
+        """TEAM/ON_PREMISE: None (AI access governed at endpoint). STARTER: -1 (no access)."""
+        if self.subscription_plan in (SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE) or self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
         return -1  # STARTER: no access
 

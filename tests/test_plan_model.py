@@ -124,3 +124,48 @@ def test_starter_max_datasets_per_project():
 def test_team_max_datasets_per_project():
     u = make_user(SubscriptionPlan.TEAM)
     assert u.max_datasets_per_project is None
+
+
+def test_team_ai_interpretations_remaining_is_none():
+    """TEAM has AI access governed at endpoint — property returns None."""
+    u = make_user(SubscriptionPlan.TEAM)
+    assert u.ai_interpretations_remaining is None
+
+
+def test_starter_ai_interpretations_remaining_is_minus_one():
+    u = make_user(SubscriptionPlan.STARTER)
+    assert u.ai_interpretations_remaining == -1
+
+
+def test_comparisons_remaining_clamps_at_zero():
+    """If used > quota (e.g., data inconsistency), remaining clamps to 0."""
+    u = make_user(SubscriptionPlan.STARTER)
+    u.comparisons_used_this_month = 35  # over the 30 quota
+    assert u.comparisons_remaining == 0
+
+
+def test_on_premise_can_launch_analyses():
+    u = make_user(SubscriptionPlan.ON_PREMISE)
+    assert u.can_launch_analyses is True
+
+
+def test_on_premise_can_use_multi_comparison():
+    u = make_user(SubscriptionPlan.ON_PREMISE)
+    assert u.can_use_multi_comparison is True
+
+
+def test_on_premise_can_export_advanced():
+    u = make_user(SubscriptionPlan.ON_PREMISE)
+    assert u.can_export_advanced is True
+
+
+def test_scilicium_admin_has_no_quota():
+    u = make_user(SubscriptionPlan.STARTER)
+    u.role = UserRole.SCILICIUM_ADMIN
+    assert u.comparisons_quota is None
+
+
+def test_scilicium_admin_can_use_ai():
+    u = make_user(SubscriptionPlan.STARTER)
+    u.role = UserRole.SCILICIUM_ADMIN
+    assert u.can_use_ai is True
