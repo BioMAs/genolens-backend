@@ -17,7 +17,7 @@ class SupabaseUser(BaseModel):
     user_id: UUID
     email: str
     role: UserRole = UserRole.USER
-    subscription_tier: SubscriptionPlan = SubscriptionPlan.BASIC
+    subscription_tier: SubscriptionPlan = SubscriptionPlan.STARTER
     max_projects: int = 1
     features_access: dict = {}
     user_metadata: dict = {}
@@ -104,14 +104,14 @@ async def verify_supabase_token(token: str) -> Optional[SupabaseUser]:
         user_metadata = payload.get("user_metadata", {})
         
         # Handle subscription plan mapping
-        sub_plan_str = user_metadata.get("subscription_tier", "BASIC").upper()
-        if sub_plan_str == "FREE":
-            sub_plan_str = "BASIC"
-            
+        sub_plan_str = user_metadata.get("subscription_tier", "STARTER").upper()
+        if sub_plan_str in ("FREE", "BASIC"):
+            sub_plan_str = "STARTER"
+
         try:
             subscription_plan = SubscriptionPlan(sub_plan_str)
         except ValueError:
-            subscription_plan = SubscriptionPlan.BASIC
+            subscription_plan = SubscriptionPlan.STARTER
 
         return SupabaseUser(
             user_id=user_id,

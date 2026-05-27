@@ -9,8 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 
 from app.api.deps import get_db, get_current_user
+from app.api.deps.license import require_active_license
+from app.api.deps.subscription import get_or_create_user
 from app.core.supabase_auth import SupabaseUser, lookup_user_by_email
-from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, UserRole
+from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, UserRole, User
 from app.services import email_service, history_service
 from app.schemas.project import (
     ProjectCreate,
@@ -49,11 +51,12 @@ async def _check_project_admin(project: Project, current_user_id: UUID, db: Asyn
     return result.scalar_one_or_none() is not None
 
 
-@router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_active_license)])
 async def create_project(
     project_in: ProjectCreate,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    db_user: Annotated[User, Depends(get_or_create_user)],
 ) -> Project:
     """
     Create a new project.
@@ -61,16 +64,35 @@ async def create_project(
     - **name**: Project name (required)
     - **description**: Optional project description
     """
+    # ── Enforce project limit by plan ─────────────────────────────────────────
+    if db_user.max_projects is not None:
+        count_result = await db.execute(
+            select(func.count()).select_from(Project).where(
+                Project.owner_id == current_user.user_id
+            )
+        )
+        project_count = count_result.scalar_one()
+        if project_count >= db_user.max_projects:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Project limit reached ({db_user.max_projects} projects max "
+                    f"on {db_user.subscription_plan.value} plan). "
+                    f"Upgrade to TEAM or ON_PREMISE for unlimited projects."
+                )
+            )
+    # ─────────────────────────────────────────────────────────────────────────
+
     project = Project(
         name=project_in.name,
         description=project_in.description,
         owner_id=current_user.user_id
     )
-    
+
     db.add(project)
     await db.commit()
     await db.refresh(project)
-    
+
     return project
 
 
