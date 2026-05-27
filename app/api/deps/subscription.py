@@ -6,7 +6,7 @@ from uuid import UUID
 from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps.supabase_deps import get_current_user
@@ -173,10 +173,14 @@ async def check_comparison_quota(
     if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
         return user
 
-    _reset_quota_if_new_month(user)
+    reset_happened = _reset_quota_if_new_month(user)
 
     remaining = user.comparisons_remaining
     if remaining is not None and remaining <= 0:
+        # Persist any reset even when blocking, so next request doesn't re-reset
+        if reset_happened:
+            db.add(user)
+            await db.commit()
         quota = user.comparisons_quota
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -187,8 +191,9 @@ async def check_comparison_quota(
             )
         )
 
-    db.add(user)
-    await db.commit()
+    if reset_happened:
+        db.add(user)
+        await db.commit()
     return user
 
 
@@ -201,21 +206,31 @@ async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
     if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or user.comparisons_quota is None:
         return  # Unlimited — skip
 
-    user.comparisons_used_this_month += 1
-    db.add(user)
+    await db.execute(
+        update(User)
+        .where(User.id == user.id)
+        .values(comparisons_used_this_month=User.comparisons_used_this_month + 1)
+    )
     await db.commit()
+    await db.refresh(user)
 
-    # 80% warning
+    # 80% warning — fire and forget, never block the upload
     quota = user.comparisons_quota
     used = user.comparisons_used_this_month
     if quota and used == int(quota * 0.8):
-        from app.services.email_service import send_quota_warning_email
-        await send_quota_warning_email(
-            to=user.email,
-            used=used,
-            quota=quota,
-            plan=user.subscription_plan.value,
-        )
+        try:
+            from app.services.email_service import send_quota_warning_email
+            await send_quota_warning_email(
+                to=user.email,
+                used=used,
+                quota=quota,
+                plan=user.subscription_plan.value,
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to send 80%% quota warning email to %s", user.email
+            )
 
 
 # ── Legacy alias (backward compat with existing callers) ─────────────────────
