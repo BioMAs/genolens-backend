@@ -94,6 +94,18 @@ class Settings(BaseSettings):
         description="Public URL of the frontend application (used in email links)"
     )
 
+    # License
+    GENOLENS_LICENSE_KEY: Optional[str] = Field(None, description="Application license key issued by Scilicium")
+    LICENSE_SECRET_KEY: Optional[str] = Field(None, description="HMAC secret used to validate the license key")
+    LICENSE_PRODUCT: str = Field(default="genolens", description="Product identifier embedded in the license key")
+
+    # Deployment tool
+    DEPLOYMENT_ENCRYPTION_KEY: Optional[str] = Field(
+        None,
+        description="Fernet key for encrypting SSH keys and deployment secrets at rest. "
+                    "Generate with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    )
+
     # Email / SMTP
     SMTP_HOST: Optional[str] = Field(None, description="SMTP host (e.g. smtp.sendgrid.net)")
     SMTP_PORT: int = Field(default=587, description="SMTP port")
@@ -103,6 +115,14 @@ class Settings(BaseSettings):
     SMTP_STARTTLS: bool = Field(default=True, description="Use STARTTLS (port 587)")
     EMAIL_FROM_ADDRESS: Optional[str] = Field(None, description="From address for outgoing emails")
     EMAIL_FROM_NAME: str = Field(default="GenoLens", description="Display name for outgoing emails")
+
+    # Stripe
+    STRIPE_SECRET_KEY: Optional[str] = Field(None, description="Stripe secret key (sk_live_... or sk_test_...)")
+    STRIPE_WEBHOOK_SECRET: Optional[str] = Field(None, description="Stripe webhook endpoint secret (whsec_...)")
+    STRIPE_PRICE_STARTER_MONTHLY: str = Field(default="", description="Stripe Price ID for STARTER monthly (price_...)")
+    STRIPE_PRICE_STARTER_ANNUAL: str = Field(default="", description="Stripe Price ID for STARTER annual (price_...)")
+    STRIPE_PRICE_TEAM_MONTHLY: str = Field(default="", description="Stripe Price ID for TEAM monthly (price_...)")
+    STRIPE_PRICE_TEAM_ANNUAL: str = Field(default="", description="Stripe Price ID for TEAM annual (price_...)")
 
     @property
     def celery_broker(self) -> str:
