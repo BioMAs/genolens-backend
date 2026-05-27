@@ -25,11 +25,14 @@ from fastapi import (
 from fastapi.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_user, get_db
+from app.api.deps.license import require_active_license
 from app.api.deps.subscription import (
     get_or_create_user,
     require_ai_access,
     check_ai_quota,
-    increment_ai_usage
+    increment_ai_usage,
+    check_comparison_quota,
+    increment_comparison_usage,
 )
 # from app.db.session import get_db  <-- Removed
 from app.core.supabase_auth import SupabaseUser
@@ -110,10 +113,11 @@ async def _check_project_read_access(project_id: UUID, current_user_id: UUID, db
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 
-@router.post("/upload", response_model=DatasetUploadResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/upload", response_model=DatasetUploadResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_active_license)])
 async def upload_dataset(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    db_user: Annotated[User, Depends(get_or_create_user)],
     project_id: UUID = Form(...),
     name: str = Form(...),
     dataset_type: DatasetType = Form(...),
@@ -149,6 +153,31 @@ async def upload_dataset(
             detail="Project not found"
         )
 
+    # ── Quota checks for DEG uploads ──────────────────────────────────────────
+    if dataset_type == DatasetType.DEG:
+        # Check monthly comparison quota (auto-resets if new month, raises 429 if exhausted)
+        db_user = await check_comparison_quota(db_user, db)
+
+        # Check dataset limit per project
+        if db_user.max_datasets_per_project is not None:
+            count_result = await db.execute(
+                select(func.count()).select_from(Dataset).where(
+                    Dataset.project_id == project_id,
+                    Dataset.type == DatasetType.DEG
+                )
+            )
+            dataset_count = count_result.scalar_one()
+            if dataset_count >= db_user.max_datasets_per_project:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        f"Dataset limit reached ({db_user.max_datasets_per_project} datasets max per project "
+                        f"on {db_user.subscription_plan.value} plan). "
+                        f"Upgrade to TEAM or ON_PREMISE for unlimited datasets."
+                    )
+                )
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Create dataset entry
     metadata = {
         "original_filename": file.filename,
@@ -179,6 +208,10 @@ async def upload_dataset(
     db.add(dataset)
     await db.commit()
     await db.refresh(dataset)
+
+    # Increment comparison counter AFTER successful DB commit
+    if dataset_type == DatasetType.DEG:
+        await increment_comparison_usage(db_user, db)
 
     # Trigger Celery task
     process_dataset_upload.delay(str(dataset.id), uploaded_path)
@@ -346,7 +379,7 @@ async def delete_dataset(
     )
 
 
-@router.post("/{dataset_id}/reprocess")
+@router.post("/{dataset_id}/reprocess", dependencies=[Depends(require_active_license)])
 async def reprocess_dataset(
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -1989,7 +2022,7 @@ async def get_enrichment_pathways(
     }
 
 
-@router.post("/{dataset_id}/enrichment-pathways/{comparison_name}/ai-select")
+@router.post("/{dataset_id}/enrichment-pathways/{comparison_name}/ai-select", dependencies=[Depends(require_active_license)])
 async def ai_select_enrichment_terms(
     dataset_id: UUID,
     comparison_name: str,
@@ -2142,7 +2175,7 @@ Return ONLY a JSON array of pathway IDs (the exact IDs from the list), nothing e
         }
 
 
-@router.post("/{dataset_id}/comparisons/{comparison_name}/interpret")
+@router.post("/{dataset_id}/comparisons/{comparison_name}/interpret", dependencies=[Depends(require_active_license)])
 async def interpret_comparison(
     dataset_id: UUID,
     comparison_name: str,
@@ -2406,7 +2439,7 @@ async def interpret_comparison(
         )
 
 
-@router.post("/{dataset_id}/comparisons/{comparison_name}/ask")
+@router.post("/{dataset_id}/comparisons/{comparison_name}/ask", dependencies=[Depends(require_active_license)])
 async def ask_ai_question(
     dataset_id: UUID,
     comparison_name: str,
@@ -2604,7 +2637,7 @@ async def get_conversation_history(
     }
 
 
-@router.post("/{dataset_id}/comparisons/{comparison_name}/visualizations/pca")
+@router.post("/{dataset_id}/comparisons/{comparison_name}/visualizations/pca", dependencies=[Depends(require_active_license)])
 async def calculate_custom_pca(
     dataset_id: UUID,
     comparison_name: str,
@@ -2722,7 +2755,7 @@ async def calculate_custom_pca(
     }
 
 
-@router.post("/{dataset_id}/comparisons/{comparison_name}/visualizations/umap")
+@router.post("/{dataset_id}/comparisons/{comparison_name}/visualizations/umap", dependencies=[Depends(require_active_license)])
 async def calculate_custom_umap(
     dataset_id: UUID,
     comparison_name: str,
@@ -2979,7 +3012,7 @@ async def check_ai_status(
     }
 
 
-@router.post("/{dataset_id}/venn-analysis")
+@router.post("/{dataset_id}/venn-analysis", dependencies=[Depends(require_active_license)])
 async def venn_analysis(
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -3282,7 +3315,7 @@ async def apply_advanced_filter(
         raise HTTPException(status_code=500, detail=f"Filter error: {str(e)}")
 
 
-@router.post("/{dataset_id}/gsea")
+@router.post("/{dataset_id}/gsea", dependencies=[Depends(require_active_license)])
 async def run_gsea_analysis(
     dataset_id: UUID,
     comparison_name: str = Body(...),
