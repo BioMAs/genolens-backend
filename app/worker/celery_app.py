@@ -36,3 +36,20 @@ celery_app.conf.task_routes = {
     "app.worker.tasks.process_dataset_upload": {"queue": "data_processing"},
     "app.worker.tasks.*": {"queue": "default"},
 }
+
+# ── Periodic tasks (Celery Beat) ──────────────────────────────────────────────
+from celery.schedules import crontab  # noqa: E402
+
+celery_app.conf.include = [
+    "app.worker.tasks",
+    "app.worker.tasks.quota_tasks",
+    "app.worker.tasks.deployment_task",
+]
+
+celery_app.conf.beat_schedule = {
+    "reset-monthly-comparison-quotas": {
+        "task": "app.worker.tasks.quota_tasks.reset_monthly_comparison_quotas",
+        "schedule": crontab(minute=5, hour=0, day_of_month=1),
+        # Runs at 00:05 UTC on the 1st of each month
+    },
+}
