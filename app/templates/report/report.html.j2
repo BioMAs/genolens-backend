@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @page { size: A4; margin: 2cm 2.5cm; }
+  body { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 10pt; color: #1a1a2e; line-height: 1.5; }
+
+  .cover { page-break-after: always; padding-top: 4cm; }
+  .cover h1 { font-size: 28pt; color: #1a1a2e; margin-bottom: 0.3cm; }
+  .cover .subtitle { font-size: 13pt; color: #6b7280; margin-bottom: 2cm; }
+  .cover .meta-table td { padding: 0.2cm 0.5cm; font-size: 10pt; }
+  .cover .meta-table td:first-child { font-weight: bold; color: #374151; width: 5cm; }
+
+  .logo-bar { border-top: 4px solid #4f46e5; padding-top: 0.3cm; margin-bottom: 1.5cm; }
+  .logo-bar span { font-size: 11pt; font-weight: bold; color: #4f46e5; letter-spacing: 0.05em; }
+
+  h2 { font-size: 16pt; color: #1a1a2e; border-bottom: 2px solid #4f46e5; padding-bottom: 0.15cm; margin-top: 1cm; }
+  h3 { font-size: 12pt; color: #374151; margin-top: 0.7cm; }
+
+  table { width: 100%; border-collapse: collapse; margin: 0.5cm 0; font-size: 9pt; }
+  thead th { background: #4f46e5; color: #fff; padding: 0.2cm 0.3cm; text-align: left; }
+  tbody tr:nth-child(even) { background: #f3f4f6; }
+  td, th { padding: 0.15cm 0.3cm; border: 1px solid #e5e7eb; }
+
+  .figure { text-align: center; margin: 0.5cm 0; }
+  .figure img { max-width: 100%; max-height: 12cm; }
+  .figure-caption { font-size: 8pt; color: #6b7280; margin-top: 0.2cm; font-style: italic; }
+
+  .page-break { page-break-before: always; }
+
+  .summary-box {
+    background: #eff6ff;
+    border-left: 4px solid #4f46e5;
+    padding: 0.4cm 0.7cm;
+    margin: 0.5cm 0;
+    border-radius: 2px;
+  }
+
+  .stat-row td { border: none; padding: 0.1cm 0.3cm; }
+  .stat-label { font-weight: bold; color: #374151; }
+  .stat-up { color: #D73027; font-weight: bold; }
+  .stat-down { color: #4575B4; font-weight: bold; }
+
+  p { margin: 0.3cm 0; }
+</style>
+</head>
+<body>
+
+<!-- ══ COVER ══ -->
+<div class="cover">
+  <div class="logo-bar"><span>GENOLENS V2 &nbsp;·&nbsp; SCILICIUM</span></div>
+  <h1>{{ project.name }}</h1>
+  <div class="subtitle">Transcriptomics Analysis Report</div>
+  <table class="meta-table" style="width:auto; border:none;">
+    <tr><td>Date</td><td>{{ generated_at }}</td></tr>
+    <tr><td>Reference</td><td>{{ reference_number }}</td></tr>
+    <tr><td>Project ID</td><td>{{ project.id }}</td></tr>
+    {% if project.description %}<tr><td>Description</td><td>{{ project.description }}</td></tr>{% endif %}
+    <tr><td>Species</td><td>{{ project.species or 'N/A' }}</td></tr>
+    <tr><td>Comparisons</td><td>{{ comparisons|length }}</td></tr>
+  </table>
+</div>
+
+<!-- ══ EXECUTIVE SUMMARY ══ -->
+<h2>Executive Summary</h2>
+<div class="summary-box">
+  This report summarises the differential expression analysis performed on project
+  <strong>{{ project.name }}</strong> (ref. {{ reference_number }}).
+  {% if comparisons|length == 1 %}
+  One comparison was analysed.
+  {% else %}
+  {{ comparisons|length }} comparisons were analysed.
+  {% endif %}
+  The report covers sample quality metrics, principal component analysis, differential expression results, and pathway enrichment.
+</div>
+
+<!-- ══ MATERIAL & METHODS ══ -->
+<h2>Material &amp; Methods</h2>
+<h3>Library preparation and sequencing</h3>
+<p>RNA-seq libraries were prepared and sequenced on an Illumina platform. Read quality was assessed with FastQC.</p>
+<h3>Bioinformatic processing</h3>
+<p>Reads were aligned against the reference genome using STAR. Gene-level read counts were generated with featureCounts and normalised using DESeq2 variance-stabilising transformation (VST) for exploratory analyses.</p>
+<h3>Differential expression analysis</h3>
+<p>Differential expression was assessed using DESeq2. Genes with adjusted p-value (Benjamini-Hochberg) &lt; 0.05 and |log₂(Fold Change)| &gt; 1 were considered significantly differentially expressed (DEGs).</p>
+<h3>Pathway enrichment analysis</h3>
+<p>Over-representation analysis (ORA) was performed against Gene Ontology (GO-BP, MF, CC), KEGG, and Reactome databases using clusterProfiler. Results were filtered at padj &lt; 0.05.</p>
+
+<!-- ══ SAMPLE QC ══ -->
+{% if qc_data %}
+<h2 class="page-break">Sample Quality Control</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Sample</th>
+      <th>Total Reads</th>
+      <th>Mapped Reads</th>
+      <th>Mapping Rate (%)</th>
+      <th>Detected Genes</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in qc_data %}
+  <tr>
+    <td>{{ row.sample }}</td>
+    <td>{{ row.total_reads }}</td>
+    <td>{{ row.mapped_reads }}</td>
+    <td>{{ row.mapping_rate }}</td>
+    <td>{{ row.detected_genes }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<!-- ══ PCA ══ -->
+{% if pca_plot_b64 %}
+<h2{% if not qc_data %} class="page-break"{% endif %}>Principal Component Analysis</h2>
+<div class="figure">
+  <img src="data:image/png;base64,{{ pca_plot_b64 }}" alt="PCA plot">
+  <div class="figure-caption">Figure 1 — PCA of VST-normalised expression across all samples. Each point represents one sample; colours indicate biological groups.</div>
+</div>
+{% endif %}
+
+<!-- ══ PER-COMPARISON RESULTS ══ -->
+{% for comp in comparisons %}
+<div class="page-break">
+<h2>Results — {{ comp.name }}</h2>
+
+<div class="summary-box">
+  <strong>DEG summary</strong> (padj &lt; 0.05, |log₂FC| &gt; 1):<br>
+  <span class="stat-up">▲ {{ comp.deg_up }} up-regulated</span> &nbsp;&nbsp;
+  <span class="stat-down">▼ {{ comp.deg_down }} down-regulated</span> &nbsp;&nbsp;
+  {{ comp.deg_total }} total genes tested
+</div>
+
+{% if comp.volcano_b64 %}
+<h3>Volcano Plot</h3>
+<div class="figure">
+  <img src="data:image/png;base64,{{ comp.volcano_b64 }}" alt="Volcano plot {{ comp.name }}">
+  <div class="figure-caption">Volcano plot — {{ comp.name }}. Red: up-regulated DEGs; Blue: down-regulated DEGs; Grey: non-significant.</div>
+</div>
+{% endif %}
+
+<h3>Top Differentially Expressed Genes</h3>
+{% if comp.top_up_genes or comp.top_down_genes %}
+<table>
+  <thead><tr><th>Gene ID</th><th>Gene Name</th><th>log₂FC</th><th>adj. p-value</th><th>Direction</th></tr></thead>
+  <tbody>
+  {% for g in comp.top_up_genes %}
+  <tr>
+    <td>{{ g.gene_id }}</td>
+    <td>{{ g.gene_name or '' }}</td>
+    <td style="color:#D73027">+{{ "%.3f"|format(g.log_fc) }}</td>
+    <td>{{ "%.2e"|format(g.padj) }}</td>
+    <td style="color:#D73027">Up</td>
+  </tr>
+  {% endfor %}
+  {% for g in comp.top_down_genes %}
+  <tr>
+    <td>{{ g.gene_id }}</td>
+    <td>{{ g.gene_name or '' }}</td>
+    <td style="color:#4575B4">{{ "%.3f"|format(g.log_fc) }}</td>
+    <td>{{ "%.2e"|format(g.padj) }}</td>
+    <td style="color:#4575B4">Down</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p><em>No significant DEGs found for this comparison.</em></p>
+{% endif %}
+
+{% if comp.dotplot_b64 %}
+<h3>Pathway Enrichment</h3>
+<div class="figure">
+  <img src="data:image/png;base64,{{ comp.dotplot_b64 }}" alt="Enrichment dotplot {{ comp.name }}">
+  <div class="figure-caption">Top enriched pathways for {{ comp.name }}. Point size reflects gene count; colour indicates significance (-log₁₀ padj).</div>
+</div>
+{% if comp.enrichment_results %}
+<table>
+  <thead>
+    <tr><th>Term</th><th>Database</th><th>adj. p-value</th><th>Gene Count</th></tr>
+  </thead>
+  <tbody>
+  {% for p in comp.enrichment_results[:30] %}
+  <tr>
+    <td>{{ p.pathway_name }}</td>
+    <td>{{ p.category or '' }}</td>
+    <td>{{ "%.2e"|format(p.padj) }}</td>
+    <td>{{ p.gene_count }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endif %}
+</div>
+{% endfor %}
+
+<!-- ══ APPENDIX ══ -->
+<div class="page-break">
+<h2>Appendix — Full DEG Tables</h2>
+{% for comp in comparisons %}
+<h3>{{ comp.name }}</h3>
+{% if comp.top_up_genes or comp.top_down_genes %}
+<table>
+  <thead>
+    <tr><th>Gene ID</th><th>Gene Name</th><th>log₂FC</th><th>adj. p-value</th><th>Direction</th></tr>
+  </thead>
+  <tbody>
+  {% for g in comp.top_up_genes %}
+  <tr>
+    <td>{{ g.gene_id }}</td>
+    <td>{{ g.gene_name or '' }}</td>
+    <td style="color:#D73027">+{{ "%.3f"|format(g.log_fc) }}</td>
+    <td>{{ "%.2e"|format(g.padj) }}</td>
+    <td>Up</td>
+  </tr>
+  {% endfor %}
+  {% for g in comp.top_down_genes %}
+  <tr>
+    <td>{{ g.gene_id }}</td>
+    <td>{{ g.gene_name or '' }}</td>
+    <td style="color:#4575B4">{{ "%.3f"|format(g.log_fc) }}</td>
+    <td>{{ "%.2e"|format(g.padj) }}</td>
+    <td>Down</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p><em>No significant DEGs for this comparison.</em></p>
+{% endif %}
+{% endfor %}
+</div>
+
+</body>
+</html>
