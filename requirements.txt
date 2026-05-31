@@ -59,3 +59,7 @@ aiosmtplib>=3.0.0
 
 # SSH client for on-premise deployment task
 paramiko>=3.4.0
+
+# PDF report generation
+weasyprint==62.3
+matplotlib>=3.8.0
