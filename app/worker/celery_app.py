@@ -34,6 +34,7 @@ celery_app.conf.update(
 # Task routing (optional - for multiple queues)
 celery_app.conf.task_routes = {
     "app.worker.tasks.process_dataset_upload": {"queue": "data_processing"},
+    "app.worker.tasks.report_task.*": {"queue": "default"},
     "app.worker.tasks.*": {"queue": "default"},
 }
 
@@ -44,6 +45,7 @@ celery_app.conf.include = [
     "app.worker.tasks",
     "app.worker.tasks.quota_tasks",
     "app.worker.tasks.deployment_task",
+    "app.worker.tasks.report_task",
 ]
 
 celery_app.conf.beat_schedule = {
