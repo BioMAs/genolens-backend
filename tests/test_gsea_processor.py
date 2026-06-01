@@ -522,3 +522,93 @@ class TestLoadFromGmt:
 
         with pytest.raises((FileNotFoundError, OSError)):
             GeneSetsLoader.load_from_gmt(str(tmp_path / "nonexistent.gmt"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GSEA-01 to GSEA-04  — edge-case complements (from FIXPLAN.md §3.1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGSEAEdgeCases:
+    """Complement tests targeting edge cases identified in FIXPLAN.md."""
+
+    def _make_proc(self, min_size=1, max_size=500):
+        from app.services.gsea_processor import GSEAProcessor
+        return GSEAProcessor(min_size=min_size, max_size=max_size)
+
+    def _ranked_df(self, genes, metrics):
+        import pandas as pd
+        return pd.DataFrame({"metric": metrics}, index=genes)
+
+    # GSEA-01: gene set with no intersection → ES = 0
+    def test_gsea01_no_overlap_gene_set_es_zero(self):
+        """_calculate_enrichment_score returns 0 when gene set has no intersection."""
+        proc = self._make_proc()
+        gene_list = [f"G{i}" for i in range(20)]
+        gene_set = ["OUTSIDER_1", "OUTSIDER_2"]   # not in gene_list
+        metrics = np.linspace(10, -10, 20)
+
+        es, running_sum, positions = proc._calculate_enrichment_score(
+            gene_list, gene_set, metrics
+        )
+        assert es == 0.0
+        assert len(positions) == 0
+
+    # GSEA-02: null distribution all positive → negative NES must not be NaN
+    def test_gsea02_one_sided_null_dist_no_nan_nes(self):
+        """NES must not be NaN when null distribution is entirely one-signed."""
+        proc = self._make_proc()
+        # Ranked list: top genes first → very enriched gene set at top
+        genes = [f"G{i}" for i in range(30)]
+        metrics = np.linspace(10, -10, 30)
+        ranked = self._ranked_df(genes, metrics)
+
+        # Gene set at the bottom of the list → negative ES; null dist may be all-positive
+        gene_sets = {"BOTTOM_SET": genes[25:]}
+        results = proc.run_gsea(ranked, gene_sets, n_permutations=50, seed=99)
+
+        for r in results:
+            assert not np.isnan(r.normalized_enrichment_score), \
+                f"NES is NaN for {r.gene_set_name}"
+            assert not np.isnan(r.p_value), \
+                f"p_value is NaN for {r.gene_set_name}"
+
+    # GSEA-03: gene set above max_size → filtered out
+    def test_gsea03_gene_set_above_max_size_filtered(self):
+        """Gene sets larger than max_size are excluded from results."""
+        proc = self._make_proc(min_size=1, max_size=10)
+        genes = [f"G{i}" for i in range(50)]
+        metrics = np.linspace(5, -5, 50)
+        ranked = self._ranked_df(genes, metrics)
+
+        # 20 genes → above max_size=10
+        gene_sets = {"BIG_SET": genes[:20], "SMALL_SET": genes[:5]}
+        results = proc.run_gsea(ranked, gene_sets, n_permutations=20, seed=0)
+
+        names = {r.gene_set_name for r in results}
+        assert "BIG_SET" not in names
+        assert "SMALL_SET" in names
+
+    # GSEA-04: performance guard — 20k genes, 50 gene sets < 30 s
+    @pytest.mark.slow
+    def test_gsea04_performance_20k_genes_50_sets(self):
+        """run_gsea on 20k genes × 50 gene sets with 100 permutations finishes in < 30 s."""
+        import time
+        proc = self._make_proc(min_size=10, max_size=300)
+        rng = np.random.default_rng(42)
+
+        N = 20_000
+        genes = [f"G{i}" for i in range(N)]
+        metrics = rng.normal(0, 1, N)
+        ranked = self._ranked_df(genes, metrics)
+
+        gene_sets = {
+            f"SET_{s}": list(rng.choice(genes, size=rng.integers(15, 200), replace=False))
+            for s in range(50)
+        }
+
+        start = time.perf_counter()
+        results = proc.run_gsea(ranked, gene_sets, n_permutations=100, seed=0)
+        elapsed = time.perf_counter() - start
+
+        assert elapsed < 30, f"GSEA took {elapsed:.1f}s — too slow (threshold: 30s)"
+        assert len(results) > 0

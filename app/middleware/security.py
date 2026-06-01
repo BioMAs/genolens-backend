@@ -28,10 +28,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Prevent MIME sniffing
         response.headers["X-Content-Type-Options"] = "nosniff"
         
-        # Enforce HTTPS only when the connection is already HTTPS
-        # (checking hostname was wrong: behind Traefik the hostname is the domain
-        #  but the scheme may still be http, causing Mixed Content errors)
-        if request.url.scheme == "https":
+        # Enforce HTTPS (only in production)
+        if not request.url.hostname in ["localhost", "127.0.0.1"]:
             response.headers["Strict-Transport-Security"] = (
                 "max-age=31536000; includeSubDomains"
             )

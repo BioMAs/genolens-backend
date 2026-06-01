@@ -850,37 +850,39 @@ class DataProcessorService:
                 logger.warning(f"[VOLCANO] Skipping '{comp_name}': missing columns")
                 continue
                 
-            # Vectorized extraction (replaces iterrows() which is ~100× slower)
-            gene_id_col = 'gene_id' if 'gene_id' in df.columns else df.index.name or 'gene_id'
-            work = df[[logfc_col, padj_col]].copy()
-            if 'gene_id' in df.columns:
-                work['gene_id'] = df['gene_id'].astype(str)
-            else:
-                work['gene_id'] = df.index.astype(str)
-
-            # Drop rows with NaN in key columns
-            work = work.dropna(subset=[logfc_col, padj_col])
-            zero_pval_count = int((work[padj_col] == 0).sum())
-            work = work[work[padj_col] > 0]
-            valid_count = len(work)
-
-            work['logFC'] = work[logfc_col].round(4)
-            work['negLogPadj'] = (-np.log10(work[padj_col])).round(4)
-            work['padj_val'] = work[padj_col]
-
-            sig_mask = work['padj_val'] < 0.05
-            sig_df = work[sig_mask]
-            non_sig_df = work[~sig_mask]
-
-            def _df_to_points(d):
-                return [
-                    {'gene_id': r['gene_id'], 'logFC': r['logFC'],
-                     'padj': r['padj_val'], 'negLogPadj': r['negLogPadj']}
-                    for r in d.to_dict('records')
-                ]
-
-            sig_genes = _df_to_points(sig_df)
-            non_sig_genes = _df_to_points(non_sig_df)
+            # Extract data
+            plot_data = []
+            zero_pval_count = 0
+            valid_count = 0
+            
+            # Optimization: Separate significant and non-significant genes
+            sig_genes = []
+            non_sig_genes = []
+            
+            for idx, row in df.iterrows():
+                gene_id = row.get('gene_id', idx)
+                logfc = row.get(logfc_col)
+                padj = row.get(padj_col)
+                
+                if pd.notna(logfc) and pd.notna(padj):
+                    # Skip genes with p-value = 0 to avoid contaminating the volcano plot
+                    if padj == 0:
+                        zero_pval_count += 1
+                        continue
+                    
+                    if padj > 0:
+                        point = {
+                            'gene_id': str(gene_id),
+                            'logFC': round(float(logfc), 4),
+                            'padj': float(padj), # Keep original precision for filtering
+                            'negLogPadj': round(-np.log10(float(padj)), 4)
+                        }
+                        
+                        if point['padj'] < 0.05:
+                            sig_genes.append(point)
+                        else:
+                            non_sig_genes.append(point)
+                        valid_count += 1
             
             # Downsample if too many points (limit to ~5000 points total for good visualization)
             MAX_POINTS = 5000
@@ -917,7 +919,7 @@ class DataProcessorService:
             for p in plot_data:
                 p['padj'] = float(f"{p['padj']:.6g}")
 
-            logger.debug(f"[VOLCANO] Comparison '{comp_name}': {valid_count} valid genes, {zero_pval_count} excluded (p-value=0). Keeping {len(plot_data)} points.")
+            print(f"[VOLCANO] Comparison '{comp_name}': {valid_count} valid genes, {zero_pval_count} excluded (p-value=0). Keeping {len(plot_data)} points.")
             volcano_plots[comp_name] = plot_data
         
         return volcano_plots
@@ -1013,8 +1015,8 @@ class DataProcessorService:
             logfc_col = cols.get('logFC')
             padj_col = cols.get('padj')
             
-            logger.debug(f"Processing comparison: {comp_name}")
-            logger.debug(f"LogFC column: {logfc_col}, Padj column: {padj_col}")
+            print(f"Processing comparison: {comp_name}")
+            print(f"LogFC column: {logfc_col}, Padj column: {padj_col}")
             
             if not logfc_col or not padj_col:
                 continue
@@ -1031,23 +1033,15 @@ class DataProcessorService:
                 continue
             
             # Separate and sort by up/down regulation
-            if 'gene_id' not in sig_genes_data.columns:
-                logger.warning(
-                    f"[DEG_HEATMAP] Comparison '{comp_name}': 'gene_id' column missing — "
-                    "heatmap will be empty. Check your Parquet file structure."
-                )
-                up_regulated = []
-                down_regulated = []
-            else:
-                up_regulated = sig_genes_data[sig_genes_data[logfc_col] > 0].sort_values(
-                    by=logfc_col, ascending=False
-                )['gene_id'].tolist()
-
-                down_regulated = sig_genes_data[sig_genes_data[logfc_col] < 0].sort_values(
-                    by=logfc_col, ascending=True
-                )['gene_id'].tolist()
+            up_regulated = sig_genes_data[sig_genes_data[logfc_col] > 0].sort_values(
+                by=logfc_col, ascending=False
+            )['gene_id'].tolist() if 'gene_id' in sig_genes_data.columns else []
             
-            logger.debug(f"Found {len(up_regulated)} up-regulated and {len(down_regulated)} down-regulated genes")
+            down_regulated = sig_genes_data[sig_genes_data[logfc_col] < 0].sort_values(
+                by=logfc_col, ascending=True
+            )['gene_id'].tolist() if 'gene_id' in sig_genes_data.columns else []
+            
+            print(f"Found {len(up_regulated)} up-regulated and {len(down_regulated)} down-regulated genes")
             
             # Combine: up-regulated first, then down-regulated
             sig_genes = up_regulated + down_regulated
@@ -1059,7 +1053,7 @@ class DataProcessorService:
             for gene in down_regulated:
                 regulation_map[gene] = 'down'
             
-            logger.debug(f"Regulation map created with {len(regulation_map)} genes")
+            print(f"Regulation map created with {len(regulation_map)} genes")
             
             if len(sig_genes) == 0:
                 continue
@@ -1141,24 +1135,24 @@ class DataProcessorService:
         parquet_buffer = io.BytesIO(parquet_data)
         df = pd.read_parquet(parquet_buffer)
 
-        logger.debug(f"[DEG_STATS] Processing {len(comparisons)} comparisons")
+        print(f"[DEG_STATS] Processing {len(comparisons)} comparisons")
 
         statistics = {}
         for comp_name, cols in comparisons.items():
             logfc_col = cols.get('logFC')
             padj_col = cols.get('padj')
 
-            logger.debug(f"[DEG_STATS] Comparison '{comp_name}': logFC={logfc_col}, padj={padj_col}")
+            print(f"[DEG_STATS] Comparison '{comp_name}': logFC={logfc_col}, padj={padj_col}")
 
             if not logfc_col or not padj_col:
-                logger.debug(f"[DEG_STATS] Skipping '{comp_name}': missing columns")
+                print(f"[DEG_STATS] Skipping '{comp_name}': missing columns")
                 continue
 
             # Check if contrast column exists for this comparison
             contrast_col = f"contrast:{comp_name}"
             has_contrast_col = contrast_col in df.columns
 
-            logger.debug(f"[DEG_STATS] Looking for contrast column: {contrast_col}, Found: {has_contrast_col}")
+            print(f"[DEG_STATS] Looking for contrast column: {contrast_col}, Found: {has_contrast_col}")
 
             if has_contrast_col:
                 # Use contrast column to count (more accurate)
@@ -1169,7 +1163,7 @@ class DataProcessorService:
                     (df[contrast_col] != None)
                 ].copy()
 
-                logger.debug(f"[DEG_STATS] Total genes in contrast column: {len(comparison_genes)}")
+                print(f"[DEG_STATS] Total genes in contrast column: {len(comparison_genes)}")
 
                 # Count UP and DOWN based on contrast column values
                 deg_up = len(comparison_genes[comparison_genes[contrast_col].str.upper() == 'UP'])
@@ -1185,7 +1179,7 @@ class DataProcessorService:
                 ].copy()
             else:
                 # Fallback: use logFC sign (old method)
-                logger.debug(f"[DEG_STATS] No contrast column found, using logFC sign")
+                print(f"[DEG_STATS] No contrast column found, using logFC sign")
                 significant = df[
                     (df[padj_col].notna()) &
                     (df[logfc_col].notna()) &
@@ -1219,7 +1213,7 @@ class DataProcessorService:
                 'top_genes': top_genes
             }
 
-            logger.debug(f"[DEG_STATS] Comparison '{comp_name}': {deg_up} up, {deg_down} down, {deg_total} total, {len(top_genes)} top genes")
+            print(f"[DEG_STATS] Comparison '{comp_name}': {deg_up} up, {deg_down} down, {deg_total} total, {len(top_genes)} top genes")
 
         return statistics
 
@@ -1242,7 +1236,7 @@ class DataProcessorService:
         parquet_buffer = io.BytesIO(parquet_data)
         df = pd.read_parquet(parquet_buffer)
 
-        logger.debug(f"[DEG_EXTRACT] Processing {len(comparisons)} comparisons for DB storage")
+        print(f"[DEG_EXTRACT] Processing {len(comparisons)} comparisons for DB storage")
 
         all_genes = {}
         for comp_name, cols in comparisons.items():
@@ -1251,7 +1245,7 @@ class DataProcessorService:
             pvalue_col = cols.get('pvalue')  # Optional
 
             if not logfc_col or not padj_col:
-                logger.debug(f"[DEG_EXTRACT] Skipping '{comp_name}': missing columns")
+                print(f"[DEG_EXTRACT] Skipping '{comp_name}': missing columns")
                 continue
 
             # Check for contrast column
@@ -1311,12 +1305,12 @@ class DataProcessorService:
                     genes_list.append(gene_record)
 
                 all_genes[comp_name] = genes_list
-                logger.debug(f"[DEG_EXTRACT] Comparison '{comp_name}': {len(genes_list)} genes extracted (using contrast column)")
+                print(f"[DEG_EXTRACT] Comparison '{comp_name}': {len(genes_list)} genes extracted (using contrast column)")
             
             else:
                 # Fallback: use logFC sign and thresholds if no contrast column
                 # This ensures we still populate the DB even without explicit contrast columns
-                logger.debug(f"[DEG_EXTRACT] No contrast column for '{comp_name}', using logFC/padj thresholds")
+                print(f"[DEG_EXTRACT] No contrast column for '{comp_name}', using logFC/padj thresholds")
                 
                 # Default thresholds for "significant" genes to store
                 # We store significant genes to populate the DEG table
@@ -1373,7 +1367,7 @@ class DataProcessorService:
                     genes_list.append(gene_record)
                 
                 all_genes[comp_name] = genes_list
-                logger.debug(f"[DEG_EXTRACT] Comparison '{comp_name}': {len(genes_list)} genes extracted (using thresholds)")
+                print(f"[DEG_EXTRACT] Comparison '{comp_name}': {len(genes_list)} genes extracted (using thresholds)")
 
         return all_genes
 
@@ -1440,10 +1434,10 @@ class DataProcessorService:
         category_col = find_col(category_cols)
 
         if not all([pathway_id_col, pathway_name_col, padj_col]):
-            logger.warning(f"[DataProcessor] Enrichment file missing required columns")
-            logger.warning(f"  - Pathway ID: {pathway_id_col}")
-            logger.warning(f"  - Pathway Name: {pathway_name_col}")
-            logger.warning(f"  - Adjusted P-value: {padj_col}")
+            print(f"[DataProcessor] Enrichment file missing required columns")
+            print(f"  - Pathway ID: {pathway_id_col}")
+            print(f"  - Pathway Name: {pathway_name_col}")
+            print(f"  - Adjusted P-value: {padj_col}")
             return {}
 
         # For enrichment files, we might have:
@@ -1575,8 +1569,8 @@ class DataProcessorService:
                     if '/' in ratio_str:
                         num, denom = ratio_str.split('/')
                         gene_ratio = float(num) / float(denom) if float(denom) > 0 else 0
-                except (ValueError, ZeroDivisionError):
-                    logger.debug(f"Could not parse gene_ratio value: {row.get(gene_ratio_col)!r}")
+                except:
+                    pass
 
             # Parse background ratio
             bg_ratio = None
@@ -1586,8 +1580,8 @@ class DataProcessorService:
                     if '/' in ratio_str:
                         num, denom = ratio_str.split('/')
                         bg_ratio = float(num) / float(denom) if float(denom) > 0 else 0
-                except (ValueError, ZeroDivisionError):
-                    logger.debug(f"Could not parse bg_ratio value: {row.get(bg_ratio_col)!r}")
+                except:
+                    pass
 
             # Parse genes list (e.g., "GENE1/GENE2/GENE3" -> ["GENE1", "GENE2", "GENE3"])
             genes = None

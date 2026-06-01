@@ -8,7 +8,6 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from app.models.models import SubscriptionPlan
-from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +70,7 @@ def get_rate_limit_by_plan(request: Request) -> str:
 limiter = Limiter(
     key_func=get_user_identifier,
     default_limits=["1000/hour"],  # Default global limit
-    # Use Redis in production for correct multi-worker rate limiting; fall back to memory in dev
-    storage_uri=settings.REDIS_URL if settings.ENVIRONMENT == "production" else "memory://",
+    storage_uri="memory://",  # Use in-memory storage (consider Redis for production)
     headers_enabled=True,  # Enable rate limit headers in response
 )
 
