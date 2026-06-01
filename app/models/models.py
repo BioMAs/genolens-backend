@@ -546,7 +546,7 @@ class User(Base, TimestampMixin):
     subscription_starts_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     subscription_ends_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     status: Mapped[UserStatus] = mapped_column(
-        SQLEnum(UserStatus, name="user_status_enum"),
+        SQLEnum(UserStatus, name="user_status_enum", values_callable=lambda x: [e.value for e in x]),
         nullable=False,
         default=UserStatus.ACTIVE,
         index=True,
