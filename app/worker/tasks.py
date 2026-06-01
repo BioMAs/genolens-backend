@@ -416,3 +416,119 @@ def health_check() -> dict:
         dict: Health status
     """
     return {"status": "healthy", "message": "Celery worker is running"}
+
+
+@celery_app.task(bind=True, base=DatabaseTask, name="app.worker.tasks.run_self_service_analysis")
+def run_self_service_analysis(self, analysis_id: str) -> dict:
+    """
+    Run a self-service DESeq2/multi-method analysis pipeline (R-based).
+    Updates SelfServiceAnalysis status and progress_log as it progresses.
+    """
+    import subprocess
+    import traceback
+    from datetime import datetime, timezone
+    from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, Dataset
+
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    async def _run():
+        async with AsyncSessionLocal() as db:
+            try:
+                analysis = await db.scalar(
+                    select(SelfServiceAnalysis).where(
+                        SelfServiceAnalysis.id == UUID(analysis_id)
+                    )
+                )
+                if not analysis:
+                    logger.error("[ANALYSIS] Analysis %s not found", analysis_id)
+                    return {"status": "error", "error": "not found"}
+
+                def _log(step: str, message: str = ""):
+                    entry = {"step": step, "message": message, "timestamp": _now_iso()}
+                    analysis.progress_log = (analysis.progress_log or []) + [entry]
+                    logger.info("[ANALYSIS] %s: %s", step, message)
+
+                # Mark as running
+                analysis.status = SelfServiceAnalysisStatus.RUNNING
+                analysis.current_step = "initializing"
+                _log("initializing", "Starting analysis pipeline")
+                db.add(analysis)
+                await db.commit()
+                await db.refresh(analysis)
+
+                # Resolve dataset file paths
+                async def _get_path(dataset_id):
+                    if not dataset_id:
+                        return None
+                    d = await db.scalar(select(Dataset).where(Dataset.id == dataset_id))
+                    return d.parquet_file_path if d else None
+
+                matrix_path = await _get_path(analysis.matrix_dataset_id)
+                samples_path = await _get_path(analysis.samples_dataset_id)
+                comparisons_path = await _get_path(analysis.comparisons_dataset_id)
+
+                if not matrix_path or not samples_path or not comparisons_path:
+                    raise ValueError("One or more input datasets have no processed file. Ensure all datasets are in READY status.")
+
+                params = analysis.params or {}
+                r_script = Path("/app/r_scripts/run_multimethod_pipeline.R")
+                if not r_script.exists():
+                    r_script = Path("/app/r_scripts/run_deseq_pipeline.R")
+                if not r_script.exists():
+                    raise FileNotFoundError("R pipeline script not found on this server.")
+
+                _log("running_pipeline", f"Executing {r_script.name}")
+                analysis.current_step = "running_pipeline"
+                db.add(analysis)
+                await db.commit()
+
+                # Build R command
+                import json as _json
+                cmd = [
+                    "Rscript", str(r_script),
+                    "--matrix", str(matrix_path),
+                    "--samples", str(samples_path),
+                    "--comparisons", str(comparisons_path),
+                    "--analysis-id", analysis_id,
+                    "--params", _json.dumps(params),
+                ]
+
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
+                )
+
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"R pipeline exited with code {proc.returncode}.\n"
+                        f"stderr: {proc.stderr[-2000:]}"
+                    )
+
+                _log("done", "Pipeline completed successfully")
+                analysis.status = SelfServiceAnalysisStatus.DONE
+                analysis.current_step = "done"
+                db.add(analysis)
+                await db.commit()
+                return {"status": "done", "analysis_id": analysis_id}
+
+            except Exception as exc:
+                error_details = traceback.format_exc()
+                error_msg = str(exc) if str(exc) else error_details[:500]
+                logger.error("[ANALYSIS] Failed for %s: %s", analysis_id, error_msg)
+                logger.error("[ANALYSIS] Traceback:\n%s", error_details)
+                await db.execute(
+                    update(SelfServiceAnalysis)
+                    .where(SelfServiceAnalysis.id == UUID(analysis_id))
+                    .values(
+                        status=SelfServiceAnalysisStatus.FAILED,
+                        error_message=error_msg,
+                        current_step="failed",
+                    )
+                )
+                await db.commit()
+                return {"status": "failed", "analysis_id": analysis_id, "error": error_msg}
+
+    return run_async(_run())

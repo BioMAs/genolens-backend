@@ -36,6 +36,15 @@ class SubscriptionPlan(str, enum.Enum):
     ON_PREMISE = "ON_PREMISE"  # Self-hosted, unlimited everything
 
 
+class SelfServiceAnalysisStatus(str, enum.Enum):
+    """Status of a self-service analysis job."""
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    DONE = "DONE"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
 class DatasetType(str, enum.Enum):
     """Types of datasets that can be stored."""
     MATRIX = "MATRIX"  # Count/Expression matrices
@@ -1573,3 +1582,58 @@ class UserLoginEvent(Base):
 
     def __repr__(self) -> str:
         return f"<UserLoginEvent(user={self.user_id}, created_at={self.created_at})>"
+
+
+class SelfServiceAnalysis(Base):
+    """
+    SelfServiceAnalysis: A user-launched DESeq2/multi-method analysis job.
+    Inputs are existing datasets (matrix + samples + comparisons).
+    Outputs are DEG/enrichment datasets produced by the R pipeline.
+    """
+    __tablename__ = "self_service_analyses"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[SelfServiceAnalysisStatus] = mapped_column(
+        SQLEnum(SelfServiceAnalysisStatus, name="self_service_analysis_status"),
+        nullable=False,
+        default=SelfServiceAnalysisStatus.PENDING,
+        index=True,
+    )
+    matrix_dataset_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True
+    )
+    samples_dataset_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True
+    )
+    comparisons_dataset_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("datasets.id", ondelete="SET NULL"), nullable=True
+    )
+    params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    result_dataset_ids: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    intermediate_dataset_ids: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    current_step: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    progress_log: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    user_id: Mapped[UUID] = mapped_column(nullable=False, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_self_service_analyses_project_status", "project_id", "status"),
+        Index("ix_self_service_analyses_user", "user_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SelfServiceAnalysis(id={self.id}, name={self.name}, status={self.status})>"
