@@ -850,39 +850,37 @@ class DataProcessorService:
                 logger.warning(f"[VOLCANO] Skipping '{comp_name}': missing columns")
                 continue
                 
-            # Extract data
-            plot_data = []
-            zero_pval_count = 0
-            valid_count = 0
-            
-            # Optimization: Separate significant and non-significant genes
-            sig_genes = []
-            non_sig_genes = []
-            
-            for idx, row in df.iterrows():
-                gene_id = row.get('gene_id', idx)
-                logfc = row.get(logfc_col)
-                padj = row.get(padj_col)
-                
-                if pd.notna(logfc) and pd.notna(padj):
-                    # Skip genes with p-value = 0 to avoid contaminating the volcano plot
-                    if padj == 0:
-                        zero_pval_count += 1
-                        continue
-                    
-                    if padj > 0:
-                        point = {
-                            'gene_id': str(gene_id),
-                            'logFC': round(float(logfc), 4),
-                            'padj': float(padj), # Keep original precision for filtering
-                            'negLogPadj': round(-np.log10(float(padj)), 4)
-                        }
-                        
-                        if point['padj'] < 0.05:
-                            sig_genes.append(point)
-                        else:
-                            non_sig_genes.append(point)
-                        valid_count += 1
+            # Vectorized extraction (replaces iterrows() which is ~100× slower)
+            gene_id_col = 'gene_id' if 'gene_id' in df.columns else df.index.name or 'gene_id'
+            work = df[[logfc_col, padj_col]].copy()
+            if 'gene_id' in df.columns:
+                work['gene_id'] = df['gene_id'].astype(str)
+            else:
+                work['gene_id'] = df.index.astype(str)
+
+            # Drop rows with NaN in key columns
+            work = work.dropna(subset=[logfc_col, padj_col])
+            zero_pval_count = int((work[padj_col] == 0).sum())
+            work = work[work[padj_col] > 0]
+            valid_count = len(work)
+
+            work['logFC'] = work[logfc_col].round(4)
+            work['negLogPadj'] = (-np.log10(work[padj_col])).round(4)
+            work['padj_val'] = work[padj_col]
+
+            sig_mask = work['padj_val'] < 0.05
+            sig_df = work[sig_mask]
+            non_sig_df = work[~sig_mask]
+
+            def _df_to_points(d):
+                return [
+                    {'gene_id': r['gene_id'], 'logFC': r['logFC'],
+                     'padj': r['padj_val'], 'negLogPadj': r['negLogPadj']}
+                    for r in d.to_dict('records')
+                ]
+
+            sig_genes = _df_to_points(sig_df)
+            non_sig_genes = _df_to_points(non_sig_df)
             
             # Downsample if too many points (limit to ~5000 points total for good visualization)
             MAX_POINTS = 5000
@@ -1577,8 +1575,8 @@ class DataProcessorService:
                     if '/' in ratio_str:
                         num, denom = ratio_str.split('/')
                         gene_ratio = float(num) / float(denom) if float(denom) > 0 else 0
-                except:
-                    pass
+                except (ValueError, ZeroDivisionError):
+                    logger.debug(f"Could not parse gene_ratio value: {row.get(gene_ratio_col)!r}")
 
             # Parse background ratio
             bg_ratio = None
@@ -1588,8 +1586,8 @@ class DataProcessorService:
                     if '/' in ratio_str:
                         num, denom = ratio_str.split('/')
                         bg_ratio = float(num) / float(denom) if float(denom) > 0 else 0
-                except:
-                    pass
+                except (ValueError, ZeroDivisionError):
+                    logger.debug(f"Could not parse bg_ratio value: {row.get(bg_ratio_col)!r}")
 
             # Parse genes list (e.g., "GENE1/GENE2/GENE3" -> ["GENE1", "GENE2", "GENE3"])
             genes = None

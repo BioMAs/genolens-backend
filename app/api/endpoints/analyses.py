@@ -15,10 +15,9 @@ from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
-from app.api.deps.license import require_active_license
 from app.api.deps.subscription import get_or_create_user
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, User, Project, ProjectMember
+from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, User, Project
 
 logger = logging.getLogger(__name__)
 
@@ -140,22 +139,16 @@ async def list_analyses(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     project_id: UUID = Query(...),
 ) -> SelfServiceAnalysisListResponse:
-    """List all analyses for a project (owner or member)."""
-    # Verify project access: owner or project member
+    """List all analyses for a project (owner only)."""
+    # Verify project ownership
     proj = await db.scalar(
-        select(Project).where(Project.id == project_id)
+        select(Project).where(
+            Project.id == project_id,
+            Project.owner_id == current_user.user_id,
+        )
     )
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
-    if proj.owner_id != current_user.user_id:
-        member = await db.scalar(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id,
-                ProjectMember.user_id == current_user.user_id,
-            )
-        )
-        if not member:
-            raise HTTPException(status_code=404, detail="Project not found")
 
     result = await db.execute(
         select(SelfServiceAnalysis)
@@ -186,7 +179,7 @@ async def get_analysis(
     return SelfServiceAnalysisResponse.from_orm(analysis)
 
 
-@router.post("", response_model=SelfServiceAnalysisResponse, status_code=201, dependencies=[Depends(require_active_license)])
+@router.post("", response_model=SelfServiceAnalysisResponse, status_code=201)
 async def create_analysis(
     payload: SelfServiceAnalysisCreate,
     db: Annotated[AsyncSession, Depends(get_db)],

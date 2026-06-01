@@ -12,7 +12,6 @@ Can be extended to use Redis for distributed caching in production.
 import logging
 import hashlib
 import json
-import threading
 from typing import Any, Optional
 from functools import lru_cache
 from cachetools import TTLCache, LRUCache
@@ -53,30 +52,24 @@ class CacheService:
             dataframe_cache_size: Max number of DataFrames to cache (for hot datasets)
             dataframe_cache_memory_mb: Memory limit for DataFrame cache
         """
-        # Thread-safe locks for each cache (cachetools is NOT thread-safe by default)
-        self._clustering_lock = threading.RLock()
-        self._volcano_lock = threading.RLock()
-        self._stats_lock = threading.RLock()
-        self._dataframe_lock = threading.RLock()
-
         # Clustering results cache (gene lists + parameters -> clustered data)
         self.clustering_cache = TTLCache(
             maxsize=clustering_cache_size,
             ttl=clustering_ttl_seconds
         )
-
+        
         # Volcano plot data cache (dataset_id + comparison -> plot data)
         self.volcano_cache = TTLCache(
             maxsize=volcano_cache_size,
             ttl=volcano_ttl_seconds
         )
-
+        
         # Statistics cache (dataset_id + params -> stats)
         self.stats_cache = TTLCache(
             maxsize=stats_cache_size,
             ttl=stats_ttl_seconds
         )
-
+        
         # DataFrame cache (for frequently accessed datasets)
         # LRU without TTL - evicts least recently used when memory limit reached
         self.dataframe_cache = LRUCache(maxsize=dataframe_cache_size)
@@ -141,14 +134,13 @@ class CacheService:
             **params
         )
         
-        with self._clustering_lock:
-            result = self.clustering_cache.get(cache_key)
-
+        result = self.clustering_cache.get(cache_key)
+        
         if result:
             logger.debug(f"Clustering cache HIT for {dataset_id[:8]}... ({len(gene_list)} genes)")
         else:
             logger.debug(f"Clustering cache MISS for {dataset_id[:8]}... ({len(gene_list)} genes)")
-
+        
         return result
     
     def set_clustering_result(
@@ -176,8 +168,7 @@ class CacheService:
             **params
         )
         
-        with self._clustering_lock:
-            self.clustering_cache[cache_key] = result
+        self.clustering_cache[cache_key] = result
         logger.debug(f"Clustering cache SET for {dataset_id[:8]}... ({len(gene_list)} genes)")
     
     # ===== Volcano Plot Cache =====
@@ -207,8 +198,7 @@ class CacheService:
             dataset_id, comparison_name, max_points, padj_threshold, logfc_threshold
         )
         
-        with self._volcano_lock:
-            result = self.volcano_cache.get(cache_key)
+        result = self.volcano_cache.get(cache_key)
         
         if result:
             logger.debug(
@@ -247,8 +237,7 @@ class CacheService:
             dataset_id, comparison_name, max_points, padj_threshold, logfc_threshold
         )
         
-        with self._volcano_lock:
-            self.volcano_cache[cache_key] = result
+        self.volcano_cache[cache_key] = result
         logger.debug(
             f"Volcano cache SET for {dataset_id[:8]}.../{comparison_name} "
             f"(padj<{padj_threshold}, |logFC|>{logfc_threshold})"
@@ -275,14 +264,13 @@ class CacheService:
         """
         cache_key = self._generate_cache_key(dataset_id, comparison_name, **params)
         
-        with self._stats_lock:
-            result = self.stats_cache.get(cache_key)
-
+        result = self.stats_cache.get(cache_key)
+        
         if result:
             logger.debug(f"Stats cache HIT for {dataset_id[:8]}...")
         else:
             logger.debug(f"Stats cache MISS for {dataset_id[:8]}...")
-
+        
         return result
     
     def set_stats(
@@ -303,8 +291,7 @@ class CacheService:
         """
         cache_key = self._generate_cache_key(dataset_id, comparison_name, **params)
         
-        with self._stats_lock:
-            self.stats_cache[cache_key] = result
+        self.stats_cache[cache_key] = result
         logger.debug(f"Stats cache SET for {dataset_id[:8]}...")
     
     # ===== DataFrame Cache =====
@@ -319,14 +306,13 @@ class CacheService:
         Returns:
             Cached DataFrame or None if not found
         """
-        with self._dataframe_lock:
-            result = self.dataframe_cache.get(dataset_id)
-
+        result = self.dataframe_cache.get(dataset_id)
+        
         if result is not None:
             logger.debug(f"DataFrame cache HIT for {dataset_id[:8]}...")
         else:
             logger.debug(f"DataFrame cache MISS for {dataset_id[:8]}...")
-
+        
         return result
     
     def set_dataframe(self, dataset_id: str, dataframe: Any) -> None:
@@ -337,8 +323,7 @@ class CacheService:
             dataset_id: Dataset identifier
             dataframe: pandas DataFrame to cache
         """
-        with self._dataframe_lock:
-            self.dataframe_cache[dataset_id] = dataframe
+        self.dataframe_cache[dataset_id] = dataframe
         logger.debug(f"DataFrame cache SET for {dataset_id[:8]}...")
     
     # ===== Cache Management =====
@@ -352,10 +337,9 @@ class CacheService:
             dataset_id: Dataset identifier
         """
         # Remove from DataFrame cache
-        with self._dataframe_lock:
-            if dataset_id in self.dataframe_cache:
-                del self.dataframe_cache[dataset_id]
-        logger.info(f"Cleared DataFrame cache for {dataset_id[:8]}...")
+        if dataset_id in self.dataframe_cache:
+            del self.dataframe_cache[dataset_id]
+            logger.info(f"Cleared DataFrame cache for {dataset_id[:8]}...")
         
         # For other caches, we'd need to iterate and remove matching keys
         # (More expensive, but necessary for correctness)

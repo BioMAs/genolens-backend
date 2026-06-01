@@ -200,10 +200,8 @@ class GSEAProcessor:
         N = len(gene_list)
         gene_set_set = set(gene_set)
 
-        # Identify hit positions — build a dict for O(1) lookup (replaces O(n²) list.index())
+        # Identify hit positions
         hit_positions = [i for i, gene in enumerate(gene_list) if gene in gene_set_set]
-        hit_position_set = set(hit_positions)
-        hit_position_idx = {pos: idx for idx, pos in enumerate(hit_positions)}
         Nh = len(hit_positions)
 
         if Nh == 0:
@@ -221,8 +219,8 @@ class GSEAProcessor:
 
         # Calculate running enrichment score
         for i in range(N):
-            if i in hit_position_set:
-                hit_idx = hit_position_idx[i]
+            if i in hit_positions:
+                hit_idx = hit_positions.index(i)
                 increment = hit_metrics[hit_idx] / Nr
             else:
                 increment = -1.0 / (N - Nh)
