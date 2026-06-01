@@ -19,6 +19,9 @@ class UserRole(str, enum.Enum):
     ADMIN = "ADMIN"  # Full access: manage users, projects, subscriptions, upload analyses
     SCILICIUM_ADMIN = "SCILICIUM_ADMIN"  # Scilicium internal admin (same access as ADMIN + license management)
     USER = "USER"  # Standard user with subscription-based access
+    VIEWER = "VIEWER"  # Read-only access
+    ANALYST = "ANALYST"  # Can run analyses but not manage users/billing
+    SUBSCRIBER = "SUBSCRIBER"  # Subscription-based access (legacy/external auth)
 
 
 class UserStatus(str, enum.Enum):
