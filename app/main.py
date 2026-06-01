@@ -4,7 +4,8 @@ A flexible, data-centric bioinformatics SaaS platform for transcriptomics analys
 """
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, status, Depends
+from app.api.deps import get_current_user
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -186,7 +187,7 @@ async def health_check():
 
 
 @app.get("/db-test", tags=["Health"])
-async def database_test():
+async def database_test(current_user=Depends(get_current_user)):
     """Test database connectivity (development only)."""
     from app.db.session import AsyncSessionLocal
     from sqlalchemy import text

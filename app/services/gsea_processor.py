@@ -129,11 +129,13 @@ class GSEAProcessor:
             es = es_observed[gene_set_name]
             null_dist = null_distributions[gene_set_name]
 
-            # Normalize ES
+            # Normalize ES — guard against empty filtered lists (would produce NaN)
             if es >= 0:
-                mean_null = np.mean([x for x in null_dist if x >= 0])
+                pos_null = [x for x in null_dist if x >= 0]
+                mean_null = np.mean(pos_null) if pos_null else 0.0
             else:
-                mean_null = np.abs(np.mean([x for x in null_dist if x < 0]))
+                neg_null = [x for x in null_dist if x < 0]
+                mean_null = np.abs(np.mean(neg_null)) if neg_null else 0.0
 
             nes = es / mean_null if mean_null != 0 else 0
 

@@ -13,12 +13,12 @@ logger = logging.getLogger(__name__)
 
 def _run_async(coro):
     """Run an async coroutine from a synchronous Celery task."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 @celery_app.task(name="app.worker.tasks.quota_tasks.reset_monthly_comparison_quotas")
