@@ -77,9 +77,9 @@ limiter = Limiter(
 
 # Rate limit configurations by subscription plan
 RATE_LIMITS = {
-    SubscriptionPlan.BASIC: "100/hour",
-    SubscriptionPlan.PREMIUM: "500/hour",
-    SubscriptionPlan.ADVANCED: "2000/hour",
+    SubscriptionPlan.STARTER: "100/hour",
+    SubscriptionPlan.TEAM: "500/hour",
+    SubscriptionPlan.ON_PREMISE: "2000/hour",
 }
 
 # Special rate limits for specific endpoints
