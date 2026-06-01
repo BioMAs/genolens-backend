@@ -1357,7 +1357,7 @@ class ProjectActivityLog(Base):
     )
 
     event_type: Mapped[ActivityEventType] = mapped_column(
-        SQLEnum(ActivityEventType, name="activity_event_type_enum"),
+        SQLEnum(ActivityEventType, name="activity_event_type_enum", values_callable=lambda x: [e.value for e in x]),
         nullable=False,
         index=True,
         comment="Type of activity event"
@@ -1521,7 +1521,7 @@ class DeploymentJob(Base, TimestampMixin):
     services: Mapped[list] = mapped_column(JSON, nullable=False, default=list, comment="List of service names deployed: backend, license, ai")
     skip_build: Mapped[bool] = mapped_column(nullable=False, default=False)
     status: Mapped[DeploymentStatus] = mapped_column(
-        SQLEnum(DeploymentStatus, name="deployment_status_enum"),
+        SQLEnum(DeploymentStatus, name="deployment_status_enum", values_callable=lambda x: [e.value for e in x]),
         nullable=False,
         default=DeploymentStatus.PENDING,
         index=True,
