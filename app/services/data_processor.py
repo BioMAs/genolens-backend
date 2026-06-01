@@ -2,6 +2,7 @@
 Data processing service for converting files to Parquet and querying.
 """
 import io
+import logging
 from typing import Any, Optional
 import pandas as pd
 import numpy as np
@@ -19,6 +20,8 @@ except ImportError:
 
 from app.core.config import settings
 from app.core.monitoring import timing_decorator
+
+logger = logging.getLogger(__name__)
 
 
 class DataProcessorService:
