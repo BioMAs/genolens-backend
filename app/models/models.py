@@ -21,6 +21,14 @@ class UserRole(str, enum.Enum):
     USER = "USER"  # Standard user with subscription-based access
 
 
+class UserStatus(str, enum.Enum):
+    """User account status."""
+    PENDING = "pending"
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    CANCELLED = "cancelled"
+
+
 class SubscriptionPlan(str, enum.Enum):
     """Subscription plans with different feature access."""
     STARTER = "STARTER"     # 3 users, 15 projects, 30 comparisons/month
@@ -537,7 +545,17 @@ class User(Base, TimestampMixin):
     # Subscription management
     subscription_starts_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     subscription_ends_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    status: Mapped[UserStatus] = mapped_column(
+        SQLEnum(UserStatus, name="user_status_enum"),
+        nullable=False,
+        default=UserStatus.ACTIVE,
+        index=True,
+    )
+
+    @property
+    def is_active(self) -> bool:
+        """Backward-compat property — True when status is ACTIVE."""
+        return self.status == UserStatus.ACTIVE
 
     # Stripe integration (for future)
     stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True)
