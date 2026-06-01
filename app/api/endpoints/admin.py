@@ -14,6 +14,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from app.api.deps import get_db, require_admin
+from app.api.deps.license import require_active_license
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
 from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent
@@ -31,13 +32,14 @@ class UserProfile(BaseModel):
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
     role: str
+    status: str = "active"
     subscription_plan: str
     ai_interpretations_used: int = 0
     ai_tokens_purchased: int = 0
     ai_tokens_used: int = 0
     ai_interpretations_remaining: int = 0
-    created_at: str
-    updated_at: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
     last_sign_in_at: Optional[str] = None
     confirmed_at: Optional[str] = None
 
@@ -182,13 +184,15 @@ async def list_users(
                 
                 # Default values if user not in local DB yet
                 sub_plan = "BASIC"
+                user_status = "active"
                 ai_used = 0
                 ai_purchased = 0
                 ai_tokens_used = 0
                 ai_remaining = 0
-                
+
                 if local_user:
                     sub_plan = local_user.subscription_plan.value
+                    user_status = local_user.status.value.lower()
                     ai_used = local_user.ai_interpretations_used
                     ai_purchased = local_user.ai_tokens_purchased
                     ai_tokens_used = local_user.ai_tokens_used
@@ -200,6 +204,7 @@ async def list_users(
                     full_name=profile.get("full_name"),
                     avatar_url=profile.get("avatar_url"),
                     role=profile.get("role", "USER"),
+                    status=user_status,
                     subscription_plan=sub_plan,
                     ai_interpretations_used=ai_used,
                     ai_interpretations_remaining=ai_remaining,
@@ -210,12 +215,16 @@ async def list_users(
                     last_sign_in_at=auth_info.get("last_sign_in_at"),
                     confirmed_at=auth_info.get("confirmed_at")
                 ))
-            
+
             return result
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error fetching users: {e}")
-        # In case of error (e.g. Supabase connection), try to return local users at least
-        return []
+        logger.error(f"Error fetching users: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch users: {str(e)}"
+        )
 
 
 @router.get("/users/{user_id}", response_model=UserProfile)
@@ -585,7 +594,7 @@ async def get_system_stats(
         )
 
 
-@router.post("/users", response_model=UserProfile)
+@router.post("/users", response_model=UserProfile, dependencies=[Depends(require_active_license)])
 async def create_user(
     user_data: UserCreate,
     current_user: SupabaseUser = Depends(require_admin),
@@ -1489,4 +1498,152 @@ async def get_login_stats(
         active_7_days=active_7_days,
         active_30_days=active_30_days,
         recent_events=recent_events,
+    )
+
+
+# ---------------------------------------------------------------------------
+# License management (on-premise key issuance)
+# ---------------------------------------------------------------------------
+
+from app.models.models import LicenseRecord
+from app.core.license import issue_license_key
+
+
+class LicenseIssueRequest(BaseModel):
+    client_id: str
+    plan: str
+    expires_at: int  # Unix timestamp
+    notes: Optional[str] = None
+
+
+class LicenseRecordResponse(BaseModel):
+    id: str
+    client_id: str
+    plan: str
+    product: str
+    expires_at: int
+    license_key: str
+    notes: Optional[str]
+    is_revoked: bool
+    is_expired: bool
+    days_until_expiry: Optional[int]
+    created_at: str
+    created_by: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+
+@router.post("/licenses", response_model=LicenseRecordResponse)
+async def issue_license(
+    req: LicenseIssueRequest,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Issue a new on-premise license key. Admin only."""
+    if not settings.LICENSE_SECRET_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="LICENSE_SECRET_KEY is not configured on this instance.",
+        )
+
+    key = issue_license_key(
+        client_id=req.client_id,
+        plan=req.plan,
+        expires_at=req.expires_at,
+        product=settings.LICENSE_PRODUCT,
+        secret=settings.LICENSE_SECRET_KEY,
+    )
+
+    record = LicenseRecord(
+        client_id=req.client_id,
+        plan=req.plan,
+        product=settings.LICENSE_PRODUCT,
+        expires_at=req.expires_at,
+        license_key=key,
+        notes=req.notes,
+        created_by=str(current_user.user_id),
+    )
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+
+    return LicenseRecordResponse(
+        id=str(record.id),
+        client_id=record.client_id,
+        plan=record.plan,
+        product=record.product,
+        expires_at=record.expires_at,
+        license_key=record.license_key,
+        notes=record.notes,
+        is_revoked=record.is_revoked,
+        is_expired=record.is_expired,
+        days_until_expiry=record.days_until_expiry,
+        created_at=record.created_at.isoformat(),
+        created_by=record.created_by,
+    )
+
+
+@router.get("/licenses", response_model=list[LicenseRecordResponse])
+async def list_licenses(
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all issued licenses. Admin only."""
+    result = await db.execute(
+        select(LicenseRecord).order_by(LicenseRecord.created_at.desc())
+    )
+    records = result.scalars().all()
+
+    return [
+        LicenseRecordResponse(
+            id=str(r.id),
+            client_id=r.client_id,
+            plan=r.plan,
+            product=r.product,
+            expires_at=r.expires_at,
+            license_key=r.license_key,
+            notes=r.notes,
+            is_revoked=r.is_revoked,
+            is_expired=r.is_expired,
+            days_until_expiry=r.days_until_expiry,
+            created_at=r.created_at.isoformat(),
+            created_by=r.created_by,
+        )
+        for r in records
+    ]
+
+
+@router.patch("/licenses/{license_id}/revoke", response_model=LicenseRecordResponse)
+async def revoke_license(
+    license_id: str,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke an issued license. Admin only."""
+    from uuid import UUID as _UUID
+    result = await db.execute(
+        select(LicenseRecord).where(LicenseRecord.id == _UUID(license_id))
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        raise HTTPException(status_code=404, detail="License not found.")
+
+    record.is_revoked = True
+    await db.commit()
+    await db.refresh(record)
+
+    return LicenseRecordResponse(
+        id=str(record.id),
+        client_id=record.client_id,
+        plan=record.plan,
+        product=record.product,
+        expires_at=record.expires_at,
+        license_key=record.license_key,
+        notes=record.notes,
+        is_revoked=record.is_revoked,
+        is_expired=record.is_expired,
+        days_until_expiry=record.days_until_expiry,
+        created_at=record.created_at.isoformat(),
+        created_by=record.created_by,
     )
