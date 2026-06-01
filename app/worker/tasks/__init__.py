@@ -22,8 +22,14 @@ _spec.loader.exec_module(_legacy_mod)
 
 process_dataset_upload = _legacy_mod.process_dataset_upload  # noqa: F401
 health_check = _legacy_mod.health_check  # noqa: F401
+run_self_service_analysis = _legacy_mod.run_self_service_analysis  # noqa: F401
 
 # ── New periodic quota task ───────────────────────────────────────────────────
 from app.worker.tasks.quota_tasks import reset_monthly_comparison_quotas  # noqa: F401
 
-__all__ = ["process_dataset_upload", "health_check", "reset_monthly_comparison_quotas"]
+__all__ = [
+    "process_dataset_upload",
+    "health_check",
+    "run_self_service_analysis",
+    "reset_monthly_comparison_quotas",
+]
