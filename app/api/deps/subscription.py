@@ -5,6 +5,8 @@ from typing import Annotated
 from uuid import UUID
 from datetime import datetime, timezone
 
+import logging
+
 from fastapi import Depends, HTTPException, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +15,11 @@ from app.api.deps.supabase_deps import get_current_user
 from app.core.supabase_auth import SupabaseUser
 from app.db.session import get_db
 from app.models.models import User, UserRole, SubscriptionPlan
+
+logger = logging.getLogger(__name__)
+
+# Roles that must never be downgraded by Supabase claims
+_PROTECTED_ROLES = {UserRole.ADMIN, UserRole.SCILICIUM_ADMIN}
 
 
 # ── User resolution ────────────────────────────────────────────────────────────
@@ -39,10 +46,22 @@ async def get_or_create_user(
         await db.refresh(user)
     else:
         if user.role != current_user.role:
-            user.role = current_user.role
-            db.add(user)
-            await db.commit()
-            await db.refresh(user)
+            # Never downgrade a protected admin role via Supabase claims
+            if user.role in _PROTECTED_ROLES:
+                logger.warning(
+                    "Blocked role downgrade attempt for user %s: "
+                    "local=%s → supabase=%s (keeping local role)",
+                    user.id, user.role, current_user.role,
+                )
+            else:
+                logger.info(
+                    "Updating role for user %s: %s → %s",
+                    user.id, user.role, current_user.role,
+                )
+                user.role = current_user.role
+                db.add(user)
+                await db.commit()
+                await db.refresh(user)
 
     return user
 
@@ -199,18 +218,35 @@ async def check_comparison_quota(
 
 async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
     """
-    Increment the comparison counter after a successful DEG dataset upload.
+    Atomically increment the comparison counter after a successful DEG upload.
+    Uses a conditional UPDATE (comparisons_used < quota) to prevent race conditions
+    where two concurrent requests both pass check_comparison_quota but only one
+    should succeed. Raises HTTP 429 if the atomic check fails.
     Also sends a warning email at 80% quota.
     Call this AFTER the dataset has been committed.
     """
-    if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or user.comparisons_quota is None:
+    quota = user.comparisons_quota
+    if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or quota is None:
         return  # Unlimited — skip
 
-    await db.execute(
+    result = await db.execute(
         update(User)
         .where(User.id == user.id)
+        .where(User.comparisons_used_this_month < quota)
         .values(comparisons_used_this_month=User.comparisons_used_this_month + 1)
+        .returning(User.comparisons_used_this_month)
     )
+    new_count = result.scalar()
+    if new_count is None:
+        # Quota was exhausted by a concurrent request — roll back the dataset commit
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Monthly comparison quota exhausted ({quota}/{quota}). "
+                "Quota resets on the 1st of next month."
+            ),
+        )
     await db.commit()
     await db.refresh(user)
 

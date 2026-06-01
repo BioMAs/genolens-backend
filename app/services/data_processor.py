@@ -919,7 +919,7 @@ class DataProcessorService:
             for p in plot_data:
                 p['padj'] = float(f"{p['padj']:.6g}")
 
-            print(f"[VOLCANO] Comparison '{comp_name}': {valid_count} valid genes, {zero_pval_count} excluded (p-value=0). Keeping {len(plot_data)} points.")
+            logger.debug(f"[VOLCANO] Comparison '{comp_name}': {valid_count} valid genes, {zero_pval_count} excluded (p-value=0). Keeping {len(plot_data)} points.")
             volcano_plots[comp_name] = plot_data
         
         return volcano_plots
@@ -1015,8 +1015,8 @@ class DataProcessorService:
             logfc_col = cols.get('logFC')
             padj_col = cols.get('padj')
             
-            print(f"Processing comparison: {comp_name}")
-            print(f"LogFC column: {logfc_col}, Padj column: {padj_col}")
+            logger.debug(f"Processing comparison: {comp_name}")
+            logger.debug(f"LogFC column: {logfc_col}, Padj column: {padj_col}")
             
             if not logfc_col or not padj_col:
                 continue
@@ -1033,15 +1033,23 @@ class DataProcessorService:
                 continue
             
             # Separate and sort by up/down regulation
-            up_regulated = sig_genes_data[sig_genes_data[logfc_col] > 0].sort_values(
-                by=logfc_col, ascending=False
-            )['gene_id'].tolist() if 'gene_id' in sig_genes_data.columns else []
+            if 'gene_id' not in sig_genes_data.columns:
+                logger.warning(
+                    f"[DEG_HEATMAP] Comparison '{comp_name}': 'gene_id' column missing — "
+                    "heatmap will be empty. Check your Parquet file structure."
+                )
+                up_regulated = []
+                down_regulated = []
+            else:
+                up_regulated = sig_genes_data[sig_genes_data[logfc_col] > 0].sort_values(
+                    by=logfc_col, ascending=False
+                )['gene_id'].tolist()
+
+                down_regulated = sig_genes_data[sig_genes_data[logfc_col] < 0].sort_values(
+                    by=logfc_col, ascending=True
+                )['gene_id'].tolist()
             
-            down_regulated = sig_genes_data[sig_genes_data[logfc_col] < 0].sort_values(
-                by=logfc_col, ascending=True
-            )['gene_id'].tolist() if 'gene_id' in sig_genes_data.columns else []
-            
-            print(f"Found {len(up_regulated)} up-regulated and {len(down_regulated)} down-regulated genes")
+            logger.debug(f"Found {len(up_regulated)} up-regulated and {len(down_regulated)} down-regulated genes")
             
             # Combine: up-regulated first, then down-regulated
             sig_genes = up_regulated + down_regulated
@@ -1053,7 +1061,7 @@ class DataProcessorService:
             for gene in down_regulated:
                 regulation_map[gene] = 'down'
             
-            print(f"Regulation map created with {len(regulation_map)} genes")
+            logger.debug(f"Regulation map created with {len(regulation_map)} genes")
             
             if len(sig_genes) == 0:
                 continue
@@ -1135,24 +1143,24 @@ class DataProcessorService:
         parquet_buffer = io.BytesIO(parquet_data)
         df = pd.read_parquet(parquet_buffer)
 
-        print(f"[DEG_STATS] Processing {len(comparisons)} comparisons")
+        logger.debug(f"[DEG_STATS] Processing {len(comparisons)} comparisons")
 
         statistics = {}
         for comp_name, cols in comparisons.items():
             logfc_col = cols.get('logFC')
             padj_col = cols.get('padj')
 
-            print(f"[DEG_STATS] Comparison '{comp_name}': logFC={logfc_col}, padj={padj_col}")
+            logger.debug(f"[DEG_STATS] Comparison '{comp_name}': logFC={logfc_col}, padj={padj_col}")
 
             if not logfc_col or not padj_col:
-                print(f"[DEG_STATS] Skipping '{comp_name}': missing columns")
+                logger.debug(f"[DEG_STATS] Skipping '{comp_name}': missing columns")
                 continue
 
             # Check if contrast column exists for this comparison
             contrast_col = f"contrast:{comp_name}"
             has_contrast_col = contrast_col in df.columns
 
-            print(f"[DEG_STATS] Looking for contrast column: {contrast_col}, Found: {has_contrast_col}")
+            logger.debug(f"[DEG_STATS] Looking for contrast column: {contrast_col}, Found: {has_contrast_col}")
 
             if has_contrast_col:
                 # Use contrast column to count (more accurate)
@@ -1163,7 +1171,7 @@ class DataProcessorService:
                     (df[contrast_col] != None)
                 ].copy()
 
-                print(f"[DEG_STATS] Total genes in contrast column: {len(comparison_genes)}")
+                logger.debug(f"[DEG_STATS] Total genes in contrast column: {len(comparison_genes)}")
 
                 # Count UP and DOWN based on contrast column values
                 deg_up = len(comparison_genes[comparison_genes[contrast_col].str.upper() == 'UP'])
@@ -1179,7 +1187,7 @@ class DataProcessorService:
                 ].copy()
             else:
                 # Fallback: use logFC sign (old method)
-                print(f"[DEG_STATS] No contrast column found, using logFC sign")
+                logger.debug(f"[DEG_STATS] No contrast column found, using logFC sign")
                 significant = df[
                     (df[padj_col].notna()) &
                     (df[logfc_col].notna()) &
@@ -1213,7 +1221,7 @@ class DataProcessorService:
                 'top_genes': top_genes
             }
 
-            print(f"[DEG_STATS] Comparison '{comp_name}': {deg_up} up, {deg_down} down, {deg_total} total, {len(top_genes)} top genes")
+            logger.debug(f"[DEG_STATS] Comparison '{comp_name}': {deg_up} up, {deg_down} down, {deg_total} total, {len(top_genes)} top genes")
 
         return statistics
 
@@ -1236,7 +1244,7 @@ class DataProcessorService:
         parquet_buffer = io.BytesIO(parquet_data)
         df = pd.read_parquet(parquet_buffer)
 
-        print(f"[DEG_EXTRACT] Processing {len(comparisons)} comparisons for DB storage")
+        logger.debug(f"[DEG_EXTRACT] Processing {len(comparisons)} comparisons for DB storage")
 
         all_genes = {}
         for comp_name, cols in comparisons.items():
@@ -1245,7 +1253,7 @@ class DataProcessorService:
             pvalue_col = cols.get('pvalue')  # Optional
 
             if not logfc_col or not padj_col:
-                print(f"[DEG_EXTRACT] Skipping '{comp_name}': missing columns")
+                logger.debug(f"[DEG_EXTRACT] Skipping '{comp_name}': missing columns")
                 continue
 
             # Check for contrast column
@@ -1305,12 +1313,12 @@ class DataProcessorService:
                     genes_list.append(gene_record)
 
                 all_genes[comp_name] = genes_list
-                print(f"[DEG_EXTRACT] Comparison '{comp_name}': {len(genes_list)} genes extracted (using contrast column)")
+                logger.debug(f"[DEG_EXTRACT] Comparison '{comp_name}': {len(genes_list)} genes extracted (using contrast column)")
             
             else:
                 # Fallback: use logFC sign and thresholds if no contrast column
                 # This ensures we still populate the DB even without explicit contrast columns
-                print(f"[DEG_EXTRACT] No contrast column for '{comp_name}', using logFC/padj thresholds")
+                logger.debug(f"[DEG_EXTRACT] No contrast column for '{comp_name}', using logFC/padj thresholds")
                 
                 # Default thresholds for "significant" genes to store
                 # We store significant genes to populate the DEG table
@@ -1367,7 +1375,7 @@ class DataProcessorService:
                     genes_list.append(gene_record)
                 
                 all_genes[comp_name] = genes_list
-                print(f"[DEG_EXTRACT] Comparison '{comp_name}': {len(genes_list)} genes extracted (using thresholds)")
+                logger.debug(f"[DEG_EXTRACT] Comparison '{comp_name}': {len(genes_list)} genes extracted (using thresholds)")
 
         return all_genes
 
@@ -1434,10 +1442,10 @@ class DataProcessorService:
         category_col = find_col(category_cols)
 
         if not all([pathway_id_col, pathway_name_col, padj_col]):
-            print(f"[DataProcessor] Enrichment file missing required columns")
-            print(f"  - Pathway ID: {pathway_id_col}")
-            print(f"  - Pathway Name: {pathway_name_col}")
-            print(f"  - Adjusted P-value: {padj_col}")
+            logger.warning(f"[DataProcessor] Enrichment file missing required columns")
+            logger.warning(f"  - Pathway ID: {pathway_id_col}")
+            logger.warning(f"  - Pathway Name: {pathway_name_col}")
+            logger.warning(f"  - Adjusted P-value: {padj_col}")
             return {}
 
         # For enrichment files, we might have:
