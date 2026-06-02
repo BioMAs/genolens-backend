@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.worker.celery_app import celery_app
 from app.db.session import AsyncSessionLocal
-from app.models.models import Dataset, DatasetStatus, DegGene, EnrichmentPathway
+from app.models.models import Dataset, DatasetStatus, DatasetType, DegGene, EnrichmentPathway
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor
 from app.core.config import settings
@@ -339,8 +339,9 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                         validation_warnings.append(warning_msg)
                         logger.warning(warning_msg)  # Log to worker console
 
-                # Merge PCA results, plot results, DEG stats, metadata and warnings
-                final_metadata = {**metadata, **pca_results, **plot_results}
+                # Merge: start with existing dataset metadata (preserves analysis_id, source,
+                # comparison_name, etc. set at creation time), then layer computed metadata on top.
+                final_metadata = {**(dataset.dataset_metadata or {}), **metadata, **pca_results, **plot_results}
 
                 # Add DEG statistics to metadata
                 # For datasets with comparisons, store statistics per comparison
@@ -422,17 +423,22 @@ def health_check() -> dict:
 def run_self_service_analysis(self, analysis_id: str) -> dict:
     """
     Run a self-service DESeq2/multi-method analysis pipeline (R-based).
-    Updates SelfServiceAnalysis status and progress_log as it progresses.
+    After R completes, registers output files as Dataset records so comparisons appear
+    in the project comparisons tab.
     """
+    import os
+    import shutil
     import subprocess
     import traceback
     from datetime import datetime, timezone
-    from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, Dataset
+    from uuid import uuid4 as _uuid4
+    from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus
 
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
     async def _run():
+        outdir = f"/tmp/analyses/{analysis_id}"
         async with AsyncSessionLocal() as db:
             try:
                 analysis = await db.scalar(
@@ -457,19 +463,28 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 await db.commit()
                 await db.refresh(analysis)
 
-                # Resolve dataset file paths
-                async def _get_path(dataset_id):
+                # Resolve raw TSV file paths on local filesystem
+                # (R script reads TSV directly; parquet_file_path is the processed binary)
+                async def _get_local_raw_path(dataset_id):
                     if not dataset_id:
                         return None
                     d = await db.scalar(select(Dataset).where(Dataset.id == dataset_id))
-                    return d.parquet_file_path if d else None
+                    if not d or not d.raw_file_path:
+                        return None
+                    return str(Path(settings.LOCAL_STORAGE_PATH) / d.raw_file_path)
 
-                matrix_path = await _get_path(analysis.matrix_dataset_id)
-                samples_path = await _get_path(analysis.samples_dataset_id)
-                comparisons_path = await _get_path(analysis.comparisons_dataset_id)
+                matrix_path = await _get_local_raw_path(analysis.matrix_dataset_id)
+                samples_path = await _get_local_raw_path(analysis.samples_dataset_id)
+                comparisons_path = await _get_local_raw_path(analysis.comparisons_dataset_id)
 
                 if not matrix_path or not samples_path or not comparisons_path:
-                    raise ValueError("One or more input datasets have no processed file. Ensure all datasets are in READY status.")
+                    raise ValueError(
+                        "One or more input datasets have no raw file. "
+                        "Ensure all datasets are in READY status."
+                    )
+
+                # Prepare output directory
+                os.makedirs(outdir, exist_ok=True)
 
                 params = analysis.params or {}
                 r_script = Path("/app/r_scripts/run_multimethod_pipeline.R")
@@ -483,16 +498,26 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 db.add(analysis)
                 await db.commit()
 
-                # Build R command
-                import json as _json
                 cmd = [
                     "Rscript", str(r_script),
-                    "--matrix", str(matrix_path),
-                    "--samples", str(samples_path),
-                    "--comparisons", str(comparisons_path),
-                    "--analysis-id", analysis_id,
-                    "--params", _json.dumps(params),
+                    "--counts", matrix_path,
+                    "--samples", samples_path,
+                    "--comparisons", comparisons_path,
+                    "--outdir", outdir,
+                    "--design", str(params.get("design", "auto")),
+                    "--fdr", str(params.get("fdr", 0.05)),
+                    "--min-log2fc", str(params.get("min_log2fc", 1.0)),
+                    "--min-reads", str(params.get("min_reads", 10)),
+                    "--min-genes", str(params.get("min_genes", 200)),
+                    "--min-count", str(params.get("min_count", 5)),
+                    "--min-reps", str(params.get("min_reps", 2)),
+                    "--threads", str(params.get("threads", 4)),
+                    "--species", str(params.get("species", "human")),
                 ]
+                enrichment_dbs = params.get("enrichment_databases")
+                if enrichment_dbs:
+                    dbs_str = ",".join(enrichment_dbs) if isinstance(enrichment_dbs, list) else enrichment_dbs
+                    cmd.extend(["--enrichment-databases", dbs_str])
 
                 proc = subprocess.run(
                     cmd,
@@ -507,18 +532,90 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                         f"stderr: {proc.stderr[-2000:]}"
                     )
 
-                _log("done", "Pipeline completed successfully")
-                analysis.status = SelfServiceAnalysisStatus.DONE
-                analysis.current_step = "done"
+                # ── Register output files as Dataset records ─────────────────
+                _log("registering_results", "Registering output datasets")
+                analysis.current_step = "registering_results"
                 db.add(analysis)
                 await db.commit()
-                return {"status": "done", "analysis_id": analysis_id}
+
+                manifest = {}
+                manifest_path = Path(outdir) / "pipeline_manifest.json"
+                if manifest_path.exists():
+                    with open(manifest_path) as f:
+                        manifest = json.load(f)
+
+                result_dataset_ids: list[str] = []
+                intermediate_dataset_ids: dict[str, str] = {}
+
+                # VST intermediate dataset (MATRIX type — used for PCA display)
+                vst_local = Path(outdir) / "vst_counts.tsv"
+                if manifest.get("has_vst") and vst_local.exists():
+                    vst_storage = f"projects/{analysis.project_id}/analyses/{analysis_id}/vst_counts.tsv"
+                    await storage_service.upload_file(vst_storage, vst_local.read_bytes())
+                    vst_ds = Dataset(
+                        id=_uuid4(),
+                        project_id=analysis.project_id,
+                        name=f"{analysis.name} — VST counts",
+                        type=DatasetType.MATRIX,
+                        status=DatasetStatus.PENDING,
+                        raw_file_path=vst_storage,
+                        dataset_metadata={"source": "vst", "analysis_id": str(analysis_id)},
+                        column_mapping={},
+                    )
+                    db.add(vst_ds)
+                    await db.flush()
+                    intermediate_dataset_ids["vst"] = str(vst_ds.id)
+                    process_dataset_upload.delay(str(vst_ds.id), vst_storage)
+                    logger.info("[ANALYSIS] Registered VST dataset %s", vst_ds.id)
+
+                # DEG result datasets (one per comparison)
+                comparisons_dir = Path(outdir) / "comparisons"
+                if comparisons_dir.exists():
+                    for comp_dir in sorted(comparisons_dir.iterdir()):
+                        if not comp_dir.is_dir():
+                            continue
+                        deg_csv = comp_dir / "genolens_deg.csv"
+                        if not deg_csv.exists():
+                            continue
+                        comp_id = comp_dir.name
+                        deg_storage = (
+                            f"projects/{analysis.project_id}/analyses/{analysis_id}"
+                            f"/comparisons/{comp_id}/genolens_deg.csv"
+                        )
+                        await storage_service.upload_file(deg_storage, deg_csv.read_bytes())
+                        deg_ds = Dataset(
+                            id=_uuid4(),
+                            project_id=analysis.project_id,
+                            name=comp_id,
+                            type=DatasetType.DEG,
+                            status=DatasetStatus.PENDING,
+                            raw_file_path=deg_storage,
+                            dataset_metadata={"analysis_id": str(analysis_id), "comparison_name": comp_id},
+                            column_mapping={},
+                        )
+                        db.add(deg_ds)
+                        await db.flush()
+                        result_dataset_ids.append(str(deg_ds.id))
+                        process_dataset_upload.delay(str(deg_ds.id), deg_storage)
+                        logger.info("[ANALYSIS] Registered DEG dataset %s for comparison %s", deg_ds.id, comp_id)
+
+                analysis.result_dataset_ids = result_dataset_ids
+                analysis.intermediate_dataset_ids = intermediate_dataset_ids
+                analysis.status = SelfServiceAnalysisStatus.DONE
+                analysis.current_step = "done"
+                _log("done", f"Pipeline completed. Registered {len(result_dataset_ids)} DEG dataset(s).")
+                db.add(analysis)
+                await db.commit()
+
+                shutil.rmtree(outdir, ignore_errors=True)
+                return {"status": "done", "analysis_id": analysis_id, "result_dataset_ids": result_dataset_ids}
 
             except Exception as exc:
                 error_details = traceback.format_exc()
                 error_msg = str(exc) if str(exc) else error_details[:500]
                 logger.error("[ANALYSIS] Failed for %s: %s", analysis_id, error_msg)
                 logger.error("[ANALYSIS] Traceback:\n%s", error_details)
+                shutil.rmtree(outdir, ignore_errors=True)
                 await db.execute(
                     update(SelfServiceAnalysis)
                     .where(SelfServiceAnalysis.id == UUID(analysis_id))

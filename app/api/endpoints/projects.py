@@ -380,7 +380,7 @@ async def get_project_summary(
             failed_count=failed_count,
             original_files_count=original_files_count
         ),
-        "comparisons": [],
+        "comparisons": all_comparisons,
         "original_files": original_files
     }
 
