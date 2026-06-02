@@ -36,7 +36,7 @@ from app.api.deps.subscription import (
 # from app.db.session import get_db  <-- Removed
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
-from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, UserRole
+from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, UserRole, GOTerm
 from sqlalchemy import select, func, delete, text, or_, desc, asc, and_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -4318,6 +4318,41 @@ async def run_go_enrichment_analysis(
     
     logger.info(f"✅ GO enrichment complete: {len(enrichment_results)} terms found")
 
+    # Persist results to EnrichmentPathway for go-hierarchy reuse
+    _NS_TO_CAT = {
+        "biological_process": "GO:BP",
+        "molecular_function": "GO:MF",
+        "cellular_component": "GO:CC",
+    }
+    await db.execute(
+        delete(EnrichmentPathway).where(
+            EnrichmentPathway.dataset_id == dataset_id,
+            EnrichmentPathway.comparison_name == comparison_name,
+            EnrichmentPathway.regulation == (regulation or "ALL"),
+            EnrichmentPathway.category.in_(["GO:BP", "GO:MF", "GO:CC"]),
+        )
+    )
+    for _r in enrichment_results:
+        _cat = _NS_TO_CAT.get(_r.get("namespace", ""))
+        if not _cat:
+            continue
+        db.add(EnrichmentPathway(
+            dataset_id=dataset_id,
+            comparison_name=comparison_name,
+            pathway_id=_r["go_id"],
+            pathway_name=_r.get("term_name", _r["go_id"]),
+            category=_cat,
+            description=_r.get("definition"),
+            gene_count=_r["study_count"],
+            pvalue=_r["pvalue"],
+            padj=_r.get("fdr", _r["pvalue"]),
+            gene_ratio=f"{_r['study_count']}/{len(study_genes)}",
+            bg_ratio=f"{_r['background_count']}/{len(background_genes)}",
+            genes=_r.get("study_genes", []),
+            regulation=regulation or "ALL",
+        ))
+    await db.commit()
+
     await history_service.log_activity(
         db, dataset.project_id, current_user.user_id, ActivityEventType.GO_ENRICHMENT_RUN,
         entity_type="comparison",
@@ -4348,6 +4383,107 @@ async def run_go_enrichment_analysis(
             "propagate_annotations": propagate_annotations,
             "organism": organism
         }
+    }
+
+
+@router.get("/{dataset_id}/comparisons/{comparison_name}/go-hierarchy")
+async def get_go_hierarchy(
+    dataset_id: UUID,
+    comparison_name: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    regulation: Optional[str] = Query(None, description="Filter by regulation: UP, DOWN (None = all)"),
+) -> dict:
+    """
+    Build a GO term hierarchy tree from persisted enrichment results.
+
+    Returns enriched GO terms (and their ancestor context) grouped by namespace,
+    structured as a recursive GOTreeNode tree ready for frontend rendering.
+    """
+    from collections import defaultdict
+
+    # Auth
+    _ds = (await db.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
+    if not _ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    await _check_project_read_access(_ds.project_id, current_user.user_id, db)
+
+    # Load enriched GO terms from EnrichmentPathway
+    stmt = select(EnrichmentPathway).where(
+        EnrichmentPathway.dataset_id == dataset_id,
+        EnrichmentPathway.comparison_name == comparison_name,
+        EnrichmentPathway.category.in_(["GO:BP", "GO:MF", "GO:CC"]),
+    )
+    if regulation:
+        stmt = stmt.where(EnrichmentPathway.regulation == regulation)
+    enriched_rows = (await db.execute(stmt)).scalars().all()
+
+    empty_response = {"biological_process": [], "molecular_function": [], "cellular_component": []}
+    if not enriched_rows:
+        return empty_response
+
+    enriched_map = {ep.pathway_id: ep for ep in enriched_rows}
+
+    # BFS to collect all ancestor IDs
+    all_ids: set[str] = set(enriched_map.keys())
+    queue: list[str] = list(all_ids)
+    while queue:
+        batch, queue = queue[:200], queue[200:]
+        term_rows = (await db.execute(
+            select(GOTerm.go_id, GOTerm.is_a, GOTerm.part_of).where(GOTerm.go_id.in_(batch))
+        )).all()
+        for row in term_rows:
+            for pid in (row.is_a or []) + (row.part_of or []):
+                if pid not in all_ids:
+                    all_ids.add(pid)
+                    queue.append(pid)
+
+    # Bulk-load all relevant GOTerm records
+    terms_map = {
+        t.go_id: t
+        for t in (await db.execute(select(GOTerm).where(GOTerm.go_id.in_(all_ids)))).scalars()
+    }
+
+    def _build_namespace_tree(namespace: str) -> list:
+        ns_ids = [go_id for go_id, t in terms_map.items() if t.namespace == namespace]
+        if not ns_ids:
+            return []
+
+        # Build parent → children mapping within this namespace
+        children_map: dict[str, list[str]] = defaultdict(list)
+        for go_id in ns_ids:
+            term = terms_map[go_id]
+            for pid in (term.is_a or []) + (term.part_of or []):
+                if pid in terms_map and terms_map[pid].namespace == namespace:
+                    children_map[pid].append(go_id)
+
+        # Root nodes = not listed as child of any other node in this subset
+        all_children: set[str] = {c for kids in children_map.values() for c in kids}
+        roots = [go_id for go_id in ns_ids if go_id not in all_children]
+
+        def _node(go_id: str) -> dict:
+            term = terms_map[go_id]
+            ep = enriched_map.get(go_id)
+            return {
+                "go_id": go_id,
+                "go_name": term.name,
+                "namespace": term.namespace,
+                "level": term.level,
+                "is_enriched": ep is not None,
+                "pvalue": ep.pvalue if ep else None,
+                "fdr": ep.padj if ep else None,
+                "enrichment_ratio": None,
+                "gene_count": ep.gene_count if ep else None,
+                "genes": ep.genes if ep else None,
+                "children": [_node(c) for c in sorted(children_map.get(go_id, []))],
+            }
+
+        return [_node(r) for r in roots]
+
+    return {
+        "biological_process": _build_namespace_tree("biological_process"),
+        "molecular_function": _build_namespace_tree("molecular_function"),
+        "cellular_component": _build_namespace_tree("cellular_component"),
     }
 
 
