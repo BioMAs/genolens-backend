@@ -49,6 +49,9 @@ services:
       - LOCAL_STORAGE_PATH=/app/data
       - OLLAMA_BASE_URL=http://72.61.97.155:11434
       - 'CORS_ORIGINS=["https://app.genolens.com", "https://api-v2.genolens.com", "http://localhost:3000"]'
+      - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY}
+      - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY}
+      - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
 
     volumes:
       - genolens_storage:/app/data
@@ -89,6 +92,9 @@ services:
       - ENVIRONMENT=production
       - LOCAL_STORAGE_PATH=/app/data
       - OLLAMA_BASE_URL=http://72.61.97.155:11434
+      - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY}
+      - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY}
+      - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
     volumes:
       - genolens_storage:/app/data
     depends_on:

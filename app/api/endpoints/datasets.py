@@ -724,6 +724,62 @@ async def get_gene_list(
         )
 
 
+@router.get("/{dataset_id}/genes/map")
+async def get_gene_map(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    primary_column: str = Query("gene_id", description="Column to use as map key"),
+    secondary_column: str = Query("gene_name", description="Column to use as map value"),
+) -> dict:
+    """
+    Return a {primary_column → secondary_column} mapping for all rows in the dataset.
+
+    Fast path for the frontend to resolve gene IDs to display names without
+    downloading the full dataset. Returns an empty gene_map if either column is absent.
+    """
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+
+    if dataset.status != DatasetStatus.READY:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Dataset is not ready. Current status: {dataset.status}",
+        )
+    if not dataset.parquet_file_path:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Parquet file path not found")
+
+    try:
+        import pyarrow.parquet as pq
+        import io
+
+        parquet_data = await storage_service.download_file(dataset.parquet_file_path)
+        table = pq.read_table(io.BytesIO(parquet_data))
+        schema_names = table.schema.names
+
+        if primary_column not in schema_names:
+            return {"gene_map": {}, "primary_column": primary_column, "secondary_column": secondary_column}
+
+        primary_col = table.column(primary_column).to_pylist()
+        if secondary_column in schema_names:
+            secondary_col = table.column(secondary_column).to_pylist()
+            gene_map = {
+                str(pk): str(sv) if sv is not None else str(pk)
+                for pk, sv in zip(primary_col, secondary_col)
+                if pk is not None
+            }
+        else:
+            gene_map = {str(pk): str(pk) for pk in primary_col if pk is not None}
+
+        return {"gene_map": gene_map, "primary_column": primary_column, "secondary_column": secondary_column}
+
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to build gene map: {str(e)}")
+
+
 @router.get("/project/{project_id}", response_model=list[DatasetResponse])
 async def list_project_datasets(
     project_id: UUID,
@@ -4297,15 +4353,13 @@ async def run_go_enrichment_analysis(
     try:
         enrichment_results = await go_service.go_enrichment_analysis(
             db=db,
-            study_genes=study_genes,
-            background_genes=background_genes,
+            gene_list=study_genes,
+            background=background_genes,
             namespace=namespace,
             organism=organism,
-            min_term_size=min_term_size,
-            max_term_size=max_term_size,
+            min_gene_count=min_term_size,
+            max_gene_count=max_term_size,
             pvalue_threshold=pvalue_threshold,
-            fdr_method=fdr_method,
-            propagate_annotations=propagate_annotations
         )
     except Exception as e:
         logger.error(f"GO enrichment failed: {e}")
