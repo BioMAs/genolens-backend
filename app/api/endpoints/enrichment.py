@@ -29,6 +29,26 @@ class EnrichmentPathwayResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
+@router.get("/{dataset_id}/comparisons")
+async def get_enrichment_comparisons(
+    dataset_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: SupabaseUser = Depends(get_current_user)
+):
+    """
+    Get list of comparisons that have enrichment results available.
+    """
+    query = select(EnrichmentPathway.comparison_name).where(
+        EnrichmentPathway.dataset_id == dataset_id
+    ).distinct()
+    
+    result = await db.execute(query)
+    comparisons = result.scalars().all()
+    
+    return comparisons
+
+
 @router.get("/{dataset_id}/{comparison_name}", response_model=List[EnrichmentPathwayResponse])
 async def get_enrichment_results(
     dataset_id: UUID,
@@ -105,25 +125,3 @@ async def get_enrichment_results(
     pathways = result.scalars().all()
     
     return pathways
-
-@router.get("/{dataset_id}/comparisons")
-async def get_enrichment_comparisons(
-    dataset_id: UUID,
-    db: AsyncSession = Depends(get_db),
-    current_user: SupabaseUser = Depends(get_current_user)
-):
-    """
-    Get list of comparisons that have enrichment results available.
-    """
-    # Access control (Reuse logic or simplify)
-    # For speed, let's assume if you can list datasets, you can see comparisons
-    # NOTE: In production, refactor access control to a dependency `deps.get_authorized_dataset`
-    
-    query = select(EnrichmentPathway.comparison_name).where(
-        EnrichmentPathway.dataset_id == dataset_id
-    ).distinct()
-    
-    result = await db.execute(query)
-    comparisons = result.scalars().all()
-    
-    return comparisons

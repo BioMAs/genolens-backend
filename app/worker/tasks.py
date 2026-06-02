@@ -15,7 +15,123 @@ from app.db.session import AsyncSessionLocal
 from app.models.models import Dataset, DatasetStatus, DatasetType, DegGene, EnrichmentPathway
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor
+from app.services.go_service import GOService
 from app.core.config import settings
+
+_NS_TO_CAT = {
+    "biological_process": "GO:BP",
+    "molecular_function": "GO:MF",
+    "cellular_component": "GO:CC",
+}
+
+
+async def _auto_run_go_enrichment(db: "AsyncSession", dataset_id: str) -> None:
+    """
+    Automatically run GO enrichment for all comparisons in a DEG dataset
+    and persist results to EnrichmentPathway. Called after DEG genes are stored.
+    """
+    go_service = GOService()
+
+    # Get distinct comparisons stored in DegGene for this dataset
+    from sqlalchemy import distinct
+    comp_result = await db.execute(
+        select(distinct(DegGene.comparison_name)).where(DegGene.dataset_id == dataset_id)
+    )
+    comparisons = [row[0] for row in comp_result.fetchall()]
+
+    if not comparisons:
+        logger.info(f"[WORKER] No comparisons found for auto GO enrichment on dataset {dataset_id}")
+        return
+
+    # Background = all distinct genes in this dataset
+    bg_result = await db.execute(
+        select(DegGene).where(DegGene.dataset_id == dataset_id)
+    )
+    all_deg_rows = bg_result.scalars().all()
+    background_genes = list({deg.gene_name or deg.gene_id for deg in all_deg_rows if (deg.gene_name or deg.gene_id)})
+    logger.info(f"[WORKER] Auto GO enrichment: {len(comparisons)} comparisons, {len(background_genes)} background genes")
+
+    for comp_name in comparisons:
+        try:
+            # Fetch all significant DEGs for this comparison (padj <= 0.05, |lfc| >= 0.5)
+            all_rows = [d for d in all_deg_rows if d.comparison_name == comp_name]
+            sig_rows = [d for d in all_rows if d.padj is not None and d.padj <= 0.05 and abs(d.log_fc or 0) >= 0.5]
+
+            if not sig_rows:
+                logger.info(f"[WORKER] No significant DEGs for '{comp_name}', skipping enrichment")
+                continue
+
+            for regulation in ("ALL", "UP", "DOWN"):
+                if regulation == "UP":
+                    subset = [d for d in sig_rows if (d.log_fc or 0) > 0]
+                elif regulation == "DOWN":
+                    subset = [d for d in sig_rows if (d.log_fc or 0) < 0]
+                else:
+                    subset = sig_rows
+
+                if not subset:
+                    continue
+
+                study_genes = [d.gene_name or d.gene_id for d in subset if (d.gene_name or d.gene_id)]
+                if not study_genes:
+                    continue
+
+                logger.info(f"[WORKER] Running GO enrichment for '{comp_name}' ({regulation}): {len(study_genes)} genes")
+                enrichment_results = await go_service.go_enrichment_analysis(
+                    db=db,
+                    gene_list=study_genes,
+                    background=background_genes,
+                    pvalue_threshold=0.05,
+                )
+
+                if not enrichment_results:
+                    logger.info(f"[WORKER] No GO terms found for '{comp_name}' ({regulation})")
+                    continue
+
+                # Delete existing results for this combo
+                await db.execute(
+                    delete(EnrichmentPathway).where(
+                        EnrichmentPathway.dataset_id == dataset_id,
+                        EnrichmentPathway.comparison_name == comp_name,
+                        EnrichmentPathway.regulation == regulation,
+                        EnrichmentPathway.category.in_(["GO:BP", "GO:MF", "GO:CC"]),
+                    )
+                )
+                await db.commit()
+
+                pathway_records = []
+                for r in enrichment_results:
+                    cat = _NS_TO_CAT.get(r.get("namespace", ""))
+                    if not cat:
+                        continue
+                    pathway_records.append({
+                        "dataset_id": dataset_id,
+                        "comparison_name": comp_name,
+                        "pathway_id": r["go_id"],
+                        "pathway_name": r.get("term_name", r["go_id"]),
+                        "category": cat,
+                        "description": r.get("definition"),
+                        "gene_count": r["study_count"],
+                        "pvalue": r["pvalue"],
+                        "padj": r.get("fdr", r["pvalue"]),
+                        "gene_ratio": f"{r['study_count']}/{len(study_genes)}",
+                        "bg_ratio": f"{r['background_count']}/{len(background_genes)}",
+                        "genes": r.get("study_genes", []),
+                        "regulation": regulation,
+                    })
+
+                chunk_size = 500
+                for i in range(0, len(pathway_records), chunk_size):
+                    chunk = pathway_records[i:i + chunk_size]
+                    await db.execute(insert(EnrichmentPathway), chunk)
+                    await db.commit()
+
+                logger.info(f"[WORKER] Stored {len(pathway_records)} GO terms for '{comp_name}' ({regulation})")
+
+        except Exception as e:
+            await db.rollback()
+            logger.warning(f"[WORKER] Auto GO enrichment failed for '{comp_name}': {e}")
+            # Non-fatal: continue with other comparisons
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +309,14 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                         import traceback
                         traceback.print_exc()
                         # Don't fail the whole task if DEG storage fails
+
+                    # Automatically run GO enrichment on the stored DEG genes
+                    self.update_state(state="PROGRESS", meta={"step": "computing_go_enrichment"})
+                    try:
+                        await _auto_run_go_enrichment(db, dataset_id)
+                    except Exception as e:
+                        logger.warning(f"[WORKER] Auto GO enrichment step failed: {e}")
+                        # Non-fatal: dataset still usable without pre-computed enrichment
 
                 # Extract and store enrichment pathways in database for ENRICHMENT datasets
                 if metadata.get("enrichment_comparisons"):
