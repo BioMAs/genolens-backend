@@ -557,7 +557,7 @@ def health_check() -> dict:
     return {"status": "healthy", "message": "Celery worker is running"}
 
 
-@celery_app.task(bind=True, base=DatabaseTask, name="app.worker.tasks.run_self_service_analysis")
+@celery_app.task(bind=True, base=DatabaseTask, name="app.worker.tasks.run_self_service_analysis", queue="r_analysis")
 def run_self_service_analysis(self, analysis_id: str) -> dict:
     """
     Run a self-service DESeq2/multi-method analysis pipeline (R-based).
