@@ -47,7 +47,7 @@ services:
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
       - ENVIRONMENT=production
       - LOCAL_STORAGE_PATH=/app/data
-      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_BASE_URL=http://72.61.97.155:11434
       - 'CORS_ORIGINS=["https://app.genolens.com", "https://api-v2.genolens.com", "http://localhost:3000"]'
 
     volumes:
@@ -57,8 +57,6 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_started
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'
     restart: always
     networks:
@@ -90,6 +88,7 @@ services:
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
       - ENVIRONMENT=production
       - LOCAL_STORAGE_PATH=/app/data
+      - OLLAMA_BASE_URL=http://72.61.97.155:11434
     volumes:
       - genolens_storage:/app/data
     depends_on:
@@ -102,20 +101,8 @@ services:
     networks:
       - default
 
-  # Ollama - Local AI for biological interpretation
-  ollama:
-    image: ollama/ollama:latest
-    volumes:
-      - ollama_data:/root/.ollama
-    environment:
-      - OLLAMA_HOST=0.0.0.0:11434
-    restart: always
-    networks:
-      - default
-
 volumes:
   postgres_data:
-  ollama_data:
   genolens_storage:
 
 networks:
