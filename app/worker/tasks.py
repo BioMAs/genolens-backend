@@ -8,15 +8,34 @@ from pathlib import Path
 from uuid import UUID
 from celery import Task
 from sqlalchemy import select, update, delete, and_, insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.worker.celery_app import celery_app
-from app.db.session import AsyncSessionLocal
 from app.models.models import Dataset, DatasetStatus, DatasetType, DegGene, EnrichmentPathway
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor
 from app.services.go_service import GOService
 from app.core.config import settings
+
+
+def _make_worker_session() -> async_sessionmaker:
+    """
+    Create a fresh AsyncSessionLocal with NullPool for the current event loop.
+    NullPool disables connection pooling so each task gets a clean connection
+    unbound from any previous event loop — required for Celery workers.
+    """
+    worker_engine = create_async_engine(
+        settings.DATABASE_URL,
+        poolclass=NullPool,
+        future=True,
+    )
+    return async_sessionmaker(
+        bind=worker_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
 
 _NS_TO_CAT = {
     "biological_process": "GO:BP",
@@ -143,12 +162,7 @@ class DatabaseTask(Task):
 
 def run_async(coro):
     """Helper to run async functions in Celery tasks."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    return asyncio.run(coro)
 
 
 @celery_app.task(bind=True, base=DatabaseTask, name="app.worker.tasks.process_dataset_upload")
@@ -169,7 +183,7 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
         dict: Processing result with status and message
     """
     async def _process():
-        async with AsyncSessionLocal() as db:
+        async with _make_worker_session()() as db:
             try:
                 # Update status to PROCESSING
                 stmt = update(Dataset).where(Dataset.id == dataset_id).values(status=DatasetStatus.PROCESSING)
@@ -563,7 +577,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
 
     async def _run():
         outdir = f"/tmp/analyses/{analysis_id}"
-        async with AsyncSessionLocal() as db:
+        async with _make_worker_session()() as db:
             try:
                 analysis = await db.scalar(
                     select(SelfServiceAnalysis).where(
