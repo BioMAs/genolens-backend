@@ -4334,19 +4334,20 @@ async def run_go_enrichment_analysis(
             detail=f"No DEGs found for comparison {comparison_name} with specified thresholds"
         )
     
-    # Extract gene symbols
-    study_genes = [deg.gene_id for deg in degs]
-    logger.info(f"Found {len(study_genes)} DEGs for GO enrichment")
+    # Extract gene symbols — go_annotations stores gene symbols (e.g. BRCA1), not Ensembl IDs.
+    # Use gene_name when available; fall back to gene_id only if gene_name is absent.
+    study_genes = [deg.gene_name or deg.gene_id for deg in degs]
+    study_genes = [g for g in study_genes if g]  # drop blanks
+    logger.info(f"Found {len(study_genes)} DEGs for GO enrichment (using gene symbols)")
     
-    # 3. Get background genes (all genes in dataset)
-    # Get all genes from dataset
+    # 3. Get background genes (all genes in dataset) — use gene symbols to match go_annotations
     all_genes_query = text("""
-        SELECT DISTINCT gene_id
+        SELECT DISTINCT COALESCE(NULLIF(gene_name, ''), gene_id)
         FROM deg_genes
         WHERE dataset_id = :dataset_id
     """)
     result = await db.execute(all_genes_query, {"dataset_id": str(dataset_id)})
-    background_genes = [row[0] for row in result.fetchall()]
+    background_genes = [row[0] for row in result.fetchall() if row[0]]
     logger.info(f"Background: {len(background_genes)} genes")
     
     # 4. Run GO enrichment analysis
