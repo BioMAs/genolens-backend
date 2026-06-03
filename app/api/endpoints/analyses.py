@@ -18,7 +18,7 @@ from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
 from app.api.deps.subscription import get_or_create_user
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, User, Project, ProjectMember
+from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, OmicsDataType, User, Project, ProjectMember
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ class AnalysisParams(BaseModel):
 class SelfServiceAnalysisCreate(BaseModel):
     project_id: UUID
     name: str = Field(..., min_length=1, max_length=255)
+    data_type: OmicsDataType = OmicsDataType.TRANSCRIPTOMICS
     matrix_dataset_id: UUID
     samples_dataset_id: UUID
     comparisons_dataset_id: UUID
@@ -58,6 +59,7 @@ class SelfServiceAnalysisResponse(BaseModel):
     id: UUID
     project_id: UUID
     name: str
+    data_type: OmicsDataType
     status: SelfServiceAnalysisStatus
     matrix_dataset_id: Optional[UUID]
     samples_dataset_id: Optional[UUID]
@@ -81,6 +83,7 @@ class SelfServiceAnalysisResponse(BaseModel):
             id=obj.id,
             project_id=obj.project_id,
             name=obj.name,
+            data_type=obj.data_type,
             status=obj.status,
             matrix_dataset_id=obj.matrix_dataset_id,
             samples_dataset_id=obj.samples_dataset_id,
@@ -208,6 +211,7 @@ async def create_analysis(
         id=uuid4(),
         project_id=payload.project_id,
         name=payload.name,
+        data_type=payload.data_type,
         status=SelfServiceAnalysisStatus.PENDING,
         matrix_dataset_id=payload.matrix_dataset_id,
         samples_dataset_id=payload.samples_dataset_id,

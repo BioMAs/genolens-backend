@@ -48,6 +48,13 @@ class SelfServiceAnalysisStatus(str, enum.Enum):
     CANCELLED = "CANCELLED"
 
 
+class OmicsDataType(str, enum.Enum):
+    """Type of omics data for a self-service analysis."""
+    TRANSCRIPTOMICS = "transcriptomics"
+    PROTEOMICS = "proteomics"
+    LIPIDOMICS = "lipidomics"
+
+
 class DatasetType(str, enum.Enum):
     """Types of datasets that can be stored."""
     MATRIX = "MATRIX"  # Count/Expression matrices
@@ -1602,6 +1609,12 @@ class SelfServiceAnalysis(Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    data_type: Mapped[OmicsDataType] = mapped_column(
+        SQLEnum(OmicsDataType, name="omics_data_type"),
+        nullable=False,
+        default=OmicsDataType.TRANSCRIPTOMICS,
+        server_default=OmicsDataType.TRANSCRIPTOMICS.value,
+    )
     status: Mapped[SelfServiceAnalysisStatus] = mapped_column(
         SQLEnum(SelfServiceAnalysisStatus, name="self_service_analysis_status"),
         nullable=False,
