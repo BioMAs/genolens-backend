@@ -3,7 +3,6 @@ API endpoints for project activity history.
 """
 import logging
 from typing import Optional
-from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,6 +10,7 @@ from sqlalchemy import select
 
 from app.api.deps.db import get_db
 from app.api.deps.auth import get_current_user
+from app.core.security import CurrentUser
 from app.models.models import Project, ProjectMember, ActivityEventType
 from app.schemas.history import ActivityLogListResponse
 from app.services import history_service
@@ -65,7 +65,7 @@ async def get_project_history(
     offset: int = Query(0, ge=0, description="Pagination offset"),
     event_type: Optional[ActivityEventType] = Query(None, description="Filter by event type"),
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """
     Get the activity history for a project.
@@ -74,7 +74,7 @@ async def get_project_history(
     Members and owners can query the history.
     """
     try:
-        user_id = UUID(current_user["sub"])
+        user_id = current_user.id
         await _require_project_access(project_id, user_id, db)
 
         result = await history_service.get_activity_log(
