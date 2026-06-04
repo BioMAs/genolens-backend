@@ -1610,7 +1610,7 @@ class SelfServiceAnalysis(Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     data_type: Mapped[OmicsDataType] = mapped_column(
-        SQLEnum(OmicsDataType, name="omics_data_type"),
+        SQLEnum(OmicsDataType, name="omics_data_type", values_callable=lambda x: [e.value for e in x]),
         nullable=False,
         default=OmicsDataType.TRANSCRIPTOMICS,
         server_default=OmicsDataType.TRANSCRIPTOMICS.value,
