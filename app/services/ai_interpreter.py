@@ -36,7 +36,7 @@ class LocalAIInterpreter:
     def __init__(
         self,
         base_url: Optional[str] = None,
-        model: str = "llama3.2:3b",
+        model: Optional[str] = None,
         timeout: float = 600.0,
         max_retries: int = 3
     ):
@@ -45,12 +45,12 @@ class LocalAIInterpreter:
         
         Args:
             base_url: Ollama API base URL (default: env OLLAMA_BASE_URL or http://localhost:11434)
-            model: Model to use (default: llama3.2:3b - lightweight, 2GB)
+            model: Model to use (default: env OLLAMA_MODEL or llama3.1:8b)
             timeout: Request timeout in seconds (default: 600s = 10 minutes)
             max_retries: Maximum number of retry attempts (default: 3)
         """
         self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.model = model
+        self.model = model or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
         self.timeout = timeout
         self.max_retries = max_retries
     
