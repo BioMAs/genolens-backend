@@ -33,7 +33,7 @@ async def _require_project_access(project_id: UUID, user_id: UUID, db: AsyncSess
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Owner always has access
-    if project.user_id == user_id:
+    if project.owner_id == user_id:
         return project
 
     # Check member access
