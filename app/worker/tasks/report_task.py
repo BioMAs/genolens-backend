@@ -33,8 +33,6 @@ def generate_project_report(self, job_id: str, project_id: str) -> dict:
 async def _async_generate(task, job_id: str, project_id: str) -> dict:
     from app.db.session import AsyncSessionLocal
     from app.models.report_job import ReportJob, ReportJobStatus
-    from app.services.report_service import report_service
-    from app.services.storage import storage_service
 
     async with AsyncSessionLocal() as db:
         job = await db.get(ReportJob, UUID(job_id))
@@ -45,6 +43,9 @@ async def _async_generate(task, job_id: str, project_id: str) -> dict:
         await db.commit()
 
         try:
+            from app.services.report_service import report_service
+            from app.services.storage import storage_service
+
             context = await report_service.collect_project_data(db, UUID(project_id))
             pdf_bytes = await report_service.render_pdf(context)
 
