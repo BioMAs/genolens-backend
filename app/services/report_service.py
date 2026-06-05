@@ -38,6 +38,20 @@ class ReportService:
 
     # ── Data collection ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _safe_meta(raw) -> dict:
+        """Return dataset_metadata as a dict, parsing JSON strings if needed."""
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            import json
+            try:
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
     async def collect_project_data(
         self, db: AsyncSession, project_id: UUID
     ) -> dict[str, Any]:
@@ -115,7 +129,7 @@ class ReportService:
                 self._generate_enrichment_dotplot, enrichment_results, deg_ds.name
             )
 
-        meta = deg_ds.dataset_metadata or {}
+        meta = self._safe_meta(deg_ds.dataset_metadata)
         return {
             "name": deg_ds.name,
             "deg_up": meta.get("deg_up_count", sum(1 for g in all_genes if g.regulation == "UP")),
@@ -131,10 +145,12 @@ class ReportService:
     def _extract_qc_data(self, matrix_datasets: list) -> list[dict]:
         rows = []
         for ds in matrix_datasets:
-            meta = ds.dataset_metadata or {}
+            meta = self._safe_meta(ds.dataset_metadata)
             qc_report = meta.get("qc_report", {})
             if isinstance(qc_report, dict):
                 for sample, stats in qc_report.items():
+                    if not isinstance(stats, dict):
+                        continue
                     rows.append({
                         "sample": sample,
                         "total_reads": stats.get("total_reads", "N/A"),
@@ -155,11 +171,11 @@ class ReportService:
     def _generate_pca_plot(self, matrix_datasets: list) -> Optional[str]:
         pca_data = None
         for ds in matrix_datasets:
-            meta = ds.dataset_metadata or {}
+            meta = self._safe_meta(ds.dataset_metadata)
             if "pca" in meta:
                 pca_data = meta["pca"]
                 break
-        if not pca_data:
+        if not pca_data or not isinstance(pca_data, dict):
             return None
 
         pc1 = pca_data.get("PC1", [])
