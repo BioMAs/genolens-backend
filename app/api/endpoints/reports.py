@@ -63,12 +63,24 @@ async def trigger_report(
         status=ReportJobStatus.PENDING,
     )
     db.add(job)
-    await db.flush()
-
-    from app.worker.tasks.report_task import generate_project_report
-    task = generate_project_report.delay(str(job.id), str(project_id))
-    job.celery_task_id = task.id
     await db.commit()
+    await db.refresh(job)
+
+    try:
+        from app.worker.tasks.report_task import generate_project_report
+        task = generate_project_report.delay(str(job.id), str(project_id))
+        job.celery_task_id = task.id
+        await db.commit()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).exception("Failed to dispatch report task for job %s", job.id)
+        job.status = ReportJobStatus.FAILED
+        job.error_message = f"Failed to queue report generation: {exc}"
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Report generation service is unavailable. Please try again later.",
+        )
 
     return ReportTriggerResponse(
         job_id=job.id,
