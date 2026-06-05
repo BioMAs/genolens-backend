@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db
-from app.core.supabase_auth import SupabaseUser
+from app.core.security import CurrentUser
 from app.models.models import Project
 from app.models.report_job import ReportJob, ReportJobStatus
 from app.schemas.report import ReportJobResponse, ReportTriggerResponse
@@ -38,7 +38,7 @@ async def _get_project_or_404(project_id: UUID, db: AsyncSession) -> Project:
 async def trigger_report(
     project_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
     """Trigger background PDF report generation for a project."""
     await _get_project_or_404(project_id, db)
@@ -59,7 +59,7 @@ async def trigger_report(
     job = ReportJob(
         id=uuid4(),
         project_id=project_id,
-        requested_by=UUID(str(current_user.user_id)),
+        requested_by=current_user.id,
         status=ReportJobStatus.PENDING,
     )
     db.add(job)
@@ -93,7 +93,7 @@ async def trigger_report(
 async def report_status(
     project_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
     """Get the status of the latest report generation job for a project."""
     stmt = (
@@ -112,7 +112,7 @@ async def report_status(
 async def download_report(
     project_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
     """Download the generated PDF report for a project."""
     stmt = (
