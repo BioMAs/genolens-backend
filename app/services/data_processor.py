@@ -540,16 +540,18 @@ class DataProcessorService:
             ('padj.Fisher:', 'padj'),
             ('padj.edgeR:', 'padj'),
             ('padj.DESeq2:', 'padj'),
+            ('padj.limma:', 'padj'),
             ('padj:', 'padj'),
             ('padj_', 'padj'),
             ('adj.P.Val_', 'padj'),
             ('FDR_', 'padj'),
-            
+
             # Raw P-value - with test methods
             ('pvalue.Stouffer:', 'pvalue'),
             ('pvalue.Fisher:', 'pvalue'),
             ('pvalue.edgeR:', 'pvalue'),
             ('pvalue.DESeq2:', 'pvalue'),
+            ('pvalue.limma:', 'pvalue'),
             ('pvalue:', 'pvalue'),
             ('pvalue_', 'pvalue'),
             ('P.Value_', 'pvalue'),
@@ -586,6 +588,8 @@ class DataProcessorService:
                         test_method = 'edgeR'
                     elif '.DESeq2:' in prefix:
                         test_method = 'DESeq2'
+                    elif '.limma:' in prefix:
+                        test_method = 'limma'
 
                     if comp_name not in comparisons:
                         comparisons[comp_name] = {}
@@ -1196,7 +1200,7 @@ class DataProcessorService:
         self,
         parquet_data: bytes,
         comparisons: dict[str, dict[str, str]],
-        logfc_threshold: float = DEG_LOGFC_THRESHOLD,
+        logfc_threshold: float = 1.0,
         padj_threshold: float = DEG_PADJ_THRESHOLD,
         test_method: Optional[str] = None,
     ) -> dict[str, dict[str, Any]]:
@@ -1272,7 +1276,7 @@ class DataProcessorService:
         self,
         parquet_data: bytes,
         comparisons: dict[str, dict[str, str]],
-        logfc_threshold: float = DEG_LOGFC_THRESHOLD,
+        logfc_threshold: float = 1.0,
         padj_threshold: float = DEG_PADJ_THRESHOLD,
     ) -> dict[str, Any]:
         """
@@ -1301,13 +1305,28 @@ class DataProcessorService:
                 continue
 
             # Build per-comparison individual frame
-            keep_cols = ['gene_id', logfc_col]
-            for method_col in all_padj.values():
-                if method_col in df.columns:
-                    keep_cols.append(method_col)
-            pval_col = cols.get('pvalue')
-            if pval_col and pval_col in df.columns:
-                keep_cols.append(pval_col)
+            keep_cols = ['gene_id']
+            if 'gene_name' in df.columns:
+                keep_cols.append('gene_name')
+            if 'baseMean' in df.columns:
+                keep_cols.append('baseMean')
+            keep_cols.append(logfc_col)
+            # Include ALL per-method pvalue + padj columns
+            all_pvalue = cols.get('all_pvalue_cols', {})
+            _METHOD_ORDER = ['Stouffer', 'DESeq2', 'edgeR', 'limma', 'Fisher', 'default']
+            for method in _METHOD_ORDER:
+                if method in all_pvalue and all_pvalue[method] in df.columns:
+                    keep_cols.append(all_pvalue[method])
+                if method in all_padj and all_padj[method] in df.columns:
+                    keep_cols.append(all_padj[method])
+            # Fallback: add any remaining pvalue/padj cols not yet included
+            for col in list(all_pvalue.values()) + list(all_padj.values()):
+                if col in df.columns and col not in keep_cols:
+                    keep_cols.append(col)
+            # n_significant_methods if present
+            n_sig_col = f"n_significant_methods"
+            if n_sig_col in df.columns and n_sig_col not in keep_cols:
+                keep_cols.append(n_sig_col)
 
             frame = df[[c for c in keep_cols if c in df.columns]].copy()
             frame.insert(1, 'comparison', comp_name)

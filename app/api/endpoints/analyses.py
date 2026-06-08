@@ -6,7 +6,7 @@ from existing datasets (matrix + samples + comparisons).
 import json
 import logging
 from pathlib import Path
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Literal, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -43,6 +43,7 @@ class AnalysisParams(BaseModel):
     threads: int = 4
     enrichment_databases: Optional[List[str]] = None
     species: Optional[str] = "human"
+    de_method: Optional[Literal["deseq2", "limma", "edger", "all"]] = "all"
 
 
 class SelfServiceAnalysisCreate(BaseModel):

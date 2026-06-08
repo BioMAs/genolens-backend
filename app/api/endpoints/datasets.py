@@ -775,6 +775,26 @@ async def export_deg_stats_csv(
     )
 
 
+@router.post("/{dataset_id}/rerun-enrichment")
+async def rerun_enrichment(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+) -> dict:
+    """Re-run GO + ORA enrichment for a DEG dataset with updated thresholds."""
+    from app.worker.tasks import _auto_run_enrichment
+
+    dataset = await db.scalar(select(Dataset).where(Dataset.id == dataset_id))
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    meta = dataset.dataset_metadata or {}
+    min_log2fc = float(meta.get("min_log2fc", 1.0))
+
+    await _auto_run_enrichment(db, str(dataset_id), min_log2fc=min_log2fc)
+    return {"status": "done", "dataset_id": str(dataset_id), "min_log2fc": min_log2fc}
+
+
 @router.get("/{dataset_id}/genes/list", response_model=GeneListResponse)
 async def get_gene_list(
     dataset_id: UUID,

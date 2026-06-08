@@ -63,7 +63,7 @@ _NS_TO_CAT = {
 }
 
 
-async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str) -> None:
+async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str, min_log2fc: float = 1.0) -> None:
     """
     Automatically run enrichment (GO + ORA on KEGG/Reactome/Hallmark/…) for all
     comparisons in a DEG dataset, persisting results to EnrichmentPathway.
@@ -102,7 +102,7 @@ async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str) -> None:
                 d for d in all_rows
                 if d.padj is not None
                 and d.padj <= DEG_PADJ_THRESHOLD
-                and abs(d.log_fc or 0) >= DEG_LOGFC_THRESHOLD
+                and abs(d.log_fc or 0) >= min_log2fc
             ]
 
             if not sig_rows:
@@ -131,6 +131,7 @@ async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str) -> None:
                     gene_list=study_genes,
                     background=None,
                     pvalue_threshold=DEG_PADJ_THRESHOLD,
+                    max_gene_count=2000,  # increase from default 500 — BP terms tend to be large
                 )
 
                 if go_results:
@@ -346,7 +347,13 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                     # Calculate DEG statistics
                     self.update_state(state="PROGRESS", meta={"step": "calculating_deg_statistics"})
                     try:
-                        deg_statistics = await data_processor.calculate_deg_statistics(parquet_data, metadata["comparisons"])
+                        _meta = dataset.dataset_metadata or {}
+                        _min_log2fc = float(_meta.get("min_log2fc", 1.0))
+                        deg_statistics = await data_processor.calculate_deg_statistics(
+                            parquet_data,
+                            metadata["comparisons"],
+                            logfc_threshold=_min_log2fc,
+                        )
                         deg_stats = deg_statistics
                     except Exception as e:
                         deg_stats["deg_stats_error"] = str(e)
@@ -408,7 +415,9 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                     # Automatically run GO enrichment on the stored DEG genes
                     self.update_state(state="PROGRESS", meta={"step": "computing_go_enrichment"})
                     try:
-                        await _auto_run_go_enrichment(db, dataset_id)
+                        _meta_enr = dataset.dataset_metadata or {}
+                        _enr_min_log2fc = float(_meta_enr.get("min_log2fc", 1.0))
+                        await _auto_run_go_enrichment(db, dataset_id, min_log2fc=_enr_min_log2fc)
                     except Exception as e:
                         logger.warning(f"[WORKER] Auto GO enrichment step failed: {e}")
                         # Non-fatal: dataset still usable without pre-computed enrichment
@@ -746,6 +755,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     "--threads", str(params.get("threads", 4)),
                     "--species", str(params.get("species", "human")),
                 ]
+                cmd.extend(["--method", str(params.get("de_method", "all"))])
                 enrichment_dbs = params.get("enrichment_databases")
                 if enrichment_dbs:
                     dbs_str = ",".join(enrichment_dbs) if isinstance(enrichment_dbs, list) else enrichment_dbs
@@ -822,7 +832,12 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                             type=DatasetType.DEG,
                             status=DatasetStatus.PENDING,
                             raw_file_path=deg_storage,
-                            dataset_metadata={"analysis_id": str(analysis_id), "comparison_name": comp_id},
+                            dataset_metadata={
+                                "analysis_id": str(analysis_id),
+                                "comparison_name": comp_id,
+                                "min_log2fc": params.get("min_log2fc", 1.0),
+                                "de_method": params.get("de_method", "all"),
+                            },
                             column_mapping={},
                         )
                         db.add(deg_ds)
