@@ -663,6 +663,62 @@ async def get_dataset_stats(
         )
 
 
+@router.get("/{dataset_id}/deg-stats")
+async def get_deg_stats_multimethod(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    test_method: Optional[str] = Query(None, description="Statistical method to filter on (e.g. Stouffer, Fisher, edgeR, DESeq2). Default: highest-priority available."),
+) -> dict:
+    """
+    Return per-comparison DEG statistics broken down by statistical method.
+
+    Returns:
+    - `general`: {comparison: {method: {up, down, total}}}  — Stouffer-first
+    - `individual`: list of gene records with all padj columns and significance flags
+    - `available_methods`: {comparison: [list of methods]}
+    """
+    result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+
+    if not dataset.parquet_file_path:
+        raise HTTPException(status_code=400, detail="Dataset has no Parquet file")
+
+    comparisons = (dataset.dataset_metadata or {}).get("comparisons", {})
+    if not comparisons:
+        return {"general": {}, "individual": [], "available_methods": {}}
+
+    parquet_data = await storage_service.download_file(dataset.parquet_file_path)
+
+    # Per-comparison stats (active or specified method)
+    stats = await data_processor.calculate_deg_statistics(
+        parquet_data=parquet_data,
+        comparisons=comparisons,
+        test_method=test_method,
+    )
+
+    # Individual + general export
+    export = await data_processor.generate_deg_stats_export(
+        parquet_data=parquet_data,
+        comparisons=comparisons,
+    )
+
+    available_methods = {
+        comp: sorted(cols.get("all_padj_cols", {}).keys())
+        for comp, cols in comparisons.items()
+    }
+
+    return {
+        "stats": stats,
+        "general": export["general"],
+        "individual": export["individual"],
+        "available_methods": available_methods,
+    }
+
+
 @router.get("/{dataset_id}/genes/list", response_model=GeneListResponse)
 async def get_gene_list(
     dataset_id: UUID,

@@ -12,11 +12,30 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sess
 from sqlalchemy.pool import NullPool
 
 from app.worker.celery_app import celery_app
-from app.models.models import Dataset, DatasetStatus, DatasetType, DegGene, EnrichmentPathway
+from app.models.models import Dataset, DatasetStatus, DatasetType, DegGene, EnrichmentPathway, GeneSet, GeneSetDatabase
 from app.services.storage import storage_service
-from app.services.data_processor import data_processor
+from app.services.data_processor import data_processor, DEG_LOGFC_THRESHOLD, DEG_PADJ_THRESHOLD
 from app.services.go_service import GOService
 from app.core.config import settings
+
+# GeneSetDatabase categories that run_ora_enrichment supports
+# (only databases actually loaded in the gene_sets table are worth trying)
+_ORA_DATABASES = [
+    GeneSetDatabase.KEGG,
+    GeneSetDatabase.REACTOME,
+    GeneSetDatabase.HALLMARK,
+    GeneSetDatabase.C5_ONTOLOGY,
+    GeneSetDatabase.C7_IMMUNOLOGIC,
+]
+
+# Map GeneSetDatabase → EnrichmentPathway.category string
+_DB_TO_CAT: dict[GeneSetDatabase, str] = {
+    GeneSetDatabase.KEGG: "KEGG",
+    GeneSetDatabase.REACTOME: "REACTOME",
+    GeneSetDatabase.HALLMARK: "HALLMARK",
+    GeneSetDatabase.C5_ONTOLOGY: "C5_ONTOLOGY",
+    GeneSetDatabase.C7_IMMUNOLOGIC: "C7_IMMUNOLOGIC",
+}
 
 
 def _make_worker_session() -> async_sessionmaker:
@@ -44,40 +63,50 @@ _NS_TO_CAT = {
 }
 
 
-async def _auto_run_go_enrichment(db: "AsyncSession", dataset_id: str) -> None:
+async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str) -> None:
     """
-    Automatically run GO enrichment for all comparisons in a DEG dataset
-    and persist results to EnrichmentPathway. Called after DEG genes are stored.
+    Automatically run enrichment (GO + ORA on KEGG/Reactome/Hallmark/…) for all
+    comparisons in a DEG dataset, persisting results to EnrichmentPathway.
+    Called after DEG genes are stored.
     """
     go_service = GOService()
 
-    # Get distinct comparisons stored in DegGene for this dataset
-    from sqlalchemy import distinct
+    from sqlalchemy import distinct as _distinct
     comp_result = await db.execute(
-        select(distinct(DegGene.comparison_name)).where(DegGene.dataset_id == dataset_id)
+        select(_distinct(DegGene.comparison_name)).where(DegGene.dataset_id == dataset_id)
     )
     comparisons = [row[0] for row in comp_result.fetchall()]
 
     if not comparisons:
-        logger.info(f"[WORKER] No comparisons found for auto GO enrichment on dataset {dataset_id}")
+        logger.info(f"[WORKER] No comparisons for auto enrichment on dataset {dataset_id}")
         return
 
-    # Background = all distinct genes in this dataset
-    bg_result = await db.execute(
-        select(DegGene).where(DegGene.dataset_id == dataset_id)
-    )
+    bg_result = await db.execute(select(DegGene).where(DegGene.dataset_id == dataset_id))
     all_deg_rows = bg_result.scalars().all()
-    background_genes = list({deg.gene_name or deg.gene_id for deg in all_deg_rows if (deg.gene_name or deg.gene_id)})
-    logger.info(f"[WORKER] Auto GO enrichment: {len(comparisons)} comparisons, {len(background_genes)} background genes")
+    logger.info(f"[WORKER] Auto enrichment: {len(comparisons)} comparisons")
+
+    # Pre-check which ORA databases have gene sets loaded
+    available_ora_dbs: list[GeneSetDatabase] = []
+    for ora_db in _ORA_DATABASES:
+        count_result = await db.execute(
+            select(GeneSet.id).where(GeneSet.database == ora_db).limit(1)
+        )
+        if count_result.scalar_one_or_none() is not None:
+            available_ora_dbs.append(ora_db)
+    logger.info(f"[WORKER] Available ORA databases: {[d.value for d in available_ora_dbs]}")
 
     for comp_name in comparisons:
         try:
-            # Fetch all significant DEGs for this comparison (padj <= 0.05, |lfc| >= 0.5)
             all_rows = [d for d in all_deg_rows if d.comparison_name == comp_name]
-            sig_rows = [d for d in all_rows if d.padj is not None and d.padj <= 0.05 and abs(d.log_fc or 0) >= 0.5]
+            sig_rows = [
+                d for d in all_rows
+                if d.padj is not None
+                and d.padj <= DEG_PADJ_THRESHOLD
+                and abs(d.log_fc or 0) >= DEG_LOGFC_THRESHOLD
+            ]
 
             if not sig_rows:
-                logger.info(f"[WORKER] No significant DEGs for '{comp_name}', skipping enrichment")
+                logger.info(f"[WORKER] No significant DEGs for '{comp_name}', skipping")
                 continue
 
             for regulation in ("ALL", "UP", "DOWN"):
@@ -95,62 +124,114 @@ async def _auto_run_go_enrichment(db: "AsyncSession", dataset_id: str) -> None:
                 if not study_genes:
                     continue
 
-                logger.info(f"[WORKER] Running GO enrichment for '{comp_name}' ({regulation}): {len(study_genes)} genes")
-                enrichment_results = await go_service.go_enrichment_analysis(
+                # ── GO enrichment (BP, MF, CC) ──────────────────────────────
+                logger.info(f"[WORKER] GO enrichment '{comp_name}' ({regulation}): {len(study_genes)} genes")
+                go_results = await go_service.go_enrichment_analysis(
                     db=db,
                     gene_list=study_genes,
-                    background=background_genes,
-                    pvalue_threshold=0.05,
+                    background=None,
+                    pvalue_threshold=DEG_PADJ_THRESHOLD,
                 )
 
-                if not enrichment_results:
-                    logger.info(f"[WORKER] No GO terms found for '{comp_name}' ({regulation})")
-                    continue
-
-                # Delete existing results for this combo
-                await db.execute(
-                    delete(EnrichmentPathway).where(
-                        EnrichmentPathway.dataset_id == dataset_id,
-                        EnrichmentPathway.comparison_name == comp_name,
-                        EnrichmentPathway.regulation == regulation,
-                        EnrichmentPathway.category.in_(["GO:BP", "GO:MF", "GO:CC"]),
+                if go_results:
+                    await db.execute(
+                        delete(EnrichmentPathway).where(
+                            EnrichmentPathway.dataset_id == dataset_id,
+                            EnrichmentPathway.comparison_name == comp_name,
+                            EnrichmentPathway.regulation == regulation,
+                            EnrichmentPathway.category.in_(["GO:BP", "GO:MF", "GO:CC"]),
+                        )
                     )
-                )
-                await db.commit()
-
-                pathway_records = []
-                for r in enrichment_results:
-                    cat = _NS_TO_CAT.get(r.get("namespace", ""))
-                    if not cat:
-                        continue
-                    pathway_records.append({
-                        "dataset_id": dataset_id,
-                        "comparison_name": comp_name,
-                        "pathway_id": r["go_id"],
-                        "pathway_name": r.get("term_name", r["go_id"]),
-                        "category": cat,
-                        "description": r.get("definition"),
-                        "gene_count": r["study_count"],
-                        "pvalue": r["pvalue"],
-                        "padj": r.get("fdr", r["pvalue"]),
-                        "gene_ratio": f"{r['study_count']}/{len(study_genes)}",
-                        "bg_ratio": f"{r['background_count']}/{len(background_genes)}",
-                        "genes": r.get("study_genes", []),
-                        "regulation": regulation,
-                    })
-
-                chunk_size = 500
-                for i in range(0, len(pathway_records), chunk_size):
-                    chunk = pathway_records[i:i + chunk_size]
-                    await db.execute(insert(EnrichmentPathway), chunk)
                     await db.commit()
 
-                logger.info(f"[WORKER] Stored {len(pathway_records)} GO terms for '{comp_name}' ({regulation})")
+                    go_records = []
+                    for r in go_results:
+                        cat = _NS_TO_CAT.get(r.get("namespace", ""))
+                        if not cat:
+                            continue
+                        go_records.append({
+                            "dataset_id": dataset_id,
+                            "comparison_name": comp_name,
+                            "pathway_id": r["go_id"],
+                            "pathway_name": r.get("term_name", r["go_id"]),
+                            "category": cat,
+                            "description": r.get("definition"),
+                            "gene_count": r["study_count"],
+                            "pvalue": r["pvalue"],
+                            "padj": r.get("fdr", r["pvalue"]),
+                            "gene_ratio": f"{r['study_count']}/{len(study_genes)}",
+                            "bg_ratio": f"{r['background_count']}/all_annotated",
+                            "genes": r.get("study_genes", []),
+                            "regulation": regulation,
+                        })
+
+                    chunk_size = 500
+                    for i in range(0, len(go_records), chunk_size):
+                        await db.execute(insert(EnrichmentPathway), go_records[i:i + chunk_size])
+                        await db.commit()
+                    logger.info(f"[WORKER] Stored {len(go_records)} GO terms for '{comp_name}' ({regulation})")
+
+                # ── ORA enrichment (KEGG, Reactome, Hallmark, …) ────────────
+                for ora_db in available_ora_dbs:
+                    cat = _DB_TO_CAT.get(ora_db, ora_db.value)
+                    try:
+                        ora_results = await go_service.run_ora_enrichment(
+                            db=db,
+                            gene_list=study_genes,
+                            database=ora_db,
+                            background=None,
+                            padj_threshold=DEG_PADJ_THRESHOLD,
+                        )
+                    except Exception as ora_err:
+                        logger.warning(f"[WORKER] ORA {ora_db.value} failed for '{comp_name}': {ora_err}")
+                        continue
+
+                    if not ora_results:
+                        continue
+
+                    await db.execute(
+                        delete(EnrichmentPathway).where(
+                            EnrichmentPathway.dataset_id == dataset_id,
+                            EnrichmentPathway.comparison_name == comp_name,
+                            EnrichmentPathway.regulation == regulation,
+                            EnrichmentPathway.category == cat,
+                        )
+                    )
+                    await db.commit()
+
+                    ora_records = [
+                        {
+                            "dataset_id": dataset_id,
+                            "comparison_name": comp_name,
+                            "pathway_id": r["pathway_id"],
+                            "pathway_name": r["pathway_name"],
+                            "category": cat,
+                            "description": r.get("pathway_name"),
+                            "gene_count": r["study_count"],
+                            "pvalue": r["pvalue"],
+                            "padj": r["fdr"],
+                            "gene_ratio": r.get("gene_ratio"),
+                            "bg_ratio": r.get("bg_ratio"),
+                            "genes": r.get("study_genes", []),
+                            "regulation": regulation,
+                        }
+                        for r in ora_results
+                    ]
+
+                    chunk_size = 500
+                    for i in range(0, len(ora_records), chunk_size):
+                        await db.execute(insert(EnrichmentPathway), ora_records[i:i + chunk_size])
+                        await db.commit()
+                    logger.info(f"[WORKER] Stored {len(ora_records)} {cat} pathways for '{comp_name}' ({regulation})")
 
         except Exception as e:
             await db.rollback()
-            logger.warning(f"[WORKER] Auto GO enrichment failed for '{comp_name}': {e}")
+            logger.warning(f"[WORKER] Auto enrichment failed for '{comp_name}': {e}")
             # Non-fatal: continue with other comparisons
+
+
+# Keep backward-compatible alias
+_auto_run_go_enrichment = _auto_run_enrichment
 
 logger = logging.getLogger(__name__)
 

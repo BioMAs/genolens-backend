@@ -23,6 +23,9 @@ from app.core.monitoring import timing_decorator
 
 logger = logging.getLogger(__name__)
 
+DEG_LOGFC_THRESHOLD: float = 0.58
+DEG_PADJ_THRESHOLD: float = 0.05
+
 
 class DataProcessorService:
     """Service for data processing operations (CSV/Excel -> Parquet)."""
@@ -552,23 +555,27 @@ class DataProcessorService:
             ('P.Value_', 'pvalue'),
         ]
         
-        # Track available test methods per comparison
-        test_methods = {}
-        
+        # Track all padj/pvalue columns per method and comparison
+        # all_padj_cols[comp_name] = {"Stouffer": col, "Fisher": col, ...}
+        all_padj_cols: dict[str, dict[str, str]] = {}
+        all_pvalue_cols: dict[str, dict[str, str]] = {}
+        # Priority for choosing the "active" padj column
+        _PADJ_PRIORITY = ['Stouffer', 'Fisher', 'edgeR', 'DESeq2', 'default']
+
         for col in columns:
             # Skip 'contrast:' columns as they are just markers, not data columns
             if col.startswith('contrast:'):
                 continue
-                
+
             for prefix, key in patterns:
                 if col.startswith(prefix):
                     comp_name_raw = col[len(prefix):]
-                    
+
                     # Remove 'contrast:' prefix from comparison name if present
                     comp_name = comp_name_raw
                     if comp_name.startswith('contrast:'):
                         comp_name = comp_name[9:]  # len('contrast:') = 9
-                    
+
                     # Extract test method from prefix if present
                     test_method = None
                     if '.Stouffer:' in prefix:
@@ -579,35 +586,58 @@ class DataProcessorService:
                         test_method = 'edgeR'
                     elif '.DESeq2:' in prefix:
                         test_method = 'DESeq2'
-                    
+
                     if comp_name not in comparisons:
                         comparisons[comp_name] = {}
-                        test_methods[comp_name] = set()
-                    
-                    # Store the column name
-                    comparisons[comp_name][key] = col
-                    
-                    # Track test method
-                    if test_method and key in ['padj', 'pvalue']:
-                        test_methods[comp_name].add(test_method)
-                    
+                        all_padj_cols[comp_name] = {}
+                        all_pvalue_cols[comp_name] = {}
+
+                    # Store ALL padj/pvalue columns per method
+                    if key == 'padj':
+                        method_key = test_method or 'default'
+                        all_padj_cols[comp_name][method_key] = col
+                    elif key == 'pvalue':
+                        method_key = test_method or 'default'
+                        all_pvalue_cols[comp_name][method_key] = col
+                    else:
+                        # logFC and other keys: store directly
+                        comparisons[comp_name][key] = col
+
                     break # Found a match for this column, move to next column
+
+        # Choose the active padj/pvalue column per comparison using priority order
+        for comp_name in comparisons:
+            padj_dict = all_padj_cols.get(comp_name, {})
+            pval_dict = all_pvalue_cols.get(comp_name, {})
+            for method in _PADJ_PRIORITY:
+                if method in padj_dict:
+                    comparisons[comp_name]['padj'] = padj_dict[method]
+                    break
+            for method in _PADJ_PRIORITY:
+                if method in pval_dict:
+                    comparisons[comp_name]['pvalue'] = pval_dict[method]
+                    break
 
         # Filter out incomplete comparisons (must have at least logFC and padj)
         valid_comparisons = {
-            k: v for k, v in comparisons.items() 
+            k: v for k, v in comparisons.items()
             if 'logFC' in v and 'padj' in v
         }
-        
-        # Add test method information to metadata
+
+        # Attach all available padj/pvalue columns and method list
         for comp_name in valid_comparisons:
-            if comp_name in test_methods and test_methods[comp_name]:
-                valid_comparisons[comp_name]['test_methods'] = sorted(list(test_methods[comp_name]))
-        
+            padj_dict = all_padj_cols.get(comp_name, {})
+            pval_dict = all_pvalue_cols.get(comp_name, {})
+            if padj_dict:
+                valid_comparisons[comp_name]['all_padj_cols'] = padj_dict
+                valid_comparisons[comp_name]['test_methods'] = sorted(padj_dict.keys())
+            if pval_dict:
+                valid_comparisons[comp_name]['all_pvalue_cols'] = pval_dict
+
         logger.info(f"[DETECT] Found {len(valid_comparisons)} comparisons:")
         for comp_name, cols in valid_comparisons.items():
             logger.info(f"  - {comp_name}: logFC={cols.get('logFC')}, padj={cols.get('padj')}, tests={cols.get('test_methods', ['default'])}")
-        
+
         return valid_comparisons
 
     def _parse_comparison_name(self, comp_name: str) -> list[str]:
@@ -1107,121 +1137,214 @@ class DataProcessorService:
         
         return heatmaps
 
+    def _compute_stats_with_padj_col(
+        self,
+        df: "pd.DataFrame",
+        comp_name: str,
+        logfc_col: str,
+        padj_col: str,
+        logfc_threshold: float,
+        padj_threshold: float,
+    ) -> dict[str, Any]:
+        """Compute DEG counts and top genes for a single padj column."""
+        contrast_col = f"contrast:{comp_name}"
+        has_contrast_col = contrast_col in df.columns
+
+        if has_contrast_col:
+            comparison_genes = df[
+                (df[contrast_col].notna()) &
+                (df[contrast_col] != '') &
+                (df[contrast_col] != None)  # noqa: E711
+            ].copy()
+            deg_up = len(comparison_genes[comparison_genes[contrast_col].str.upper() == 'UP'])
+            deg_down = len(comparison_genes[comparison_genes[contrast_col].str.upper() == 'DOWN'])
+            deg_total = deg_up + deg_down
+            significant = comparison_genes[
+                (comparison_genes[padj_col].notna()) &
+                (comparison_genes[logfc_col].notna()) &
+                (comparison_genes[padj_col] < padj_threshold) &
+                (np.abs(comparison_genes[logfc_col]) > logfc_threshold)
+            ].copy()
+        else:
+            significant = df[
+                (df[padj_col].notna()) &
+                (df[logfc_col].notna()) &
+                (df[padj_col] < padj_threshold) &
+                (np.abs(df[logfc_col]) > logfc_threshold)
+            ].copy()
+            deg_up = len(significant[significant[logfc_col] > 0])
+            deg_down = len(significant[significant[logfc_col] < 0])
+            deg_total = len(significant)
+
+        top_genes = []
+        if not significant.empty:
+            for idx, row in significant.nsmallest(10, padj_col).iterrows():
+                gene_id = row.get('gene_id', idx)
+                logfc = row.get(logfc_col)
+                padj = row.get(padj_col)
+                top_genes.append({'gene': str(gene_id), 'logFC': float(logfc), 'padj': float(padj)})
+
+        return {
+            'deg_up': deg_up,
+            'deg_down': deg_down,
+            'deg_total': deg_total,
+            'top_genes': top_genes,
+            'padj_col': padj_col,
+        }
+
     async def calculate_deg_statistics(
         self,
         parquet_data: bytes,
         comparisons: dict[str, dict[str, str]],
-        logfc_threshold: float = 0.58,
-        padj_threshold: float = 0.05
+        logfc_threshold: float = DEG_LOGFC_THRESHOLD,
+        padj_threshold: float = DEG_PADJ_THRESHOLD,
+        test_method: Optional[str] = None,
     ) -> dict[str, dict[str, Any]]:
         """
-        Calculate DEG statistics for all comparisons in a DEG dataset.
-        Matches the exact filtering logic used in the DEG table component.
+        Calculate DEG statistics for all comparisons.
 
         Args:
             parquet_data: Parquet file bytes
-            comparisons: Dict of comparison names to column mappings
-            logfc_threshold: Log2 fold change threshold for significance (default: 0.58)
-            padj_threshold: Adjusted p-value threshold for significance (default: 0.05)
+            comparisons: Dict of comparison names to column mappings (from _detect_comparisons)
+            logfc_threshold: Log2 fold change threshold (default: DEG_LOGFC_THRESHOLD)
+            padj_threshold: Adjusted p-value threshold (default: DEG_PADJ_THRESHOLD)
+            test_method: Optional method name to filter on (e.g. "Stouffer", "Fisher").
+                         If None, uses the active padj column (highest-priority method).
 
         Returns:
-            Dict mapping comparison names to statistics:
+            Dict mapping comparison names to statistics. Each entry includes:
+            - deg_up, deg_down, deg_total, top_genes (active method)
+            - stats_per_method: {method: {deg_up, deg_down, deg_total}} for all methods
+        """
+        parquet_buffer = io.BytesIO(parquet_data)
+        df = pd.read_parquet(parquet_buffer)
+        logger.debug(f"[DEG_STATS] Processing {len(comparisons)} comparisons, test_method={test_method}")
+
+        statistics = {}
+        for comp_name, cols in comparisons.items():
+            logfc_col = cols.get('logFC')
+            if not logfc_col:
+                continue
+
+            all_padj = cols.get('all_padj_cols', {})
+
+            # Determine active padj column
+            if test_method and all_padj.get(test_method):
+                active_padj_col = all_padj[test_method]
+            else:
+                active_padj_col = cols.get('padj')
+
+            if not active_padj_col:
+                logger.debug(f"[DEG_STATS] Skipping '{comp_name}': no padj column")
+                continue
+
+            # Compute stats for the active method
+            result = self._compute_stats_with_padj_col(
+                df, comp_name, logfc_col, active_padj_col, logfc_threshold, padj_threshold
+            )
+
+            # Compute stats per method when multiple padj columns exist
+            stats_per_method: dict[str, Any] = {}
+            for method_name, method_col in all_padj.items():
+                if method_col in df.columns:
+                    m_result = self._compute_stats_with_padj_col(
+                        df, comp_name, logfc_col, method_col, logfc_threshold, padj_threshold
+                    )
+                    stats_per_method[method_name] = {
+                        'deg_up': m_result['deg_up'],
+                        'deg_down': m_result['deg_down'],
+                        'deg_total': m_result['deg_total'],
+                    }
+
+            result['stats_per_method'] = stats_per_method
+            result['active_method'] = test_method or (
+                next(iter(all_padj.keys()), 'default') if all_padj else 'default'
+            )
+            statistics[comp_name] = result
+            logger.debug(
+                f"[DEG_STATS] '{comp_name}': {result['deg_up']} up, {result['deg_down']} down "
+                f"({result['active_method']})"
+            )
+
+        return statistics
+
+    async def generate_deg_stats_export(
+        self,
+        parquet_data: bytes,
+        comparisons: dict[str, dict[str, str]],
+        logfc_threshold: float = DEG_LOGFC_THRESHOLD,
+        padj_threshold: float = DEG_PADJ_THRESHOLD,
+    ) -> dict[str, Any]:
+        """
+        Generate individual and general DEG stats export files.
+
+        Returns:
             {
-                'comparison_name': {
-                    'deg_up': int,
-                    'deg_down': int,
-                    'deg_total': int,
-                    'top_genes': [
-                        {'gene': str, 'logFC': float, 'padj': float},
-                        ...
-                    ]
-                }
+              "individual": DataFrame as dict (all padj columns per gene),
+              "general": {comparison: {method: {up, down, total}}}   ← Stouffer-first
             }
         """
         parquet_buffer = io.BytesIO(parquet_data)
         df = pd.read_parquet(parquet_buffer)
 
-        logger.debug(f"[DEG_STATS] Processing {len(comparisons)} comparisons")
+        general: dict[str, Any] = {}
+        individual_frames: list = []
 
-        statistics = {}
         for comp_name, cols in comparisons.items():
             logfc_col = cols.get('logFC')
-            padj_col = cols.get('padj')
-
-            logger.debug(f"[DEG_STATS] Comparison '{comp_name}': logFC={logfc_col}, padj={padj_col}")
-
-            if not logfc_col or not padj_col:
-                logger.debug(f"[DEG_STATS] Skipping '{comp_name}': missing columns")
+            if not logfc_col or logfc_col not in df.columns:
                 continue
 
-            # Check if contrast column exists for this comparison
-            contrast_col = f"contrast:{comp_name}"
-            has_contrast_col = contrast_col in df.columns
+            all_padj = cols.get('all_padj_cols', {})
+            active_padj = cols.get('padj')
+            if not active_padj:
+                continue
 
-            logger.debug(f"[DEG_STATS] Looking for contrast column: {contrast_col}, Found: {has_contrast_col}")
+            # Build per-comparison individual frame
+            keep_cols = ['gene_id', logfc_col]
+            for method_col in all_padj.values():
+                if method_col in df.columns:
+                    keep_cols.append(method_col)
+            pval_col = cols.get('pvalue')
+            if pval_col and pval_col in df.columns:
+                keep_cols.append(pval_col)
 
-            if has_contrast_col:
-                # Use contrast column to count (more accurate)
-                # Filter genes that belong to this comparison (non-empty contrast value)
-                comparison_genes = df[
-                    (df[contrast_col].notna()) &
-                    (df[contrast_col] != '') &
-                    (df[contrast_col] != None)
-                ].copy()
+            frame = df[[c for c in keep_cols if c in df.columns]].copy()
+            frame.insert(1, 'comparison', comp_name)
 
-                logger.debug(f"[DEG_STATS] Total genes in contrast column: {len(comparison_genes)}")
+            # Add significance flags per method
+            for method_name, method_col in all_padj.items():
+                if method_col in df.columns:
+                    frame[f'is_sig.{method_name}'] = (
+                        (frame[method_col] < padj_threshold) &
+                        (np.abs(frame[logfc_col]) > logfc_threshold)
+                    )
 
-                # Count UP and DOWN based on contrast column values
-                deg_up = len(comparison_genes[comparison_genes[contrast_col].str.upper() == 'UP'])
-                deg_down = len(comparison_genes[comparison_genes[contrast_col].str.upper() == 'DOWN'])
-                deg_total = deg_up + deg_down
+            individual_frames.append(frame)
 
-                # For top genes, filter by the same criteria as DEG table
-                significant = comparison_genes[
-                    (comparison_genes[padj_col].notna()) &
-                    (comparison_genes[logfc_col].notna()) &
-                    (comparison_genes[padj_col] < padj_threshold) &
-                    (np.abs(comparison_genes[logfc_col]) > logfc_threshold)
-                ].copy()
-            else:
-                # Fallback: use logFC sign (old method)
-                logger.debug(f"[DEG_STATS] No contrast column found, using logFC sign")
-                significant = df[
-                    (df[padj_col].notna()) &
-                    (df[logfc_col].notna()) &
-                    (df[padj_col] < padj_threshold) &
-                    (np.abs(df[logfc_col]) > logfc_threshold)
-                ].copy()
+            # General stats: per method counts
+            comp_general: dict[str, Any] = {}
+            for method_name, method_col in all_padj.items():
+                if method_col not in df.columns:
+                    continue
+                r = self._compute_stats_with_padj_col(
+                    df, comp_name, logfc_col, method_col, logfc_threshold, padj_threshold
+                )
+                comp_general[method_name] = {'up': r['deg_up'], 'down': r['deg_down'], 'total': r['deg_total']}
+            # Fallback to active padj if no named methods
+            if not comp_general:
+                r = self._compute_stats_with_padj_col(
+                    df, comp_name, logfc_col, active_padj, logfc_threshold, padj_threshold
+                )
+                comp_general['default'] = {'up': r['deg_up'], 'down': r['deg_down'], 'total': r['deg_total']}
 
-                deg_up = len(significant[significant[logfc_col] > 0])
-                deg_down = len(significant[significant[logfc_col] < 0])
-                deg_total = len(significant)
+            general[comp_name] = comp_general
 
-            # Get top 10 genes by adjusted p-value
-            top_genes_df = significant.nsmallest(10, padj_col)
-            top_genes = []
-
-            for idx, row in top_genes_df.iterrows():
-                gene_id = row.get('gene_id', idx)
-                logfc = row.get(logfc_col)
-                padj = row.get(padj_col)
-
-                top_genes.append({
-                    'gene': str(gene_id),
-                    'logFC': float(logfc),
-                    'padj': float(padj)
-                })
-
-            statistics[comp_name] = {
-                'deg_up': deg_up,
-                'deg_down': deg_down,
-                'deg_total': deg_total,
-                'top_genes': top_genes
-            }
-
-            logger.debug(f"[DEG_STATS] Comparison '{comp_name}': {deg_up} up, {deg_down} down, {deg_total} total, {len(top_genes)} top genes")
-
-        return statistics
+        individual_df = pd.concat(individual_frames, ignore_index=True) if individual_frames else pd.DataFrame()
+        return {
+            "individual": individual_df.to_dict(orient='records'),
+            "general": general,
+        }
 
     async def extract_deg_genes_for_db(
         self,
@@ -1320,8 +1443,8 @@ class DataProcessorService:
                 
                 # Default thresholds for "significant" genes to store
                 # We store significant genes to populate the DEG table
-                padj_threshold = 0.05
-                logfc_threshold = 0.58 # approx 1.5 fold change
+                padj_threshold = DEG_PADJ_THRESHOLD
+                logfc_threshold = DEG_LOGFC_THRESHOLD
                 
                 comparison_genes = df[
                     (df[padj_col].notna()) &
