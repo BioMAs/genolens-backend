@@ -580,12 +580,25 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
 
                 # Update database
                 self.update_state(state="PROGRESS", meta={"step": "finalizing"})
-            
+
+                # Extract DEG counts for DB columns (first comparison, active method)
+                deg_up_count = None
+                deg_down_count = None
+                deg_significant_count = None
+                if deg_stats:
+                    first_comp = next(iter(deg_stats.values()), {})
+                    deg_up_count = first_comp.get('deg_up')
+                    deg_down_count = first_comp.get('deg_down')
+                    deg_significant_count = first_comp.get('deg_total')
+
                 stmt = update(Dataset).where(Dataset.id == dataset_id).values(
                     status=DatasetStatus.READY,
                     parquet_file_path=parquet_path,
                     dataset_metadata=final_metadata,
-                    error_message=None
+                    error_message=None,
+                    deg_up_count=deg_up_count,
+                    deg_down_count=deg_down_count,
+                    deg_significant_count=deg_significant_count,
                 )
                 await db.execute(stmt)
                 await db.commit()

@@ -1,6 +1,7 @@
 """
 Dataset API endpoints.
 """
+import io
 import logging
 import json
 import hashlib
@@ -21,6 +22,7 @@ from fastapi import (
     Query,
     Body
 )
+from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_user, get_db
@@ -717,6 +719,60 @@ async def get_deg_stats_multimethod(
         "individual": export["individual"],
         "available_methods": available_methods,
     }
+
+
+@router.get("/{dataset_id}/deg-stats/export")
+async def export_deg_stats_csv(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    comparison: Optional[str] = Query(None, description="Filter to a single comparison name"),
+    format: str = Query("csv", description="Output format: csv or tsv"),
+) -> StreamingResponse:
+    """
+    Download DEG statistics for all statistical methods as a CSV/TSV file.
+
+    Each row is a gene. Columns include all padj columns (padj.Stouffer, padj.edgeR, …)
+    and boolean significance flags (is_sig.Stouffer, …).
+    """
+    result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+
+    if not dataset.parquet_file_path:
+        raise HTTPException(status_code=400, detail="Dataset has no Parquet file")
+
+    comparisons = (dataset.dataset_metadata or {}).get("comparisons", {})
+    if not comparisons:
+        raise HTTPException(status_code=400, detail="No comparisons found in dataset metadata")
+
+    parquet_data = await storage_service.download_file(dataset.parquet_file_path)
+    export = await data_processor.generate_deg_stats_export(
+        parquet_data=parquet_data,
+        comparisons=comparisons,
+    )
+
+    records = export.get("individual", [])
+    if not records:
+        raise HTTPException(status_code=404, detail="No gene statistics available")
+
+    df = pd.DataFrame(records)
+    if comparison and "comparison" in df.columns:
+        df = df[df["comparison"] == comparison]
+
+    sep = "\t" if format == "tsv" else ","
+    ext = "tsv" if format == "tsv" else "csv"
+    buf = io.StringIO()
+    df.to_csv(buf, sep=sep, index=False)
+
+    filename = f"deg_stats_{dataset_id}.{ext}"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/{dataset_id}/genes/list", response_model=GeneListResponse)
