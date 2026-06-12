@@ -1,6 +1,7 @@
 import pytest
 from httpx import AsyncClient, ASGITransport
 from app.main import app
+from app.core.config import settings
 
 @pytest.mark.asyncio
 async def test_health_check():
@@ -10,6 +11,6 @@ async def test_health_check():
     assert response.status_code == 200
     assert response.json() == {
         "status": "healthy",
-        "app": "GenoLens Next",
-        "version": "1.0.0"
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
     }
