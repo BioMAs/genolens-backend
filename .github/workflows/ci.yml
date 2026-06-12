@@ -124,6 +124,17 @@ jobs:
             --exclude='.env' \
             ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
 
+      - name: Sync alembic migrations exactly (remove stale files)
+        # alembic/versions must match the repo exactly: stale migration files left
+        # on the server create extra alembic heads and break `alembic upgrade head`.
+        # --delete is safe here because the dir only ever contains migration files.
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            ./alembic/versions/ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/alembic/versions/"
+
       - name: Build, migrate, restart
         # Build first, run migrations, then restart services with the new image.
         run: |
