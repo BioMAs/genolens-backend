@@ -610,5 +610,7 @@ class TestGSEAEdgeCases:
         results = proc.run_gsea(ranked, gene_sets, n_permutations=100, seed=0)
         elapsed = time.perf_counter() - start
 
-        assert elapsed < 30, f"GSEA took {elapsed:.1f}s — too slow (threshold: 30s)"
+        # Generous threshold: this is a "doesn't hang" smoke test, and shared CI
+        # runners vary enough to flake a tighter bound.
+        assert elapsed < 60, f"GSEA took {elapsed:.1f}s — too slow (threshold: 60s)"
         assert len(results) > 0

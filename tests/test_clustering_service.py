@@ -363,7 +363,8 @@ class TestClusteringEdgeCases:
                                             method="ward", metric="euclidean")
         elapsed = time.perf_counter() - start
 
-        assert elapsed < 10, f"Clustering took {elapsed:.1f}s — too slow (threshold: 10s)"
+        # Generous threshold: "doesn't hang" smoke test; shared CI runners vary.
+        assert elapsed < 30, f"Clustering took {elapsed:.1f}s — too slow (threshold: 30s)"
         # Service keeps the top_n_genes (default 1000) most variable genes.
         assert len(result["row_order"]) == 1_000
 
