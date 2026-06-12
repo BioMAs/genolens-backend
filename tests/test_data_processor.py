@@ -191,14 +191,12 @@ class TestDetectComparisons:
         comps = svc._detect_comparisons(cols)
         assert set(comps.keys()) == {"A_vs_B", "C_vs_D"}
 
-    def test_dp03_incomplete_columns_still_detected(self):
-        """A comparison with only logFC (no padj) is still partially detected."""
+    def test_dp03_incomplete_columns_filtered_out(self):
+        """A comparison missing padj (only logFC) is filtered out (needs logFC+padj)."""
         svc = _make_service()
         cols = ["gene_id", "log2FoldChange:A_vs_B"]
         comps = svc._detect_comparisons(cols)
-        assert "A_vs_B" in comps
-        assert "logFC" in comps["A_vs_B"]
-        assert "padj" not in comps["A_vs_B"]
+        assert "A_vs_B" not in comps
 
     def test_dp03_contrast_column_skipped(self):
         """Columns starting with 'contrast:' are not parsed as comparisons."""
@@ -224,16 +222,17 @@ class TestDetectComparisonsAdvanced:
         assert comps["A_vs_B"].get("padj") == "padj.Stouffer:A_vs_B"
 
     def test_dp04_fisher_padj_prefix_detected(self):
-        """padj.Fisher:CompName detected as padj column."""
+        """padj.Fisher:CompName detected as padj column (paired with logFC)."""
         svc = _make_service()
-        cols = ["gene_id", "padj.Fisher:X_vs_Y"]
+        cols = ["gene_id", "log2FoldChange:X_vs_Y", "padj.Fisher:X_vs_Y"]
         comps = svc._detect_comparisons(cols)
         assert "X_vs_Y" in comps
+        assert comps["X_vs_Y"].get("padj") == "padj.Fisher:X_vs_Y"
 
     def test_dp04_contrast_prefix_stripped_from_comp_name(self):
         """'contrast:' prefix inside comparison name is stripped."""
         svc = _make_service()
-        cols = ["gene_id", "log2FoldChange:contrast:TRT_vs_CTL"]
+        cols = ["gene_id", "log2FoldChange:contrast:TRT_vs_CTL", "padj:contrast:TRT_vs_CTL"]
         comps = svc._detect_comparisons(cols)
         assert "TRT_vs_CTL" in comps
         assert "contrast:TRT_vs_CTL" not in comps

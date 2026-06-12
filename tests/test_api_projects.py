@@ -56,6 +56,9 @@ async def projects_client():
     """
     from app.main import app
     from app.api.deps import get_current_user, get_db
+    from app.api.deps.license import require_active_license
+    from app.api.deps.subscription import get_or_create_user
+    from app.models.models import User, SubscriptionPlan, UserStatus, UserRole
 
     fake_user = make_fake_supabase_user()
     mock_db = _make_db_with_project()
@@ -66,8 +69,22 @@ async def projects_client():
     async def _override_db():
         yield mock_db
 
+    async def _override_license():
+        return None
+
+    async def _override_db_user():
+        u = User()
+        u.id = TEST_USER_ID
+        u.email = "test@example.com"
+        u.role = UserRole.USER
+        u.subscription_plan = SubscriptionPlan.TEAM  # max_projects = None (unlimited)
+        u.status = UserStatus.ACTIVE
+        return u
+
     app.dependency_overrides[get_current_user] = _override_user
     app.dependency_overrides[get_db] = _override_db
+    app.dependency_overrides[require_active_license] = _override_license
+    app.dependency_overrides[get_or_create_user] = _override_db_user
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:

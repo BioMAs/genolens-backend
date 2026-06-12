@@ -1,7 +1,7 @@
 """Tests for the new STARTER / TEAM / ON_PREMISE plan model."""
 import pytest
 from uuid import uuid4
-from app.models.models import User, UserRole, SubscriptionPlan
+from app.models.models import User, UserRole, SubscriptionPlan, UserStatus
 
 
 def make_user(plan: SubscriptionPlan) -> User:
@@ -14,7 +14,7 @@ def make_user(plan: SubscriptionPlan) -> User:
     u.ai_tokens_purchased = 0
     u.ai_tokens_used = 0
     u.comparisons_used_this_month = 0
-    u.is_active = True
+    u.status = UserStatus.ACTIVE
     return u
 
 

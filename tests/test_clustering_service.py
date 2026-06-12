@@ -176,23 +176,25 @@ class TestPerformClusteringHappyPaths:
 
 class TestPerformClusteringErrors:
 
-    def test_raises_on_nan_data(self):
-        """NaN values in the DataFrame should raise ValueError."""
+    def test_imputes_nan_data(self):
+        """NaN values are imputed (gene mean); clustering still succeeds."""
         df = _make_df(n_genes=10, n_samples=4)
         df.iloc[3, 2] = float("nan")
         service = _make_service()
 
-        with pytest.raises(ValueError, match="NaN"):
-            service.perform_clustering(df.copy())
+        result = service.perform_clustering(df.copy())
+        assert "row_order" in result
+        assert len(result["row_order"]) == 10
 
-    def test_raises_on_infinite_data(self):
-        """Inf values in the DataFrame should raise ValueError."""
+    def test_imputes_infinite_data(self):
+        """Inf values are imputed (gene mean); clustering still succeeds."""
         df = _make_df(n_genes=10, n_samples=4)
         df.iloc[1, 1] = float("inf")
         service = _make_service()
 
-        with pytest.raises(ValueError, match="infinite"):
-            service.perform_clustering(df.copy())
+        result = service.perform_clustering(df.copy())
+        assert "row_order" in result
+        assert len(result["row_order"]) == 10
 
     def test_raises_when_gene_ids_not_in_dataframe(self):
         """gene_ids that don't match any row should raise ValueError."""
@@ -358,11 +360,12 @@ class TestClusteringEdgeCases:
 
         start = time.perf_counter()
         result = service.perform_clustering(df, cluster_rows=True, cluster_cols=True,
-                                            method="hierarchical", metric="euclidean")
+                                            method="ward", metric="euclidean")
         elapsed = time.perf_counter() - start
 
         assert elapsed < 10, f"Clustering took {elapsed:.1f}s — too slow (threshold: 10s)"
-        assert len(result["row_order"]) == 5_000
+        # Service keeps the top_n_genes (default 1000) most variable genes.
+        assert len(result["row_order"]) == 1_000
 
     # CL-04: gene_ids with no overlap → explicit ValueError
     def test_cl04_nonexistent_gene_ids_raises_value_error(self):

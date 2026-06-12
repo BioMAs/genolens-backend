@@ -18,7 +18,7 @@ from httpx import AsyncClient, ASGITransport
 
 from tests.conftest import (
     TEST_USER_ID, TEST_PROJECT_ID, TEST_BOOKMARK_ID, TEST_GENE_LIST_ID,
-    make_bookmark, make_gene_list,
+    make_bookmark, make_gene_list, make_fake_supabase_user,
 )
 
 # The exact auth function used in bookmarks router
@@ -42,15 +42,14 @@ async def bookmarks_client():
     DB is mocked via a simple AsyncMock injected as dependency.
     """
     from app.main import app
-    from app.api.deps.auth import get_current_user
-    from app.api.deps.db import get_db
+    from app.api.deps import get_current_user, get_db
 
     mock_db = AsyncMock()
     mock_db.add = MagicMock()
     mock_db.commit = AsyncMock()
     mock_db.refresh = AsyncMock()
 
-    fake_user = _fake_user_dict()
+    fake_user = make_fake_supabase_user()
 
     async def _override_user():
         return fake_user
