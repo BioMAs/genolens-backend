@@ -850,6 +850,76 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                         process_dataset_upload.delay(str(deg_ds.id), deg_storage)
                         logger.info("[ANALYSIS] Registered DEG dataset %s for comparison %s", deg_ds.id, comp_id)
 
+                        # ── annoDB functional enrichment (GO/KEGG/Reactome/Hallmark/…) ──
+                        # Runs on the r-worker where /app/anno_db is mounted. Produces a
+                        # genolens_enrichment.csv ingested via the standard ENRICHMENT path.
+                        # Non-fatal: a failure here never fails the analysis.
+                        try:
+                            enrich_script = Path("/app/r_scripts/functional_enrichment.R")
+                            anno_db_dir = os.environ.get("ANNO_DB_PATH", "/app/anno_db")
+                            enrich_local = comp_dir / "genolens_enrichment.csv"
+                            if enrich_script.exists():
+                                enrich_cmd = [
+                                    "Rscript", str(enrich_script),
+                                    "--deg", str(deg_csv),
+                                    "--anno-db-dir", anno_db_dir,
+                                    "--species", str(params.get("species", "human")),
+                                    "--comparison", comp_id,
+                                    "--output", str(enrich_local),
+                                    "--fdr", str(params.get("fdr", 0.05)),
+                                    "--min-log2fc", str(params.get("min_log2fc", 1.0)),
+                                ]
+                                enrich_proc = subprocess.run(
+                                    enrich_cmd, capture_output=True, text=True, timeout=1800
+                                )
+                                if enrich_proc.returncode != 0:
+                                    logger.warning(
+                                        "[ANALYSIS] Enrichment R failed for %s: %s",
+                                        comp_id, enrich_proc.stderr[-1000:],
+                                    )
+                                elif enrich_local.exists():
+                                    # Only register if there is at least one data row (not header-only)
+                                    with open(enrich_local) as _ef:
+                                        has_rows = sum(1 for _ in _ef) > 1
+                                    if has_rows:
+                                        enrich_storage = (
+                                            f"projects/{analysis.project_id}/analyses/{analysis_id}"
+                                            f"/comparisons/{comp_id}/genolens_enrichment.csv"
+                                        )
+                                        await storage_service.upload_file(
+                                            enrich_storage, enrich_local.read_bytes()
+                                        )
+                                        enrich_ds = Dataset(
+                                            id=_uuid4(),
+                                            project_id=analysis.project_id,
+                                            name=f"{comp_id} — enrichment",
+                                            type=DatasetType.ENRICHMENT,
+                                            status=DatasetStatus.PENDING,
+                                            raw_file_path=enrich_storage,
+                                            dataset_metadata={
+                                                "analysis_id": str(analysis_id),
+                                                "comparison_name": comp_id,
+                                                "source": "annodb",
+                                            },
+                                            column_mapping={},
+                                        )
+                                        db.add(enrich_ds)
+                                        await db.flush()
+                                        result_dataset_ids.append(str(enrich_ds.id))
+                                        process_dataset_upload.delay(str(enrich_ds.id), enrich_storage)
+                                        logger.info(
+                                            "[ANALYSIS] Registered enrichment dataset %s for comparison %s",
+                                            enrich_ds.id, comp_id,
+                                        )
+                                    else:
+                                        logger.info("[ANALYSIS] No enriched terms for comparison %s", comp_id)
+                            else:
+                                logger.info("[ANALYSIS] functional_enrichment.R not found — skipping enrichment")
+                        except Exception as enr_exc:
+                            logger.warning(
+                                "[ANALYSIS] annoDB enrichment step skipped for %s: %s", comp_id, enr_exc
+                            )
+
                 analysis.result_dataset_ids = result_dataset_ids
                 analysis.intermediate_dataset_ids = intermediate_dataset_ids
                 analysis.status = SelfServiceAnalysisStatus.DONE
