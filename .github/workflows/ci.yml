@@ -147,6 +147,16 @@ jobs:
              docker compose -f $COMPOSE_FILE ps"
 
       - name: Health check
+        # Retry: the freshly restarted container needs a few seconds to accept traffic.
         run: |
-          sleep 5
-          curl --fail --silent --show-error "$HEALTH_URL" && echo " OK"
+          for i in $(seq 1 20); do
+            if curl --fail --silent --show-error "$HEALTH_URL" >/dev/null 2>&1; then
+              echo "healthy after $i attempt(s)"
+              curl --silent "$HEALTH_URL"; echo
+              exit 0
+            fi
+            echo "attempt $i/20: not ready yet, waiting 5s..."
+            sleep 5
+          done
+          echo "Health check failed after 20 attempts" >&2
+          exit 1
