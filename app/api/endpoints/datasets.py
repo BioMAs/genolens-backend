@@ -755,24 +755,35 @@ async def export_deg_stats_csv(
     if not comparisons:
         raise HTTPException(status_code=400, detail="No comparisons found in dataset metadata")
 
-    parquet_data = await storage_service.download_file(dataset.parquet_file_path)
-    export = await data_processor.generate_deg_stats_export(
-        parquet_data=parquet_data,
-        comparisons=comparisons,
-    )
+    try:
+        parquet_data = await storage_service.download_file(dataset.parquet_file_path)
+        export = await data_processor.generate_deg_stats_export(
+            parquet_data=parquet_data,
+            comparisons=comparisons,
+        )
 
-    records = export.get("individual", [])
-    if not records:
-        raise HTTPException(status_code=404, detail="No gene statistics available")
+        records = export.get("individual", [])
+        if not records:
+            raise HTTPException(status_code=404, detail="No gene statistics available")
 
-    df = pd.DataFrame(records)
-    if comparison and "comparison" in df.columns:
-        df = df[df["comparison"] == comparison]
+        df = pd.DataFrame(records)
+        if comparison and "comparison" in df.columns:
+            df = df[df["comparison"] == comparison]
 
-    sep = "\t" if format == "tsv" else ","
-    ext = "tsv" if format == "tsv" else "csv"
-    buf = io.StringIO()
-    df.to_csv(buf, sep=sep, index=False)
+        sep = "\t" if format == "tsv" else ","
+        ext = "tsv" if format == "tsv" else "csv"
+        buf = io.StringIO()
+        df.to_csv(buf, sep=sep, index=False)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logging.getLogger(__name__).exception(
+            "DEG stats export failed for dataset %s (comparison=%s)", dataset_id, comparison
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate DEG statistics export: {exc}",
+        )
 
     filename = f"deg_stats_{dataset_id}.{ext}"
     return StreamingResponse(

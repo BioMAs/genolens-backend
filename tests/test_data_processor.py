@@ -295,6 +295,60 @@ class TestCalculateDegStats:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DP-11  comparisons stored as a list (legacy) + non-numeric padj — no 500
+#        Regression for: AttributeError 'list' object has no attribute 'items'
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestComparisonsNormalization:
+
+    def _legacy_df(self) -> pd.DataFrame:
+        # Detectable comparison columns so _detect_comparisons can rebuild the mapping.
+        return pd.DataFrame({
+            "gene_id": [f"G{i}" for i in range(6)],
+            "gene_name": [f"Gene{i}" for i in range(6)],
+            "log2FoldChange:Treated_vs_Control": [2.0, -1.5, 0.1, 3.0, -2.0, 0.05],
+            # padj as object column containing an "NA" string (as exported by R)
+            "padj.Stouffer:Treated_vs_Control": ["0.01", "0.02", "0.5", "NA", "0.001", "0.9"],
+        })
+
+    @pytest.mark.asyncio
+    async def test_dp11_export_with_list_comparisons(self):
+        """generate_deg_stats_export rebuilds mappings when comparisons is a list."""
+        svc = _make_service()
+        parquet = _df_to_parquet_bytes(self._legacy_df())
+        # Legacy shape: a list of comparison names instead of the canonical dict.
+        export = await svc.generate_deg_stats_export(
+            parquet_data=parquet,
+            comparisons=["Treated_vs_Control"],
+        )
+        assert "Treated_vs_Control" in export["general"]
+        assert len(export["individual"]) == 6  # all genes, no crash
+
+    @pytest.mark.asyncio
+    async def test_dp11_stats_with_list_comparisons(self):
+        """calculate_deg_statistics also tolerates a list of comparisons."""
+        svc = _make_service()
+        parquet = _df_to_parquet_bytes(self._legacy_df())
+        stats = await svc.calculate_deg_statistics(
+            parquet_data=parquet,
+            comparisons=["Treated_vs_Control"],
+        )
+        assert "Treated_vs_Control" in stats
+        # "NA" padj coerced to NaN → excluded; up = G0(2.0,0.01), G4(-2.0… down)
+        assert stats["Treated_vs_Control"]["deg_total"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_dp11_canonical_dict_unchanged(self):
+        """A proper dict mapping is passed through untouched."""
+        svc = _make_service()
+        df = self._legacy_df()
+        parquet = _df_to_parquet_bytes(df)
+        canonical = svc._detect_comparisons(df.columns.tolist())
+        export = await svc.generate_deg_stats_export(parquet_data=parquet, comparisons=canonical)
+        assert "Treated_vs_Control" in export["general"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DP-07  calculate_volcano_plots — valid data, downsampling, zero padj
 # ─────────────────────────────────────────────────────────────────────────────
 

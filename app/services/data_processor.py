@@ -1196,6 +1196,55 @@ class DataProcessorService:
             'padj_col': padj_col,
         }
 
+    def _normalize_comparisons(
+        self, comparisons: Any, df: "pd.DataFrame"
+    ) -> dict[str, dict[str, str]]:
+        """
+        Return comparisons as the canonical dict {name: {logFC, padj, all_padj_cols, ...}}.
+
+        Legacy datasets may store ``dataset_metadata["comparisons"]`` as a list of comparison
+        names (or any non-canonical shape), which breaks ``.items()`` / key access downstream.
+        In that case we rebuild the column mappings from the Parquet columns via
+        ``_detect_comparisons`` (self-healing, no data migration required).
+        """
+        # Already canonical: dict whose values carry column mappings.
+        if isinstance(comparisons, dict) and comparisons:
+            sample = next(iter(comparisons.values()))
+            if isinstance(sample, dict) and ("logFC" in sample or "all_padj_cols" in sample):
+                return comparisons
+
+        # Legacy / invalid shape → re-derive from the actual columns.
+        detected = self._detect_comparisons(df.columns.tolist())
+
+        # If a list of names was provided, keep only those that match; otherwise return all.
+        if isinstance(comparisons, (list, tuple)) and comparisons:
+            names = {str(c) for c in comparisons}
+            filtered = {k: v for k, v in detected.items() if k in names}
+            if filtered:
+                return filtered
+        return detected
+
+    def _coerce_numeric_columns(
+        self, df: "pd.DataFrame", comparisons: dict[str, dict[str, str]]
+    ) -> None:
+        """
+        Coerce every logFC / padj / pvalue column referenced by ``comparisons`` to numeric
+        (in place). Guards against ``"NA"`` strings produced by R, which would otherwise raise
+        ``TypeError`` on ``<`` comparisons or ``np.abs`` downstream.
+        """
+        cols: set[str] = set()
+        for mapping in comparisons.values():
+            if not isinstance(mapping, dict):
+                continue
+            for key in ("logFC", "padj", "pvalue"):
+                if mapping.get(key):
+                    cols.add(mapping[key])
+            for bucket in ("all_padj_cols", "all_pvalue_cols"):
+                cols.update((mapping.get(bucket) or {}).values())
+        for col in cols:
+            if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
     async def calculate_deg_statistics(
         self,
         parquet_data: bytes,
@@ -1222,6 +1271,8 @@ class DataProcessorService:
         """
         parquet_buffer = io.BytesIO(parquet_data)
         df = pd.read_parquet(parquet_buffer)
+        comparisons = self._normalize_comparisons(comparisons, df)
+        self._coerce_numeric_columns(df, comparisons)
         logger.debug(f"[DEG_STATS] Processing {len(comparisons)} comparisons, test_method={test_method}")
 
         statistics = {}
@@ -1290,6 +1341,8 @@ class DataProcessorService:
         """
         parquet_buffer = io.BytesIO(parquet_data)
         df = pd.read_parquet(parquet_buffer)
+        comparisons = self._normalize_comparisons(comparisons, df)
+        self._coerce_numeric_columns(df, comparisons)
 
         general: dict[str, Any] = {}
         individual_frames: list = []
