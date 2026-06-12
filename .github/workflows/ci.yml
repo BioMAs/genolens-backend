@@ -5,6 +5,7 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -81,3 +82,58 @@ jobs:
       - name: Show logs on failure
         if: failure()
         run: docker compose logs api
+
+  deploy:
+    name: Deploy to production
+    needs: test
+    # Auto-deploy only on a push to main (not on PRs / develop). Also runnable manually.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+
+    env:
+      DEPLOY_HOST: 37.187.254.33
+      DEPLOY_USER: tdarde
+      DEPLOY_PATH: /opt/genolens/backend
+      COMPOSE_FILE: docker-compose.prod.yml
+      HEALTH_URL: https://api-v2.genolens.com/health
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Sync backend source to server
+        # The prod server is NOT a git checkout; the Dockerfile builds via `COPY . .`,
+        # so we push the source tree and rebuild (mirrors the manual deploy.py flow).
+        run: |
+          rsync -az \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.pytest_cache' \
+            --exclude='.venv' \
+            --exclude='venv' \
+            --exclude='.env' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/"
+
+      - name: Build, migrate, restart
+        # Build first, run migrations, then restart services with the new image.
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$DEPLOY_USER@$DEPLOY_HOST" \
+            "set -e; cd $DEPLOY_PATH && \
+             docker compose -f $COMPOSE_FILE build api worker && \
+             docker compose -f $COMPOSE_FILE run --rm api alembic upgrade head && \
+             docker compose -f $COMPOSE_FILE up -d --no-deps api worker && \
+             docker compose -f $COMPOSE_FILE ps"
+
+      - name: Health check
+        run: |
+          sleep 5
+          curl --fail --silent --show-error "$HEALTH_URL" && echo " OK"
