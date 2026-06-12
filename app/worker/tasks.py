@@ -24,7 +24,9 @@ _ORA_DATABASES = [
     GeneSetDatabase.KEGG,
     GeneSetDatabase.REACTOME,
     GeneSetDatabase.HALLMARK,
+    GeneSetDatabase.C2_CURATED,
     GeneSetDatabase.C5_ONTOLOGY,
+    GeneSetDatabase.C6_ONCOGENIC,
     GeneSetDatabase.C7_IMMUNOLOGIC,
 ]
 
@@ -33,7 +35,9 @@ _DB_TO_CAT: dict[GeneSetDatabase, str] = {
     GeneSetDatabase.KEGG: "KEGG",
     GeneSetDatabase.REACTOME: "REACTOME",
     GeneSetDatabase.HALLMARK: "HALLMARK",
+    GeneSetDatabase.C2_CURATED: "C2_CURATED",
     GeneSetDatabase.C5_ONTOLOGY: "C5_ONTOLOGY",
+    GeneSetDatabase.C6_ONCOGENIC: "C6_ONCOGENIC",
     GeneSetDatabase.C7_IMMUNOLOGIC: "C7_IMMUNOLOGIC",
 }
 

@@ -671,6 +671,7 @@ async def get_deg_stats_multimethod(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     test_method: Optional[str] = Query(None, description="Statistical method to filter on (e.g. Stouffer, Fisher, edgeR, DESeq2). Default: highest-priority available."),
+    comparison: Optional[str] = Query(None, description="Restrict the result to a single comparison name."),
 ) -> dict:
     """
     Return per-comparison DEG statistics broken down by statistical method.
@@ -691,7 +692,13 @@ async def get_deg_stats_multimethod(
 
     comparisons = (dataset.dataset_metadata or {}).get("comparisons", {})
     if not comparisons:
-        return {"general": {}, "individual": [], "available_methods": {}}
+        return {"stats": {}, "general": {}, "individual": [], "available_methods": {}}
+
+    # Optionally restrict to a single comparison (lighter payload for the UI)
+    if comparison is not None:
+        if comparison not in comparisons:
+            raise HTTPException(status_code=404, detail=f"Comparison '{comparison}' not found")
+        comparisons = {comparison: comparisons[comparison]}
 
     parquet_data = await storage_service.download_file(dataset.parquet_file_path)
 
