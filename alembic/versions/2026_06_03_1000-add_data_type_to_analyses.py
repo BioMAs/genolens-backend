@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "add_data_type_to_analyses_001"
-down_revision: Union[str, None] = "add_scilicium_admin_role_001"
+down_revision: Union[str, None] = "create_self_service_analyses_001"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
