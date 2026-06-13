@@ -1762,27 +1762,14 @@ class DataProcessorService:
         pathways_list = []
 
         for _, row in df.iterrows():
-            # Parse gene ratio (e.g., "5/100" -> 0.05)
+            # gene_ratio / bg_ratio are stored as strings (VARCHAR column, e.g. "5/100").
             gene_ratio = None
             if gene_ratio_col and pd.notna(row.get(gene_ratio_col)):
-                try:
-                    ratio_str = str(row[gene_ratio_col])
-                    if '/' in ratio_str:
-                        num, denom = ratio_str.split('/')
-                        gene_ratio = float(num) / float(denom) if float(denom) > 0 else 0
-                except (ValueError, ZeroDivisionError):
-                    logger.debug(f"Could not parse gene_ratio value: {row.get(gene_ratio_col)!r}")
+                gene_ratio = str(row[gene_ratio_col])
 
-            # Parse background ratio
             bg_ratio = None
             if bg_ratio_col and pd.notna(row.get(bg_ratio_col)):
-                try:
-                    ratio_str = str(row[bg_ratio_col])
-                    if '/' in ratio_str:
-                        num, denom = ratio_str.split('/')
-                        bg_ratio = float(num) / float(denom) if float(denom) > 0 else 0
-                except (ValueError, ZeroDivisionError):
-                    logger.debug(f"Could not parse bg_ratio value: {row.get(bg_ratio_col)!r}")
+                bg_ratio = str(row[bg_ratio_col])
 
             # Parse genes list (e.g., "GENE1/GENE2/GENE3" -> ["GENE1", "GENE2", "GENE3"])
             genes = None

@@ -792,6 +792,10 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
 
                 result_dataset_ids: list[str] = []
                 intermediate_dataset_ids: dict[str, str] = {}
+                # Datasets are dispatched for processing only AFTER the final commit,
+                # otherwise the Celery worker (separate session) races the not-yet-
+                # committed transaction and fails with "No row was found".
+                pending_dispatch: list[tuple[str, str]] = []
 
                 # VST intermediate dataset (MATRIX type — used for PCA display)
                 vst_local = Path(outdir) / "vst_counts.tsv"
@@ -811,7 +815,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     db.add(vst_ds)
                     await db.flush()
                     intermediate_dataset_ids["vst"] = str(vst_ds.id)
-                    process_dataset_upload.delay(str(vst_ds.id), vst_storage)
+                    pending_dispatch.append((str(vst_ds.id), vst_storage))
                     logger.info("[ANALYSIS] Registered VST dataset %s", vst_ds.id)
 
                 # DEG result datasets (one per comparison)
@@ -847,7 +851,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                         db.add(deg_ds)
                         await db.flush()
                         result_dataset_ids.append(str(deg_ds.id))
-                        process_dataset_upload.delay(str(deg_ds.id), deg_storage)
+                        pending_dispatch.append((str(deg_ds.id), deg_storage))
                         logger.info("[ANALYSIS] Registered DEG dataset %s for comparison %s", deg_ds.id, comp_id)
 
                         # ── annoDB functional enrichment (GO/KEGG/Reactome/Hallmark/…) ──
@@ -906,7 +910,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                                         db.add(enrich_ds)
                                         await db.flush()
                                         result_dataset_ids.append(str(enrich_ds.id))
-                                        process_dataset_upload.delay(str(enrich_ds.id), enrich_storage)
+                                        pending_dispatch.append((str(enrich_ds.id), enrich_storage))
                                         logger.info(
                                             "[ANALYSIS] Registered enrichment dataset %s for comparison %s",
                                             enrich_ds.id, comp_id,
@@ -927,6 +931,12 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 _log("done", f"Pipeline completed. Registered {len(result_dataset_ids)} DEG dataset(s).")
                 db.add(analysis)
                 await db.commit()
+
+                # Now that everything is committed, dispatch dataset processing so the
+                # worker's separate session can read the rows (avoids the commit race).
+                for ds_id, ds_storage in pending_dispatch:
+                    process_dataset_upload.delay(ds_id, ds_storage)
+                logger.info("[ANALYSIS] Dispatched %d dataset(s) for processing", len(pending_dispatch))
 
                 shutil.rmtree(outdir, ignore_errors=True)
                 return {"status": "done", "analysis_id": analysis_id, "result_dataset_ids": result_dataset_ids}
