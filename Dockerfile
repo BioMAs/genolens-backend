@@ -51,3 +51,54 @@ FROM base as worker
 
 # Run Celery worker
 CMD ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "-Q", "default,data_processing"]
+
+# ================================
+# R Worker Target (DEG pipeline + annoDB functional enrichment)
+# ================================
+# R and the CRAN/Bioconductor packages live in their own stage so the slow
+# install layer stays cached across application-code changes (the final
+# r-worker stage only re-copies the source).
+FROM python:3.11-slim as r-deps
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Python build deps + R and the system libraries the R packages need to compile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libpq-dev \
+    libffi-dev \
+    r-base \
+    r-base-dev \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    libxml2-dev \
+    libfontconfig1-dev \
+    libharfbuzz-dev \
+    libfribidi-dev \
+    libfreetype6-dev \
+    libpng-dev \
+    libtiff5-dev \
+    libjpeg-dev \
+    libuv1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install CRAN + Bioconductor R packages (see r_scripts/install_packages.R).
+# Cached unless install_packages.R changes.
+COPY r_scripts/install_packages.R /app/r_scripts/install_packages.R
+RUN Rscript /app/r_scripts/install_packages.R
+
+FROM r-deps as r-worker
+
+# Application source (and the rest of r_scripts, incl. the pipeline + enrichment)
+COPY . .
+
+CMD ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "-Q", "r_analysis", "--concurrency=1"]

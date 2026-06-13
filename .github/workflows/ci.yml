@@ -141,9 +141,9 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             "$DEPLOY_USER@$DEPLOY_HOST" \
             "set -e; cd $DEPLOY_PATH && \
-             docker compose -f $COMPOSE_FILE build api worker && \
+             docker compose -f $COMPOSE_FILE build api worker r-worker && \
              docker compose -f $COMPOSE_FILE run --rm api alembic upgrade head && \
-             docker compose -f $COMPOSE_FILE up -d --no-deps api worker && \
+             docker compose -f $COMPOSE_FILE up -d --no-deps api worker r-worker && \
              docker compose -f $COMPOSE_FILE ps"
 
       - name: Health check

@@ -107,6 +107,42 @@ services:
     networks:
       - default
 
+  # R worker — DEG pipeline (DESeq2/edgeR/limma) + annoDB functional enrichment
+  r-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: r-worker
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-genolens}
+      - REDIS_URL=redis://redis:6379/0
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
+      - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
+      - ENVIRONMENT=production
+      - LOCAL_STORAGE_PATH=/app/data
+      - R_SCRIPTS_PATH=/app/r_scripts
+      - ANNO_DB_PATH=/app/anno_db
+      - ANNO_DB_STORAGE=${ANNO_DB_STORAGE:-/app/anno_db}
+      - OLLAMA_BASE_URL=http://72.61.97.155:11434
+      - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY}
+      - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY}
+      - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
+    volumes:
+      - genolens_storage:/app/data
+      - ${ANNO_DB_HOST_PATH:-./anno_db}:/app/anno_db:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: celery -A app.worker.celery_app worker --loglevel=info -Q r_analysis --concurrency=1
+    restart: always
+    networks:
+      - default
+
 volumes:
   postgres_data:
   genolens_storage:
