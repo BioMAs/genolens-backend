@@ -141,11 +141,20 @@ message("  Retained ", nrow(counts_mat), " genes and ", ncol(counts_mat), " samp
 
 # Normalise contrast table
 colnames(contrasts) <- tolower(colnames(contrasts))
-comp_col  <- intersect(c("comparison", "name", "contrast"), colnames(contrasts))[1]
+comp_col  <- intersect(c("comparison", "comparison_id", "comparison_name", "name", "contrast"), colnames(contrasts))[1]
 cond1_col <- intersect(c("condition1", "test", "numerator",  "group1"), colnames(contrasts))[1]
 cond2_col <- intersect(c("condition2", "ref",  "denominator","group2"), colnames(contrasts))[1]
 if (is.na(comp_col) || is.na(cond1_col) || is.na(cond2_col)) {
   stop("comparisons.tsv must have comparison/condition1/condition2 columns (case-insensitive)")
+}
+
+# Honour an optional perform_analysis / run flag column (skip rows set to false)
+flag_col <- intersect(c("perform_analysis", "perform", "run", "include", "active"), colnames(contrasts))[1]
+if (!is.na(flag_col)) {
+  keep <- tolower(trimws(as.character(contrasts[[flag_col]]))) %in% c("true", "t", "1", "yes", "y")
+  contrasts <- contrasts[keep, , drop = FALSE]
+  message("  perform_analysis filter: kept ", nrow(contrasts), " comparison(s)")
+  if (nrow(contrasts) == 0) stop("No comparisons left to run after perform_analysis filter")
 }
 
 manifest <- list(has_vst = FALSE, comparisons = c())
