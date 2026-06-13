@@ -550,8 +550,12 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                         if ds_metadata.get('comparison_name'):
                             project_comparisons.add(ds_metadata['comparison_name'])
                         # From global DEG files with comparisons metadata
-                        if ds_metadata.get('comparisons'):
-                            project_comparisons.update(ds_metadata['comparisons'].keys())
+                        # (tolerate legacy datasets that stored comparisons as a list)
+                        comps = ds_metadata.get('comparisons')
+                        if isinstance(comps, dict):
+                            project_comparisons.update(comps.keys())
+                        elif isinstance(comps, (list, tuple)):
+                            project_comparisons.update(str(c) for c in comps)
 
                     # Check for enrichment comparisons not in project
                     # Remove (up)/(down) suffixes for validation since enrichment files add these
