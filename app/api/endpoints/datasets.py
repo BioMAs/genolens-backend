@@ -4627,7 +4627,28 @@ async def get_go_hierarchy(
     if not enriched_rows:
         return empty_response
 
-    enriched_map = {ep.pathway_id: ep for ep in enriched_rows}
+    # Key by the clean GO id. annoDB enrichment stores pathway_id as the full term
+    # label (e.g. "regulation of cell cycle (GO:0051726)"), so extract "GO:0051726"
+    # to match against the GOTerm table; fall back to clusterProfiler-style "GO:xxxx".
+    import re as _re
+
+    def _extract_go_id(*candidates: Optional[str]) -> Optional[str]:
+        for c in candidates:
+            if not c:
+                continue
+            m = _re.search(r"GO:\d{4,}", c)
+            if m:
+                return m.group(0)
+        return None
+
+    enriched_map = {}
+    for ep in enriched_rows:
+        gid = _extract_go_id(ep.pathway_id, ep.pathway_name)
+        if gid:
+            enriched_map[gid] = ep
+
+    if not enriched_map:
+        return empty_response
 
     # BFS to collect all ancestor IDs
     all_ids: set[str] = set(enriched_map.keys())
