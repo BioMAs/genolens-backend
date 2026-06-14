@@ -323,6 +323,12 @@ class TestComparisonsNormalization:
         )
         assert "Treated_vs_Control" in export["general"]
         assert len(export["individual"]) == 6  # all genes, no crash
+        # Records must be JSON-serialisable: NaN/inf (from "NA"/non-sig padj) → None,
+        # otherwise the /deg-stats endpoint 500s with "Out of range float values".
+        import json
+        json.dumps(export["individual"])  # raises ValueError if NaN/inf leak through
+        na_row = next(r for r in export["individual"] if r["gene_id"] == "G3")  # padj was "NA"
+        assert na_row["padj.Stouffer:Treated_vs_Control"] is None
 
     @pytest.mark.asyncio
     async def test_dp11_stats_with_list_comparisons(self):

@@ -1413,8 +1413,15 @@ class DataProcessorService:
             general[comp_name] = comp_general
 
         individual_df = pd.concat(individual_frames, ignore_index=True) if individual_frames else pd.DataFrame()
+        # Replace NaN/inf with None so the payload is JSON-serialisable (padj can be
+        # NaN for non-significant genes / coerced "NA" values, which json.dumps rejects).
+        if not individual_df.empty:
+            individual_df = individual_df.replace([np.inf, -np.inf], np.nan)
+            records = individual_df.astype(object).where(pd.notna(individual_df), None).to_dict(orient="records")
+        else:
+            records = []
         return {
-            "individual": individual_df.to_dict(orient='records'),
+            "individual": records,
             "general": general,
         }
 
