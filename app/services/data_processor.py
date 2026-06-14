@@ -1312,9 +1312,15 @@ class DataProcessorService:
                     }
 
             result['stats_per_method'] = stats_per_method
-            result['active_method'] = test_method or (
-                next(iter(all_padj.keys()), 'default') if all_padj else 'default'
-            )
+            # Active method = the one whose column is the priority-chosen active padj
+            # column (cols['padj'], Stouffer-first), not just the first dict key.
+            if test_method:
+                result['active_method'] = test_method
+            else:
+                result['active_method'] = next(
+                    (m for m, c in all_padj.items() if c == active_padj_col),
+                    next(iter(all_padj.keys()), 'default') if all_padj else 'default',
+                )
             statistics[comp_name] = result
             logger.debug(
                 f"[DEG_STATS] '{comp_name}': {result['deg_up']} up, {result['deg_down']} down "

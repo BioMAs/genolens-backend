@@ -29,9 +29,11 @@ weighted_stouffer_pvalue <- function(pvalues, weights = NULL) {
   if (n == 1) return(pvalues)
   pvalues <- pmin(pvalues, 0.95)
   pvalues <- pmax(pvalues, 1e-10)
-  z_scores <- qnorm(1 - pvalues)
+  # Use upper-tail forms to avoid catastrophic cancellation: 1 - pnorm(z) collapses
+  # to exactly 0 for large z (pnorm rounds to 1.0), which made Stouffer p/padj show 0.
+  z_scores <- qnorm(pvalues, lower.tail = FALSE)
   z_combined <- sum(weights * z_scores) / sqrt(sum(weights^2))
-  p_combined <- 1 - pnorm(z_combined)
+  p_combined <- pnorm(z_combined, lower.tail = FALSE)
   return(max(min(p_combined, 1), 0))
 }
 
