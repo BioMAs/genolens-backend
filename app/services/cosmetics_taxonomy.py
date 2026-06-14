@@ -14,7 +14,15 @@ taxonomy) and the scoring service (to aggregate scores per claim and per zone).
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
+
+# Ontology accessions can be embedded anywhere in an enrichment pathway id, e.g.
+# Enrichr-style "protein binding (GO:0005515)" or "name (R-HSA-69306)".
+_GO_RE = re.compile(r"GO:(\d{5,7})", re.IGNORECASE)
+_REACTOME_RE = re.compile(r"R-HSA-(\d+)", re.IGNORECASE)
+_HSA_RE = re.compile(r"(?<![A-Za-z0-9])HSA-(\d+)", re.IGNORECASE)
+_CL_RE = re.compile(r"(?<![A-Za-z0-9])CL:(\d+)", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Canonical claim taxonomy (English). Seeded into the cosmetic_claims table.
@@ -200,19 +208,36 @@ _CLAIM_KEYWORDS: list[tuple[str, str]] = [
 
 def normalize_pathway_id(pid: Optional[str]) -> str:
     """Normalize a pathway/term id so the claim referential joins robustly
-    against EnrichmentPathway.pathway_id.
+    against the enrichment results.
 
-    - uppercases and trims
-    - unifies Reactome "R-HSA-123" / "REACTOME:HSA-123" -> "HSA-123"
-    - leaves GO:xxxx and CL:xxxx untouched
+    Enrichment ids are often Enrichr/GSEA-style with the accession embedded in
+    the label, e.g. "protein binding (GO:0005515)" or "name (R-HSA-69306)". The
+    referential stores clean ids ("GO:0006084", "HSA-111447", "CL:9273"). This
+    extracts the accession from anywhere in the string and unifies Reactome
+    "R-HSA-123" -> "HSA-123" so both sides match.
     """
     if not pid:
         return ""
-    s = str(pid).strip().upper()
-    s = s.replace("REACTOME:", "")
-    if s.startswith("R-HSA-"):
-        s = s[2:]  # drop leading "R-"
-    return s
+    s = str(pid).strip()
+
+    m = _GO_RE.search(s)
+    if m:
+        return "GO:" + m.group(1)
+    m = _REACTOME_RE.search(s)
+    if m:
+        return "HSA-" + m.group(1)
+    m = _HSA_RE.search(s)
+    if m:
+        return "HSA-" + m.group(1)
+    m = _CL_RE.search(s)
+    if m:
+        return "CL:" + m.group(1)
+
+    # Fallback: uppercase and unify any leftover Reactome prefix.
+    u = s.upper().replace("REACTOME:", "")
+    if u.startswith("R-HSA-"):
+        u = u[2:]
+    return u
 
 
 def derive_canonical_claims(

@@ -29,6 +29,16 @@ def test_normalize_pathway_id_go_and_cl_untouched():
     assert normalize_pathway_id(None) == ""
 
 
+def test_normalize_pathway_id_extracts_embedded_accession():
+    # Enrichr/GSEA-style labels with the accession embedded
+    assert normalize_pathway_id("protein binding (GO:0005515)") == "GO:0005515"
+    assert normalize_pathway_id("ISG15-protein conjugation (GO:0032020)") == "GO:0032020"
+    assert normalize_pathway_id("Some pathway (R-HSA-69306)") == "HSA-69306"
+    # Gene-set names without an accession fall back (won't false-match referential)
+    assert normalize_pathway_id("INTERFERON_SIGNALING") == "INTERFERON_SIGNALING"
+    assert "GO:" not in normalize_pathway_id("hsa00100 Steroid biosynthesis")
+
+
 def test_derive_canonical_claims_from_text():
     assert "anti-ageing" in derive_canonical_claims("Anti-ageing, Energising", None)
     assert "firming" in derive_canonical_claims("Firming, Elasticity", "ECM_CYTO")
