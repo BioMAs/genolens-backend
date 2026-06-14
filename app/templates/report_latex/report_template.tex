@@ -1,0 +1,222 @@
+% \documentclass[unrestricted,unrestrictedsummary]{template/cls/sciliciumreport}
+\documentclass[confidential,unrestrictedsummary]{template/cls/sciliciumreport}
+
+\newcommand{\JINJAVAR}[1]{}
+\newcommand{\JINJABLOCK}[1]{}
+
+\institute{SciLicium}
+\address{35 bd du portugal\\35\,200 Rennes, France}
+\vat{FR\,21\,890\,522\,568}
+
+\pdftitle{\JINJAVAR{jj_file_title}}
+\title{\JINJAVAR{jj_report_title}}
+\subtitle{\JINJAVAR{jj_report_subtitle}}
+\version{\JINJAVAR{jj_report_version}}
+\reportnumber{\JINJAVAR{jj_report_number}}
+\author{\JINJAVAR{jj_report_author}}
+\client{}
+\clientref{\JINJAVAR{jj_report_clientref}}
+\sponsorname{\JINJAVAR{jj_sponsor_name}}
+\sponsorcontact{\JINJAVAR{jj_sponsor_contact}}
+\sponsoremail{\JINJAVAR{jj_sponsor_email}}
+\sponsoraddress{\JINJAVAR{jj_sponsor_address}}
+\testfacilityname{\JINJAVAR{jj_test_facility_name}}
+\testfacilitycontact{\JINJAVAR{jj_test_facility_contact}}
+\testfacilityemail{\JINJAVAR{jj_test_facility_email}}
+\testfacilityaddress{\JINJAVAR{jj_test_facility_address}}
+\testsitename{\JINJAVAR{jj_test_site_name}}
+\testsitecontact{\JINJAVAR{jj_test_site_contact}}
+\testsiteemail{\JINJAVAR{jj_test_site_email}}
+\testsiteaddress{\JINJAVAR{jj_test_site_address}}
+\project{\JINJAVAR{jj_report_project}}
+\attachmentpages{}
+\prepared{\JINJAVAR{jj_report_prepared_by}}
+\checked{\JINJAVAR{jj_report_checked_by}}
+\approved{\JINJAVAR{jj_report_approved_by}}
+\keywords{}
+\coverbackground{template/images/Scilicium_background}
+
+% \history{
+    % \historyentry{0.1}{2021-01-02}{Blablabla?}
+    % \historyentry{0.2}{2021-11-11}{Blabloublabli!}
+    % \historyentry{0.5}{2022-11-24}{Test version}
+% }
+
+\attachments{}
+
+
+
+
+\usepackage{fancyvrb}
+\usepackage{longtable}
+\usepackage{pdflscape}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{txfonts}
+\usepackage{mathdots}
+% \usepackage[classicReIm,notextcomp]{kpfonts}  % DISABLED: conflicts with txfonts
+\usepackage{graphicx}
+\usepackage{float}
+
+\usepackage{array}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}m{#1}} %m for middle vertical alignment, other options = p (top) or b (bottom)
+\newcolumntype{R}[1]{>{\raggedleft\arraybackslash}m{#1}} %m for middle vertical alignment, other options = p (top) or b (bottom)
+%                       raggedleft aligns to the right
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}m{#1}} %m for middle vertical alignment, other options = p (top) or b (bottom)
+%                       raggedright aligns to the right
+% \usepackage{ragged2e}
+\usepackage{booktabs}
+
+
+
+\newcommand{\VerbBar}{|}
+\newcommand{\VERB}{\Verb[commandchars=\\\{\}]}
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\{\}}
+% Add ',fontsize=\small' for more characters per line
+\newenvironment{Shaded}{}{}
+\newcommand{\AlertTok}[1]{\textcolor[rgb]{1.00,0.00,0.00}{\textbf{#1}}}
+\newcommand{\AnnotationTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\AttributeTok}[1]{\textcolor[rgb]{0.49,0.56,0.16}{#1}}
+\newcommand{\BaseNTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\BuiltInTok}[1]{\textcolor[rgb]{0.00,0.50,0.00}{#1}}
+\newcommand{\CharTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\CommentTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textit{#1}}}
+\newcommand{\CommentVarTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\ConstantTok}[1]{\textcolor[rgb]{0.53,0.00,0.00}{#1}}
+\newcommand{\ControlFlowTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{\textbf{#1}}}
+\newcommand{\DataTypeTok}[1]{\textcolor[rgb]{0.56,0.13,0.00}{#1}}
+\newcommand{\DecValTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\DocumentationTok}[1]{\textcolor[rgb]{0.73,0.13,0.13}{\textit{#1}}}
+\newcommand{\ErrorTok}[1]{\textcolor[rgb]{1.00,0.00,0.00}{\textbf{#1}}}
+\newcommand{\ExtensionTok}[1]{#1}
+\newcommand{\FloatTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\FunctionTok}[1]{\textcolor[rgb]{0.02,0.16,0.49}{#1}}
+\newcommand{\ImportTok}[1]{\textcolor[rgb]{0.00,0.50,0.00}{\textbf{#1}}}
+\newcommand{\InformationTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\KeywordTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{\textbf{#1}}}
+\newcommand{\NormalTok}[1]{#1}
+\newcommand{\OperatorTok}[1]{\textcolor[rgb]{0.40,0.40,0.40}{#1}}
+\newcommand{\OtherTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{#1}}
+\newcommand{\PreprocessorTok}[1]{\textcolor[rgb]{0.74,0.48,0.00}{#1}}
+\newcommand{\RegionMarkerTok}[1]{#1}
+\newcommand{\SpecialCharTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\SpecialStringTok}[1]{\textcolor[rgb]{0.73,0.40,0.53}{#1}}
+\newcommand{\StringTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\VariableTok}[1]{\textcolor[rgb]{0.10,0.09,0.49}{#1}}
+\newcommand{\VerbatimStringTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\WarningTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\usepackage{graphicx}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+
+
+
+
+
+
+% \IfFileExists{bookmark.sty}{\usepackage{bookmark}}{\usepackage{hyperref}}
+% \IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\urlstyle{same} % disable monospaced font for URLs
+
+% Make \_ and \textsubscript/\textsuperscript safe in PDF bookmark strings.
+% Without this, project/comparison names containing underscores (e.g. Testis\_23)
+% would trigger "Missing \endcsname" during the second pdflatex pass.
+\pdfstringdefDisableCommands{%
+  \def\_{{_}}%
+  \def\textunderscore{{_}}%
+  \def\textsubscript#1{{}}%
+  \def\textsuperscript#1{{}}%
+}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% to have font lining and tabular figures (=digits)
+% linig = all digits on the same line and with the same height, as opposed to oldstyle in which some parts of digit characters can go upper or lower than the rest of the digits
+% tabular = all the same width, as opposed to proportional 
+% use of tocloft package to have lining (every digit character has the same height as opposite to old-style) tabular figures (=fixed-width digit characters) for page numbers in table of content
+\usepackage{tocloft}
+\renewcommand{\cftsecpagefont}{\carlitoTLF}
+\renewcommand{\cftsubsecpagefont}{\carlitoTLF}
+\renewcommand{\cftsubsubsecpagefont}{\carlitoTLF}
+
+% changing to tabular figures in longtable environments
+% \AtBeginEnvironment{longtable}{\carlitoTLF} %not necessary if using package siunitx
+
+% have alternating row colors in longtable - DISABLED due to LaTeX compilation issues
+% \let\oldlongtable\longtable
+% \let\endoldlongtable\endlongtable
+% \renewenvironment{longtable}{\rowcolors{2}{white}{sciliciumgreenlight}\oldlongtable}{\endoldlongtable}
+
+
+% for thousand separator in numbers
+\usepackage{siunitx}
+
+
+\begin{document}
+\frontmatter %will add cover page, first page, and table of content.
+
+\JINJABLOCK{if jj_executive_summary}
+\clearpage
+\section*{Executive Summary}
+\addcontentsline{toc}{section}{Executive Summary}
+\JINJAVAR{jj_executive_summary}
+\JINJABLOCK{endif}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\hypertarget{materials_methods}{%
+\section{Material and Methods}\label{materials_methods}}
+
+\JINJAVAR{jj_materials_methods|subrender}
+
+
+
+
+
+\JINJAVAR{jj_projects_results}
+
+
+\JINJAVAR{jj_appendix}
+
+\JINJABLOCK{if jj_conclusion}
+\clearpage
+\section{Conclusion}
+\JINJAVAR{jj_conclusion}
+\JINJABLOCK{endif}
+
+
+
+
+
+
+
+
+
+
+\backmatter
+\end{document}

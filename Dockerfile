@@ -96,6 +96,24 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY r_scripts/install_packages.R /app/r_scripts/install_packages.R
 RUN Rscript /app/r_scripts/install_packages.R
 
+# LaTeX toolchain for the SciLicium PDF report (rendered + compiled on this worker).
+# Distinct layer so it caches independently of the app source / R packages.
+# Covers the packages required by the SciLicium template: tcolorbox/pgf, siunitx,
+# longtable/booktabs, txfonts, tocloft, datetime2, fancyhdr, geometry, Carlito, …
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    texlive-latex-recommended \
+    texlive-latex-extra \
+    texlive-fonts-recommended \
+    texlive-fonts-extra \
+    texlive-science \
+    texlive-pictures \
+    texlive-plain-generic \
+    texlive-lang-french \
+    lmodern \
+    fonts-crosextra-carlito \
+    ghostscript \
+    && rm -rf /var/lib/apt/lists/*
+
 FROM r-deps as r-worker
 
 # Application source (and the rest of r_scripts, incl. the pipeline + enrichment)

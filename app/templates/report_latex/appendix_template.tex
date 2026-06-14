@@ -1,0 +1,97 @@
+% Appendix document — same cover page as the main report, body = appendices only.
+% Generated automatically by the BRB-seq pipeline (fill_latex_template.py).
+% The Python script sets jj_report_subtitle = 'Appendix' when rendering this template.
+\documentclass[confidential,unrestrictedsummary]{template/cls/sciliciumreport}
+
+\newcommand{\JINJAVAR}[1]{}
+\newcommand{\JINJABLOCK}[1]{}
+
+\institute{SciLicium}
+\address{35 bd du portugal\\35\,200 Rennes, France}
+\vat{FR\,21\,890\,522\,568}
+
+\pdftitle{\JINJAVAR{jj_file_title} --- Appendix}
+\title{\JINJAVAR{jj_report_title}}
+\subtitle{\JINJAVAR{jj_report_subtitle}}
+\version{\JINJAVAR{jj_report_version}}
+\reportnumber{\JINJAVAR{jj_report_number}}
+\author{\JINJAVAR{jj_report_author}}
+\client{}
+\clientref{\JINJAVAR{jj_report_clientref}}
+\sponsorname{\JINJAVAR{jj_sponsor_name}}
+\sponsorcontact{\JINJAVAR{jj_sponsor_contact}}
+\sponsoremail{\JINJAVAR{jj_sponsor_email}}
+\sponsoraddress{\JINJAVAR{jj_sponsor_address}}
+\testfacilityname{\JINJAVAR{jj_test_facility_name}}
+\testfacilitycontact{\JINJAVAR{jj_test_facility_contact}}
+\testfacilityemail{\JINJAVAR{jj_test_facility_email}}
+\testfacilityaddress{\JINJAVAR{jj_test_facility_address}}
+\testsitename{\JINJAVAR{jj_test_site_name}}
+\testsitecontact{\JINJAVAR{jj_test_site_contact}}
+\testsiteemail{\JINJAVAR{jj_test_site_email}}
+\testsiteaddress{\JINJAVAR{jj_test_site_address}}
+\project{\JINJAVAR{jj_report_project}}
+\attachmentpages{}
+\prepared{\JINJAVAR{jj_report_prepared_by}}
+\checked{\JINJAVAR{jj_report_checked_by}}
+\approved{\JINJAVAR{jj_report_approved_by}}
+\keywords{}
+\coverbackground{template/images/Scilicium_background}
+
+\attachments{}
+
+
+\usepackage{fancyvrb}
+\usepackage{longtable}
+\usepackage{pdflscape}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{txfonts}
+\usepackage{mathdots}
+\usepackage{graphicx}
+\usepackage{float}
+
+\usepackage{array}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}m{#1}}
+\newcolumntype{R}[1]{>{\raggedleft\arraybackslash}m{#1}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}m{#1}}
+\usepackage{booktabs}
+
+\newcommand{\VerbBar}{|}
+\newcommand{\VERB}{\Verb[commandchars=\\\{\}]}
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\{\}}
+\newenvironment{Shaded}{}{}
+\usepackage{graphicx}
+\usepackage{tcolorbox}
+\tcbuselibrary{skins,breakable}
+
+\setlength{\emergencystretch}{3em}
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setcounter{secnumdepth}{-\maxdimen}
+
+\urlstyle{same}
+
+% Make \_ safe in PDF bookmark strings (prevents "Missing \endcsname" on 2nd pass).
+\pdfstringdefDisableCommands{%
+  \def\_{{_}}%
+  \def\textunderscore{{_}}%
+  \def\textsubscript#1{{}}%
+  \def\textsuperscript#1{{}}%
+}
+
+\usepackage{tocloft}
+\renewcommand{\cftsecpagefont}{\carlitoTLF}
+\renewcommand{\cftsubsecpagefont}{\carlitoTLF}
+\renewcommand{\cftsubsubsecpagefont}{\carlitoTLF}
+
+\usepackage{siunitx}
+
+
+\begin{document}
+\frontmatter %will add cover page, first page, and table of content.
+
+\JINJAVAR{jj_appendix}
+
+\backmatter
+\end{document}

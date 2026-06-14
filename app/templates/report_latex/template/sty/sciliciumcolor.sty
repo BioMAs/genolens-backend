@@ -1,0 +1,39 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{sciliciumcolor}[2022/11/24 Scilicium color definitions]
+
+\RequirePackage{xcolor}
+
+% Main colours
+\definecolor{sciliciumblue}{RGB}{0,60,101}
+\definecolor{sciliciumgreen}{RGB}{66,226,186}
+\definecolor{sciliciumdarkgreen}{RGB}{52,181,156}
+\definecolor{sciliciumsalmonred}{RGB}{255,95,95}
+\definecolor{sciliciumoxfordblue}{RGB}{11,42,62}
+\definecolor{sciliciumpoliceblue}{RGB}{56,76,101}
+\definecolor{sciliciumpearlviolet}{RGB}{93,88,146}
+\definecolor{sciliciumsky}{RGB}{71,189,215}
+\definecolor{sciliciumsteelblue}{RGB}{21,131,148}
+\definecolor{sciliciumdarksteelblue}{RGB}{42,100,120}
+\definecolor{sciliciumdarkgrayblue}{RGB}{46,72,87}
+\definecolor{sciliciumdarkolive}{RGB}{54,75,68}
+
+% Warm grey
+\definecolor{sciliciumgrey}{RGB}{235,235,230}
+\colorlet{sciliciumgray}{sciliciumgrey}
+
+% Greens (commented for reference)
+% \definecolorset{RGB}{scilicium}{}{lightgreen, 205,250,225;%
+                                    % green,       20,185,120;%
+                                    % darkgreen,    0, 70, 40}
+
+% Additional colours
+\definecolorset{RGB}{scilicium}{}{yellow, 200,155,20;%
+                                    red,    190, 60,55;%
+                                    lilla,  120,  0,80}
+
+% Deprecated colours for backward compatibility
+\definecolorset{HTML}{scilicium}{}{cyan,      22A7E5;%
+                                magenta,   EC008C;%
+                                lightgrey, D8D0C7}
+\colorlet{sciliciumlightgray}{sciliciumlightgrey}
+
