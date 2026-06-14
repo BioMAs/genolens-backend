@@ -416,15 +416,26 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                         traceback.print_exc()
                         # Don't fail the whole task if DEG storage fails
 
-                    # Automatically run GO enrichment on the stored DEG genes
-                    self.update_state(state="PROGRESS", meta={"step": "computing_go_enrichment"})
-                    try:
-                        _meta_enr = dataset.dataset_metadata or {}
-                        _enr_min_log2fc = float(_meta_enr.get("min_log2fc", 1.0))
-                        await _auto_run_go_enrichment(db, dataset_id, min_log2fc=_enr_min_log2fc)
-                    except Exception as e:
-                        logger.warning(f"[WORKER] Auto GO enrichment step failed: {e}")
-                        # Non-fatal: dataset still usable without pre-computed enrichment
+                    # Automatically run GO enrichment on the stored DEG genes.
+                    # Skipped for self-service analyses: those get full annoDB enrichment
+                    # (GO + KEGG/Reactome/Hallmark/…) from the R pipeline as a separate
+                    # ENRICHMENT dataset, and the legacy go_service path is very slow
+                    # (get_gene_annotations ~5 min), which left DEG datasets stuck in
+                    # PROCESSING.
+                    _meta_enr = dataset.dataset_metadata or {}
+                    if _meta_enr.get("analysis_id"):
+                        logger.info(
+                            "[WORKER] Skipping legacy GO enrichment for self-service DEG dataset %s "
+                            "(annoDB enrichment handled by the R pipeline)", dataset_id,
+                        )
+                    else:
+                        self.update_state(state="PROGRESS", meta={"step": "computing_go_enrichment"})
+                        try:
+                            _enr_min_log2fc = float(_meta_enr.get("min_log2fc", 1.0))
+                            await _auto_run_go_enrichment(db, dataset_id, min_log2fc=_enr_min_log2fc)
+                        except Exception as e:
+                            logger.warning(f"[WORKER] Auto GO enrichment step failed: {e}")
+                            # Non-fatal: dataset still usable without pre-computed enrichment
 
                 # Extract and store enrichment pathways in database for ENRICHMENT datasets
                 if metadata.get("enrichment_comparisons"):
