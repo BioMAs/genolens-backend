@@ -141,6 +141,26 @@ async def increment_ai_usage(
     await db.commit()
 
 
+# ── Cosmetics module (per-user add-on) ───────────────────────────────────────────
+
+async def require_cosmetics_access(
+    user: Annotated[User, Depends(get_or_create_user)]
+) -> User:
+    """Require the Cosmetics add-on module to be unlocked for this user.
+
+    Unlocked explicitly per-user by an admin (User.cosmetics_module_enabled);
+    admins always have access. The frontend keeps the Cosmetics tab visible for
+    everyone and renders a locked teaser when access is denied — so a 403 here is
+    expected for users without the module.
+    """
+    if not user.has_cosmetics_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cosmetics module is not enabled for this account.",
+        )
+    return user
+
+
 # ── TEAM plan guard ────────────────────────────────────────────────────────────
 
 async def require_team_plan(

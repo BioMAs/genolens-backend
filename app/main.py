@@ -13,7 +13,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
 from app.db.session import close_db
-from app.api.endpoints import projects, datasets, admin, admin_deployment, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, billing, reports, analyses
+from app.api.endpoints import projects, datasets, admin, admin_deployment, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, billing, reports, analyses, cosmetics
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -244,6 +244,16 @@ app.include_router(
 
 app.include_router(
     enrichment.router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    cosmetics.router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    cosmetics.admin_router,
     prefix=settings.API_V1_PREFIX,
 )
 

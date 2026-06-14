@@ -38,3 +38,5 @@ class UserSelf(User):
     can_use_ai: bool = False
     can_use_multi_comparison: bool = False
     can_export_advanced: bool = False
+    # Add-on modules (unlocked per-user by an admin)
+    has_cosmetics_module: bool = False

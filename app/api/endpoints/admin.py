@@ -38,6 +38,7 @@ class UserProfile(BaseModel):
     ai_tokens_purchased: int = 0
     ai_tokens_used: int = 0
     ai_interpretations_remaining: int = 0
+    cosmetics_module_enabled: bool = False
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     last_sign_in_at: Optional[str] = None
@@ -46,6 +47,10 @@ class UserProfile(BaseModel):
 class SubscriptionUpdate(BaseModel):
     """Schema for updating subscription."""
     plan: SubscriptionPlan
+
+class CosmeticsModuleUpdate(BaseModel):
+    """Schema for toggling the Cosmetics add-on module for a user."""
+    enabled: bool
 
 class TokenAdd(BaseModel):
     """Schema for adding AI tokens."""
@@ -189,6 +194,7 @@ async def list_users(
                 ai_purchased = 0
                 ai_tokens_used = 0
                 ai_remaining = 0
+                cosmetics_enabled = False
 
                 if local_user:
                     sub_plan = local_user.subscription_plan.value
@@ -197,6 +203,7 @@ async def list_users(
                     ai_purchased = local_user.ai_tokens_purchased
                     ai_tokens_used = local_user.ai_tokens_used
                     ai_remaining = local_user.ai_interpretations_remaining
+                    cosmetics_enabled = local_user.has_cosmetics_module
 
                 result.append(UserProfile(
                     id=UUID(user_id),
@@ -210,6 +217,7 @@ async def list_users(
                     ai_interpretations_remaining=ai_remaining,
                     ai_tokens_purchased=ai_purchased,
                     ai_tokens_used=ai_tokens_used,
+                    cosmetics_module_enabled=cosmetics_enabled,
                     created_at=profile.get("created_at"),
                     updated_at=profile.get("updated_at"),
                     last_sign_in_at=auth_info.get("last_sign_in_at"),
@@ -283,6 +291,7 @@ async def get_user_details(
                     ai_remaining = 0
                     ai_purchased = 0
                     ai_tokens_used = 0
+                    cosmetics_enabled = False
 
                     if local_user:
                         sub_plan = local_user.subscription_plan.value
@@ -290,6 +299,7 @@ async def get_user_details(
                         ai_remaining = local_user.ai_interpretations_remaining
                         ai_purchased = local_user.ai_tokens_purchased
                         ai_tokens_used = local_user.ai_tokens_used
+                        cosmetics_enabled = local_user.has_cosmetics_module
 
                     return UserProfile(
                         id=UUID(profile["id"]),
@@ -302,6 +312,7 @@ async def get_user_details(
                         ai_interpretations_remaining=ai_remaining,
                         ai_tokens_purchased=ai_purchased,
                         ai_tokens_used=ai_tokens_used,
+                        cosmetics_module_enabled=cosmetics_enabled,
                         created_at=profile.get("created_at"),
                         updated_at=profile.get("updated_at"),
                         last_sign_in_at=last_sign_in,
@@ -369,6 +380,33 @@ async def update_user_subscription(
     await db.refresh(user)
     
     # Return full profile (reuse get_user_details logic)
+    return await get_user_details(user_id, current_user, db)
+
+
+@router.patch("/users/{user_id}/cosmetics-module", response_model=UserProfile)
+async def update_user_cosmetics_module(
+    user_id: UUID,
+    update: CosmeticsModuleUpdate,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Enable or disable the Cosmetics add-on module for a user.
+    Admin only.
+    """
+    query = select(User).where(User.id == user_id)
+    result = await db.execute(query)
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not initialized in local database. Please update subscription first.",
+        )
+
+    user.cosmetics_module_enabled = update.enabled
+    await db.commit()
+
     return await get_user_details(user_id, current_user, db)
 
 

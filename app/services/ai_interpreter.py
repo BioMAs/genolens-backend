@@ -195,6 +195,128 @@ class LocalAIInterpreter:
             logger.error(f"AI interpretation error: {str(e)}")
             raise
     
+    async def interpret_cosmetics(
+        self,
+        cosmetics_data: Dict[str, Any],
+        comparison_name: Optional[str] = None,
+    ) -> str:
+        """
+        Generate a cosmetic-focused interpretation aid from scored claim data.
+
+        Output is always in ENGLISH and structured as:
+          1. Per-claim narrative (mechanism in skin-care terms)
+          2. Executive marketing summary
+          3. Regulatory guardrail (cosmetic, not medical claims)
+
+        Args:
+            cosmetics_data: output of cosmetics_service.score_claims()
+            comparison_name: optional comparison label
+
+        Returns:
+            AI-generated, English markdown interpretation text.
+        """
+        prompt = self._build_cosmetics_prompt(cosmetics_data, comparison_name)
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                payload = {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.4,
+                        "top_p": 0.9,
+                        "num_predict": 900,
+                        "num_ctx": 2048,
+                    },
+                }
+                response = await self._call_with_retry(
+                    client, f"{self.base_url}/api/generate", payload
+                )
+                result = response.json()
+                interpretation = result.get("response", "")
+                if not interpretation:
+                    raise Exception("Empty response from AI model")
+                return interpretation
+        except httpx.ConnectError:
+            logger.error("Cannot connect to Ollama for cosmetics interpretation")
+            raise Exception(
+                "Cannot connect to Ollama. Ensure the AI server is running and "
+                "the model is available."
+            )
+        except Exception as e:
+            logger.error(f"Cosmetics AI interpretation error: {str(e)}")
+            raise
+
+    def _build_cosmetics_prompt(
+        self, data: Dict[str, Any], comparison_name: Optional[str] = None
+    ) -> str:
+        """Build the English cosmetic-persona prompt from scored claim data."""
+        claims = [c for c in data.get("claims", []) if c.get("n_supporting", 0) > 0]
+        claims = claims[:8]
+        zones = data.get("skin_zones", [])
+        caveats = data.get("caveats", [])
+
+        if claims:
+            claims_text = "\n".join(
+                f"- {c['label']}: activation score {c['score']}/100, "
+                f"direction {c['direction']}, confidence {c['confidence']}, "
+                f"{c['n_supporting']} supporting pathways"
+                + (f" (e.g. {', '.join(p['pathway_name'] for p in c['evidence_pathways'][:3])})"
+                   if c.get('evidence_pathways') else "")
+                + (f"; key genes: {', '.join(c['top_genes'][:6])}" if c.get("top_genes") else "")
+                for c in claims
+            )
+        else:
+            claims_text = "- No cosmetic claim was significantly supported in this comparison."
+
+        zones_text = "\n".join(
+            f"- {z['label']}: activity {z['activity']}/100 ({z['dominant_direction']})"
+            for z in zones
+            if z.get("activity", 0) > 0
+        ) or "- No clear skin-compartment engagement."
+
+        caveats_text = "\n".join(
+            f"- {c.get('pathway_name', c.get('term_id'))} [{c.get('flag')}]: {c.get('note') or ''}"
+            for c in caveats[:6]
+        ) or "- None flagged."
+
+        comp = f" for the comparison '{comparison_name}'" if comparison_name else ""
+
+        return f"""You are a senior cosmetic-science expert helping a R&D team turn \
+transcriptomic results into clear, marketing-ready skin-benefit insights{comp}.
+
+The data below was computed by mapping the modulated biological pathways of this \
+comparison onto a curated catalogue of skin "claims". Each claim has an activation \
+score (0-100), a direction (favorable/unfavorable), and a confidence level.
+
+COSMETIC CLAIM SCORES:
+{claims_text}
+
+SKIN COMPARTMENT ENGAGEMENT:
+{zones_text}
+
+CAVEATS / FLAGS (pathways to handle with care):
+{caveats_text}
+
+Write your answer in ENGLISH, in markdown, with EXACTLY these three sections:
+
+## Claim-by-claim narrative
+For each well-supported claim (highest scores first), explain in 2-3 sentences the \
+biological mechanism in accessible skin-care language (what it means for the skin), \
+and how strongly the data supports it. Skip claims with no support.
+
+## Executive summary
+One short, punchy marketing-oriented paragraph (4-6 sentences) describing the overall \
+effect of the tested product/ingredient on the skin.
+
+## Regulatory note
+A brief disclaimer. These are COSMETIC effects only, not medical or therapeutic claims. \
+Mention any caveats above. Use cautious, compliant wording (e.g. "helps support", \
+"appears to", "may contribute to") and avoid disease/treatment language.
+
+Be specific, rely only on the data provided, and never invent gene names or pathways."""
+
     async def interpret_comparison_stream(
         self,
         comparison_name: str,

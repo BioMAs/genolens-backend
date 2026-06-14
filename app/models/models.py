@@ -55,6 +55,25 @@ class OmicsDataType(str, enum.Enum):
     LIPIDOMICS = "lipidomics"
 
 
+class ClaimDirection(str, enum.Enum):
+    """Direction of a pathway signature that supports a cosmetic claim.
+
+    Mirrors the `Updated_direction` column of the SciLicium claim referential.
+    """
+    UP = "UP"            # increased pathway signature supports the claim
+    DOWN = "DOWN"        # decreased pathway signature supports the claim
+    BOTH = "BOTH"        # direction depends on context
+    UNKNOWN = "UNKNOWN"  # insufficient basis
+    AVOID = "AVOID"      # not appropriate for consumer-benefit inference (pathology/oncogenic)
+
+
+class EvidenceLevel(str, enum.Enum):
+    """Strength of the literature evidence backing a claim mapping."""
+    HIGH = "HIGH"        # broad consensus / hallmark link
+    MODERATE = "MODERATE"  # plausible / common but context-dependent
+    LOW = "LOW"          # weak or indirect evidence
+
+
 class DatasetType(str, enum.Enum):
     """Types of datasets that can be stored."""
     MATRIX = "MATRIX"  # Count/Expression matrices
@@ -590,6 +609,14 @@ class User(Base, TimestampMixin):
         comment="Timestamp of last monthly quota reset"
     )
 
+    # Optional add-on modules unlocked individually by an admin (independent of plan)
+    cosmetics_module_enabled: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        server_default=sa_text("false"),
+        comment="Whether the Cosmetics (skin-claims) module is unlocked for this user",
+    )
+
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email}, role={self.role}, plan={self.subscription_plan})>"
 
@@ -668,6 +695,11 @@ class User(Base, TimestampMixin):
         if self.subscription_plan in (SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE) or self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
         return -1  # STARTER: no access
+
+    @property
+    def has_cosmetics_module(self) -> bool:
+        """Cosmetics add-on: explicitly unlocked per-user by an admin. Admins always have it."""
+        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.cosmetics_module_enabled
 
 
 class AIUsageLog(Base, TimestampMixin):
@@ -1653,3 +1685,138 @@ class SelfServiceAnalysis(Base):
 
     def __repr__(self) -> str:
         return f"<SelfServiceAnalysis(id={self.id}, name={self.name}, status={self.status})>"
+
+
+# ---------------------------------------------------------------------------
+# Cosmetics module — claim referential (pathway -> skin claim associations)
+# ---------------------------------------------------------------------------
+
+
+class ClaimPathwayMapping(Base, TimestampMixin):
+    """
+    ClaimPathwayMapping: one row per curated pathway in the SciLicium claim
+    referential. Maps a functional term (GO / Reactome / annoDB cluster) to one
+    or more cosmetic claims, with the direction that supports the claim and the
+    strength of the underlying evidence.
+
+    Admin-managed (CRUD/import restricted to admins). Joined against
+    EnrichmentPathway.pathway_id (via term_id_normalized) to score a comparison.
+    """
+    __tablename__ = "claim_pathway_mappings"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+
+    # Original term id as authored (e.g. "GO:0006084", "HSA-111447", "CL:9273")
+    term_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    # Normalized join key (uppercased, "R-" prefix stripped, etc.) — see normalize_pathway_id()
+    term_id_normalized: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    common_abbrev: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    suggested_acronym: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    original_claims: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    original_direction: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    updated_claim_framing: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    updated_direction: Mapped[ClaimDirection] = mapped_column(
+        SQLEnum(ClaimDirection, name="claim_direction_enum"),
+        nullable=False,
+        default=ClaimDirection.UNKNOWN,
+    )
+
+    category: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    evidence_level: Mapped[EvidenceLevel] = mapped_column(
+        SQLEnum(EvidenceLevel, name="evidence_level_enum"),
+        nullable=False,
+        default=EvidenceLevel.LOW,
+    )
+
+    rationale: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    caveats: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ref_cat: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # Canonical claim slugs derived from original_claims / category (e.g. ["anti-ageing", "firming"])
+    canonical_claims: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    is_active: Mapped[bool] = mapped_column(
+        nullable=False, default=True, server_default=sa_text("true")
+    )
+
+    __table_args__ = (
+        Index("ix_claim_pathway_mappings_norm_active", "term_id_normalized", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ClaimPathwayMapping(term_id={self.term_id}, dir={self.updated_direction})>"
+
+
+class ClaimReference(Base, TimestampMixin):
+    """
+    ClaimReference: category-level literature citation backing claim mappings.
+    Sourced from the `References` sheet of the claim referential workbooks.
+    """
+    __tablename__ = "claim_references"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    ref_cat: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<ClaimReference(ref_cat={self.ref_cat})>"
+
+
+class CosmeticClaim(Base, TimestampMixin):
+    """
+    CosmeticClaim: canonical, display-facing taxonomy of cosmetic claims
+    (English labels). Each curated mapping is reduced to one or more of these
+    slugs so the UI (radar, claim cards, skin schematic) shows a stable set.
+    """
+    __tablename__ = "cosmetic_claims"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    slug: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    skin_zone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    color: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    icon: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    is_active: Mapped[bool] = mapped_column(
+        nullable=False, default=True, server_default=sa_text("true")
+    )
+
+    def __repr__(self) -> str:
+        return f"<CosmeticClaim(slug={self.slug})>"
+
+
+class CosmeticInterpretation(Base, TimestampMixin):
+    """
+    CosmeticInterpretation: cached AI cosmetic-focused interpretation for a
+    comparison (kept separate from AIInterpretation so the transcriptomics flow
+    is untouched). One row per (dataset, comparison).
+    """
+    __tablename__ = "cosmetic_interpretations"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    dataset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    comparison_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    interpretation: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    claims_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    dataset: Mapped["Dataset"] = relationship()
+
+    __table_args__ = (
+        Index(
+            "ix_cosmetic_interpretations_dataset_comparison",
+            "dataset_id",
+            "comparison_name",
+            unique=True,
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CosmeticInterpretation(dataset_id={self.dataset_id}, comparison={self.comparison_name})>"
