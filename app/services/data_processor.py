@@ -1400,21 +1400,20 @@ class DataProcessorService:
 
             individual_frames.append(frame)
 
-            # General stats: per method counts
+            # General stats: per-method counts. Count each method by ITS OWN padj
+            # significance (not the shared contrast column), so methods can differ.
+            logfc_vals = pd.to_numeric(df[logfc_col], errors="coerce")
+            sig_logfc = logfc_vals.abs() > logfc_threshold
             comp_general: dict[str, Any] = {}
-            for method_name, method_col in all_padj.items():
-                if method_col not in df.columns:
+            count_cols = all_padj if all_padj else {'default': active_padj}
+            for method_name, method_col in count_cols.items():
+                if not method_col or method_col not in df.columns:
                     continue
-                r = self._compute_stats_with_padj_col(
-                    df, comp_name, logfc_col, method_col, logfc_threshold, padj_threshold
-                )
-                comp_general[method_name] = {'up': r['deg_up'], 'down': r['deg_down'], 'total': r['deg_total']}
-            # Fallback to active padj if no named methods
-            if not comp_general:
-                r = self._compute_stats_with_padj_col(
-                    df, comp_name, logfc_col, active_padj, logfc_threshold, padj_threshold
-                )
-                comp_general['default'] = {'up': r['deg_up'], 'down': r['deg_down'], 'total': r['deg_total']}
+                padj_vals = pd.to_numeric(df[method_col], errors="coerce")
+                sig = (padj_vals < padj_threshold) & sig_logfc
+                up = int(((logfc_vals > 0) & sig).sum())
+                down = int(((logfc_vals < 0) & sig).sum())
+                comp_general[method_name] = {'up': up, 'down': down, 'total': up + down}
 
             general[comp_name] = comp_general
 
