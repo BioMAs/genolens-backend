@@ -516,10 +516,15 @@ class ReportLatexService:
             )
         )
         if ai is None and generate_ai:
+            # Time-boxed, best-effort: Ollama generation is slow (minutes) and the
+            # r-worker is single-concurrency, so never let it block the report/worker.
             try:
                 from app.services.ai_interpreter import generate_and_store  # T6
-                ai = await generate_and_store(db, deg_ds.id, enr_ds.id if enr_ds else None, comp_name)
-            except Exception as exc:
+                ai = await asyncio.wait_for(
+                    generate_and_store(db, deg_ds.id, enr_ds.id if enr_ds else None, comp_name),
+                    timeout=120,
+                )
+            except (asyncio.TimeoutError, Exception) as exc:
                 logger.info("AI interpretation skipped for %s: %s", comp_name, exc)
         if ai is not None:
             comp["ai_interpretation"] = ai.interpretation
@@ -692,7 +697,7 @@ class ReportLatexService:
                 return out.read_bytes()
         return pdf_path.read_bytes()
 
-    async def render_pdf(self, db: AsyncSession, analysis_id: UUID, generate_ai: bool = True) -> bytes:
+    async def render_pdf(self, db: AsyncSession, analysis_id: UUID, generate_ai: bool = False) -> bytes:
         with tempfile.TemporaryDirectory(prefix="report_") as work_dir:
             data = await self.collect_analysis_data(db, analysis_id, work_dir, generate_ai)
             tex_str = self.assemble_tex(data)
