@@ -43,14 +43,17 @@ def test_derive_canonical_claims_category_fallback():
 
 # ── score_claims with a mocked DB ────────────────────────────────────────────
 
-def _enr(pathway_id, regulation, padj=1e-4, category="ECM_CYTO", genes=None, name="P"):
+def _enr(pathway_id, regulation, padj=1e-4, category="ECM_CYTO", genes=None, name="P",
+         comparison_name="cmp", pvalue=1e-4):
     row = MagicMock()
     row.pathway_id = pathway_id
     row.regulation = regulation
     row.padj = padj
+    row.pvalue = pvalue
     row.category = category
     row.genes = genes or ["COL1A1", "ELN"]
     row.pathway_name = name
+    row.comparison_name = comparison_name
     return row
 
 
@@ -111,6 +114,32 @@ async def test_score_claims_favorable_match():
     assert firming["score"] > 0
     assert firming["confidence"] == "HIGH"
     assert out["coverage"]["n_matched"] == 2
+
+
+@pytest.mark.asyncio
+async def test_score_claims_direction_from_comparison_suffix():
+    """annoDB ENRICHMENT pipeline encodes direction in the comparison suffix."""
+    dataset_id = uuid4()
+    enr_rows = [
+        _enr("GO:0030198", "ALL", category="ECM_CYTO", name="ECM organization",
+             comparison_name="UVB_cream_vs_UVB_ctrl (up)"),
+    ]
+    mappings = [_mapping("GO:0030198", ClaimDirection.UP, ["firming"])]
+
+    db = MagicMock()
+
+    async def fake_execute(stmt):
+        fake_execute.calls += 1
+        return _Result(enr_rows if fake_execute.calls == 1 else mappings)
+
+    fake_execute.calls = 0
+    db.execute = fake_execute
+
+    out = await score_claims(db, dataset_id, "UVB_cream_vs_UVB_ctrl")
+    firming = next(c for c in out["claims"] if c["slug"] == "firming")
+    assert firming["n_supporting"] == 1
+    assert firming["score"] > 0
+    assert out["coverage"]["significance_basis"] == "fdr"
 
 
 @pytest.mark.asyncio

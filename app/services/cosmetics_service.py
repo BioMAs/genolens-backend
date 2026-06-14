@@ -16,13 +16,15 @@ from __future__ import annotations
 import math
 from uuid import UUID
 
-from sqlalchemy import and_, select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import (
     ClaimDirection,
     ClaimPathwayMapping,
     ClaimReference,
+    Dataset,
+    DatasetType,
     EnrichmentPathway,
 )
 from app.services.cosmetics_taxonomy import (
@@ -56,6 +58,97 @@ def _confidence(evidence_levels: list[str], n_supporting: int) -> str:
     return "LOW"
 
 
+def _observed_direction(row) -> str | None:
+    """Observed regulation of an enrichment row.
+
+    Some pipelines store it in the `regulation` column (UP/DOWN/ALL); the annoDB
+    ENRICHMENT-dataset pipeline encodes it in the comparison name suffix instead
+    (e.g. "X (up)" / "X (down)").
+    """
+    reg = (row.regulation or "").upper()
+    if reg in ("UP", "DOWN"):
+        return reg
+    cn = (row.comparison_name or "").lower().strip()
+    if cn.endswith("(up)"):
+        return "UP"
+    if cn.endswith("(down)"):
+        return "DOWN"
+    return None
+
+
+async def _resolve_enrichment_rows(
+    db: AsyncSession, dataset_id: UUID, comparison_name: str, max_padj: float
+) -> tuple[list, str]:
+    """Find the enrichment rows for a comparison and pick a significance basis.
+
+    Enrichment may be stored either directly under the given (DEG) dataset id, or
+    under a separate ENRICHMENT-type dataset (annoDB pipeline). Direction may be
+    split into "(up)"/"(down)" comparison variants. Returns (rows, basis) where
+    basis is one of: "fdr", "nominal", "exploratory", "none".
+    """
+    variants = [
+        comparison_name,
+        f"{comparison_name} (up)",
+        f"{comparison_name} (down)",
+        f"{comparison_name} (UP)",
+        f"{comparison_name} (DOWN)",
+    ]
+
+    def _query(ids):
+        return select(EnrichmentPathway).where(
+            EnrichmentPathway.dataset_id.in_(ids),
+            or_(
+                EnrichmentPathway.comparison_name.in_(variants),
+                EnrichmentPathway.comparison_name.like(f"{comparison_name}%"),
+            ),
+        )
+
+    # 1. Directly under the given dataset id.
+    rows = (await db.execute(_query([dataset_id]))).scalars().all()
+
+    # 2. Fall back to ENRICHMENT-type datasets in the same project.
+    if not rows:
+        deg = (
+            await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+        ).scalar_one_or_none()
+        if deg is not None:
+            enr_ds = (
+                await db.execute(
+                    select(Dataset).where(
+                        Dataset.project_id == deg.project_id,
+                        Dataset.type == DatasetType.ENRICHMENT,
+                    )
+                )
+            ).scalars().all()
+            matched_ids = []
+            for d in enr_ds:
+                meta = d.dataset_metadata or {}
+                cn = meta.get("comparison_name")
+                comps = meta.get("enrichment_comparisons") or meta.get("comparisons") or []
+                if (
+                    cn == comparison_name
+                    or comparison_name in comps
+                    or any(str(c).startswith(comparison_name) for c in comps)
+                    or (d.name or "").startswith(comparison_name)
+                ):
+                    matched_ids.append(d.id)
+            if matched_ids:
+                rows = (await db.execute(_query(matched_ids))).scalars().all()
+
+    if not rows:
+        return [], "none"
+
+    # 3. Significance basis: prefer FDR, then nominal p, then exploratory top-N.
+    sig = [r for r in rows if r.padj is not None and r.padj <= max_padj]
+    if sig:
+        return sig, "fdr"
+    nom = [r for r in rows if r.pvalue is not None and r.pvalue <= 0.05]
+    if nom:
+        return nom, "nominal"
+    rows_sorted = sorted(rows, key=lambda r: (r.padj if r.padj is not None else 1.0))
+    return rows_sorted[:150], "exploratory"
+
+
 async def score_claims(
     db: AsyncSession,
     dataset_id: UUID,
@@ -64,18 +157,10 @@ async def score_claims(
 ) -> dict:
     """Compute cosmetic claim scores and skin-zone activity for one comparison."""
 
-    # 1. Significant enrichment rows for this comparison.
-    enr_rows = (
-        await db.execute(
-            select(EnrichmentPathway).where(
-                and_(
-                    EnrichmentPathway.dataset_id == dataset_id,
-                    EnrichmentPathway.comparison_name == comparison_name,
-                    EnrichmentPathway.padj <= max_padj,
-                )
-            )
-        )
-    ).scalars().all()
+    # 1. Resolve enrichment rows (DEG dataset or ENRICHMENT dataset) + basis.
+    enr_rows, significance_basis = await _resolve_enrichment_rows(
+        db, dataset_id, comparison_name, max_padj
+    )
 
     # 2. Active claim referential, indexed by normalized term id.
     mappings = (
@@ -123,14 +208,15 @@ async def score_claims(
         )
         base_w = EVIDENCE_WEIGHTS.get(evidence, 0.3) * _significance_weight(row.padj)
         zone = category_to_zone(row.category) or category_to_zone(mapping.category)
+        obs = _observed_direction(row)
 
         # --- skin-zone activity (any regulation engages the compartment) ---
         if zone:
             zone_activity[zone] += base_w
             zone_n[zone] += 1
-            if row.regulation == "UP":
+            if obs == "UP":
                 zone_up[zone] += base_w
-            elif row.regulation == "DOWN":
+            elif obs == "DOWN":
                 zone_down[zone] += base_w
 
         direction = mapping.updated_direction
@@ -159,9 +245,9 @@ async def score_claims(
             continue
 
         # --- directional claim scoring (needs UP/DOWN observed direction) ---
-        if row.regulation not in ("UP", "DOWN"):
+        if obs not in ("UP", "DOWN"):
             continue
-        observed = ClaimDirection(row.regulation)
+        observed = ClaimDirection(obs)
         match = 1 if observed == direction else -1
 
         for slug in (mapping.canonical_claims or []):
@@ -266,5 +352,6 @@ async def score_claims(
             "n_matched": n_matched,
             "n_terms_matched": len(matched_terms),
             "match_rate": round(n_matched / n_significant, 3) if n_significant else 0.0,
+            "significance_basis": significance_basis,
         },
     }
