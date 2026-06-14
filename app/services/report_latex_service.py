@@ -196,7 +196,7 @@ def _plot_enrichment_dotplot(pathways: list[dict], out_path: str) -> bool:
 
 
 def _plot_pca(pca: dict, sample_conditions: dict[str, str], out_path: str) -> bool:
-    points = pca.get("points") or pca.get("samples") or []
+    points = pca.get("data") or pca.get("points") or pca.get("samples") or []
     if not points:
         return False
     fig, ax = plt.subplots(figsize=(7, 5))
