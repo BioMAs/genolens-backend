@@ -491,3 +491,79 @@ Answer DIRECTLY without repeating raw data."""
             logger.error(f"Error generating answer: {str(e)}")
             raise
 
+
+
+async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparison_name, language: str = "fr"):
+    """
+    Build the AI context from the DB and generate + persist an AIInterpretation.
+
+    Genes come from the DEG dataset; pathways from the (separate) annoDB ENRICHMENT
+    dataset when provided — the legacy interpret endpoint read pathways from the DEG
+    dataset, which no longer holds enrichment rows. Returns the AIInterpretation, or
+    None if Ollama is unavailable / there is no DEG data (graceful for report use).
+    """
+    from sqlalchemy import select, func
+    from app.models.models import DegGene, EnrichmentPathway, AIInterpretation
+
+    up = (await db.execute(select(func.count()).where(
+        DegGene.dataset_id == deg_dataset_id,
+        DegGene.comparison_name == comparison_name,
+        DegGene.regulation == "UP"))).scalar() or 0
+    down = (await db.execute(select(func.count()).where(
+        DegGene.dataset_id == deg_dataset_id,
+        DegGene.comparison_name == comparison_name,
+        DegGene.regulation == "DOWN"))).scalar() or 0
+    if up + down == 0:
+        logger.info("generate_and_store: no DEG data for %s", comparison_name)
+        return None
+
+    deg_summary = {"up_count": up, "down_count": down, "total": up + down}
+
+    pathways_ds = enrichment_dataset_id or deg_dataset_id
+    pathways_rows = (await db.execute(
+        select(EnrichmentPathway)
+        .where(EnrichmentPathway.dataset_id == pathways_ds,
+               EnrichmentPathway.comparison_name == comparison_name)
+        .order_by(EnrichmentPathway.padj.asc()).limit(15)
+    )).scalars().all()
+    top_pathways = [{"pathway_name": p.pathway_name, "category": p.category,
+                     "padj": p.padj, "gene_count": p.gene_count, "genes": p.genes or []}
+                    for p in pathways_rows]
+
+    top_genes_rows = (await db.execute(
+        select(DegGene).where(DegGene.dataset_id == deg_dataset_id,
+                              DegGene.comparison_name == comparison_name)
+        .order_by(func.abs(DegGene.log_fc).desc()).limit(20)
+    )).scalars().all()
+    top_genes = [{"gene_id": g.gene_id, "gene_name": g.gene_name or g.gene_id,
+                  "log_fc": g.log_fc, "padj": g.padj, "regulation": g.regulation}
+                 for g in top_genes_rows]
+
+    interpreter = LocalAIInterpreter()
+    availability = await interpreter.check_availability()
+    if not availability.get("available") or not availability.get("model_available"):
+        logger.info("generate_and_store: Ollama unavailable for %s", comparison_name)
+        return None
+
+    interpretation = await interpreter.interpret_comparison(
+        comparison_name=comparison_name, deg_summary=deg_summary,
+        top_pathways=top_pathways, top_genes=top_genes, language=language)
+
+    ai = AIInterpretation(
+        dataset_id=deg_dataset_id, comparison_name=comparison_name,
+        interpretation=interpretation, model=interpreter.model,
+        deg_up=up, deg_down=down, pathways_count=len(top_pathways), genes_count=len(top_genes))
+    db.add(ai)
+    try:
+        await db.commit()
+        await db.refresh(ai)
+    except Exception as exc:
+        await db.rollback()
+        existing = await db.scalar(select(AIInterpretation).where(
+            AIInterpretation.dataset_id == deg_dataset_id,
+            AIInterpretation.comparison_name == comparison_name))
+        if existing:
+            return existing
+        logger.warning("generate_and_store persist failed for %s: %s", comparison_name, exc)
+        return None
+    return ai

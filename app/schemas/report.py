@@ -8,6 +8,7 @@ from app.models.report_job import ReportJobStatus
 class ReportJobResponse(BaseModel):
     id: UUID
     project_id: UUID
+    analysis_id: Optional[UUID] = None
     celery_task_id: Optional[str]
     status: ReportJobStatus
     pdf_path: Optional[str]

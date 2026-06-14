@@ -23,6 +23,12 @@ class ReportJob(Base, TimestampMixin):
         nullable=False,
         index=True,
     )
+    # Analysis-scoped report (the SciLicium LaTeX report covers one analysis).
+    analysis_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("self_service_analyses.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[ReportJobStatus] = mapped_column(
         SQLEnum(ReportJobStatus, name="report_job_status"),
