@@ -1,42 +1,23 @@
 
-\subsection{RNA Extraction}
-Total RNA was extracted using the Direct-zol{\scriptsize \texttrademark} 96 RNA extraction kit (Zymo Research) following manufacturer's instructions. RNA quality and quantity was assessed using a NanoDrop{\scriptsize \texttrademark} ND-1000 Spectrophotometer (Thermo Fisher Scientific).
-
-\subsection{Bulk RNA barcoding (BRB) library preparation and sequencing}
-The 3' Bulk RNA Barcoding and sequencing (BRB-seq) (Alpern et al., 2019) protocol was performed as described in Alpern et al. (2019) and Giacosa et al. (2021). Briefly a first step of reverse transcription and template switching reactions were performed using 4 µL total RNA at 10 ng/µL. The resulting cDNA was purified, followed by the synthesis of double-stranded cDNA via PCR. Library preparation was performed using 50 ng of double-stranded cDNA, which was tagmented with the Illumina Nextera XT Kit (\#FC-131-1024) according to the manufacturer’s recommendations. The concentration of the final library was assessed using a Quantus{\scriptsize \texttrademark} Fluorometer (Promega). The resulting library was sequenced on an Illumina NovaSeq X by the Macrogen company (https://www.macrogen.com/). Image analysis and base calling were performed using RTA 2.7.7 and bcl2fastq 2.17.1.14.
-
-\subsection{Read Processing and Transcript Quantification}
-
-Sequencing data were first demultiplexed, assigning each read pair to its respective sample based on a 6-bp unique sample-specific barcode present in the first read. The second reads were trimmed using Cutadapt to remove adapter sequences and low-quality bases. Processed reads were pseudoaligned to the reference transcriptome (\JINJAVAR{jj_genome_version}) using Salmon (Patro et al., 2017) with quasi-mapping and selective alignment enabled. Gene-level expression estimates (raw counts) were imported using tximport (Soneson et al., 2015). Unique 10-bp molecular identifiers (UMIs) were used to collapse PCR duplicates prior to counting.
-
-Low-quality samples, characterized by insufficient mapped read counts or detected genes, were filtered out prior to downstream analysis. Conditions without a sufficient number of biological replicates after sample quality control were discarded. Genes with very low expression across samples were removed to improve statistical power.
+\subsection{Input Data}
+The analysis was performed on the provided gene-level count matrix. Low-quality samples and conditions with an insufficient number of biological replicates were filtered out prior to analysis, and genes with very low expression across samples were removed to improve statistical power.
 
 \subsection{Differential Gene Expression Analysis}
 
-To ensure robust detection of differentially expressed genes (DEGs), a multi-method consensus approach was applied, combining four complementary statistical frameworks on the normalised count data:
+To ensure robust detection of differentially expressed genes (DEGs), a multi-method consensus approach was applied, combining complementary statistical frameworks on the normalised count data:
 
 \begin{enumerate}
   \item \textbf{limma-voom} (Ritchie et al., 2015): models log-transformed data with precision weights derived from the mean--variance trend and employs empirical Bayes shrinkage of variance estimates.
   \item \textbf{edgeR} (Robinson et al., 2010): fits a negative binomial model and performs quasi-likelihood F-tests to account for overdispersion.
   \item \textbf{DESeq2} (Love et al., 2014): uses a negative binomial generalised linear model with shrinkage of dispersion parameters and log$_2$ fold-change estimates via \textit{apeglm} (Zhu et al., 2019).
-  \item \textbf{Non-parametric methods} (RankProducts and Wilcoxon rank-sum test), applied when the number of biological replicates per condition is limited.
 \end{enumerate}
 
-The p-values from all applicable methods were combined using Stouffer's Z-score meta-analysis approach, with p-values constrained to [10$^{-10}$, 0.95] to avoid numerical instabilities. Combined p-values were corrected for multiple testing using the Benjamini-Hochberg (BH) False Discovery Rate. Genes were classified as DEGs if: (i) combined adjusted p-value $< 0.05$, and (ii) absolute log$_2$ fold-change $\geq$ log$_2$(1.2). Log$_2$ fold-change values reported throughout the document are derived from limma-voom with empirical Bayes shrinkage.
-
-All software versions are specified in section \JINJAVAR{ref_appendix_soft_versions}.
+The p-values from all applicable methods were combined using Stouffer's Z-score meta-analysis approach, with p-values constrained to [10$^{-10}$, 0.95] to avoid numerical instabilities. Combined p-values were corrected for multiple testing using the Benjamini-Hochberg (BH) False Discovery Rate. Genes were classified as DEGs if: (i) combined adjusted p-value $< 0.05$, and (ii) absolute log$_2$ fold-change $\geq$ log$_2$(1.2).
 
 \subsection{Functional Enrichment Analysis}
 
-Functional enrichment analysis was performed using a multi-database, multi-ontology approach implemented in clusterProfiler (Yu et al., 2012). Analyses were conducted separately for up-regulated and down-regulated DEG sets.
+Functional enrichment analysis was performed using an over-representation analysis (ORA) approach against the local annotation database. Analyses were conducted separately for up-regulated and down-regulated DEG sets.
 
-\textbf{Over-representation analysis (ORA)} tested whether DEGs were significantly over-represented in curated biological term sets using hypergeometric tests against multiple databases: Gene Ontology (GO --- Biological Process, Molecular Function, Cellular Component), KEGG pathways, Reactome pathways, and MSigDB gene set collections (Hallmark, C2, C3, C5, C6). \textbf{Gene Set Enrichment Analysis (GSEA)} was additionally applied to the complete ranked gene list (ranked by sign($\log_2$FC) $\times$ $-\log_{10}$(p-value)) to identify coordinated changes in functionally related gene sets without applying a fold-change cutoff.
+\textbf{Over-representation analysis (ORA)} tested whether DEGs were significantly over-represented in curated biological term sets using hypergeometric tests against multiple databases: Gene Ontology (GO --- Biological Process, Molecular Function, Cellular Component), KEGG pathways, Reactome pathways, WikiPathways, and MSigDB gene set collections (Hallmark, C2, C5, C6, C7).
 
-Enriched terms were clustered by semantic similarity to identify overarching biological themes and reduce redundancy. Only results with Benjamini-Hochberg adjusted p-value $\leq$ 0.05 are reported. In dotplots, dot size reflects the gene ratio (proportion of DEGs annotated to that term) and dot colour represents statistical significance ($-\log_{10}$ adjusted p-value).
-
-% DANS LE PIPELINE : on vire les samples qui n'ont pas (minReads & minGenes)
-% DANS LE RAPPORT : on qualifie PASS/WARNING/FAIL
-
-% PASS = minGENES & minReads
-% WARNING = minGenes & not minReads
-% FAIL = not minGenes
+Only results with Benjamini-Hochberg adjusted p-value $\leq$ 0.05 are reported. In dotplots, dot size reflects the gene ratio (proportion of DEGs annotated to that term) and dot colour represents statistical significance ($-\log_{10}$ adjusted p-value).
