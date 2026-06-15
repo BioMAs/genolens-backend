@@ -20,7 +20,9 @@ suppressPackageStartupMessages({
 })
 
 option_list <- list(
-  make_option("--deg",         type = "character", help = "Per-comparison genolens_deg.csv"),
+  make_option("--deg",         type = "character", default = NULL, help = "Per-comparison genolens_deg.csv"),
+  make_option("--gene-list",   type = "character", default = NULL,
+              help = "Plain gene-symbol list (one per line). When set, enrich exactly this set and ignore --deg / thresholds (ad-hoc intersection enrichment)."),
   make_option("--anno-db-dir", type = "character", help = "Directory holding anno.db.<species>.gene_symbol.*.rds"),
   make_option("--species",     type = "character", default = "human", help = "Species (human, mouse, rat, zebrafish, medaka)"),
   make_option("--comparison",  type = "character", help = "Comparison name (used for the gene.cluster column)"),
@@ -32,7 +34,8 @@ option_list <- list(
   make_option("--r-cutoff",    type = "integer",   default = 3L,   help = "Minimum query genes per term")
 )
 opt <- parse_args(OptionParser(option_list = option_list))
-stopifnot(!is.null(opt$deg), !is.null(opt$`anno-db-dir`), !is.null(opt$output), !is.null(opt$comparison))
+stopifnot(!is.null(opt$`anno-db-dir`), !is.null(opt$output), !is.null(opt$comparison))
+if (is.null(opt$deg) && is.null(opt$`gene-list`)) stop("Provide either --deg or --gene-list")
 
 message("=== GenoLens annoDB Enrichment ===")
 message("DEG file: ", opt$deg)
@@ -147,39 +150,50 @@ message("Loaded anno.db with ", length(names(anno.db.obj$annotations)), " catego
 # -----------------------------------------------------------------------------
 # Read DEG results and select significant genes for this single comparison
 # -----------------------------------------------------------------------------
-deg <- readr::read_csv(opt$deg, show_col_types = FALSE)
+if (!is.null(opt$`gene-list`)) {
+  # Ad-hoc mode: enrich exactly the provided gene-symbol set (e.g. a Venn
+  # intersection). No DEG file, no thresholds, no up/down split.
+  genes <- readLines(opt$`gene-list`, warn = FALSE)
+  genes <- unique(trimws(genes))
+  genes <- genes[nzchar(genes)]
+  message("Gene-list mode: ", length(genes), " genes")
+  list.groups   <- list(all = genes)
+  cluster_label <- list(all = opt$comparison)
+} else {
+  deg <- readr::read_csv(opt$deg, show_col_types = FALSE)
 
-# The per-comparison genolens_deg.csv has dynamic, comparison-suffixed columns.
-logfc_col <- grep("^log2FoldChange|^logFC", names(deg), value = TRUE)[1]
-padj_priority <- c("^padj\\.Stouffer", "^padj\\.DESeq2", "^padj\\.edgeR", "^padj\\.limma", "^padj")
-padj_col <- NA_character_
-for (pat in padj_priority) {
-  hit <- grep(pat, names(deg), value = TRUE)
-  if (length(hit) > 0) { padj_col <- hit[1]; break }
+  # The per-comparison genolens_deg.csv has dynamic, comparison-suffixed columns.
+  logfc_col <- grep("^log2FoldChange|^logFC", names(deg), value = TRUE)[1]
+  padj_priority <- c("^padj\\.Stouffer", "^padj\\.DESeq2", "^padj\\.edgeR", "^padj\\.limma", "^padj")
+  padj_col <- NA_character_
+  for (pat in padj_priority) {
+    hit <- grep(pat, names(deg), value = TRUE)
+    if (length(hit) > 0) { padj_col <- hit[1]; break }
+  }
+  if (is.na(logfc_col) || is.na(padj_col) || !("gene_name" %in% names(deg))) {
+    stop("DEG file missing logFC / padj / gene_name columns")
+  }
+
+  deg <- deg %>%
+    mutate(
+      .lfc  = suppressWarnings(as.numeric(.data[[logfc_col]])),
+      .padj = suppressWarnings(as.numeric(.data[[padj_col]]))
+    ) %>%
+    filter(!is.na(gene_name), !is.na(.padj), !is.na(.lfc),
+           .padj < opt$fdr, abs(.lfc) >= opt$`min-log2fc`)
+
+  message("Significant DEGs: ", nrow(deg))
+
+  list.groups <- list(
+    all  = unique(deg$gene_name),
+    up   = unique(deg$gene_name[deg$.lfc > 0]),
+    down = unique(deg$gene_name[deg$.lfc < 0])
+  )
+  # gene.cluster suffix understood by extract_enrichment_pathways_for_db
+  cluster_label <- list(all = opt$comparison,
+                        up = paste0(opt$comparison, " (up)"),
+                        down = paste0(opt$comparison, " (down)"))
 }
-if (is.na(logfc_col) || is.na(padj_col) || !("gene_name" %in% names(deg))) {
-  stop("DEG file missing logFC / padj / gene_name columns")
-}
-
-deg <- deg %>%
-  mutate(
-    .lfc  = suppressWarnings(as.numeric(.data[[logfc_col]])),
-    .padj = suppressWarnings(as.numeric(.data[[padj_col]]))
-  ) %>%
-  filter(!is.na(gene_name), !is.na(.padj), !is.na(.lfc),
-         .padj < opt$fdr, abs(.lfc) >= opt$`min-log2fc`)
-
-message("Significant DEGs: ", nrow(deg))
-
-list.groups <- list(
-  all  = unique(deg$gene_name),
-  up   = unique(deg$gene_name[deg$.lfc > 0]),
-  down = unique(deg$gene_name[deg$.lfc < 0])
-)
-# gene.cluster suffix understood by extract_enrichment_pathways_for_db
-cluster_label <- list(all = opt$comparison,
-                      up = paste0(opt$comparison, " (up)"),
-                      down = paste0(opt$comparison, " (down)"))
 
 all_ids <- unique(unlist(lapply(anno.db.obj$annotations, function(x) {
   if (inherits(x, "Matrix") || is.matrix(x)) rownames(x) else NULL

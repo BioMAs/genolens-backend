@@ -3326,8 +3326,11 @@ async def venn_analysis(
     comparison_genes: dict[str, set[str]] = {}
 
     for ref in refs:
-        # Query deg_genes table for this comparison
-        stmt = select(DegGene.gene_id).where(
+        # Query deg_genes table for this comparison. Use gene_name (symbol) as the
+        # set element identity — annoDB enrichment is keyed by gene_symbol, so the
+        # intersection genes can feed enrichment directly. Fall back to gene_id
+        # (e.g. Ensembl) when a symbol is missing.
+        stmt = select(DegGene.gene_id, DegGene.gene_name).where(
             DegGene.dataset_id == ref["dataset_id"],
             DegGene.comparison_name == ref["comparison_name"],
             DegGene.padj <= padj_threshold,
@@ -3335,7 +3338,7 @@ async def venn_analysis(
         )
 
         result = await db.execute(stmt)
-        genes = {row for row in result.scalars().all()}
+        genes = {(row.gene_name or row.gene_id) for row in result.all()}
         comparison_genes[ref["label"]] = genes
 
         logger.debug(f"[Venn] {ref['label']}: {len(genes)} genes")
@@ -3382,6 +3385,9 @@ async def venn_analysis(
         "comparisons": labels,
         "sets": labels,
         "total_genes": {label: len(genes) for label, genes in comparison_genes.items()},
+        # Full per-set gene lists so the client can build the diagram and compute
+        # intersections itself (e.g. with @upsetjs). Genes are symbols.
+        "set_genes": {label: sorted(genes) for label, genes in comparison_genes.items()},
         "intersections": intersections,
         "thresholds": {
             "padj": padj_threshold,

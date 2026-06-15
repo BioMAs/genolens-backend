@@ -49,6 +49,19 @@ def _rows_all(rows):
     return res
 
 
+def _gene_rows(symbols):
+    """Result whose all() returns (gene_id, gene_name) rows (venn uses gene_name)."""
+    rows = []
+    for s in symbols:
+        row = MagicMock()
+        row.gene_name = s
+        row.gene_id = s
+        rows.append(row)
+    res = MagicMock()
+    res.all.return_value = rows
+    return res
+
+
 def _make_dataset(dataset_id, project):
     ds = MagicMock()
     ds.id = dataset_id
@@ -108,8 +121,8 @@ class TestVennCrossDataset:
         mock_db.execute = AsyncMock(side_effect=[
             _scalar_one(path_dataset),
             _rows_all([other_row]),
-            _scalars_all(["GENE1", "GENE2", "SHARED"]),
-            _scalars_all(["GENE3", "SHARED"]),
+            _gene_rows(["GENE1", "GENE2", "SHARED"]),
+            _gene_rows(["GENE3", "SHARED"]),
         ])
 
         response = await client.post(
@@ -129,6 +142,9 @@ class TestVennCrossDataset:
         # The A∩B intersection should contain exactly SHARED
         shared = next(i for i in data["intersections"] if sorted(i["sets"]) == ["A", "B"])
         assert shared["genes"] == ["SHARED"]
+        # set_genes exposes the full per-set gene lists (sorted symbols)
+        assert data["set_genes"]["A"] == ["GENE1", "GENE2", "SHARED"]
+        assert data["set_genes"]["B"] == ["GENE3", "SHARED"]
 
     @pytest.mark.asyncio
     async def test_foreign_project_dataset_rejected(self, venn_client):
