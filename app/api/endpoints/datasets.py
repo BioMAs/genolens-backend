@@ -3222,7 +3222,13 @@ async def venn_analysis(
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
-    comparisons: list[str] = Body(..., description="List of comparison names to analyze"),
+    comparisons: Optional[list[str]] = Body(
+        None, description="Legacy: list of comparison names within this dataset"
+    ),
+    comparison_refs: Optional[list[dict]] = Body(
+        None,
+        description="Cross-dataset comparisons: [{dataset_id, comparison_name, label}]",
+    ),
     padj_threshold: float = Body(0.05, description="Adjusted p-value threshold"),
     logfc_threshold: float = Body(0.58, description="Log fold change threshold")
 ) -> dict:
@@ -3233,15 +3239,13 @@ async def venn_analysis(
     - 2-3 comparisons: Returns data for Venn diagram
     - 4-5 comparisons: Returns data for UpSet plot
 
+    Comparisons may live in different DEG datasets (via ``comparison_refs``), as long
+    as every referenced dataset belongs to the same project as the path dataset. The
+    legacy ``comparisons`` (list of names within the path dataset) is still supported.
+
     Returns all intersections with their gene lists for export.
     """
-    # Validate number of comparisons
-    if len(comparisons) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 comparisons required")
-    if len(comparisons) > 5:
-        raise HTTPException(status_code=400, detail="Maximum 5 comparisons allowed")
-
-    # Verify dataset exists and user has access
+    # Verify path dataset exists and user has access to its project
     query = select(Dataset).options(joinedload(Dataset.project)).where(Dataset.id == dataset_id)
     result = await db.execute(query)
     dataset = result.scalar_one_or_none()
@@ -3264,32 +3268,86 @@ async def venn_analysis(
         if not is_member:
             raise HTTPException(status_code=403, detail="Access denied")
 
-    # Fetch DEG genes for each comparison from database
+    # Normalize input into a list of refs: {label, dataset_id, comparison_name}
+    refs: list[dict] = []
+    if comparison_refs:
+        for ref in comparison_refs:
+            comp_name = ref.get("comparison_name")
+            ref_dataset_id = ref.get("dataset_id")
+            if not comp_name or not ref_dataset_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Each comparison_ref needs dataset_id and comparison_name",
+                )
+            try:
+                ref_dataset_uuid = UUID(str(ref_dataset_id))
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"Invalid dataset_id: {ref_dataset_id}")
+            refs.append({
+                "label": ref.get("label") or comp_name,
+                "dataset_id": ref_dataset_uuid,
+                "comparison_name": comp_name,
+            })
+    elif comparisons:
+        refs = [
+            {"label": comp_name, "dataset_id": dataset_id, "comparison_name": comp_name}
+            for comp_name in comparisons
+        ]
+    else:
+        raise HTTPException(
+            status_code=400, detail="Provide either comparisons or comparison_refs"
+        )
+
+    # Validate set count and unique labels
+    if len(refs) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 comparisons required")
+    if len(refs) > 5:
+        raise HTTPException(status_code=400, detail="Maximum 5 comparisons allowed")
+    labels = [r["label"] for r in refs]
+    if len(set(labels)) != len(labels):
+        raise HTTPException(status_code=400, detail="Comparison labels must be unique")
+
+    # Validate every referenced dataset belongs to the same project
+    referenced_ids = {r["dataset_id"] for r in refs if r["dataset_id"] != dataset_id}
+    if referenced_ids:
+        ds_query = select(Dataset.id, Dataset.project_id).where(Dataset.id.in_(referenced_ids))
+        ds_result = await db.execute(ds_query)
+        project_by_dataset = {row.id: row.project_id for row in ds_result.all()}
+        for ref_id in referenced_ids:
+            if ref_id not in project_by_dataset:
+                raise HTTPException(status_code=404, detail=f"Dataset not found: {ref_id}")
+            if project_by_dataset[ref_id] != project.id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="All comparisons must belong to the same project",
+                )
+
+    # Fetch DEG genes for each comparison from database, keyed by label
     comparison_genes: dict[str, set[str]] = {}
 
-    for comp_name in comparisons:
+    for ref in refs:
         # Query deg_genes table for this comparison
         stmt = select(DegGene.gene_id).where(
-            DegGene.dataset_id == dataset_id,
-            DegGene.comparison_name == comp_name,
+            DegGene.dataset_id == ref["dataset_id"],
+            DegGene.comparison_name == ref["comparison_name"],
             DegGene.padj <= padj_threshold,
             or_(DegGene.log_fc >= logfc_threshold, DegGene.log_fc <= -logfc_threshold)
         )
 
         result = await db.execute(stmt)
         genes = {row for row in result.scalars().all()}
-        comparison_genes[comp_name] = genes
+        comparison_genes[ref["label"]] = genes
 
-        logger.debug(f"[Venn] {comp_name}: {len(genes)} genes")
+        logger.debug(f"[Venn] {ref['label']}: {len(genes)} genes")
 
     # Calculate all possible intersections
     from itertools import combinations
 
     intersections = []
 
-    # For each possible combination of sets (from 1 to n comparisons)
-    for r in range(1, len(comparisons) + 1):
-        for combo in combinations(comparisons, r):
+    # For each possible combination of sets (from 1 to n labels)
+    for r in range(1, len(labels) + 1):
+        for combo in combinations(labels, r):
             combo_list = list(combo)
 
             # Find genes in this intersection
@@ -3297,7 +3355,7 @@ async def venn_analysis(
                 # Genes unique to this comparison
                 genes_in_combo = comparison_genes[combo_list[0]].copy()
                 # Remove genes that appear in any other comparison
-                for other_comp in comparisons:
+                for other_comp in labels:
                     if other_comp not in combo_list:
                         genes_in_combo -= comparison_genes[other_comp]
             else:
@@ -3308,7 +3366,7 @@ async def venn_analysis(
 
                 # Remove genes that appear in comparisons NOT in this combo
                 # (to get exclusive intersection)
-                other_comps = set(comparisons) - set(combo_list)
+                other_comps = set(labels) - set(combo_list)
                 for other_comp in other_comps:
                     genes_in_combo -= comparison_genes[other_comp]
 
@@ -3321,9 +3379,9 @@ async def venn_analysis(
 
     return {
         "dataset_id": str(dataset_id),
-        "comparisons": comparisons,
-        "sets": comparisons,
-        "total_genes": {comp: len(genes) for comp, genes in comparison_genes.items()},
+        "comparisons": labels,
+        "sets": labels,
+        "total_genes": {label: len(genes) for label, genes in comparison_genes.items()},
         "intersections": intersections,
         "thresholds": {
             "padj": padj_threshold,
