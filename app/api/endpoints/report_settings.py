@@ -4,6 +4,7 @@ Report customization settings endpoints (per-user branding).
 GET    /users/me/report-settings        — fetch persistent branding settings
 PUT    /users/me/report-settings        — update branding settings
 POST   /users/me/report-settings/logo   — upload a custom logo
+GET    /users/me/report-settings/logo   — stream the stored logo (for preview)
 
 All routes are gated behind the report customization module
 (User.has_report_customization). The frontend renders a locked teaser when a
@@ -14,6 +15,7 @@ import os
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps.db import get_db
@@ -25,6 +27,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/users/me/report-settings", tags=["report-settings"])
 
 _ALLOWED_LOGO_EXT = {".png", ".jpg", ".jpeg", ".pdf"}
+_LOGO_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".pdf": "application/pdf",
+}
 _MAX_LOGO_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
@@ -88,3 +96,19 @@ async def upload_report_logo(
     await db.commit()
     await db.refresh(settings)
     return settings
+
+
+@router.get("/logo")
+async def get_report_logo(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(require_report_customization_access)],
+):
+    """Stream the stored logo so the frontend can preview it."""
+    settings = await db.get(UserReportSettings, user.id)
+    if not settings or not settings.logo_path:
+        raise HTTPException(status_code=404, detail="No logo uploaded")
+
+    ext = os.path.splitext(settings.logo_path)[1].lower()
+    from app.services.storage import storage_service
+    data = await storage_service.download_file(settings.logo_path)
+    return Response(content=data, media_type=_LOGO_MIME.get(ext, "application/octet-stream"))
