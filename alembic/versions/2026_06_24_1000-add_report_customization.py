@@ -28,23 +28,11 @@ def upgrade() -> None:
     existing_tables = set(inspector.get_table_names())
 
     # --- report_jobs: comparison-scoped fields ---------------------------
+    # Add all columns first, then create the FK/indexes (the composite index
+    # references comparison_name, so the column must exist beforehand).
     report_columns = {c["name"] for c in inspector.get_columns("report_jobs")}
     if "dataset_id" not in report_columns:
         op.add_column("report_jobs", sa.Column("dataset_id", sa.UUID(), nullable=True))
-        op.create_index("ix_report_jobs_dataset_id", "report_jobs", ["dataset_id"])
-        op.create_foreign_key(
-            "fk_report_jobs_dataset_id",
-            "report_jobs",
-            "datasets",
-            ["dataset_id"],
-            ["id"],
-            ondelete="CASCADE",
-        )
-        op.create_index(
-            "ix_report_jobs_dataset_comparison",
-            "report_jobs",
-            ["dataset_id", "comparison_name"],
-        )
     if "comparison_name" not in report_columns:
         op.add_column(
             "report_jobs", sa.Column("comparison_name", sa.String(length=512), nullable=True)
@@ -53,6 +41,26 @@ def upgrade() -> None:
         op.add_column("report_jobs", sa.Column("conclusion", sa.Text(), nullable=True))
     if "materials_methods" not in report_columns:
         op.add_column("report_jobs", sa.Column("materials_methods", sa.Text(), nullable=True))
+
+    existing_indexes = {ix["name"] for ix in inspector.get_indexes("report_jobs")}
+    existing_fks = {fk["name"] for fk in inspector.get_foreign_keys("report_jobs")}
+    if "ix_report_jobs_dataset_id" not in existing_indexes:
+        op.create_index("ix_report_jobs_dataset_id", "report_jobs", ["dataset_id"])
+    if "fk_report_jobs_dataset_id" not in existing_fks:
+        op.create_foreign_key(
+            "fk_report_jobs_dataset_id",
+            "report_jobs",
+            "datasets",
+            ["dataset_id"],
+            ["id"],
+            ondelete="CASCADE",
+        )
+    if "ix_report_jobs_dataset_comparison" not in existing_indexes:
+        op.create_index(
+            "ix_report_jobs_dataset_comparison",
+            "report_jobs",
+            ["dataset_id", "comparison_name"],
+        )
 
     # --- users.report_customization_module_enabled -----------------------
     user_columns = {c["name"] for c in inspector.get_columns("users")}
