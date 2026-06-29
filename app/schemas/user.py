@@ -40,3 +40,4 @@ class UserSelf(User):
     can_export_advanced: bool = False
     # Add-on modules (unlocked per-user by an admin)
     has_cosmetics_module: bool = False
+    has_report_customization: bool = False

@@ -161,6 +161,26 @@ async def require_cosmetics_access(
     return user
 
 
+# ── Report customization module (per-user add-on) ────────────────────────────────
+
+async def require_report_customization_access(
+    user: Annotated[User, Depends(get_or_create_user)]
+) -> User:
+    """Require the report customization add-on module to be unlocked for this user.
+
+    Unlocked explicitly per-user by an admin (User.report_customization_module_enabled);
+    admins always have access. Mirrors the Cosmetics module pattern — the frontend
+    renders a locked teaser when access is denied, so a 403 here is expected for
+    users without the module.
+    """
+    if not user.has_report_customization:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Report customization module is not enabled for this account.",
+        )
+    return user
+
+
 # ── TEAM plan guard ────────────────────────────────────────────────────────────
 
 async def require_team_plan(

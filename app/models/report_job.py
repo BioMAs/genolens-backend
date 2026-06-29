@@ -23,12 +23,23 @@ class ReportJob(Base, TimestampMixin):
         nullable=False,
         index=True,
     )
-    # Analysis-scoped report (the SciLicium LaTeX report covers one analysis).
+    # Analysis-scoped report (legacy; kept nullable for back-compat and grouping).
     analysis_id: Mapped[Optional[UUID]] = mapped_column(
         ForeignKey("self_service_analyses.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
+    # Comparison-scoped report: a comparison is the logical pair
+    # (DEG dataset, comparison_name). This is the new primary scope.
+    dataset_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    comparison_name: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    # Per-report editable content (report customization module).
+    conclusion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    materials_methods: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[ReportJobStatus] = mapped_column(
         SQLEnum(ReportJobStatus, name="report_job_status"),
@@ -41,4 +52,5 @@ class ReportJob(Base, TimestampMixin):
 
     __table_args__ = (
         Index("ix_report_jobs_project_status", "project_id", "status"),
+        Index("ix_report_jobs_dataset_comparison", "dataset_id", "comparison_name"),
     )

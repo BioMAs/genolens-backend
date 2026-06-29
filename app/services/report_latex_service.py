@@ -433,6 +433,59 @@ class ReportLatexService:
             "qc_rows": qc_rows,
         }
 
+    # ── Data collection (comparison-scoped) ──────────────────────────────────
+    async def _find_parent_analysis(self, db: AsyncSession, dataset_id: UUID,
+                                    project_id) -> Optional[SelfServiceAnalysis]:
+        """Resolve the analysis whose result_dataset_ids contains this DEG dataset."""
+        rows = (await db.execute(
+            select(SelfServiceAnalysis).where(SelfServiceAnalysis.project_id == project_id)
+        )).scalars().all()
+        sid = str(dataset_id)
+        for a in rows:
+            if sid in (a.result_dataset_ids or []):
+                return a
+        return None
+
+    async def collect_comparison_data(self, db: AsyncSession, dataset_id: UUID,
+                                      comparison_name: str, work_dir: str,
+                                      generate_ai: bool = False) -> dict[str, Any]:
+        deg_ds = await db.get(Dataset, dataset_id)
+        if not deg_ds:
+            raise ValueError(f"Dataset {dataset_id} not found")
+        project = await db.get(Project, deg_ds.project_id)
+        analysis = await self._find_parent_analysis(db, dataset_id, deg_ds.project_id)
+        params = (analysis.params or {}) if analysis else {}
+
+        # Enrichment datasets + comparison conditions come from the parent analysis.
+        enr_datasets = []
+        comp_conditions: dict[str, dict] = {}
+        pca_fig = None
+        qc_rows: list[dict] = []
+        if analysis:
+            result_ids = [UUID(x) for x in (analysis.result_dataset_ids or [])]
+            if result_ids:
+                datasets = (await db.execute(
+                    select(Dataset).where(Dataset.id.in_(result_ids))
+                )).scalars().all()
+                enr_datasets = [d for d in datasets if d.type == DatasetType.ENRICHMENT]
+            comp_conditions = await self._load_comparison_conditions(db, analysis.comparisons_dataset_id)
+            pca_fig = await self._make_pca(db, analysis, work_dir)
+            qc_rows = await self._make_qc(db, analysis)
+
+        comp = await self._build_comparison(db, deg_ds, enr_datasets, comp_conditions,
+                                            work_dir, generate_ai, comparison_name=comparison_name)
+
+        return {
+            "project": project,
+            "analysis": analysis,
+            "params": params,
+            "comparison_name": comparison_name,
+            "dataset_id": dataset_id,
+            "comparisons": [comp],
+            "pca_fig": pca_fig,
+            "qc_rows": qc_rows,
+        }
+
     async def _load_comparison_conditions(self, db, comparisons_dataset_id) -> dict[str, dict]:
         if not comparisons_dataset_id:
             return {}
@@ -457,14 +510,15 @@ class ReportLatexService:
             return {}
 
     async def _build_comparison(self, db, deg_ds, enr_datasets, comp_conditions,
-                                work_dir, generate_ai) -> dict:
+                                work_dir, generate_ai, comparison_name: Optional[str] = None) -> dict:
         meta = deg_ds.dataset_metadata if isinstance(deg_ds.dataset_metadata, dict) else {}
-        comp_name = meta.get("comparison_name") or deg_ds.name
+        comp_name = comparison_name or meta.get("comparison_name") or deg_ds.name
         safe_id = re.sub(r"[^a-zA-Z0-9]+", "-", comp_name).strip("-")
 
-        all_genes = (await db.execute(
-            select(DegGene).where(DegGene.dataset_id == deg_ds.id)
-        )).scalars().all()
+        gene_stmt = select(DegGene).where(DegGene.dataset_id == deg_ds.id)
+        if comparison_name:
+            gene_stmt = gene_stmt.where(DegGene.comparison_name == comparison_name)
+        all_genes = (await db.execute(gene_stmt)).scalars().all()
         deg_dicts = [{"gene_id": g.gene_id, "gene_name": g.gene_name, "log_fc": g.log_fc,
                       "padj": g.padj, "pvalue": g.pvalue, "regulation": g.regulation} for g in all_genes]
         n_up = sum(1 for g in all_genes if (g.regulation or "").upper() == "UP")
@@ -478,9 +532,10 @@ class ReportLatexService:
         )
         enr_all, enr_up, enr_down = [], [], []
         if enr_ds:
-            rows = (await db.execute(
-                select(EnrichmentPathway).where(EnrichmentPathway.dataset_id == enr_ds.id)
-            )).scalars().all()
+            enr_stmt = select(EnrichmentPathway).where(EnrichmentPathway.dataset_id == enr_ds.id)
+            if comparison_name:
+                enr_stmt = enr_stmt.where(EnrichmentPathway.comparison_name == comparison_name)
+            rows = (await db.execute(enr_stmt)).scalars().all()
             for ep in rows:
                 d = {"pathway_id": ep.pathway_id, "pathway_name": ep.pathway_name,
                      "category": ep.category, "pvalue": ep.pvalue, "padj": ep.padj,
@@ -610,10 +665,34 @@ class ReportLatexService:
 
     def assemble_tex(self, data: dict) -> str:
         project = data["project"]
-        analysis = data["analysis"]
+        analysis = data.get("analysis")
         params = data["params"]
         species = str(params.get("species", "human"))
         proj_name = getattr(project, "name", "") or getattr(analysis, "name", "")
+
+        # Subtitle + report number: comparison-scoped when a comparison is set,
+        # otherwise the legacy analysis-scoped values.
+        comparison_name = data.get("comparison_name")
+        if comparison_name:
+            report_subtitle = f"Comparison: {comparison_name}"
+            number_src = data.get("dataset_id") or (analysis.id if analysis else "")
+        else:
+            report_subtitle = f"Analysis: {getattr(analysis, 'name', '')}"
+            number_src = analysis.id if analysis else ""
+        report_number = f"GL-{str(number_src)[:8].upper()}" if number_src else "GL-REPORT"
+
+        # Branding (report customization module). Empty/None → SciLicium defaults.
+        branding = data.get("branding") or {}
+        default_address = r"35 bd du portugal\\35\,200 Rennes, France"
+        institute_name = (
+            tex_escape(branding["institute_name"]) if branding.get("institute_name")
+            else tex_escape("SciLicium")
+        )
+        institute_address = (
+            tex_escape(branding["institute_address"]) if branding.get("institute_address")
+            else default_address
+        )
+        mm = data.get("materials_methods")
 
         # Results section: title + QC + PCA + per-comparison
         results = [f"\\section{{Results: {tex_escape(proj_name)}}}"]
@@ -633,22 +712,27 @@ class ReportLatexService:
         template_vars = {
             "jj_file_title": tex_escape(f"GenoLens Report - {proj_name}"),
             "jj_report_title": tex_escape("Transcriptomics Analysis Report"),
-            "jj_report_subtitle": tex_escape(f"Analysis: {getattr(analysis, 'name', '')}"),
+            "jj_report_subtitle": tex_escape(report_subtitle),
             "jj_report_version": "1.0",
-            "jj_report_number": tex_escape(f"GL-{str(analysis.id)[:8].upper()}"),
-            "jj_report_author": tex_escape("SciLicium"),
+            "jj_report_number": tex_escape(report_number),
+            "jj_report_author": institute_name,
+            "jj_institute_name": institute_name,
+            "jj_institute_address": institute_address,
+            "jj_primary_color": branding.get("primary_color") or "",
+            "jj_secondary_color": branding.get("secondary_color") or "",
+            "jj_logo_path": branding.get("logo_file") or "",
             "jj_report_clientref": "",
             "jj_sponsor_name": "", "jj_sponsor_contact": "", "jj_sponsor_email": "", "jj_sponsor_address": "",
-            "jj_test_facility_name": tex_escape("SciLicium"), "jj_test_facility_contact": "",
+            "jj_test_facility_name": institute_name, "jj_test_facility_contact": "",
             "jj_test_facility_email": "", "jj_test_facility_address": "",
-            "jj_test_site_name": tex_escape("SciLicium"), "jj_test_site_contact": "",
+            "jj_test_site_name": institute_name, "jj_test_site_contact": "",
             "jj_test_site_email": "", "jj_test_site_address": "",
             "jj_report_project": tex_escape(proj_name),
             "jj_report_prepared_by": "", "jj_report_checked_by": "", "jj_report_approved_by": "",
             "jj_analysis_date": datetime.utcnow().strftime("%Y-%m-%d"),
             "jj_pipeline_version": "2.0",
             "jj_genome_version": tex_escape(species),
-            "jj_materials_methods": self._read_mm(),
+            "jj_materials_methods": mm if mm else self._read_mm(),
             "jj_executive_summary": data.get("executive_summary", ""),
             "jj_conclusion": data.get("conclusion", ""),
             "jj_projects_results": projects_results,
@@ -700,6 +784,61 @@ class ReportLatexService:
     async def render_pdf(self, db: AsyncSession, analysis_id: UUID, generate_ai: bool = False) -> bytes:
         with tempfile.TemporaryDirectory(prefix="report_") as work_dir:
             data = await self.collect_analysis_data(db, analysis_id, work_dir, generate_ai)
+            tex_str = self.assemble_tex(data)
+            return await asyncio.to_thread(self.compile_pdf, tex_str, work_dir)
+
+    async def _load_branding(self, db: AsyncSession, user_id, work_dir: str) -> Optional[dict]:
+        """Load persistent report branding for a user, gated by the customization module.
+
+        Returns None (→ SciLicium defaults) when the user lacks the module or has
+        no settings. Stages the custom logo into the work dir when present.
+        """
+        if not user_id:
+            return None
+        from app.models.models import User, UserReportSettings
+        user = await db.get(User, user_id)
+        if not user or not user.has_report_customization:
+            return None
+        settings = await db.get(UserReportSettings, user_id)
+        if not settings:
+            return None
+        out = {
+            "institute_name": settings.institute_name,
+            "institute_address": settings.institute_address,
+            "primary_color": (settings.primary_color or "").lstrip("#") or None,
+            "secondary_color": (settings.secondary_color or "").lstrip("#") or None,
+            "default_conclusion": settings.default_conclusion,
+            "logo_file": None,
+        }
+        if settings.logo_path:
+            try:
+                from app.services.storage import storage_service
+                data = await storage_service.download_file(settings.logo_path)
+                ext = os.path.splitext(settings.logo_path)[1] or ".png"
+                fname = f"custom_logo{ext}"
+                Path(work_dir, fname).write_bytes(data)
+                out["logo_file"] = fname
+            except Exception as exc:
+                logger.warning("Custom logo staging failed: %s", exc)
+        return out
+
+    async def render_comparison_pdf(self, db: AsyncSession, dataset_id: UUID,
+                                    comparison_name: str, requested_by=None,
+                                    conclusion: Optional[str] = None,
+                                    materials_methods: Optional[str] = None,
+                                    generate_ai: bool = False) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="report_") as work_dir:
+            data = await self.collect_comparison_data(
+                db, dataset_id, comparison_name, work_dir, generate_ai
+            )
+            branding = await self._load_branding(db, requested_by, work_dir)
+            data["branding"] = branding
+            if conclusion:
+                data["conclusion"] = conclusion
+            elif branding and branding.get("default_conclusion"):
+                data["conclusion"] = branding["default_conclusion"]
+            if materials_methods:
+                data["materials_methods"] = materials_methods
             tex_str = self.assemble_tex(data)
             return await asyncio.to_thread(self.compile_pdf, tex_str, work_dir)
 

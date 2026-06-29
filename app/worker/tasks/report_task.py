@@ -65,3 +65,55 @@ async def _async_generate(task, job_id: str, analysis_id: str) -> dict:
             job.error_message = str(exc)[:2000]
             await db.commit()
             return {"status": "failed", "error": str(exc)}
+
+
+@celery_app.task(
+    bind=True,
+    name="app.worker.tasks.report_task.generate_comparison_report",
+    queue="r_analysis",
+    max_retries=1,
+    default_retry_delay=30,
+)
+def generate_comparison_report(self, job_id: str) -> dict:
+    return _run_async(_async_generate_comparison(self, job_id))
+
+
+async def _async_generate_comparison(task, job_id: str) -> dict:
+    from app.db.session import AsyncSessionLocal
+    from app.models.report_job import ReportJob, ReportJobStatus
+
+    async with AsyncSessionLocal() as db:
+        job = await db.get(ReportJob, UUID(job_id))
+        if not job:
+            raise ValueError(f"ReportJob {job_id} not found")
+
+        job.status = ReportJobStatus.RUNNING
+        await db.commit()
+
+        try:
+            from app.services.report_latex_service import report_latex_service
+            from app.services.storage import storage_service
+
+            pdf_bytes = await report_latex_service.render_comparison_pdf(
+                db,
+                job.dataset_id,
+                job.comparison_name,
+                requested_by=job.requested_by,
+                conclusion=job.conclusion,
+                materials_methods=job.materials_methods,
+            )
+
+            pdf_path = f"reports/comparisons/{job.dataset_id}/{job_id}.pdf"
+            await storage_service.upload_file(pdf_path, pdf_bytes, "application/pdf")
+
+            job.status = ReportJobStatus.DONE
+            job.pdf_path = pdf_path
+            await db.commit()
+            return {"status": "done", "pdf_path": pdf_path}
+
+        except Exception as exc:
+            logger.exception("Comparison report generation failed for job %s", job_id)
+            job.status = ReportJobStatus.FAILED
+            job.error_message = str(exc)[:2000]
+            await db.commit()
+            return {"status": "failed", "error": str(exc)}

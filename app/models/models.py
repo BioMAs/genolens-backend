@@ -616,6 +616,12 @@ class User(Base, TimestampMixin):
         server_default=sa_text("false"),
         comment="Whether the Cosmetics (skin-claims) module is unlocked for this user",
     )
+    report_customization_module_enabled: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        server_default=sa_text("false"),
+        comment="Whether the report customization module (branding, logo, conclusion, M&M) is unlocked for this user",
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email}, role={self.role}, plan={self.subscription_plan})>"
@@ -700,6 +706,36 @@ class User(Base, TimestampMixin):
     def has_cosmetics_module(self) -> bool:
         """Cosmetics add-on: explicitly unlocked per-user by an admin. Admins always have it."""
         return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.cosmetics_module_enabled
+
+    @property
+    def has_report_customization(self) -> bool:
+        """Report customization add-on: explicitly unlocked per-user by an admin. Admins always have it."""
+        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.report_customization_module_enabled
+
+
+class UserReportSettings(Base, TimestampMixin):
+    """
+    Persistent per-user report branding settings (report customization module).
+
+    Logo and colours are reused across every report the user generates; the
+    default M&M / conclusion text pre-fill the per-report editor. Gated behind
+    User.has_report_customization.
+    """
+    __tablename__ = "user_report_settings"
+
+    user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # Branding (override the hardcoded SciLicium defaults in the LaTeX templates)
+    logo_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    institute_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    institute_address: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    primary_color: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    secondary_color: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # Defaults that pre-fill the per-report editor
+    default_materials_methods: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    default_conclusion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class AIUsageLog(Base, TimestampMixin):
