@@ -70,6 +70,40 @@ def tex_escape_address(text) -> str:
     return r'\\'.join(tex_escape(line) for line in str(text).split('\\\\'))
 
 
+# Common Unicode punctuation that pdflatex can choke on, mapped to LaTeX-safe ASCII.
+_UNICODE_PUNCT = {
+    "’": "'", "‘": "'", "“": "``", "”": "''",
+    "–": "--", "—": "---", "…": r"\ldots{}",
+    " ": " ", " ": " ", "°": r"\textdegree{}",
+    "×": r"\texttimes{}", "−": "-",
+}
+
+
+def plaintext_to_latex(text) -> str:
+    """Convert user-entered prose into LaTeX-safe markup.
+
+    User-provided conclusion / Material & Methods are plain text, not LaTeX, so
+    every special character must be escaped (e.g. a literal '#' or '&' otherwise
+    aborts pdflatex). Blank lines become paragraph breaks; single newlines are
+    treated as soft wraps (joined with spaces).
+    """
+    if not text:
+        return ""
+    paragraphs = re.split(r"\n\s*\n", str(text).strip())
+    out = []
+    for para in paragraphs:
+        line = " ".join(seg.strip() for seg in para.splitlines() if seg.strip())
+        if not line:
+            continue
+        # Escape LaTeX specials first, then map Unicode punctuation to LaTeX
+        # commands (tex_escape leaves these Unicode chars untouched).
+        escaped = tex_escape(line)
+        for uni, repl in _UNICODE_PUNCT.items():
+            escaped = escaped.replace(uni, repl)
+        out.append(escaped)
+    return "\n\n".join(out)
+
+
 def sanitize_condition_name(condition) -> str:
     if condition is None:
         return ""
@@ -692,7 +726,11 @@ class ReportLatexService:
             tex_escape(branding["institute_address"]) if branding.get("institute_address")
             else default_address
         )
-        mm = data.get("materials_methods")
+        # User-provided M&M / conclusion are plain prose → LaTeX-escape them.
+        # (Empty → fall back to the default LaTeX M&M template / no conclusion.)
+        mm_raw = data.get("materials_methods")
+        mm = plaintext_to_latex(mm_raw) if mm_raw else None
+        conclusion = plaintext_to_latex(data.get("conclusion"))
 
         # Results section: title + QC + PCA + per-comparison
         results = [f"\\section{{Results: {tex_escape(proj_name)}}}"]
@@ -734,7 +772,7 @@ class ReportLatexService:
             "jj_genome_version": tex_escape(species),
             "jj_materials_methods": mm if mm else self._read_mm(),
             "jj_executive_summary": data.get("executive_summary", ""),
-            "jj_conclusion": data.get("conclusion", ""),
+            "jj_conclusion": conclusion,
             "jj_projects_results": projects_results,
             "jj_appendix": "",
             "ref_appendix_soft_versions": "A",
