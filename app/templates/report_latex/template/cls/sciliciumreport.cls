@@ -169,12 +169,13 @@
   }
 }
 
+% Logo used on the coloured back cover. Overridable for custom branding.
+\newcommand{\@invertedlogo}{Scilicium_Logo_centered_inverted_\ifbool{print}{CMYK}{RGB}}
+
 \fancypagestyle{backcover}{%
   \fancyhf{}% clear all header and footer fields
   \lhead{\renewcommand{\baselinestretch}{0}%
-         \raisebox{0.2mm}{\includegraphics[height=2.34cm]{%
-         Scilicium_Logo_centered_inverted_\ifbool{print}{CMYK}{RGB}%
-         }}%
+         \raisebox{0.2mm}{\includegraphics[height=2.34cm]{\@invertedlogo}}%
         }
 }
 

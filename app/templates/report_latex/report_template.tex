@@ -4,10 +4,27 @@
 \newcommand{\JINJAVAR}[1]{}
 \newcommand{\JINJABLOCK}[1]{}
 
-% Optional brand-colour overrides (report customization module). When empty the
-% template keeps the default SciLicium palette defined in sciliciumcolor.sty.
-\JINJABLOCK{if jj_primary_color}\definecolor{sciliciumblue}{HTML}{\JINJAVAR{jj_primary_color}}\JINJABLOCK{endif}
-\JINJABLOCK{if jj_secondary_color}\definecolor{sciliciumgreen}{HTML}{\JINJAVAR{jj_secondary_color}}\JINJABLOCK{endif}
+% Optional brand overrides (report customization module). When empty the
+% template keeps the default SciLicium palette/logos. Colours are redefined by
+% name (resolved at use-time), so they recolour section titles, the cover and
+% the footers. Primary → heading/title colours; secondary → footer/back-cover.
+\JINJABLOCK{if jj_primary_color}
+\definecolor{sciliciumpoliceblue}{HTML}{\JINJAVAR{jj_primary_color}}
+\definecolor{sciliciumsteelblue}{HTML}{\JINJAVAR{jj_primary_color}}
+\definecolor{sciliciumpearlviolet}{HTML}{\JINJAVAR{jj_primary_color}}
+\definecolor{sciliciumblue}{HTML}{\JINJAVAR{jj_primary_color}}
+\JINJABLOCK{endif}
+\JINJABLOCK{if jj_secondary_color}
+\definecolor{sciliciumgreen}{HTML}{\JINJAVAR{jj_secondary_color}}
+\definecolor{sciliciumdarkgreen}{HTML}{\JINJAVAR{jj_secondary_color}}
+\JINJABLOCK{endif}
+% Custom logo replaces the SciLicium logo in the header, cover and back cover.
+\JINJABLOCK{if jj_logo_path}
+\makeatletter
+\renewcommand{\@mainlogo}{\JINJAVAR{jj_logo_path}}
+\renewcommand{\@invertedlogo}{\JINJAVAR{jj_logo_path}}
+\makeatother
+\JINJABLOCK{endif}
 
 \institute{\JINJAVAR{jj_institute_name}}
 \address{\JINJAVAR{jj_institute_address}}
@@ -164,13 +181,6 @@
 
 \begin{document}
 \frontmatter %will add cover page, first page, and table of content.
-
-\JINJABLOCK{if jj_logo_path}
-\clearpage
-\begin{center}
-\includegraphics[height=2.2cm,keepaspectratio]{\JINJAVAR{jj_logo_path}}
-\end{center}
-\JINJABLOCK{endif}
 
 \JINJABLOCK{if jj_executive_summary}
 \clearpage
