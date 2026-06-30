@@ -6,6 +6,7 @@ Runs on the `r_analysis` queue (the r-worker), where the LaTeX toolchain
 """
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from uuid import UUID
 
 from app.worker.celery_app import celery_app
@@ -22,6 +23,31 @@ def _run_async(coro):
         loop.close()
 
 
+@asynccontextmanager
+async def _fresh_session():
+    """Yield a DB session on a brand-new NullPool engine bound to the current loop.
+
+    Celery runs each task in a fresh event loop (see _run_async). The app's shared
+    pooled engine would hand back asyncpg connections created on a *previous* loop,
+    raising "got Future attached to a different loop". A per-task NullPool engine
+    guarantees the connection is created on (and tied to) this task's loop, and is
+    disposed when the task finishes.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy.pool import NullPool
+    from app.core.config import settings
+
+    eng = create_async_engine(settings.DATABASE_URL, poolclass=NullPool, future=True)
+    SessionLocal = async_sessionmaker(
+        bind=eng, class_=AsyncSession, expire_on_commit=False, autoflush=False
+    )
+    try:
+        async with SessionLocal() as session:
+            yield session
+    finally:
+        await eng.dispose()
+
+
 @celery_app.task(
     bind=True,
     name="app.worker.tasks.report_task.generate_analysis_report",
@@ -34,10 +60,9 @@ def generate_analysis_report(self, job_id: str, analysis_id: str) -> dict:
 
 
 async def _async_generate(task, job_id: str, analysis_id: str) -> dict:
-    from app.db.session import AsyncSessionLocal
     from app.models.report_job import ReportJob, ReportJobStatus
 
-    async with AsyncSessionLocal() as db:
+    async with _fresh_session() as db:
         job = await db.get(ReportJob, UUID(job_id))
         if not job:
             raise ValueError(f"ReportJob {job_id} not found")
@@ -79,10 +104,9 @@ def generate_comparison_report(self, job_id: str) -> dict:
 
 
 async def _async_generate_comparison(task, job_id: str) -> dict:
-    from app.db.session import AsyncSessionLocal
     from app.models.report_job import ReportJob, ReportJobStatus
 
-    async with AsyncSessionLocal() as db:
+    async with _fresh_session() as db:
         job = await db.get(ReportJob, UUID(job_id))
         if not job:
             raise ValueError(f"ReportJob {job_id} not found")

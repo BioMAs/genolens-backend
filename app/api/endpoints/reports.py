@@ -6,6 +6,7 @@ GET    /analyses/{analysis_id}/report/status   — poll job status
 GET    /analyses/{analysis_id}/report/download  — download generated PDF
 """
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from uuid import UUID, uuid4
 
@@ -179,13 +180,22 @@ async def trigger_comparison_report(
     """
     dataset = await _get_dataset_or_404(dataset_id, db)
 
-    # Return existing in-progress job rather than spawning a duplicate
-    stmt = select(ReportJob).where(
-        ReportJob.dataset_id == dataset_id,
-        ReportJob.comparison_name == comparison_name,
-        ReportJob.status.in_([ReportJobStatus.PENDING, ReportJobStatus.RUNNING]),
+    # Return existing in-progress job rather than spawning a duplicate — but only
+    # if it is *recent*. A job that has been PENDING/RUNNING for too long is stale
+    # (e.g. the worker died) and must not block regeneration forever.
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    stmt = (
+        select(ReportJob)
+        .where(
+            ReportJob.dataset_id == dataset_id,
+            ReportJob.comparison_name == comparison_name,
+            ReportJob.status.in_([ReportJobStatus.PENDING, ReportJobStatus.RUNNING]),
+            ReportJob.created_at >= recent_cutoff,
+        )
+        .order_by(desc(ReportJob.created_at))
+        .limit(1)
     )
-    existing = (await db.execute(stmt)).scalar_one_or_none()
+    existing = (await db.execute(stmt)).scalars().first()
     if existing:
         return ReportTriggerResponse(
             job_id=existing.id, status=existing.status,
