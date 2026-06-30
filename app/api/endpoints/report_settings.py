@@ -21,7 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps.db import get_db
 from app.api.deps.subscription import require_report_customization_access
 from app.models.models import User, UserReportSettings
-from app.schemas.report import ReportSettingsResponse, ReportSettingsUpdate
+from app.schemas.report import (
+    FIRST_PAGE_TYPES,
+    LAST_PAGE_TYPES,
+    ReportSettingsResponse,
+    ReportSettingsUpdate,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/users/me/report-settings", tags=["report-settings"])
@@ -60,8 +65,14 @@ async def update_report_settings(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(require_report_customization_access)],
 ):
+    data = payload.model_dump(exclude_unset=True)
+    if data.get("first_page_type") and data["first_page_type"] not in FIRST_PAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid first_page_type")
+    if data.get("last_page_type") and data["last_page_type"] not in LAST_PAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid last_page_type")
+
     settings = await _get_or_create_settings(db, user.id)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    for field, value in data.items():
         setattr(settings, field, value)
     await db.commit()
     await db.refresh(settings)

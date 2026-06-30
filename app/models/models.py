@@ -736,6 +736,17 @@ class UserReportSettings(Base, TimestampMixin):
     # Defaults that pre-fill the per-report editor
     default_materials_methods: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     default_conclusion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Page-layout defaults: first_page_type in {detailed, simple, cover};
+    # last_page_type in {color, contact}.
+    first_page_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="detailed", server_default="detailed"
+    )
+    last_page_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="color", server_default="color"
+    )
+    # Default cover/project information (project name, client, sponsor, test
+    # facility/site, signatures, contact) — see schemas.report.CoverInfo.
+    cover_info: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
 
 class AIUsageLog(Base, TimestampMixin):

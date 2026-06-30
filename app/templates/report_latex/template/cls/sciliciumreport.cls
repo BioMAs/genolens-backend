@@ -185,6 +185,12 @@
 \newcommand{\@clientlogo}{}
 \newcommand{\clientlogo}[1]{\renewcommand{\@clientlogo}{#1}}
 
+% Contact details (used by the alternative "contact" back page). Empty by default.
+\newcommand{\@contactemail}{}
+\newcommand{\contactemail}[1]{\renewcommand{\@contactemail}{#1}}
+\newcommand{\@contactphone}{}
+\newcommand{\contactphone}[1]{\renewcommand{\@contactphone}{#1}}
+
 
 
 
@@ -329,4 +335,69 @@
   \vspace*{\fill}
   \centering\Huge\bfseries\color{white}\@motto
   \vspace*{\fill}
+}
+
+% ---- Alternative SIMPLE first page: compact title + minimal info + TOC ----
+\newcommand{\frontmattersimple}{%
+  \thispagestyle{firstpage}%
+  \vspace*{2cm}
+  \begin{center}
+    {\Huge\color{sciliciumpoliceblue}\@title\par}
+    \vspace{1ex}
+    {\large \@subtitle\par}
+    \vspace{2ex}
+    {\large \@LabelText \@projectlabel: \@reportnumber\par}
+  \end{center}
+  \vfill
+  \noindent
+  \begin{minipage}[t]{0.5\textwidth}
+    \@LabelText \@versionlabel\\ \@version
+  \end{minipage}%
+  \begin{minipage}[t]{0.47\textwidth}
+    \@LabelText \@datelabel\\ \@date
+  \end{minipage}\\[1.5ex]
+  \@separator\\
+  \begin{minipage}[t]{0.97\textwidth}
+    \@LabelText \@Authorlabel\\ \@author
+  \end{minipage}\\
+  \@separator\\
+  \clearpage
+  \tableofcontents
+  \clearpage
+  \noindent
+}
+
+% ---- Alternative COVER first page: full-page coloured cover, then detailed ----
+% Avoid the `titlepage` environment (it resets the page counter, breaking the
+% "page X of Y" footer). Use a plain styled page instead.
+\newcommand{\frontmattercover}{%
+  \thispagestyle{empty}%
+  \pagecolor{sciliciumpoliceblue}\color{white}%
+  \begin{center}
+    \vspace*{\fill}
+    \includegraphics[height=3.5cm,keepaspectratio]{\@invertedlogo}\\[1.5cm]
+    {\Huge\bfseries \@title\par}\vspace{0.6cm}
+    {\Large \@subtitle\par}
+    \vspace*{\fill}
+  \end{center}
+  \clearpage
+  \nopagecolor\color{black}%
+  \frontmatter
+}
+
+% ---- Alternative CONTACT back page: plain logo + institute + contact ----
+\newcommand{\backmattercontact}{%
+  \clearpage%
+  \addtocounter{page}{-1}%
+  \thispagestyle{firstpage}%
+  \vspace*{3cm}
+  \begin{center}
+    \includegraphics[height=3cm,keepaspectratio]{\@mainlogo}\\[1cm]
+    {\Large\color{sciliciumpoliceblue}\@institute\par}
+    \vspace{0.5ex}
+    {\@address\par}
+    \vspace{1ex}
+    \ifdefempty{\@contactemail}{}{\texttt{\@contactemail}\par}
+    \ifdefempty{\@contactphone}{}{\@contactphone\par}
+  \end{center}
 }

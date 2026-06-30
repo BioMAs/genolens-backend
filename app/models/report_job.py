@@ -1,7 +1,7 @@
 import enum
 from uuid import UUID, uuid4
 from typing import Optional
-from sqlalchemy import String, ForeignKey, Text, Enum as SQLEnum, Index
+from sqlalchemy import String, ForeignKey, Text, Enum as SQLEnum, Index, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -37,9 +37,12 @@ class ReportJob(Base, TimestampMixin):
         index=True,
     )
     comparison_name: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-    # Per-report editable content (report customization module).
+    # Per-report editable content + layout overrides (report customization module).
     conclusion: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     materials_methods: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    first_page_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    last_page_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    cover_info: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[ReportJobStatus] = mapped_column(
         SQLEnum(ReportJobStatus, name="report_job_status"),

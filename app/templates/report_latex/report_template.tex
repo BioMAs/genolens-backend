@@ -28,6 +28,8 @@
 
 \institute{\JINJAVAR{jj_institute_name}}
 \address{\JINJAVAR{jj_institute_address}}
+\contactemail{\JINJAVAR{jj_contact_email}}
+\contactphone{\JINJAVAR{jj_contact_phone}}
 \vat{FR\,21\,890\,522\,568}
 
 \pdftitle{\JINJAVAR{jj_file_title}}
@@ -180,7 +182,13 @@
 
 
 \begin{document}
+\JINJABLOCK{if jj_first_page_type == 'simple'}
+\frontmattersimple
+\JINJABLOCK{elif jj_first_page_type == 'cover'}
+\frontmattercover
+\JINJABLOCK{else}
 \frontmatter %will add cover page, first page, and table of content.
+\JINJABLOCK{endif}
 
 \JINJABLOCK{if jj_executive_summary}
 \clearpage
@@ -240,5 +248,9 @@
 
 
 
+\JINJABLOCK{if jj_last_page_type == 'contact'}
+\backmattercontact
+\JINJABLOCK{else}
 \backmatter
+\JINJABLOCK{endif}
 \end{document}

@@ -747,6 +747,16 @@ class ReportLatexService:
             results.append(build_comparison_section(comp))
         projects_results = "\n\n".join(results)
 
+        # Cover / project information (escaped). Page-layout selection.
+        cover = data.get("cover_info") or {}
+
+        def _cv(key: str, default: str = "") -> str:
+            val = cover.get(key)
+            return tex_escape(val) if val else default
+
+        first_page_type = data.get("first_page_type") or "detailed"
+        last_page_type = data.get("last_page_type") or "color"
+
         template_vars = {
             "jj_file_title": tex_escape(f"GenoLens Report - {proj_name}"),
             "jj_report_title": tex_escape("Transcriptomics Analysis Report"),
@@ -759,14 +769,25 @@ class ReportLatexService:
             "jj_primary_color": branding.get("primary_color") or "",
             "jj_secondary_color": branding.get("secondary_color") or "",
             "jj_logo_path": branding.get("logo_file") or "",
-            "jj_report_clientref": "",
-            "jj_sponsor_name": "", "jj_sponsor_contact": "", "jj_sponsor_email": "", "jj_sponsor_address": "",
-            "jj_test_facility_name": institute_name, "jj_test_facility_contact": "",
-            "jj_test_facility_email": "", "jj_test_facility_address": "",
-            "jj_test_site_name": institute_name, "jj_test_site_contact": "",
-            "jj_test_site_email": "", "jj_test_site_address": "",
-            "jj_report_project": tex_escape(proj_name),
-            "jj_report_prepared_by": "", "jj_report_checked_by": "", "jj_report_approved_by": "",
+            "jj_first_page_type": first_page_type,
+            "jj_last_page_type": last_page_type,
+            "jj_report_clientref": _cv("client_ref"),
+            "jj_sponsor_name": _cv("sponsor_name"), "jj_sponsor_contact": _cv("sponsor_contact"),
+            "jj_sponsor_email": _cv("sponsor_email"), "jj_sponsor_address": _cv("sponsor_address"),
+            "jj_test_facility_name": _cv("test_facility_name", institute_name),
+            "jj_test_facility_contact": _cv("test_facility_contact"),
+            "jj_test_facility_email": _cv("test_facility_email"),
+            "jj_test_facility_address": _cv("test_facility_address"),
+            "jj_test_site_name": _cv("test_site_name", institute_name),
+            "jj_test_site_contact": _cv("test_site_contact"),
+            "jj_test_site_email": _cv("test_site_email"),
+            "jj_test_site_address": _cv("test_site_address"),
+            "jj_report_project": _cv("project_name", tex_escape(proj_name)),
+            "jj_report_prepared_by": _cv("prepared_by"),
+            "jj_report_checked_by": _cv("checked_by"),
+            "jj_report_approved_by": _cv("approved_by"),
+            "jj_contact_email": _cv("contact_email"),
+            "jj_contact_phone": _cv("contact_phone"),
             "jj_analysis_date": datetime.utcnow().strftime("%Y-%m-%d"),
             "jj_pipeline_version": "2.0",
             "jj_genome_version": tex_escape(species),
@@ -846,6 +867,10 @@ class ReportLatexService:
             "primary_color": (settings.primary_color or "").lstrip("#") or None,
             "secondary_color": (settings.secondary_color or "").lstrip("#") or None,
             "default_conclusion": settings.default_conclusion,
+            "default_materials_methods": settings.default_materials_methods,
+            "first_page_type": settings.first_page_type or "detailed",
+            "last_page_type": settings.last_page_type or "color",
+            "cover_info": settings.cover_info or {},
             "logo_file": None,
         }
         if settings.logo_path:
@@ -864,6 +889,9 @@ class ReportLatexService:
                                     comparison_name: str, requested_by=None,
                                     conclusion: Optional[str] = None,
                                     materials_methods: Optional[str] = None,
+                                    first_page_type: Optional[str] = None,
+                                    last_page_type: Optional[str] = None,
+                                    cover_info: Optional[dict] = None,
                                     generate_ai: bool = False) -> bytes:
         with tempfile.TemporaryDirectory(prefix="report_") as work_dir:
             data = await self.collect_comparison_data(
@@ -871,12 +899,28 @@ class ReportLatexService:
             )
             branding = await self._load_branding(db, requested_by, work_dir)
             data["branding"] = branding
+            defaults = branding or {}
+
+            # Per-report content (job override → user default)
             if conclusion:
                 data["conclusion"] = conclusion
-            elif branding and branding.get("default_conclusion"):
-                data["conclusion"] = branding["default_conclusion"]
+            elif defaults.get("default_conclusion"):
+                data["conclusion"] = defaults["default_conclusion"]
             if materials_methods:
                 data["materials_methods"] = materials_methods
+            elif defaults.get("default_materials_methods"):
+                data["materials_methods"] = defaults["default_materials_methods"]
+
+            # Page layout (job override → user default → template default)
+            data["first_page_type"] = first_page_type or defaults.get("first_page_type") or "detailed"
+            data["last_page_type"] = last_page_type or defaults.get("last_page_type") or "color"
+
+            # Cover info: merge user defaults with per-report overrides (override wins)
+            merged_cover = dict(defaults.get("cover_info") or {})
+            if cover_info:
+                merged_cover.update({k: v for k, v in cover_info.items() if v})
+            data["cover_info"] = merged_cover
+
             tex_str = self.assemble_tex(data)
             return await asyncio.to_thread(self.compile_pdf, tex_str, work_dir)
 

@@ -194,9 +194,15 @@ async def trigger_comparison_report(
 
     conclusion = None
     materials_methods = None
+    first_page_type = None
+    last_page_type = None
+    cover_info = None
     if payload and user.has_report_customization:
         conclusion = payload.conclusion
         materials_methods = payload.materials_methods
+        first_page_type = payload.first_page_type
+        last_page_type = payload.last_page_type
+        cover_info = payload.cover_info.model_dump(exclude_none=True) if payload.cover_info else None
 
     job = ReportJob(
         id=uuid4(),
@@ -205,6 +211,9 @@ async def trigger_comparison_report(
         comparison_name=comparison_name,
         conclusion=conclusion,
         materials_methods=materials_methods,
+        first_page_type=first_page_type,
+        last_page_type=last_page_type,
+        cover_info=cover_info,
         requested_by=user.id,
         status=ReportJobStatus.PENDING,
     )

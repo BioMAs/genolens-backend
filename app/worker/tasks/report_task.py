@@ -101,6 +101,9 @@ async def _async_generate_comparison(task, job_id: str) -> dict:
                 requested_by=job.requested_by,
                 conclusion=job.conclusion,
                 materials_methods=job.materials_methods,
+                first_page_type=job.first_page_type,
+                last_page_type=job.last_page_type,
+                cover_info=job.cover_info,
             )
 
             pdf_path = f"reports/comparisons/{job.dataset_id}/{job_id}.pdf"
