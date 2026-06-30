@@ -271,6 +271,16 @@ async def comparison_report_status(
     job = (await db.execute(stmt)).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="No report job found for this comparison")
+
+    # Auto-fail a stale in-progress job (worker died / lost) so the UI stops
+    # showing "Generating" forever and offers a Retry instead.
+    if job.status in (ReportJobStatus.PENDING, ReportJobStatus.RUNNING) and (
+        job.created_at < datetime.now(timezone.utc) - timedelta(minutes=15)
+    ):
+        job.status = ReportJobStatus.FAILED
+        job.error_message = job.error_message or "Report generation timed out. Please retry."
+        await db.commit()
+        await db.refresh(job)
     return job
 
 
