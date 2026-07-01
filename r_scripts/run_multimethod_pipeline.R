@@ -226,9 +226,16 @@ for (i in seq_len(nrow(contrasts))) {
 
   # ── Build result frame base ─────────────────────────────────────────────────
   base_df <- data.frame(gene_id = rownames(cnt_sub), stringsAsFactors = FALSE)
+  # Always emit a gene_name column: downstream annoDB enrichment keys on symbols.
+  # When the counts have a dedicated symbol column use it (falling back to gene_id
+  # for any unmapped entry); otherwise the gene_id already holds the symbol.
   if (!is.null(gene_name_col)) {
     gn_map <- setNames(counts_raw[[gene_name_col]], counts_raw[[gene_col]])
     base_df$gene_name <- gn_map[base_df$gene_id]
+    na_gn <- is.na(base_df$gene_name) | base_df$gene_name == ""
+    base_df$gene_name[na_gn] <- base_df$gene_id[na_gn]
+  } else {
+    base_df$gene_name <- base_df$gene_id
   }
 
   lfc_col        <- paste0("logFC:",         comp_name)

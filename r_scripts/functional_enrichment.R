@@ -170,6 +170,11 @@ if (!is.null(opt$`gene-list`)) {
     hit <- grep(pat, names(deg), value = TRUE)
     if (length(hit) > 0) { padj_col <- hit[1]; break }
   }
+  # When no dedicated symbol column is present, the gene_id already holds the
+  # symbol (e.g. HGNC-symbol count matrices) — use it so enrichment still runs.
+  if (!("gene_name" %in% names(deg)) && ("gene_id" %in% names(deg))) {
+    deg$gene_name <- deg$gene_id
+  }
   if (is.na(logfc_col) || is.na(padj_col) || !("gene_name" %in% names(deg))) {
     stop("DEG file missing logFC / padj / gene_name columns")
   }
