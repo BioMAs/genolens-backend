@@ -215,7 +215,8 @@ for (i in seq_len(nrow(contrasts))) {
   smp_sub <- smp[smp[[sid_col]] %in% sids_comp, ]
 
   cond_vec <- factor(smp_sub[[cond_col]], levels = c(cond2, cond1))  # ref=cond2, test=cond1
-  has_batch <- !is.null(batch_col) && batch_col %in% colnames(smp_sub) && opt$design != "condition"
+  has_batch <- !is.null(batch_col) && batch_col %in% colnames(smp_sub) && opt$design != "condition" &&
+    length(unique(smp_sub[[batch_col]])) > 1
   n_per_cond <- table(cond_vec)
 
   # ── Build result frame base ─────────────────────────────────────────────────
@@ -267,6 +268,7 @@ for (i in seq_len(nrow(contrasts))) {
   # ── edgeR ────────────────────────────────────────────────────────────────────
   edger_padj   <- rep(NA_real_, nrow(cnt_sub))
   edger_pvalue <- rep(NA_real_, nrow(cnt_sub))
+  edger_lfc    <- rep(NA_real_, nrow(cnt_sub))
 
   if (run_edger) {
     tryCatch({
@@ -284,7 +286,7 @@ for (i in seq_len(nrow(contrasts))) {
       tt  <- topTags(qlt, n = Inf, sort.by = "none")$table
       edger_padj   <- tt$FDR
       edger_pvalue <- tt$PValue
-      if (all(is.na(deseq_lfc))) deseq_lfc <- tt$logFC
+      edger_lfc    <- tt$logFC
       if (all(is.na(basemean)))  basemean  <- rowMeans(cpm(dge))
       message("    edgeR:  ", sum(!is.na(edger_padj) & edger_padj < opt$fdr, na.rm = TRUE), " sig genes")
     }, error = function(e) message("    edgeR failed: ", conditionMessage(e)))
@@ -293,6 +295,7 @@ for (i in seq_len(nrow(contrasts))) {
   # ── limma-voom ───────────────────────────────────────────────────────────────
   limma_padj   <- rep(NA_real_, nrow(cnt_sub))
   limma_pvalue <- rep(NA_real_, nrow(cnt_sub))
+  limma_lfc    <- rep(NA_real_, nrow(cnt_sub))
 
   if (run_limma) {
     tryCatch({
@@ -310,7 +313,7 @@ for (i in seq_len(nrow(contrasts))) {
       tt  <- topTable(fit, coef = ncol(design_l), n = Inf, sort.by = "none")
       limma_padj   <- tt$adj.P.Val
       limma_pvalue <- tt$P.Value
-      if (all(is.na(deseq_lfc))) deseq_lfc <- tt$logFC
+      limma_lfc    <- tt$logFC
       if (all(is.na(basemean)))  basemean  <- rowMeans(cpm(dge_l))
       message("    limma:  ", sum(!is.na(limma_padj) & limma_padj < opt$fdr, na.rm = TRUE), " sig genes")
     }, error = function(e) message("    limma failed: ", conditionMessage(e)))
@@ -356,17 +359,28 @@ for (i in seq_len(nrow(contrasts))) {
     primary_pvalue <- limma_pvalue
   }
 
+  # Canonical log2FoldChange for filtering/reporting: limma (matches pipe_scilicium's
+  # step3_multimethod_comparison.R, which always uses limma-voom's logFC), falling
+  # back to edgeR then DESeq2 if limma didn't run.
+  if (!all(is.na(limma_lfc))) {
+    canonical_lfc <- limma_lfc
+  } else if (!all(is.na(edger_lfc))) {
+    canonical_lfc <- edger_lfc
+  } else {
+    canonical_lfc <- deseq_lfc
+  }
+
   # ── Contrast column (UP/DOWN regulation) ───────────────────────────────────
   regulation <- rep(NA_character_, nrow(cnt_sub))
-  sig_mask   <- !is.na(primary_padj) & primary_padj < opt$fdr & !is.na(deseq_lfc) & abs(deseq_lfc) >= opt$`min-log2fc`
-  regulation[sig_mask & deseq_lfc > 0]  <- "UP"
-  regulation[sig_mask & deseq_lfc <= 0] <- "DOWN"
+  sig_mask   <- !is.na(primary_padj) & primary_padj < opt$fdr & !is.na(canonical_lfc) & abs(canonical_lfc) >= opt$`min-log2fc`
+  regulation[sig_mask & canonical_lfc > 0]  <- "UP"
+  regulation[sig_mask & canonical_lfc <= 0] <- "DOWN"
 
   # ── Assemble output data frame ──────────────────────────────────────────────
   out_df <- base_df
   out_df$baseMean <- basemean
 
-  out_df[[lfc_col]]        <- deseq_lfc
+  out_df[[lfc_col]]        <- canonical_lfc
   out_df[[padj_deseq_col]] <- deseq_padj
   out_df[[pval_deseq_col]] <- deseq_pvalue
 
