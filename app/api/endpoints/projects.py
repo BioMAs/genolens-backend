@@ -217,6 +217,14 @@ def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
     for d in datasets:
         metadata = d.dataset_metadata or {}
 
+        # Skip datasets that never finished processing. A FAILED/PROCESSING DEG
+        # dataset carries no counts (deg_up_count NULL, no `comparisons` metadata);
+        # because entries are keyed by comparison name and the loop is ordered
+        # newest-first, a stale failed dataset from an earlier run is processed
+        # last and would overwrite a good comparison's counts with zeros.
+        if str(d.status).upper() != "READY":
+            continue
+
         # Single file per comparison (old way)
         if d.type == "DEG":
             # Prefer explicit comparison_name; fall back to first item in list; then dataset name
