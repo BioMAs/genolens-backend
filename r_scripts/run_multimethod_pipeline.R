@@ -159,7 +159,7 @@ if (!is.na(flag_col)) {
   if (nrow(contrasts) == 0) stop("No comparisons left to run after perform_analysis filter")
 }
 
-manifest <- list(has_vst = FALSE, comparisons = c())
+manifest <- list(has_vst = FALSE, comparisons = c(), comparison_stats = list())
 results_dir <- file.path(opt$outdir, "comparisons")
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -207,7 +207,12 @@ for (i in seq_len(nrow(contrasts))) {
   sids_comp <- intersect(sids_comp, colnames(counts_mat))
 
   if (length(sids_comp) < 2) {
-    message("    Skipping: <2 samples found for conditions")
+    message("    Skipping: <2 samples found for conditions '", cond1, "' / '", cond2,
+            "' (matched ", length(sids_comp), " sample(s) between samples file and counts matrix)")
+    manifest$comparison_stats[[comp_name]] <- list(
+      skipped = TRUE, n_samples = length(sids_comp), cond1 = cond1, cond2 = cond2,
+      n_up = 0L, n_down = 0L
+    )
     next
   }
 
@@ -409,6 +414,10 @@ for (i in seq_len(nrow(contrasts))) {
   n_down <- sum(regulation == "DOWN", na.rm = TRUE)
   message("    Output: ", nrow(out_df), " genes | UP=", n_up, " DOWN=", n_down)
   manifest$comparisons <- c(manifest$comparisons, comp_name)
+  manifest$comparison_stats[[comp_name]] <- list(
+    skipped = FALSE, n_samples = length(sids_comp),
+    n_up = n_up, n_down = n_down, n_genes_tested = nrow(out_df)
+  )
 }
 
 # =============================================================================

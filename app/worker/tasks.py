@@ -793,6 +793,23 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                         f"stderr: {proc.stderr[-2000:]}"
                     )
 
+                # Persist the R diagnostic output (message() writes to stderr) even on
+                # success. Otherwise a "silent" 0-DEG run — a DE method failing inside a
+                # tryCatch, or a comparison skipped because its samples/conditions did not
+                # match — leaves no trace at all (returncode is still 0). Keep the DEA
+                # summary lines that explain the outcome.
+                if proc.stderr:
+                    logger.info("[ANALYSIS] R pipeline stderr (tail):\n%s", proc.stderr[-4000:])
+                    summary_lines = [
+                        ln for ln in proc.stderr.splitlines()
+                        if any(k in ln for k in (
+                            "Retained", "perform_analysis filter", "sig genes",
+                            "Stouffer:", "Skipping:", "failed:", "Output:",
+                        ))
+                    ]
+                    if summary_lines:
+                        _log("pipeline_summary", "\n".join(summary_lines[-40:]))
+
                 # ── Register output files as Dataset records ─────────────────
                 _log("registering_results", "Registering output datasets")
                 analysis.current_step = "registering_results"
@@ -806,6 +823,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                         manifest = json.load(f)
 
                 result_dataset_ids: list[str] = []
+                deg_comparison_ids: list[str] = []
                 intermediate_dataset_ids: dict[str, str] = {}
                 # Datasets are dispatched for processing only AFTER the final commit,
                 # otherwise the Celery worker (separate session) races the not-yet-
@@ -866,6 +884,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                         db.add(deg_ds)
                         await db.flush()
                         result_dataset_ids.append(str(deg_ds.id))
+                        deg_comparison_ids.append(comp_id)
                         pending_dispatch.append((str(deg_ds.id), deg_storage))
                         logger.info("[ANALYSIS] Registered DEG dataset %s for comparison %s", deg_ds.id, comp_id)
 
@@ -939,11 +958,27 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                                 "[ANALYSIS] annoDB enrichment step skipped for %s: %s", comp_id, enr_exc
                             )
 
+                # A run can succeed (returncode 0) yet produce no DEG table when every
+                # comparison is skipped — typically because the counts-matrix column
+                # headers do not match `sample_id` in the samples file, or the
+                # comparisons' condition1/condition2 do not match the samples' condition
+                # values. Surface this instead of reporting a clean "0 DEG" success.
+                if not deg_comparison_ids:
+                    warn = (
+                        "No differential-expression results were produced (0 comparisons "
+                        "yielded a genolens_deg.csv). Likely a sample/condition mapping "
+                        "mismatch: check that the counts matrix column names match sample_id "
+                        "in the samples file, and that condition1/condition2 in the comparisons "
+                        "file match the samples' condition values. See the pipeline_summary log."
+                    )
+                    logger.warning("[ANALYSIS] %s", warn)
+                    _log("no_results_warning", warn)
+
                 analysis.result_dataset_ids = result_dataset_ids
                 analysis.intermediate_dataset_ids = intermediate_dataset_ids
                 analysis.status = SelfServiceAnalysisStatus.DONE
                 analysis.current_step = "done"
-                _log("done", f"Pipeline completed. Registered {len(result_dataset_ids)} DEG dataset(s).")
+                _log("done", f"Pipeline completed. Registered {len(deg_comparison_ids)} DEG comparison(s).")
                 db.add(analysis)
                 await db.commit()
 
