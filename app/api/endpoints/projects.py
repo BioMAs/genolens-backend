@@ -222,7 +222,7 @@ def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
         # because entries are keyed by comparison name and the loop is ordered
         # newest-first, a stale failed dataset from an earlier run is processed
         # last and would overwrite a good comparison's counts with zeros.
-        if str(d.status).upper() != "READY":
+        if d.status != "READY":
             continue
 
         # Single file per comparison (old way)
