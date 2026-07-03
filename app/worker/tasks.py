@@ -669,6 +669,35 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
     return run_async(_process())
 
 
+def _pick_geo_condition_column(samples) -> str | None:
+    """
+    Choose the best GEO characteristic column to use as the DEA 'condition'.
+
+    Prefers a column that splits samples into ≥2 groups each with replicates
+    (min group size ≥ 2), maximising replicate count then minimising the number
+    of groups. Falls back to any column with 2..n-1 distinct values. Returns
+    None when no characteristic offers a usable grouping.
+    """
+    n = len(samples)
+    skip = {"sample_id", "sample", "title", "condition"}
+    best_col: str | None = None
+    best_score = None
+    for col in samples.columns:
+        if col in skip:
+            continue
+        vals = samples[col].dropna().astype(str).str.strip()
+        vals = vals[vals != ""]
+        distinct = vals.nunique()
+        if distinct < 2 or distinct >= n:
+            continue
+        min_group = int(vals.value_counts().min())
+        # (has_replicates, replicate_count, fewer_groups) — higher is better
+        score = (min_group >= 2, min_group, -distinct)
+        if best_score is None or score > best_score:
+            best_score, best_col = score, col
+    return best_col
+
+
 @celery_app.task(
     bind=True,
     base=DatabaseTask,
@@ -718,11 +747,13 @@ def import_geo_dataset(
                 # Collapse duplicate symbols by summing their (integer) counts
                 counts = counts.groupby("gene_id", as_index=False)[sample_cols].sum()
 
-                matrix_path = f"projects/{project_id}/raw/{accession}_counts.csv"
+                # Written as TSV — the R DEA pipeline reads inputs with read_tsv,
+                # and tabs avoid clashes with commas inside metadata values.
+                matrix_path = f"projects/{project_id}/raw/{accession}_counts.tsv"
                 await storage_service.upload_file(
                     matrix_path,
-                    counts.to_csv(index=False).encode("utf-8"),
-                    content_type="text/csv",
+                    counts.to_csv(index=False, sep="\t").encode("utf-8"),
+                    content_type="text/tab-separated-values",
                 )
 
                 # 2. Sample metadata, aligned to the matrix columns
@@ -735,12 +766,23 @@ def import_geo_dataset(
                     .reindex(sample_cols)
                     .reset_index()
                 )
+                # Shape into the GenoLens/R schema: 'sample_id' + a 'condition'
+                # grouping column (required by the DEA pipeline). The condition is
+                # inferred from the GEO characteristics; original columns are kept.
+                samples = samples.rename(columns={"sample": "sample_id"})
+                condition_col = _pick_geo_condition_column(samples)
+                samples.insert(
+                    1,
+                    "condition",
+                    samples[condition_col].astype(str) if condition_col
+                    else samples["sample_id"].astype(str),
+                )
 
-                samples_path = f"projects/{project_id}/raw/{accession}_samples.csv"
+                samples_path = f"projects/{project_id}/raw/{accession}_samples.tsv"
                 await storage_service.upload_file(
                     samples_path,
-                    samples.to_csv(index=False).encode("utf-8"),
-                    content_type="text/csv",
+                    samples.to_csv(index=False, sep="\t").encode("utf-8"),
+                    content_type="text/tab-separated-values",
                 )
 
                 # 3. Persist raw file paths
