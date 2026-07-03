@@ -131,7 +131,7 @@ async def geo_search(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     q: str = Query(..., min_length=3, description="Free-text search query"),
     max_results: int = Query(default=10, ge=1, le=50),
-    db: str = Query(default="gds", pattern="^(gds|geo)$"),
+    db: str = Query(default="gds", pattern="^gds$"),
     counts_only: bool = Query(
         default=False,
         description="Restrict to series with NCBI-generated RNA-seq counts (importable)",
