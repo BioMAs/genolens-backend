@@ -21,6 +21,7 @@ _sys.modules.setdefault("app.worker._tasks_legacy", _legacy_mod)
 _spec.loader.exec_module(_legacy_mod)
 
 process_dataset_upload = _legacy_mod.process_dataset_upload  # noqa: F401
+import_geo_dataset = _legacy_mod.import_geo_dataset  # noqa: F401
 health_check = _legacy_mod.health_check  # noqa: F401
 run_self_service_analysis = _legacy_mod.run_self_service_analysis  # noqa: F401
 
@@ -29,6 +30,7 @@ from app.worker.tasks.quota_tasks import reset_monthly_comparison_quotas  # noqa
 
 __all__ = [
     "process_dataset_upload",
+    "import_geo_dataset",
     "health_check",
     "run_self_service_analysis",
     "reset_monthly_comparison_quotas",

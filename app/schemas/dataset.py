@@ -75,6 +75,30 @@ class DatasetUploadResponse(BaseModel):
     status: DatasetStatus
 
 
+class GeoImportRequest(BaseModel):
+    """Request to import a public GEO series (NCBI-generated RNA-seq counts)."""
+    project_id: UUID
+    accession: str = Field(..., min_length=4, max_length=32)
+    organism: str = Field(..., min_length=2, max_length=64)
+
+    @field_validator('accession')
+    @classmethod
+    def validate_accession(cls, v: str) -> str:
+        """GEO Series accessions look like GSE12345."""
+        v = v.strip().upper()
+        if not re.match(r'^GSE\d+$', v):
+            raise ValueError('Accession must be a GEO Series id, e.g. GSE164073')
+        return v
+
+
+class GeoImportResponse(BaseModel):
+    """Response after dispatching a GEO import job."""
+    matrix_dataset_id: UUID
+    samples_dataset_id: UUID
+    status: DatasetStatus
+    message: str
+
+
 class DatasetQueryParams(BaseModel):
     """Schema for dataset query parameters with validation."""
     gene_ids: Optional[list[str]] = Field(None, description="Filter by gene IDs", max_length=10000)

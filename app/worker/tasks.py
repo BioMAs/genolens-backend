@@ -16,6 +16,7 @@ from app.models.models import Dataset, DatasetStatus, DatasetType, DegGene, Enri
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor, DEG_LOGFC_THRESHOLD, DEG_PADJ_THRESHOLD
 from app.services.go_service import GOService
+from app.services.external_integrations import geo_service
 from app.core.config import settings
 
 # GeneSetDatabase categories that run_ora_enrichment supports
@@ -666,6 +667,127 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
             }
 
     return run_async(_process())
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.worker.tasks.import_geo_dataset",
+    queue="data_processing",
+)
+def import_geo_dataset(
+    self,
+    matrix_dataset_id: str,
+    samples_dataset_id: str,
+    accession: str,
+    organism: str,
+) -> dict:
+    """
+    Import an NCBI-generated RNA-seq series from GEO.
+
+    1. Download the raw-count matrix, gene annotation and sample metadata.
+    2. Standardise to a `gene_id` × GSM count matrix (Entrez → symbol) and a
+       matching sample sheet.
+    3. Store both as raw CSV, then hand off each to `process_dataset_upload`
+       (parquet conversion, PCA, READY) — no duplicated ingestion logic.
+    """
+    async def _process() -> dict:
+        async with _make_worker_session()() as db:
+            try:
+                # Both datasets → PROCESSING
+                await db.execute(
+                    update(Dataset)
+                    .where(Dataset.id.in_([matrix_dataset_id, samples_dataset_id]))
+                    .values(status=DatasetStatus.PROCESSING)
+                )
+                await db.commit()
+
+                result = await db.execute(
+                    select(Dataset).where(Dataset.id == matrix_dataset_id)
+                )
+                project_id = result.scalar_one().project_id
+
+                # 1. Count matrix + gene-symbol mapping
+                self.update_state(state="PROGRESS", meta={"step": "downloading_counts"})
+                counts = await geo_service.download_rnaseq_counts(accession, organism)
+                annotation = await geo_service.download_annotation(organism)
+
+                self.update_state(state="PROGRESS", meta={"step": "mapping_genes"})
+                counts["gene_id"] = counts["gene_id"].map(lambda g: annotation.get(g, g))
+                sample_cols = [c for c in counts.columns if c != "gene_id"]
+                # Collapse duplicate symbols by summing their (integer) counts
+                counts = counts.groupby("gene_id", as_index=False)[sample_cols].sum()
+
+                matrix_path = f"projects/{project_id}/raw/{accession}_counts.csv"
+                await storage_service.upload_file(
+                    matrix_path,
+                    counts.to_csv(index=False).encode("utf-8"),
+                    content_type="text/csv",
+                )
+
+                # 2. Sample metadata, aligned to the matrix columns
+                self.update_state(state="PROGRESS", meta={"step": "downloading_metadata"})
+                samples = await geo_service.download_series_metadata(accession)
+                # One row per matrix sample, in matrix order (missing → NaN)
+                samples = (
+                    samples.drop_duplicates(subset="sample")
+                    .set_index("sample")
+                    .reindex(sample_cols)
+                    .reset_index()
+                )
+
+                samples_path = f"projects/{project_id}/raw/{accession}_samples.csv"
+                await storage_service.upload_file(
+                    samples_path,
+                    samples.to_csv(index=False).encode("utf-8"),
+                    content_type="text/csv",
+                )
+
+                # 3. Persist raw file paths
+                await db.execute(
+                    update(Dataset)
+                    .where(Dataset.id == matrix_dataset_id)
+                    .values(raw_file_path=matrix_path)
+                )
+                await db.execute(
+                    update(Dataset)
+                    .where(Dataset.id == samples_dataset_id)
+                    .values(raw_file_path=samples_path)
+                )
+                await db.commit()
+
+                return {
+                    "status": "ok",
+                    "matrix_path": matrix_path,
+                    "samples_path": samples_path,
+                }
+
+            except Exception as e:
+                await db.rollback()
+                import traceback
+                error_details = traceback.format_exc()
+                error_message = str(e) if str(e) else error_details[:500]
+                logger.error(f"[WORKER] GEO import failed for {accession}: {error_message}")
+                logger.error(f"[WORKER] Full traceback:\n{error_details}")
+                await db.execute(
+                    update(Dataset)
+                    .where(Dataset.id.in_([matrix_dataset_id, samples_dataset_id]))
+                    .values(
+                        status=DatasetStatus.FAILED,
+                        error_message=f"GEO import failed: {error_message}"[:1000],
+                    )
+                )
+                await db.commit()
+                return {"status": "failed", "accession": accession, "error": error_message}
+
+    outcome = run_async(_process())
+
+    # Hand off to the standard ingestion pipeline on success
+    if outcome.get("status") == "ok":
+        process_dataset_upload.delay(matrix_dataset_id, outcome["matrix_path"])
+        process_dataset_upload.delay(samples_dataset_id, outcome["samples_path"])
+
+    return outcome
 
 
 @celery_app.task(name="app.worker.tasks.health_check")

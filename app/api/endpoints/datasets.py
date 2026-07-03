@@ -50,12 +50,15 @@ from app.schemas.dataset import (
     DatasetUpdate,
     DatasetColumnsResponse,
     DatasetStatsResponse,
-    GeneListResponse
+    GeneListResponse,
+    GeoImportRequest,
+    GeoImportResponse,
 )
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor
 from app.services.cache_service import cache_service
-from app.worker.tasks import process_dataset_upload
+from app.services.external_integrations import geo_service
+from app.worker.tasks import process_dataset_upload, import_geo_dataset
 from app.services.gsea_processor import GSEAProcessor, prepare_ranked_gene_list, GeneSetsLoader
 from app.services.gene_set_loader import GeneSetLoader
 from app.models.models import GeneSetDatabase
@@ -230,6 +233,112 @@ async def upload_dataset(
         "dataset_id": dataset.id,
         "message": f"Dataset '{name}' uploaded successfully and processing has started",
         "status": dataset.status
+    }
+
+
+@router.post(
+    "/import-from-geo",
+    response_model=GeoImportResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_active_license)],
+)
+async def import_from_geo(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    db_user: Annotated[User, Depends(get_or_create_user)],
+    payload: GeoImportRequest = Body(...),
+) -> dict:
+    """
+    Import a public GEO series into the project.
+
+    Fetches the NCBI-generated RNA-seq raw-count matrix and the sample-level
+    metadata, then ingests them as a MATRIX + METADATA_SAMPLE dataset pair
+    (processed asynchronously, same pipeline as manual uploads).
+    """
+    # Check project ownership (same pattern as /upload)
+    query = select(Project).where(
+        Project.id == payload.project_id,
+        Project.owner_id == current_user.user_id,
+    )
+    result = await db.execute(query)
+    project = result.scalar_one_or_none()
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        )
+
+    # Validate organism is supported (human/mouse) before doing any network I/O
+    try:
+        geo_service._normalize_organism(payload.organism)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+
+    # Verify NCBI has generated counts for this series
+    available = await geo_service.check_counts_availability(payload.accession, payload.organism)
+    if not available:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"No NCBI-generated RNA-seq counts are available for {payload.accession}. "
+                "Only human/mouse RNA-seq series processed by NCBI can be imported."
+            ),
+        )
+
+    base_metadata = {
+        "source": "GEO",
+        "geo_accession": payload.accession,
+        "geo_link": f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={payload.accession}",
+        "organism": payload.organism,
+    }
+
+    matrix_dataset = Dataset(
+        project_id=payload.project_id,
+        name=f"GEO {payload.accession} — counts",
+        type=DatasetType.MATRIX,
+        description=f"RNA-seq raw counts imported from GEO series {payload.accession}",
+        status=DatasetStatus.PENDING,
+        dataset_metadata={**base_metadata, "role": "matrix"},
+        column_mapping={},
+    )
+    samples_dataset = Dataset(
+        project_id=payload.project_id,
+        name=f"GEO {payload.accession} — samples",
+        type=DatasetType.METADATA_SAMPLE,
+        description=f"Sample metadata imported from GEO series {payload.accession}",
+        status=DatasetStatus.PENDING,
+        dataset_metadata={**base_metadata, "role": "samples"},
+        column_mapping={},
+    )
+    db.add_all([matrix_dataset, samples_dataset])
+    await db.commit()
+    await db.refresh(matrix_dataset)
+    await db.refresh(samples_dataset)
+
+    # Dispatch the async import + ingestion job
+    import_geo_dataset.delay(
+        str(matrix_dataset.id),
+        str(samples_dataset.id),
+        payload.accession,
+        payload.organism,
+    )
+
+    await history_service.log_activity(
+        db, payload.project_id, current_user.user_id, ActivityEventType.DATASET_UPLOADED,
+        entity_type="dataset",
+        entity_id=str(matrix_dataset.id),
+        entity_name=matrix_dataset.name,
+        extra_metadata={"source": "GEO", "geo_accession": payload.accession},
+    )
+
+    return {
+        "matrix_dataset_id": matrix_dataset.id,
+        "samples_dataset_id": samples_dataset.id,
+        "status": DatasetStatus.PENDING,
+        "message": f"Import of GEO series {payload.accession} started",
     }
 
 

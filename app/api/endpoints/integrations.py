@@ -132,6 +132,10 @@ async def geo_search(
     q: str = Query(..., min_length=3, description="Free-text search query"),
     max_results: int = Query(default=10, ge=1, le=50),
     db: str = Query(default="gds", pattern="^(gds|geo)$"),
+    counts_only: bool = Query(
+        default=False,
+        description="Restrict to series with NCBI-generated RNA-seq counts (importable)",
+    ),
 ) -> dict:
     """
     Search NCBI GEO for public gene expression datasets.
@@ -149,6 +153,7 @@ async def geo_search(
         query=q,
         max_results=max_results,
         db=db,
+        counts_only=counts_only,
     )
     if "error" in result:
         raise HTTPException(
