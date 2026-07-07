@@ -2489,6 +2489,49 @@ Return ONLY a JSON array of pathway IDs (the exact IDs from the list), nothing e
         }
 
 
+@router.get("/{dataset_id}/comparisons/{comparison_name}/interpretation", dependencies=[Depends(require_active_license)])
+async def get_comparison_interpretation(
+    dataset_id: UUID,
+    comparison_name: str,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+) -> dict:
+    """
+    Return the stored AI interpretation for a comparison, or {"interpretation": None}
+    if none exists yet.
+
+    Read-only: this NEVER triggers generation (no LLM call, no AI quota consumed).
+    The frontend calls this on mount to display a saved interpretation; generation
+    happens only on explicit user action via POST .../interpret.
+    """
+    _ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    dataset = _ds_result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+
+    existing = await db.scalar(
+        select(AIInterpretation)
+        .where(AIInterpretation.dataset_id == dataset_id)
+        .where(AIInterpretation.comparison_name == comparison_name)
+    )
+    if not existing:
+        return {"interpretation": None}
+    return {
+        "interpretation": existing.interpretation,
+        "cached": True,
+        "generated_at": existing.created_at.isoformat(),
+        "model": existing.model,
+        "comparison_name": comparison_name,
+        "summary": {
+            "deg_up": existing.deg_up,
+            "deg_down": existing.deg_down,
+            "top_pathways_count": existing.pathways_count,
+            "top_genes_count": existing.genes_count,
+        },
+    }
+
+
 @router.post("/{dataset_id}/comparisons/{comparison_name}/interpret", dependencies=[Depends(require_active_license)])
 async def interpret_comparison(
     dataset_id: UUID,
