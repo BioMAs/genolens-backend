@@ -8,14 +8,14 @@ render the same plot components from a `figure` SSE event that it would from a f
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.models.models import DegGene, EnrichmentPathway
+from app.services import chart_builder
 from app.services.chat_tools.base import BaseTool, ToolContext, ToolResult
-
 
 # ── Parameter schemas ────────────────────────────────────────────────────────
 
@@ -39,15 +39,39 @@ class DegListParams(BaseModel):
     )
 
 
-class VolcanoParams(BaseModel):
-    padj_threshold: float = Field(
-        0.05, ge=0.0, le=1.0, description="Adjusted p-value significance threshold."
+class GenerateChartParams(BaseModel):
+    """Constrained figure spec — the server expands it into a full Plotly figure."""
+
+    chart_type: Literal[
+        "volcano", "histogram", "ma_plot", "bar_genes",
+        "bar_regulation", "enrichment_bar", "scatter",
+    ] = Field(..., description="Which chart to draw (required).")
+    title: Optional[str] = Field(None, description="Optional chart title override.")
+    color: Optional[str] = Field(
+        None, description="Named colour for single-series charts, e.g. 'blue', 'red'."
     )
-    logfc_threshold: float = Field(
-        0.58, ge=0.0, le=10.0, description="Absolute log2 fold-change significance threshold."
+    palette: Optional[str] = Field(
+        None, description="Palette key: 'standard' or 'colorblind'."
     )
-    max_points: int = Field(
-        5000, ge=100, le=20000, description="Maximum number of points to plot."
+    top_n: Optional[int] = Field(
+        None, ge=1, le=50,
+        description="How many items for bar_genes (default 15) / enrichment_bar (default 15).",
+    )
+    field: Optional[Literal["log_fc", "padj", "pvalue", "base_mean"]] = Field(
+        None, description="Numeric field for histogram (default 'log_fc')."
+    )
+    bins: Optional[int] = Field(None, ge=2, le=200, description="Histogram bin count (default 40).")
+    x_field: Optional[Literal["log_fc", "padj", "pvalue", "base_mean"]] = Field(
+        None, description="X axis field for a generic scatter."
+    )
+    y_field: Optional[Literal["log_fc", "padj", "pvalue", "base_mean"]] = Field(
+        None, description="Y axis field for a generic scatter."
+    )
+    padj_threshold: Optional[float] = Field(
+        None, ge=0.0, le=1.0, description="Volcano significance threshold on adjusted p-value."
+    )
+    logfc_threshold: Optional[float] = Field(
+        None, ge=0.0, le=10.0, description="Volcano significance threshold on |log2 fold-change|."
     )
 
 
@@ -150,39 +174,41 @@ class ListDegGenesTool(BaseTool):
         return ToolResult(summary_for_model=summary, params=params.model_dump(exclude_none=True))
 
 
-class GenerateVolcanoPlotTool(BaseTool):
-    name = "generate_volcano_plot"
+class GenerateChartTool(BaseTool):
+    name = "generate_chart"
     description = (
-        "Generate a volcano plot (log2 fold-change vs -log10 adjusted p-value) for the "
-        "selected comparison. Call this whenever the user asks to see, draw, plot or "
-        "visualise a volcano plot."
+        "Generate a figure for the selected comparison. Call this whenever the user asks "
+        "to see, draw, plot or visualise something. Choose one 'chart_type':\n"
+        "  - volcano: log2 fold-change vs -log10(padj), coloured by significance.\n"
+        "  - histogram: distribution of one field (default log_fc); set 'field' and 'bins'.\n"
+        "  - ma_plot: log10(base mean) vs log2 fold-change, coloured by regulation.\n"
+        "  - bar_genes: top 'top_n' genes by |log2FC| (default 15), coloured up/down.\n"
+        "  - bar_regulation: counts of up- vs down-regulated genes.\n"
+        "  - enrichment_bar: top 'top_n' enriched pathways by significance.\n"
+        "  - scatter: generic scatter of any two numeric fields ('x_field','y_field').\n"
+        "Numeric fields available per gene: log_fc, padj, pvalue, base_mean. Optional "
+        "'title', 'color' (e.g. 'blue') and 'palette' ('standard'|'colorblind') tune the look. "
+        "Only pass parameters relevant to the chosen chart_type."
     )
-    params_model = VolcanoParams
-    figure_type = "volcano"
+    params_model = GenerateChartParams
+    figure_type = "plotly"
 
-    async def execute(self, ctx: ToolContext, params: VolcanoParams) -> ToolResult:
-        from app.api.endpoints.datasets import get_volcano_plot_data
-
-        payload = await get_volcano_plot_data(
+    async def execute(self, ctx: ToolContext, params: GenerateChartParams) -> ToolResult:
+        options = params.model_dump(exclude_none=True)
+        figure, summary = await chart_builder.build_chart(
+            db=ctx.db,
             dataset_id=ctx.dataset_id,
             comparison_name=ctx.comparison_name,
-            db=ctx.db,
-            current_user=ctx.current_user,
-            max_points=params.max_points,
-            force_recalculate=False,
-            padj_threshold=params.padj_threshold,
-            logfc_threshold=params.logfc_threshold,
+            chart_type=params.chart_type,
+            options=options,
         )
-        summary = {
-            "total_genes": payload.get("total_genes"),
-            "significant_genes": payload.get("significant_genes"),
-            "thresholds": payload.get("thresholds"),
-        }
+        # figure is None when there is no data to draw (e.g. enrichment with no pathways):
+        # return a text-only summary so the model narrates instead of showing an empty plot.
         return ToolResult(
             summary_for_model=summary,
-            figure_type=self.figure_type,
-            figure_payload=payload,
-            params=params.model_dump(),
+            figure_type=self.figure_type if figure is not None else None,
+            figure_payload=figure,
+            params=options,
         )
 
 
@@ -230,6 +256,6 @@ def build_default_tools() -> List[BaseTool]:
     return [
         GetDatasetSummaryTool(),
         ListDegGenesTool(),
-        GenerateVolcanoPlotTool(),
+        GenerateChartTool(),
         GetEnrichmentPathwaysTool(),
     ]

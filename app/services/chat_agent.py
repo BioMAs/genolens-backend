@@ -184,11 +184,13 @@ class ChatAgent:
 
                     tool_count += 1
                     if result.figure_type and result.figure_payload is not None:
+                        # For Plotly figures the payload IS the {data, layout} spec that
+                        # the frontend renders directly; carry it as `spec`.
                         figure = {
                             "call_id": f"fig{len(figures) + 1}",
                             "figure_type": result.figure_type,
                             "params": result.params,
-                            "payload": result.figure_payload,
+                            "spec": result.figure_payload,
                         }
                         figures.append(figure)
                         yield _event("figure", **figure)
