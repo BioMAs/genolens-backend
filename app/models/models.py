@@ -552,6 +552,75 @@ class AIInterpretation(Base, TimestampMixin):
         return f"<AIInterpretation(dataset_id={self.dataset_id}, comparison={self.comparison_name})>"
 
 
+class AgentSession(Base, TimestampMixin):
+    """
+    AgentSession: a multi-turn conversation with the agentic "chat mode".
+    Bound to an explicitly selected context (project + DEG dataset + comparison).
+    Distinct from the legacy per-comparison AIConversation Q&A history.
+    """
+    __tablename__ = "agent_sessions"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        nullable=False, index=True, comment="Supabase Auth user UUID"
+    )
+    project_id: Mapped[UUID] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    dataset_id: Mapped[UUID] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    comparison_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    messages: Mapped[list["AgentMessage"]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="AgentMessage.sequence",
+    )
+
+    __table_args__ = (
+        Index("ix_agent_sessions_user", "user_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AgentSession(id={self.id}, dataset_id={self.dataset_id}, comparison={self.comparison_name})>"
+
+
+class AgentMessage(Base, TimestampMixin):
+    """
+    AgentMessage: one turn in an AgentSession.
+
+    A single assistant turn can carry narrative text, the tool calls it made, the
+    compact tool results fed to the model, and the full figure payloads used to
+    re-render plots on reload.
+    """
+    __tablename__ = "agent_messages"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    session_id: Mapped[UUID] = mapped_column(
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user | assistant
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    tool_calls: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    tool_results: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    figures: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+
+    model: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    session: Mapped["AgentSession"] = relationship(back_populates="messages")
+
+    __table_args__ = (
+        Index("ix_agent_messages_session_sequence", "session_id", "sequence"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AgentMessage(session_id={self.session_id}, role={self.role}, seq={self.sequence})>"
+
+
 class User(Base, TimestampMixin):
     """
     User: Extended user profile linked to Supabase Auth.

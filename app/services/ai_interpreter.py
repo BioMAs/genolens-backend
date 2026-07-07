@@ -580,10 +580,10 @@ Answer DIRECTLY without repeating raw data."""
     async def generate_simple_answer(self, prompt: str) -> str:
         """
         Generate a simple answer to a user question.
-        
+
         Args:
             prompt: The question prompt with context
-            
+
         Returns:
             str: The AI's answer
         """
@@ -602,15 +602,126 @@ Answer DIRECTLY without repeating raw data."""
                         }
                     }
                 )
-                
+
                 if response.status_code != 200:
                     raise Exception(f"Ollama API error: {response.status_code}")
-                
+
                 result = response.json()
                 return result.get("response", "").strip()
-                
+
         except Exception as e:
             logger.error(f"Error generating answer: {str(e)}")
+            raise
+
+    # ── Tool-calling chat (agentic chat mode) ────────────────────────────────
+    async def chat_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: float = 0.2,
+        num_ctx: int = 8192,
+        num_predict: int = 1024,
+    ) -> Dict[str, Any]:
+        """
+        One non-streamed turn against Ollama's /api/chat with optional tool binding.
+
+        Used by the agentic chat orchestrator to let the model decide whether to
+        call a tool. Returns the raw assistant message dict:
+            {"role": "assistant", "content": str, "tool_calls": [ ... ] | None}
+
+        Ollama returns tool-call arguments already parsed as dicts (not JSON
+        strings). llama3.1:8b sometimes emits a tool call inside `content` instead
+        of `tool_calls`; the orchestrator handles that fallback, this method only
+        transports the response faithfully.
+        """
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_ctx": num_ctx,
+                "num_predict": num_predict,
+            },
+        }
+        if tools:
+            payload["tools"] = tools
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await self._call_with_retry(
+                    client, f"{self.base_url}/api/chat", payload
+                )
+                result = response.json()
+                message = result.get("message") or {}
+                # Normalise: always expose a content string and a tool_calls list/None
+                return {
+                    "role": message.get("role", "assistant"),
+                    "content": message.get("content", "") or "",
+                    "tool_calls": message.get("tool_calls") or None,
+                }
+        except httpx.ConnectError:
+            logger.error("Cannot connect to Ollama for tool-calling chat")
+            raise Exception(
+                "Impossible de se connecter à Ollama. Vérifiez qu'Ollama est démarré."
+            )
+        except Exception as e:
+            logger.error(f"chat_with_tools error: {str(e)}")
+            raise
+
+    async def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.2,
+        num_ctx: int = 8192,
+        num_predict: int = 1024,
+    ) -> AsyncGenerator[str, None]:
+        """
+        Stream the FINAL narrative turn from /api/chat (no tools bound).
+
+        The 8B model is more reliable when tool-selection and prose generation are
+        split: the orchestrator resolves tool calls with `chat_with_tools`, then
+        streams the answer here with `tools=None` to force prose. Yields content
+        tokens as they arrive.
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+                "num_ctx": num_ctx,
+                "num_predict": num_predict,
+            },
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream(
+                    "POST", f"{self.base_url}/api/chat", json=payload
+                ) as response:
+                    if response.status_code != 200:
+                        logger.error(f"Ollama chat stream error: {response.status_code}")
+                        raise Exception(f"Ollama API returned status {response.status_code}")
+
+                    import json as _json
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = _json.loads(line)
+                        except _json.JSONDecodeError:
+                            continue
+                        token = (chunk.get("message") or {}).get("content", "")
+                        if token:
+                            yield token
+                        if chunk.get("done", False):
+                            break
+        except httpx.ConnectError:
+            logger.error("Cannot connect to Ollama for chat streaming")
+            raise Exception("Impossible de se connecter à Ollama pour le streaming")
+        except Exception as e:
+            logger.error(f"chat_stream error: {str(e)}")
             raise
 
 
