@@ -2409,7 +2409,7 @@ Return ONLY a JSON array of pathway IDs (the exact IDs from the list), nothing e
     interpreter = LocalAIInterpreter()
     
     try:
-        ai_response = await interpreter._call_ollama_raw(ai_prompt, max_tokens=500)
+        ai_response = await interpreter._call_llm_raw(ai_prompt, max_tokens=500)
         
         # Parse AI response
         import json
@@ -2501,14 +2501,11 @@ async def interpret_comparison(
     language: str = Query("fr", description="Output language: fr or en")
 ) -> dict:
     """
-    Generate AI interpretation of a comparison using local Ollama.
-    
-    **Privacy**: All processing is done locally - no data exported to external services.
-    
-    **Prerequisites**:
-    1. Ollama installed and running (ollama serve)
-    2. BioMistral model downloaded (ollama pull biomistral)
-    
+    Generate AI interpretation of a comparison using the remote LLM endpoint (Modal/vLLM, Gemma 4).
+
+    **Prerequisites**: LLM_BASE_URL / LLM_API_KEY / LLM_MODEL configured and the
+    Modal service deployed (see infra/modal/gemma_vllm.py).
+
     The interpretation is cached in dataset metadata to avoid regeneration.
     Use force_regenerate=true to update the interpretation.
     
@@ -2651,20 +2648,21 @@ async def interpret_comparison(
         # 4. Call local AI interpreter
         interpreter = LocalAIInterpreter()
         
-        # Check if Ollama is available
+        # Check if the LLM endpoint (Modal/vLLM) is reachable
         availability = await interpreter.check_availability()
         if not availability["available"]:
             raise HTTPException(
                 status_code=503,
-                detail="Ollama n'est pas disponible. Vérifiez qu'Ollama est démarré (ollama serve) "
-                       "et que le modèle est téléchargé (ollama pull biomistral)."
+                detail="Le service d'inférence LLM est indisponible. Vérifiez que le "
+                       "point d'accès Modal est déployé et que LLM_BASE_URL / LLM_API_KEY "
+                       "sont configurés."
             )
-        
+
         if not availability["model_available"]:
             raise HTTPException(
                 status_code=503,
-                detail=f"Le modèle '{interpreter.model}' n'est pas installé. "
-                       f"Téléchargez-le avec: ollama pull {interpreter.model}"
+                detail=f"Le modèle '{interpreter.model}' n'est pas servi par le point "
+                       f"d'accès LLM ({interpreter.base_url})."
             )
         
         interpretation = await interpreter.interpret_comparison(
@@ -3301,28 +3299,23 @@ async def check_ai_status(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)]
 ) -> dict:
     """
-    Check if local AI (Ollama) is available and which models are installed.
-    
+    Check if the remote LLM endpoint (Modal/vLLM) is reachable and which model it serves.
+
     Returns:
         {
             "available": bool,
             "models": List[str],
-            "recommended_model": str,
             "current_model": str,
-            "version": str
+            "model_available": bool,
+            "base_url": str
         }
     """
     interpreter = LocalAIInterpreter()
     status_info = await interpreter.check_availability()
-    
+
     return {
         **status_info,
-        "recommended_model": "biomistral",
-        "install_instructions": {
-            "macos": "brew install ollama && ollama serve && ollama pull biomistral",
-            "linux": "curl -fsSL https://ollama.ai/install.sh | sh && ollama serve && ollama pull biomistral",
-            "windows": "Download from https://ollama.ai/download"
-        }
+        "recommended_model": "google/gemma-4-E4B-it",
     }
 
 

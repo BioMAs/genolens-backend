@@ -58,6 +58,20 @@ class Settings(BaseSettings):
         description="Supabase storage bucket name"
     )
 
+    # LLM inference (Modal + vLLM, OpenAI-compatible endpoint serving Gemma 4)
+    LLM_BASE_URL: str = Field(
+        default="http://localhost:11434/v1",
+        description="OpenAI-compatible base URL of the LLM server (Modal/vLLM), incl. /v1",
+    )
+    LLM_API_KEY: str = Field(
+        default="not-needed",
+        description="Bearer token for the LLM server (matches vLLM --api-key / Modal secret)",
+    )
+    LLM_MODEL: str = Field(
+        default="google/gemma-4-E4B-it",
+        description="Model id served by the LLM endpoint",
+    )
+
     # CORS
     CORS_ORIGINS: list[str] = Field(
         default=["http://localhost:3000", "http://localhost:5173"],

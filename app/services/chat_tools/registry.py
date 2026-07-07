@@ -1,5 +1,5 @@
 """
-Tool registry: holds the instantiated tool set, exposes Ollama tool schemas, and
+Tool registry: holds the instantiated tool set, exposes OpenAI-compatible tool schemas, and
 dispatches validated tool calls.
 
 Validation happens here (Pydantic per tool). On invalid args we DO NOT raise — we
@@ -29,7 +29,7 @@ class ToolRegistry:
         self._tools: Dict[str, BaseTool] = {t.name: t for t in (tools or build_default_tools())}
 
     def schemas(self) -> List[Dict[str, Any]]:
-        """Ollama /api/chat tool schemas for every registered tool."""
+        """OpenAI-compatible tool schemas for every registered tool."""
         return [t.schema() for t in self._tools.values()]
 
     def has(self, name: str) -> bool:

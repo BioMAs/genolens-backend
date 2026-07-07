@@ -2,7 +2,7 @@
 Base types for chat-mode tools.
 
 A tool declares:
-  - name / description   : surfaced to the LLM in the Ollama tool schema
+  - name / description   : surfaced to the LLM in the tool schema
   - params_model         : a Pydantic model validating the model-supplied args
   - figure_type          : the frontend plot component this tool feeds (or None)
   - execute(ctx, params) : runs the underlying analysis and returns a ToolResult
@@ -58,9 +58,9 @@ class BaseTool(ABC):
     figure_type: Optional[str] = None
 
     def schema(self) -> Dict[str, Any]:
-        """Return the Ollama /api/chat tool schema for this tool."""
+        """Return the OpenAI-compatible tool schema for this tool."""
         params_schema = self.params_model.model_json_schema()
-        # Ollama/llama expects a plain JSON-schema object for parameters.
+        # vLLM/OpenAI expects a plain JSON-schema object for parameters.
         params_schema.pop("title", None)
         return {
             "type": "function",

@@ -34,9 +34,9 @@ umap-learn==0.5.5
 # HTTP Client
 httpx>=0.24,<0.26
 
-# AI/LLM - Local inference
-# Used for local AI interpretation with Ollama (no data export)
-# Install Ollama separately: brew install ollama (macOS) or see https://ollama.ai
+# AI/LLM - remote inference via OpenAI-compatible endpoint (Modal + vLLM, Gemma 4)
+# See infra/modal/gemma_vllm.py and docs/setup/ai-modal.md
+openai>=1.40,<2
 
 # File Processing
 aiofiles==23.2.1

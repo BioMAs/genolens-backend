@@ -33,11 +33,11 @@ SERVICES_WITH_BUILD = {"backend", "license"}
 SERVICE_ENV_KEYS = {
     "backend": [
         "POSTGRES_PASSWORD", "SUPABASE_URL", "SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY",
-        "SUPABASE_JWT_SECRET", "ADMIN_API_KEY", "AI_HOST", "OLLAMA_MODEL",
+        "SUPABASE_JWT_SECRET", "ADMIN_API_KEY",
+        "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
         "LICENSE_DOMAIN", "BACKEND_DOMAIN",
     ],
     "license": ["ADMIN_API_KEY", "LICENSE_DOMAIN"],
-    "ai": ["AI_HOST"],
 }
 
 
@@ -240,19 +240,6 @@ def run_deployment(self, job_id: str) -> dict:
                             ssh.close()
                             return {"status": "error"}
 
-                    elif svc == "ai":
-                        ai_dir = f"{repo}/ai"
-                        ok = await exec_step(
-                            "docker compose pull (ai)",
-                            f"cd {ai_dir} && docker compose pull"
-                        )
-                        # pull errors are non-fatal (image may already be present)
-                        await exec_step(
-                            "restart ai",
-                            f"cd {ai_dir} && docker compose up -d",
-                            allow_fail=True
-                        )
-
                     elif svc == "git_pull":
                         # Update submodules to their latest remote commits.
                         # The main repo git pull already ran above; this step
@@ -319,7 +306,6 @@ async def _fail(db, job: DeploymentJob, reason: str):
 
 def _build_backend_env(env: dict[str, str], server) -> str:
     """Build the .env file content for the backend service."""
-    ai_host = env.get("AI_HOST", "")
     license_domain = env.get("LICENSE_DOMAIN", "")
     backend_domain = env.get("BACKEND_DOMAIN", "")
     return f"""DATABASE_URL=postgresql+asyncpg://postgres:{env.get('POSTGRES_PASSWORD', '')}@postgres:5432/genolens
@@ -335,8 +321,9 @@ SUPABASE_STORAGE_BUCKET=genolens-data
 ENVIRONMENT=production
 LOCAL_STORAGE_PATH=/app/data
 APP_URL=https://app.genolens.com
-OLLAMA_BASE_URL=http://{ai_host}:11434
-OLLAMA_MODEL={env.get('OLLAMA_MODEL', 'llama3.1:8b')}
+LLM_BASE_URL={env.get('LLM_BASE_URL', '')}
+LLM_API_KEY={env.get('LLM_API_KEY', '')}
+LLM_MODEL={env.get('LLM_MODEL', 'google/gemma-4-E4B-it')}
 LICENSE_SERVER_URL=https://{license_domain}
 LICENSE_ADMIN_API_KEY={env.get('ADMIN_API_KEY', '')}
 CORS_ORIGINS=["https://app.genolens.com","https://{backend_domain}","http://localhost:3000"]

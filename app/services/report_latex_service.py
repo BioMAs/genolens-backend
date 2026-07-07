@@ -605,7 +605,7 @@ class ReportLatexService:
             )
         )
         if ai is None and generate_ai:
-            # Time-boxed, best-effort: Ollama generation is slow (minutes) and the
+            # Time-boxed, best-effort: LLM generation can be slow (cold start) and the
             # r-worker is single-concurrency, so never let it block the report/worker.
             try:
                 from app.services.ai_interpreter import generate_and_store  # T6

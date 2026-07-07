@@ -1,147 +1,82 @@
 """
 AI Interpreter Service for GenoLens.
-Uses local AI models (Ollama) to interpret RNA-seq comparison results.
-No data is exported to external services - fully private and offline.
+
+Talks to a remote OpenAI-compatible LLM endpoint (Modal + vLLM serving Gemma 4)
+to interpret RNA-seq comparison results. Configured via LLM_BASE_URL /
+LLM_API_KEY / LLM_MODEL (see app/core/config.py and infra/modal/gemma_vllm.py).
 """
-import asyncio
-import httpx
-import os
-from typing import Dict, Any, Optional, List, AsyncGenerator
 import logging
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
+import httpx
+from openai import APIConnectionError, AsyncOpenAI
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Gemma 4 is a thinking model. Our tasks all want a direct answer within a small
+# token budget, so we disable chain-of-thought per request: it would otherwise
+# consume the max_tokens budget and (in streaming) leak into the prose. Templates
+# that don't support the flag simply ignore it.
+_NO_THINKING: Dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 class LocalAIInterpreter:
     """
-    Local AI interpreter using Ollama with retry logic and fallback support.
-    
-    Prerequisites:
-    1. Install Ollama: brew install ollama (macOS) or see https://ollama.ai
-    2. Start Ollama: ollama serve
-    3. Download BioMistral: ollama pull biomistral
-    
-    Alternative models (used as fallbacks):
-    - ollama pull llama3.2:3b (2GB, lightweight)
-    - ollama pull llama3.1:8b (8GB, general purpose)
+    Interpreter backed by an OpenAI-compatible LLM server (Modal/vLLM, Gemma 4).
+
+    The class name is kept for backward compatibility with existing callers; the
+    inference itself is now remote and stateless.
     """
-    
-    # Model fallback chain (from most capable to most lightweight)
-    MODEL_FALLBACK_CHAIN = [
-        "llama3.2:3b",      # 2GB - Default, lightweight
-        "llama3.1:8b",      # 8GB - Better quality if available
-        "biomistral",       # 4.1GB - Specialized biomedical (may cause OOM)
-    ]
-    
+
     def __init__(
         self,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         timeout: float = 600.0,
-        max_retries: int = 3
+        max_retries: int = 3,
     ):
         """
-        Initialize the AI interpreter.
-        
         Args:
-            base_url: Ollama API base URL (default: env OLLAMA_BASE_URL or http://localhost:11434)
-            model: Model to use (default: env OLLAMA_MODEL or llama3.1:8b)
+            base_url: OpenAI-compatible base URL incl. /v1 (default: settings.LLM_BASE_URL)
+            model: Model id to use (default: settings.LLM_MODEL)
             timeout: Request timeout in seconds (default: 600s = 10 minutes)
-            max_retries: Maximum number of retry attempts (default: 3)
+            max_retries: Retry attempts on transient errors (handled by the SDK)
         """
-        self.base_url = base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        self.model = model or os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+        self.base_url = base_url or settings.LLM_BASE_URL
+        self.model = model or settings.LLM_MODEL
         self.timeout = timeout
         self.max_retries = max_retries
-    
-    async def _call_with_retry(
-        self,
-        client: httpx.AsyncClient,
-        url: str,
-        payload: Dict[str, Any],
-        attempt: int = 1
-    ) -> httpx.Response:
-        """
-        Call Ollama API with exponential backoff retry logic.
-        
-        Args:
-            client: HTTP client
-            url: API endpoint URL
-            payload: Request payload
-            attempt: Current attempt number
-            
-        Returns:
-            HTTP response
-            
-        Raises:
-            Exception: If all retries fail
-        """
-        try:
-            response = await client.post(url, json=payload)
-            
-            # Handle OOM errors by falling back to lighter model
-            if response.status_code == 500:
-                logger.warning(f"Model {self.model} failed with OOM on attempt {attempt}")
-                
-                # Try next lighter model in fallback chain
-                current_idx = self.MODEL_FALLBACK_CHAIN.index(self.model) if self.model in self.MODEL_FALLBACK_CHAIN else 0
-                if current_idx < len(self.MODEL_FALLBACK_CHAIN) - 1:
-                    fallback_model = self.MODEL_FALLBACK_CHAIN[current_idx + 1]
-                    logger.info(f"Falling back to lighter model: {fallback_model}")
-                    payload["model"] = fallback_model
-                    return await self._call_with_retry(client, url, payload, attempt)
-                else:
-                    raise Exception(
-                        "AI model out of memory. Please increase Docker memory allocation "
-                        "(Settings > Resources > Memory to 8+ GB) or use a lighter model."
-                    )
-            
-            if response.status_code != 200:
-                logger.error(f"Ollama API error: {response.status_code} - {response.text}")
-                
-                if attempt < self.max_retries:
-                    # Exponential backoff: wait 2^attempt seconds
-                    wait_time = 2 ** attempt
-                    logger.info(f"Retrying in {wait_time} seconds... (attempt {attempt + 1}/{self.max_retries})")
-                    await asyncio.sleep(wait_time)
-                    return await self._call_with_retry(client, url, payload, attempt + 1)
-                else:
-                    raise Exception(f"Ollama API returned status {response.status_code} after {self.max_retries} attempts")
-            
-            return response
-            
-        except httpx.TimeoutException:
-            if attempt < self.max_retries:
-                wait_time = 2 ** attempt
-                logger.warning(f"Request timeout, retrying in {wait_time}s... (attempt {attempt + 1}/{self.max_retries})")
-                await asyncio.sleep(wait_time)
-                return await self._call_with_retry(client, url, payload, attempt + 1)
-            else:
-                logger.error(f"Request timeout after {self.max_retries} attempts")
-                raise Exception(
-                    f"AI model timeout after {self.timeout}s and {self.max_retries} attempts. "
-                    "Try using a smaller model or increase timeout."
-                )
-        self.max_retries = max_retries
-        
+        # Modal returns a 303 redirect (to the same URL + __modal_function_call_id)
+        # whenever a request outlives ~150s — which happens on every scale-to-zero
+        # cold start while Gemma loads. The openai SDK's httpx client does NOT follow
+        # redirects by default and would raise; we must opt in explicitly.
+        self.client = AsyncOpenAI(
+            base_url=self.base_url,
+            api_key=settings.LLM_API_KEY,
+            max_retries=max_retries,
+            http_client=httpx.AsyncClient(follow_redirects=True, timeout=timeout),
+        )
+
     async def interpret_comparison(
         self,
         comparison_name: str,
         deg_summary: Dict[str, Any],
         top_pathways: List[Dict[str, Any]],
         top_genes: List[Dict[str, Any]],
-        language: str = "en"
+        language: str = "en",
     ) -> str:
         """
         Generate a biological interpretation of a comparison.
-        
+
         Args:
             comparison_name: Name of the comparison (e.g., "Treated_vs_Control")
             deg_summary: Summary of DEGs {"up_count": 520, "down_count": 312}
             top_pathways: Top enriched pathways (max 15)
             top_genes: Top differentially expressed genes (max 20)
             language: Output language ("fr" or "en")
-        
+
         Returns:
             AI-generated interpretation text
         """
@@ -150,51 +85,34 @@ class LocalAIInterpreter:
             "deg_up": deg_summary.get("up_count", 0),
             "deg_down": deg_summary.get("down_count", 0),
             "top_pathways": top_pathways[:15],
-            "top_genes": top_genes[:20]
+            "top_genes": top_genes[:20],
         }
-        
+
         prompt = self._build_prompt(context, language)
-        
+
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                payload = {
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.3,  # Lower = more deterministic
-                        "top_p": 0.9,
-                        "num_predict": 600,  # Increased for better quality
-                        "num_ctx": 1024,     # Context window size
-                    }
-                }
-                
-                # Use retry logic
-                response = await self._call_with_retry(
-                    client,
-                    f"{self.base_url}/api/generate",
-                    payload
-                )
-                
-                result = response.json()
-                interpretation = result.get("response", "")
-                
-                if not interpretation:
-                    raise Exception("Empty response from AI model")
-                
-                return interpretation
-                
-        except httpx.ConnectError:
-            logger.error("Cannot connect to Ollama. Is it running? (ollama serve)")
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,  # Lower = more deterministic
+                top_p=0.9,
+                max_tokens=600,
+                extra_body=_NO_THINKING,
+            )
+            interpretation = (response.choices[0].message.content or "").strip()
+            if not interpretation:
+                raise Exception("Empty response from AI model")
+            return interpretation
+        except APIConnectionError:
+            logger.error("Cannot reach the LLM endpoint (%s)", self.base_url)
             raise Exception(
-                "Impossible de se connecter à Ollama. "
-                "Vérifiez qu'Ollama est démarré (ollama serve) "
-                "et que le modèle est téléchargé (ollama pull llama3.2)"
+                "Service LLM indisponible. Vérifiez que le point d'accès Modal "
+                "est déployé et que LLM_BASE_URL / LLM_API_KEY sont configurés."
             )
         except Exception as e:
             logger.error(f"AI interpretation error: {str(e)}")
             raise
-    
+
     async def interpret_cosmetics(
         self,
         cosmetics_data: Dict[str, Any],
@@ -218,31 +136,23 @@ class LocalAIInterpreter:
         prompt = self._build_cosmetics_prompt(cosmetics_data, comparison_name)
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                payload = {
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.4,
-                        "top_p": 0.9,
-                        "num_predict": 900,
-                        "num_ctx": 2048,
-                    },
-                }
-                response = await self._call_with_retry(
-                    client, f"{self.base_url}/api/generate", payload
-                )
-                result = response.json()
-                interpretation = result.get("response", "")
-                if not interpretation:
-                    raise Exception("Empty response from AI model")
-                return interpretation
-        except httpx.ConnectError:
-            logger.error("Cannot connect to Ollama for cosmetics interpretation")
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                top_p=0.9,
+                max_tokens=900,
+                extra_body=_NO_THINKING,
+            )
+            interpretation = (response.choices[0].message.content or "").strip()
+            if not interpretation:
+                raise Exception("Empty response from AI model")
+            return interpretation
+        except APIConnectionError:
+            logger.error("Cannot reach the LLM endpoint for cosmetics interpretation")
             raise Exception(
-                "Cannot connect to Ollama. Ensure the AI server is running and "
-                "the model is available."
+                "LLM endpoint unavailable. Ensure the Modal service is deployed "
+                "and LLM_BASE_URL / LLM_API_KEY are configured."
             )
         except Exception as e:
             logger.error(f"Cosmetics AI interpretation error: {str(e)}")
@@ -323,120 +233,70 @@ Be specific, rely only on the data provided, and never invent gene names or path
         deg_summary: Dict[str, Any],
         top_pathways: List[Dict[str, Any]],
         top_genes: List[Dict[str, Any]],
-        language: str = "en"
+        language: str = "en",
     ) -> AsyncGenerator[str, None]:
         """
-        Generate a biological interpretation of a comparison with streaming support.
-        Yields text chunks as they are generated by the AI model.
-        
-        Args:
-            comparison_name: Name of the comparison
-            deg_summary: Summary of DEGs
-            top_pathways: Top enriched pathways
-            top_genes: Top differentially expressed genes
-            language: Output language ("fr" or "en")
-        
-        Yields:
-            str: Text chunks as generated
+        Streaming variant of interpret_comparison. Yields text chunks as generated.
         """
         context = {
             "comparison": comparison_name,
             "deg_up": deg_summary.get("up_count", 0),
             "deg_down": deg_summary.get("down_count", 0),
             "top_pathways": top_pathways[:15],
-            "top_genes": top_genes[:20]
+            "top_genes": top_genes[:20],
         }
-        
+
         prompt = self._build_prompt(context, language)
-        
+
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                payload = {
-                    "model": self.model,
-                    "prompt": prompt,
-                    "stream": True,  # Enable streaming
-                    "options": {
-                        "temperature": 0.3,
-                        "top_p": 0.9,
-                        "num_predict": 600,
-                        "num_ctx": 1024,
-                    }
-                }
-                
-                async with client.stream(
-                    "POST",
-                    f"{self.base_url}/api/generate",
-                    json=payload
-                ) as response:
-                    if response.status_code != 200:
-                        logger.error(f"Ollama streaming error: {response.status_code}")
-                        raise Exception(f"Ollama API returned status {response.status_code}")
-                    
-                    async for line in response.aiter_lines():
-                        if line:
-                            try:
-                                import json
-                                chunk = json.loads(line)
-                                if "response" in chunk:
-                                    yield chunk["response"]
-                                if chunk.get("done", False):
-                                    break
-                            except json.JSONDecodeError:
-                                continue
-                                
-        except httpx.ConnectError:
-            logger.error("Cannot connect to Ollama for streaming")
-            raise Exception("Impossible de se connecter à Ollama pour le streaming")
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                top_p=0.9,
+                max_tokens=600,
+                stream=True,
+                extra_body=_NO_THINKING,
+            )
+            async for chunk in stream:
+                token = chunk.choices[0].delta.content if chunk.choices else None
+                if token:
+                    yield token
+        except APIConnectionError:
+            logger.error("Cannot reach the LLM endpoint for streaming")
+            raise Exception("Service LLM indisponible pour le streaming.")
         except Exception as e:
             logger.error(f"AI streaming error: {str(e)}")
             raise
-    
-    async def _call_ollama_raw(self, prompt: str, max_tokens: int = 2000) -> str:
+
+    async def _call_llm_raw(self, prompt: str, max_tokens: int = 2000) -> str:
         """
-        Raw call to Ollama API for custom prompts.
-        
-        Args:
-            prompt: The prompt to send
-            max_tokens: Maximum tokens to generate
-            
-        Returns:
-            Raw AI response text
+        Raw single-shot generation for custom prompts (e.g. pathway selection).
+
+        Returns the assistant text (empty string if the model returns nothing).
         """
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    f"{self.base_url}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "num_predict": max_tokens,
-                            "temperature": 0.3,  # Lower temperature for more focused responses
-                            "top_p": 0.9
-                        }
-                    }
-                )
-                
-                if response.status_code != 200:
-                    logger.error(f"Ollama API error: {response.status_code} - {response.text}")
-                    raise Exception(f"Ollama API returned status {response.status_code}")
-                
-                result = response.json()
-                return result.get("response", "")
-                
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                top_p=0.9,
+                max_tokens=max_tokens,
+                extra_body=_NO_THINKING,
+            )
+            return (response.choices[0].message.content or "").strip()
         except Exception as e:
-            logger.error(f"Ollama raw call error: {str(e)}")
+            logger.error(f"LLM raw call error: {str(e)}")
             raise
-    
+
     def _build_prompt(self, context: Dict[str, Any], language: str = "fr") -> str:
         """
         Build the prompt for the AI model.
-        
+
         Args:
             context: Comparison context with DEG and pathway data
             language: Output language
-        
+
         Returns:
             Formatted prompt string
         """
@@ -447,7 +307,7 @@ Be specific, rely only on the data provided, and never invent gene names or path
             f"{p.get('gene_count', p.get('count', 0))} gènes)"
             for p in context["top_pathways"][:10]  # Only top 10
         ])
-        
+
         # Format genes list
         genes_text = "\n".join([
             f"- {g.get('gene_name', g.get('gene_id', 'Unknown'))}: "
@@ -455,7 +315,7 @@ Be specific, rely only on the data provided, and never invent gene names or path
             f"adj.p={g.get('padj', 1):.2e}"
             for g in context["top_genes"][:15]  # Only top 15
         ])
-        
+
         # Build the interpretation prompt (simplified for faster response)
         if language == "fr":
             return f"""Tu es un expert en bioinformatique et biologie moléculaire spécialisé en analyse transcriptomique RNA-seq.
@@ -523,10 +383,10 @@ Answer DIRECTLY without repeating raw data."""
     def _format_pathways_text(self, pathways: List[Any]) -> str:
         """
         Format pathways for display.
-        
+
         Args:
             pathways: List of pathway dictionaries
-            
+
         Returns:
             Formatted string
         """
@@ -535,48 +395,41 @@ Answer DIRECTLY without repeating raw data."""
             f"p={p.get('padj', 1):.2e}, {p.get('gene_count', 0)} genes"
             for p in pathways[:10]
         ])
-    
+
     async def check_availability(self) -> Dict[str, Any]:
         """
-        Check if Ollama is available and which models are installed.
-        
+        Check if the LLM endpoint is reachable and which models it serves.
+
         Returns:
             {
                 "available": bool,
                 "models": List[str],
                 "current_model": str,
-                "version": str
+                "model_available": bool,
+                "base_url": str,
             }
         """
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                # Check version
-                version_response = await client.get(f"{self.base_url}/api/version")
-                version = version_response.json().get("version", "unknown")
-                
-                # List models
-                models_response = await client.get(f"{self.base_url}/api/tags")
-                models_data = models_response.json()
-                models = [m["name"] for m in models_data.get("models", [])]
-                
-                return {
-                    "available": True,
-                    "models": models,
-                    "current_model": self.model,
-                    "model_available": self.model in models,
-                    "version": version,
-                    "base_url": self.base_url
-                }
+            models = await self.client.models.list()
+            model_ids = [m.id for m in models.data]
+            return {
+                "available": True,
+                "models": model_ids,
+                "current_model": self.model,
+                # vLLM serves a single model; treat "reachable" as "available".
+                "model_available": (self.model in model_ids) or bool(model_ids),
+                "base_url": self.base_url,
+            }
         except Exception as e:
-            logger.warning(f"Ollama not available: {str(e)}")
+            logger.warning(f"LLM endpoint not available: {str(e)}")
             return {
                 "available": False,
                 "models": [],
                 "current_model": self.model,
                 "model_available": False,
-                "error": str(e)
+                "error": str(e),
             }
-    
+
     async def generate_simple_answer(self, prompt: str) -> str:
         """
         Generate a simple answer to a user question.
@@ -588,27 +441,14 @@ Answer DIRECTLY without repeating raw data."""
             str: The AI's answer
         """
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    f"{self.base_url}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "temperature": 0.3,
-                            "num_predict": 300,  # Shorter answers for Q&A
-                            "num_ctx": 1024,     # Reduced to prevent OOM
-                        }
-                    }
-                )
-
-                if response.status_code != 200:
-                    raise Exception(f"Ollama API error: {response.status_code}")
-
-                result = response.json()
-                return result.get("response", "").strip()
-
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=300,  # Shorter answers for Q&A
+                extra_body=_NO_THINKING,
+            )
+            return (response.choices[0].message.content or "").strip()
         except Exception as e:
             logger.error(f"Error generating answer: {str(e)}")
             raise
@@ -619,52 +459,51 @@ Answer DIRECTLY without repeating raw data."""
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
         temperature: float = 0.2,
-        num_ctx: int = 8192,
         num_predict: int = 1024,
     ) -> Dict[str, Any]:
         """
-        One non-streamed turn against Ollama's /api/chat with optional tool binding.
+        One non-streamed turn against /v1/chat/completions with optional tools.
 
-        Used by the agentic chat orchestrator to let the model decide whether to
-        call a tool. Returns the raw assistant message dict:
+        Returns the normalised assistant message dict:
             {"role": "assistant", "content": str, "tool_calls": [ ... ] | None}
 
-        Ollama returns tool-call arguments already parsed as dicts (not JSON
-        strings). llama3.1:8b sometimes emits a tool call inside `content` instead
-        of `tool_calls`; the orchestrator handles that fallback, this method only
-        transports the response faithfully.
+        OpenAI/vLLM returns tool-call arguments as JSON *strings*; the orchestrator
+        (chat_agent._extract_tool_calls) parses them.
         """
-        payload: Dict[str, Any] = {
+        kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "stream": False,
-            "options": {
-                "temperature": temperature,
-                "num_ctx": num_ctx,
-                "num_predict": num_predict,
-            },
+            "temperature": temperature,
+            "max_tokens": num_predict,
+            "extra_body": _NO_THINKING,
         }
         if tools:
-            payload["tools"] = tools
+            kwargs["tools"] = tools
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await self._call_with_retry(
-                    client, f"{self.base_url}/api/chat", payload
-                )
-                result = response.json()
-                message = result.get("message") or {}
-                # Normalise: always expose a content string and a tool_calls list/None
-                return {
-                    "role": message.get("role", "assistant"),
-                    "content": message.get("content", "") or "",
-                    "tool_calls": message.get("tool_calls") or None,
-                }
-        except httpx.ConnectError:
-            logger.error("Cannot connect to Ollama for tool-calling chat")
-            raise Exception(
-                "Impossible de se connecter à Ollama. Vérifiez qu'Ollama est démarré."
-            )
+            response = await self.client.chat.completions.create(**kwargs)
+            message = response.choices[0].message
+            tool_calls = None
+            if message.tool_calls:
+                tool_calls = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,  # JSON string
+                        },
+                    }
+                    for tc in message.tool_calls
+                ]
+            return {
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": tool_calls,
+            }
+        except APIConnectionError:
+            logger.error("Cannot reach the LLM endpoint for tool-calling chat")
+            raise Exception("Service LLM indisponible pour le chat.")
         except Exception as e:
             logger.error(f"chat_with_tools error: {str(e)}")
             raise
@@ -673,57 +512,33 @@ Answer DIRECTLY without repeating raw data."""
         self,
         messages: List[Dict[str, Any]],
         temperature: float = 0.2,
-        num_ctx: int = 8192,
         num_predict: int = 1024,
     ) -> AsyncGenerator[str, None]:
         """
-        Stream the FINAL narrative turn from /api/chat (no tools bound).
+        Stream the FINAL narrative turn from /v1/chat/completions (no tools bound).
 
-        The 8B model is more reliable when tool-selection and prose generation are
-        split: the orchestrator resolves tool calls with `chat_with_tools`, then
-        streams the answer here with `tools=None` to force prose. Yields content
+        Thinking is disabled so the stream carries prose only. Yields content
         tokens as they arrive.
         """
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            "options": {
-                "temperature": temperature,
-                "num_ctx": num_ctx,
-                "num_predict": num_predict,
-            },
-        }
-
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                async with client.stream(
-                    "POST", f"{self.base_url}/api/chat", json=payload
-                ) as response:
-                    if response.status_code != 200:
-                        logger.error(f"Ollama chat stream error: {response.status_code}")
-                        raise Exception(f"Ollama API returned status {response.status_code}")
-
-                    import json as _json
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        try:
-                            chunk = _json.loads(line)
-                        except _json.JSONDecodeError:
-                            continue
-                        token = (chunk.get("message") or {}).get("content", "")
-                        if token:
-                            yield token
-                        if chunk.get("done", False):
-                            break
-        except httpx.ConnectError:
-            logger.error("Cannot connect to Ollama for chat streaming")
-            raise Exception("Impossible de se connecter à Ollama pour le streaming")
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=num_predict,
+                stream=True,
+                extra_body=_NO_THINKING,
+            )
+            async for chunk in stream:
+                token = chunk.choices[0].delta.content if chunk.choices else None
+                if token:
+                    yield token
+        except APIConnectionError:
+            logger.error("Cannot reach the LLM endpoint for chat streaming")
+            raise Exception("Service LLM indisponible pour le streaming.")
         except Exception as e:
             logger.error(f"chat_stream error: {str(e)}")
             raise
-
 
 
 async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparison_name, language: str = "fr"):
@@ -733,7 +548,7 @@ async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparis
     Genes come from the DEG dataset; pathways from the (separate) annoDB ENRICHMENT
     dataset when provided — the legacy interpret endpoint read pathways from the DEG
     dataset, which no longer holds enrichment rows. Returns the AIInterpretation, or
-    None if Ollama is unavailable / there is no DEG data (graceful for report use).
+    None if the LLM is unavailable / there is no DEG data (graceful for report use).
     """
     from sqlalchemy import select, func
     from app.models.models import DegGene, EnrichmentPathway, AIInterpretation
@@ -775,7 +590,7 @@ async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparis
     interpreter = LocalAIInterpreter()
     availability = await interpreter.check_availability()
     if not availability.get("available") or not availability.get("model_available"):
-        logger.info("generate_and_store: Ollama unavailable for %s", comparison_name)
+        logger.info("generate_and_store: LLM endpoint unavailable for %s", comparison_name)
         return None
 
     interpretation = await interpreter.interpret_comparison(

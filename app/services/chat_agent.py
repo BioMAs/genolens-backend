@@ -1,7 +1,7 @@
 """
 Agentic chat orchestrator for GenoLens "chat mode".
 
-Runs a bounded tool-calling loop against Ollama (llama3.1:8b): the model decides
+Runs a bounded tool-calling loop against the LLM (Gemma 4 via Modal/vLLM): the model decides
 which analysis tool to call, we execute it in-process, feed a compact summary back,
 and finally stream a plain-language narrative. Figures produced by tools are emitted
 as structured events so the frontend renders the existing plot components inline.
@@ -74,7 +74,7 @@ class ChatAgent:
         )
 
     def _history_messages(self, history: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-        """Reconstruct a windowed Ollama message list from stored turns (content only)."""
+        """Reconstruct a windowed message list from stored turns (content only)."""
         msgs: List[Dict[str, str]] = []
         for turn in history[-self.MAX_CONTEXT_MESSAGES:]:
             role = turn.get("role")
@@ -87,14 +87,15 @@ class ChatAgent:
 
     def _extract_tool_calls(self, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Normalise tool calls to [{"name": str, "arguments": dict}].
+        Normalise tool calls to [{"id": str, "name": str, "arguments": dict}].
 
-        Handles the native Ollama shape and a fallback where an 8B model emits a
-        tool call as JSON inside `content` instead of the `tool_calls` field.
+        Handles the OpenAI/vLLM shape (arguments are JSON *strings*, each call has
+        an `id`) and a fallback where the model emits a tool call as JSON inside
+        `content` instead of the `tool_calls` field (synthetic ids assigned).
         """
         calls: List[Dict[str, Any]] = []
         raw_calls = msg.get("tool_calls") or []
-        for tc in raw_calls:
+        for idx, tc in enumerate(raw_calls):
             fn = (tc or {}).get("function") or {}
             name = fn.get("name")
             args = fn.get("arguments")
@@ -104,7 +105,8 @@ class ChatAgent:
                 except json.JSONDecodeError:
                     args = {}
             if name:
-                calls.append({"name": name, "arguments": args or {}})
+                call_id = (tc or {}).get("id") or f"call_{idx}"
+                calls.append({"id": call_id, "name": name, "arguments": args or {}})
 
         if calls:
             return calls
@@ -112,7 +114,7 @@ class ChatAgent:
         # Fallback: scan content for a bare JSON object naming a known tool.
         content = msg.get("content") or ""
         if content and "{" in content:
-            for match in re.finditer(r"\{[^{}]*\}", content):
+            for idx, match in enumerate(re.finditer(r"\{[^{}]*\}", content)):
                 try:
                     obj = json.loads(match.group(0))
                 except json.JSONDecodeError:
@@ -120,7 +122,11 @@ class ChatAgent:
                 name = obj.get("name") or obj.get("tool")
                 if name and self.registry.has(name):
                     args = obj.get("arguments") or obj.get("parameters") or {}
-                    calls.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
+                    calls.append({
+                        "id": f"call_{idx}",
+                        "name": name,
+                        "arguments": args if isinstance(args, dict) else {},
+                    })
         return calls
 
     # ── main loop ────────────────────────────────────────────────────────────
@@ -153,25 +159,33 @@ class ChatAgent:
                     # Model is ready to answer — stop the tool loop.
                     break
 
-                # Record the assistant's tool-call turn for the model's context.
+                # Record the assistant's tool-call turn for the model's context,
+                # in the OpenAI schema (id + type + JSON-string arguments).
                 messages.append({
                     "role": "assistant",
                     "content": msg.get("content", ""),
                     "tool_calls": [
-                        {"function": {"name": c["name"], "arguments": c["arguments"]}}
+                        {
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {
+                                "name": c["name"],
+                                "arguments": json.dumps(c["arguments"], default=str),
+                            },
+                        }
                         for c in tool_calls
                     ],
                 })
 
                 for call in tool_calls:
-                    name, args = call["name"], call["arguments"]
+                    call_id, name, args = call["id"], call["name"], call["arguments"]
                     yield _event("status", phase="calling_tool")
                     yield _event("tool_call", tool=name, args=args)
                     try:
                         result = await self.registry.dispatch(name, args)
                     except ToolDispatchError as exc:
                         yield _event("error", message=str(exc), recoverable=True)
-                        messages.append({"role": "tool", "content": f"ERROR: {exc}"})
+                        messages.append({"role": "tool", "tool_call_id": call_id, "content": f"ERROR: {exc}"})
                         continue
                     except Exception as exc:  # noqa: BLE001 — tool runtime failure
                         logger.warning("Tool '%s' failed: %s", name, exc)
@@ -179,7 +193,7 @@ class ChatAgent:
                         yield _event(
                             "error", message=f"Tool '{name}' failed: {detail}", recoverable=True
                         )
-                        messages.append({"role": "tool", "content": f"ERROR: {detail}"})
+                        messages.append({"role": "tool", "tool_call_id": call_id, "content": f"ERROR: {detail}"})
                         continue
 
                     tool_count += 1
@@ -196,6 +210,7 @@ class ChatAgent:
                         yield _event("figure", **figure)
                     messages.append({
                         "role": "tool",
+                        "tool_call_id": call_id,
                         "content": json.dumps(result.summary_for_model, default=str),
                     })
             else:

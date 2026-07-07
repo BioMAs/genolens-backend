@@ -191,7 +191,7 @@ async def trigger_deployment(
     """Trigger an on-premise deployment. Returns immediately; follow progress via GET /deployments/{id}."""
     await _get_server_or_404(db, payload.server_id)
 
-    valid_services = {"backend", "license", "ai", "git_pull"}
+    valid_services = {"backend", "license", "git_pull"}
     bad = [s for s in payload.services if s not in valid_services]
     if bad:
         raise HTTPException(status_code=400, detail=f"Unknown services: {bad}")

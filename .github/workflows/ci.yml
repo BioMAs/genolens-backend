@@ -52,7 +52,9 @@ jobs:
           STRIPE_PRICE_PREMIUM_MONTHLY=
           STRIPE_PRICE_ADVANCED_MONTHLY=
           LOCAL_STORAGE_PATH=/tmp/genolens_test
-          OLLAMA_BASE_URL=http://localhost:11434
+          LLM_BASE_URL=http://localhost:11434/v1
+          LLM_API_KEY=ci-not-needed
+          LLM_MODEL=google/gemma-4-E4B-it
           EOF
 
       - name: Build and start services (postgres, redis, api only)
