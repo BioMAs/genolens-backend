@@ -999,6 +999,13 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 if manifest.get("has_vst") and vst_local.exists():
                     vst_storage = f"projects/{analysis.project_id}/analyses/{analysis_id}/vst_counts.tsv"
                     await storage_service.upload_file(vst_storage, vst_local.read_bytes())
+                    vst_meta = {"source": "vst", "analysis_id": str(analysis_id)}
+                    # Persist the QC report emitted by the R pipeline so the frontend
+                    # can render preprocessing metrics (samples passed/removed, gene
+                    # filtering, thresholds) on the analysis page.
+                    qc_report = manifest.get("qc_report")
+                    if isinstance(qc_report, dict):
+                        vst_meta["qc_report"] = qc_report
                     vst_ds = Dataset(
                         id=_uuid4(),
                         project_id=analysis.project_id,
@@ -1006,7 +1013,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                         type=DatasetType.MATRIX,
                         status=DatasetStatus.PENDING,
                         raw_file_path=vst_storage,
-                        dataset_metadata={"source": "vst", "analysis_id": str(analysis_id)},
+                        dataset_metadata=vst_meta,
                         column_mapping={},
                     )
                     db.add(vst_ds)

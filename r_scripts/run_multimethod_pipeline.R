@@ -116,6 +116,11 @@ counts_mat <- as.matrix(counts_raw[, count_cols, drop = FALSE])
 rownames(counts_mat) <- gene_ids
 storage.mode(counts_mat) <- "integer"
 
+# QC capture — pre-filter totals (persisted to the manifest as qc_report)
+qc_input_sample_ids <- colnames(counts_mat)
+qc_total_samples    <- length(qc_input_sample_ids)
+qc_genes_before     <- nrow(counts_mat)
+
 # Filter samples by min_reads / min_genes
 message("[2/5] QC filtering...")
 col_reads <- colSums(counts_mat)
@@ -139,6 +144,7 @@ gene_names  <- if (!is.null(gene_name_col)) {
   counts_raw[[gene_name_col]][counts_raw[[gene_col]] %in% gene_ids]
 } else gene_ids
 
+qc_genes_after <- nrow(counts_mat)
 message("  Retained ", nrow(counts_mat), " genes and ", ncol(counts_mat), " samples")
 
 # Normalise contrast table
@@ -159,7 +165,27 @@ if (!is.na(flag_col)) {
   if (nrow(contrasts) == 0) stop("No comparisons left to run after perform_analysis filter")
 }
 
-manifest <- list(has_vst = FALSE, comparisons = c(), comparison_stats = list())
+qc_removed_ids <- setdiff(qc_input_sample_ids, sample_ids)
+manifest <- list(
+  has_vst = FALSE,
+  comparisons = c(),
+  comparison_stats = list(),
+  qc_report = list(
+    total_input_samples  = qc_total_samples,
+    samples_passed       = length(sample_ids),
+    samples_removed      = length(qc_removed_ids),
+    removed_sample_ids   = as.list(qc_removed_ids),
+    genes_before_filter  = qc_genes_before,
+    genes_after_filter   = qc_genes_after,
+    genes_removed        = qc_genes_before - qc_genes_after,
+    min_reads_threshold  = opt$`min-reads`,
+    min_genes_threshold  = opt$`min-genes`,
+    min_count_threshold  = opt$`min-count`,
+    min_reps_threshold   = opt$`min-reps`,
+    design_formula       = as.character(opt$design),
+    has_batch_correction = grepl("batch", tolower(as.character(opt$design)))
+  )
+)
 results_dir <- file.path(opt$outdir, "comparisons")
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
