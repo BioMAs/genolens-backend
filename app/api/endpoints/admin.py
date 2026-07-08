@@ -896,6 +896,19 @@ async def delete_user(
             except Exception as e:
                 logger.warning(f"Warning: Failed to clean up remote sequencing_projects: {e}")
 
+            # 4.1b Clean up 'status_history' rows referencing this user, either as
+            # the subject (user_id) or the actor (changed_by). Those FKs have no
+            # ON DELETE rule and otherwise block deleting the user.
+            for column in ("changed_by", "user_id"):
+                try:
+                    await client.delete(
+                        f"{settings.SUPABASE_URL}/rest/v1/status_history",
+                        headers=headers,
+                        params={column: f"eq.{user_id}"}
+                    )
+                except Exception as e:
+                    logger.warning(f"Warning: Failed to clean up status_history.{column}: {e}")
+
             # 4.2 Delete user via Supabase Admin API
             response = await client.delete(
                 f"{settings.SUPABASE_URL}/auth/v1/admin/users/{user_id}",
