@@ -2767,7 +2767,8 @@ async def interpret_comparison(
             action_type="interpretation",
             dataset_id=dataset_id,
             comparison_name=comparison_name,
-            model_used=interpreter.model
+            model_used=interpreter.model,
+            tokens_used=interpreter.last_usage["total_tokens"],
         )
 
         return {
@@ -2912,7 +2913,8 @@ IMPORTANT: Write in plain text only. Do NOT use Markdown formatting (no # for he
             action_type="question",
             dataset_id=dataset_id,
             comparison_name=comparison_name,
-            model_used=interpreter.model
+            model_used=interpreter.model,
+            tokens_used=interpreter.last_usage["total_tokens"],
         )
 
         return {

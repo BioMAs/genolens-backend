@@ -861,6 +861,28 @@ class AIUsageLog(Base, TimestampMixin):
         return f"<AIUsageLog(user_id={self.user_id}, action={self.action_type}, tokens={self.tokens_used})>"
 
 
+class ModalMonthlyCost(Base, TimestampMixin):
+    """
+    Modal LLM spend for a given calendar month, entered by an admin.
+
+    Drives per-user AI cost estimation: rate = spend_eur / total_tokens(month),
+    cost_user = tokens_user(month) * rate. One row per (year, month).
+    """
+    __tablename__ = "modal_monthly_costs"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    year: Mapped[int] = mapped_column(Integer, nullable=False)
+    month: Mapped[int] = mapped_column(Integer, nullable=False, comment="1-12")
+    spend_eur: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    __table_args__ = (
+        Index("ux_modal_monthly_costs_year_month", "year", "month", unique=True),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ModalMonthlyCost({self.year}-{self.month:02d}: {self.spend_eur}€)>"
+
+
 class CachedComputation(Base, TimestampMixin):
     """
     CachedComputation: Persistent cache for expensive computations.

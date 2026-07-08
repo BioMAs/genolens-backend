@@ -12,6 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps.supabase_deps import get_current_user
+from app.core.config import settings
 from app.core.supabase_auth import SupabaseUser
 from app.db.session import get_db
 from app.models.models import User, UserRole, SubscriptionPlan
@@ -124,17 +125,23 @@ async def increment_ai_usage(
     action_type: str = "interpretation",
     dataset_id: UUID = None,
     comparison_name: str = None,
-    model_used: str = "biomistral"
+    model_used: str = None,
+    tokens_used: int = 1,
 ) -> None:
-    """Log AI usage. Quota enforcement is via DB unique index, not counters."""
+    """Log AI usage. Quota enforcement is via DB unique index, not counters.
+
+    `tokens_used` should be the real token count from the LLM response
+    (interpreter.last_usage["total_tokens"]); it drives per-user cost accounting.
+    Falls back to 1 when the caller has no token count (keeps a per-action tally).
+    """
     from app.models.models import AIUsageLog
     log = AIUsageLog(
         user_id=user.id,
         dataset_id=dataset_id,
         action_type=action_type,
         comparison_name=comparison_name,
-        model_used=model_used,
-        tokens_used=1,
+        model_used=model_used or settings.LLM_MODEL,
+        tokens_used=max(int(tokens_used or 0), 0),
         was_free=True,
     )
     db.add(log)

@@ -191,6 +191,7 @@ async def interpret_cosmetics(
             dataset_id=dataset_id,
             comparison_name=comparison_name,
             model_used=interpreter.model,
+            tokens_used=interpreter.last_usage["total_tokens"],
         )
     except Exception:  # noqa: BLE001 — usage logging must never block the response
         logger.warning("Failed to log cosmetics AI usage", exc_info=True)

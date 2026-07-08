@@ -211,6 +211,7 @@ async def send_chat_message(
                             user=db_user, db=sdb, action_type="chat_agent",
                             dataset_id=dataset_id, comparison_name=comparison_name,
                             model_used=interpreter.model,
+                            tokens_used=interpreter.last_usage["total_tokens"],
                         )
                 except Exception as persist_exc:  # noqa: BLE001
                     logger.warning("Failed to persist assistant turn: %s", persist_exc)

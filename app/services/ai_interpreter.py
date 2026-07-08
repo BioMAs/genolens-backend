@@ -58,6 +58,22 @@ class LocalAIInterpreter:
             max_retries=max_retries,
             http_client=httpx.AsyncClient(follow_redirects=True, timeout=timeout),
         )
+        # Token usage of the most recent completion (set by _record_usage). Read by
+        # callers to log real token counts for per-user cost accounting.
+        self.last_usage: Dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def _record_usage(self, response: Any) -> None:
+        """Capture token usage from a completion response into self.last_usage."""
+        u = getattr(response, "usage", None)
+        self.last_usage = {
+            "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+            "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
+            "total_tokens": getattr(u, "total_tokens", 0) or 0,
+        }
 
     async def interpret_comparison(
         self,
@@ -99,6 +115,7 @@ class LocalAIInterpreter:
                 max_tokens=600,
                 extra_body=_NO_THINKING,
             )
+            self._record_usage(response)
             interpretation = (response.choices[0].message.content or "").strip()
             if not interpretation:
                 raise Exception("Empty response from AI model")
@@ -144,6 +161,7 @@ class LocalAIInterpreter:
                 max_tokens=900,
                 extra_body=_NO_THINKING,
             )
+            self._record_usage(response)
             interpretation = (response.choices[0].message.content or "").strip()
             if not interpretation:
                 raise Exception("Empty response from AI model")
@@ -284,6 +302,7 @@ Be specific, rely only on the data provided, and never invent gene names or path
                 max_tokens=max_tokens,
                 extra_body=_NO_THINKING,
             )
+            self._record_usage(response)
             return (response.choices[0].message.content or "").strip()
         except Exception as e:
             logger.error(f"LLM raw call error: {str(e)}")
@@ -398,37 +417,24 @@ Answer DIRECTLY without repeating raw data."""
 
     async def check_availability(self) -> Dict[str, Any]:
         """
-        Check if the LLM endpoint is reachable and which models it serves.
+        Report LLM availability from CONFIG, without probing the endpoint.
 
-        Returns:
-            {
-                "available": bool,
-                "models": List[str],
-                "current_model": str,
-                "model_available": bool,
-                "base_url": str,
-            }
+        The LLM is a serverless (scale-to-zero) Modal endpoint. Actively probing it
+        (e.g. on every page mount) would wake the container, hammer it with 429s
+        during cold start, waste Modal credit, and yield false negatives that block
+        the whole feature. So availability is derived from configuration: if a real
+        remote endpoint is configured, the feature is available. Real failures
+        surface at generation time (with retries/backoff).
         """
-        try:
-            models = await self.client.models.list()
-            model_ids = [m.id for m in models.data]
-            return {
-                "available": True,
-                "models": model_ids,
-                "current_model": self.model,
-                # vLLM serves a single model; treat "reachable" as "available".
-                "model_available": (self.model in model_ids) or bool(model_ids),
-                "base_url": self.base_url,
-            }
-        except Exception as e:
-            logger.warning(f"LLM endpoint not available: {str(e)}")
-            return {
-                "available": False,
-                "models": [],
-                "current_model": self.model,
-                "model_available": False,
-                "error": str(e),
-            }
+        url = self.base_url or ""
+        configured = bool(url) and "localhost" not in url and "127.0.0.1" not in url
+        return {
+            "available": configured,
+            "models": [self.model] if configured else [],
+            "current_model": self.model,
+            "model_available": configured,
+            "base_url": self.base_url,
+        }
 
     async def generate_simple_answer(self, prompt: str) -> str:
         """
@@ -448,6 +454,7 @@ Answer DIRECTLY without repeating raw data."""
                 max_tokens=300,  # Shorter answers for Q&A
                 extra_body=_NO_THINKING,
             )
+            self._record_usage(response)
             return (response.choices[0].message.content or "").strip()
         except Exception as e:
             logger.error(f"Error generating answer: {str(e)}")
@@ -482,6 +489,7 @@ Answer DIRECTLY without repeating raw data."""
 
         try:
             response = await self.client.chat.completions.create(**kwargs)
+            self._record_usage(response)
             message = response.choices[0].message
             tool_calls = None
             if message.tool_calls:
