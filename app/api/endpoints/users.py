@@ -1,12 +1,21 @@
-from typing import Any, Annotated
+from typing import Any, Annotated, Optional, Literal
 from fastapi import APIRouter, Depends, Body
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps.subscription import get_or_create_user
 from app.api.deps import get_db
 from app.models.models import User, SubscriptionPlan
 from app.schemas import user as user_schemas
+from app.services import email_service
 
 router = APIRouter()
+
+
+class AccessRequest(BaseModel):
+    """A user's request to change plan or unlock a module (emailed to sales)."""
+    type: Literal["plan", "module"]
+    item: str = Field(..., max_length=120)
+    details: Optional[str] = Field(None, max_length=500)
 
 @router.get("/me", response_model=user_schemas.UserSelf)
 async def read_user_me(
@@ -32,3 +41,22 @@ async def update_my_subscription(
     await db.commit()
     await db.refresh(current_user)
     return current_user
+
+
+@router.post("/requests")
+async def submit_access_request(
+    payload: AccessRequest,
+    current_user: Annotated[User, Depends(get_or_create_user)],
+) -> dict:
+    """
+    Submit a plan-change or module-access request. Emails the sales inbox so the
+    team can follow up. Always returns 200 so the UI can confirm receipt even if
+    the mail transport is momentarily unavailable (the attempt is logged).
+    """
+    sent = await email_service.send_access_request(
+        requester_email=current_user.email or "unknown user",
+        kind=payload.type,
+        item=payload.item,
+        details=payload.details,
+    )
+    return {"status": "received", "emailed": sent}

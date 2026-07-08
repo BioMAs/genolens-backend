@@ -318,6 +318,35 @@ async def send_email(
 # Public helpers
 # ---------------------------------------------------------------------------
 
+async def send_access_request(
+    requester_email: str,
+    kind: str,
+    item: str,
+    details: Optional[str] = None,
+) -> bool:
+    """
+    Notify the sales inbox that a user requested a plan change or a module.
+
+    *kind* is "plan" or "module"; *item* is the human-readable name.
+    """
+    label = "Plan" if kind == "plan" else "Module"
+    subject = f"{label} request — {item} · GenoLens"
+    detail_html = f"<p style='color:#5b6472'>{details}</p>" if details else ""
+    detail_text = f"\nDetails: {details}" if details else ""
+    html_body = (
+        f"<p><b>{requester_email}</b> requested the <b>{item}</b> {kind}.</p>"
+        f"{detail_html}"
+        f"<p style='color:#9aa0ab;font-size:12px'>Sent from the GenoLens app.</p>"
+    )
+    text_body = f"{requester_email} requested the {item} {kind}.{detail_text}\n\nSent from the GenoLens app."
+    return await send_email(
+        to=settings.SALES_EMAIL,
+        subject=subject,
+        html_body=html_body,
+        text_body=text_body,
+    )
+
+
 async def send_project_invitation(
     invitee_email: str,
     inviter_email: str,

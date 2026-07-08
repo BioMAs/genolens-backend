@@ -129,6 +129,7 @@ class Settings(BaseSettings):
     SMTP_STARTTLS: bool = Field(default=True, description="Use STARTTLS (port 587)")
     EMAIL_FROM_ADDRESS: Optional[str] = Field(None, description="From address for outgoing emails")
     EMAIL_FROM_NAME: str = Field(default="GenoLens", description="Display name for outgoing emails")
+    SALES_EMAIL: str = Field(default="contact@scilicium.com", description="Recipient for plan / module access requests")
 
     # Stripe
     STRIPE_SECRET_KEY: Optional[str] = Field(None, description="Stripe secret key (sk_live_... or sk_test_...)")
