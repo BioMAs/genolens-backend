@@ -210,8 +210,11 @@ async def list_users(
                     ai_purchased = local_user.ai_tokens_purchased
                     ai_tokens_used = local_user.ai_tokens_used
                     ai_remaining = local_user.ai_interpretations_remaining
-                    cosmetics_enabled = local_user.has_cosmetics_module
-                    report_customization_enabled = local_user.has_report_customization
+                    # Raw per-user flags (NOT has_* which is role-inflated: admins would
+                    # always show ON, making the toggle look stuck). Admin panel edits
+                    # the stored flag; effective access is still role-aware at feature endpoints.
+                    cosmetics_enabled = local_user.cosmetics_module_enabled
+                    report_customization_enabled = local_user.report_customization_module_enabled
 
                 result.append(UserProfile(
                     id=UUID(user_id),
@@ -309,8 +312,9 @@ async def get_user_details(
                         ai_remaining = local_user.ai_interpretations_remaining
                         ai_purchased = local_user.ai_tokens_purchased
                         ai_tokens_used = local_user.ai_tokens_used
-                        cosmetics_enabled = local_user.has_cosmetics_module
-                        report_customization_enabled = local_user.has_report_customization
+                        # Raw per-user flags (see note above) — not the role-inflated has_*.
+                        cosmetics_enabled = local_user.cosmetics_module_enabled
+                        report_customization_enabled = local_user.report_customization_module_enabled
 
                     return UserProfile(
                         id=UUID(profile["id"]),
