@@ -202,6 +202,7 @@ async def list_users(
                 ai_remaining = 0
                 cosmetics_enabled = False
                 report_customization_enabled = False
+                role_value = profile.get("role", "USER")
 
                 if local_user:
                     sub_plan = local_user.subscription_plan.value
@@ -210,6 +211,10 @@ async def list_users(
                     ai_purchased = local_user.ai_tokens_purchased
                     ai_tokens_used = local_user.ai_tokens_used
                     ai_remaining = local_user.ai_interpretations_remaining
+                    # Local role is authoritative (it drives access gating); the Supabase
+                    # profile role can be stale (hence "Blocked role downgrade" warnings).
+                    # Lowercased to match the admin panel's role convention.
+                    role_value = local_user.role.value.lower()
                     # Raw per-user flags (NOT has_* which is role-inflated: admins would
                     # always show ON, making the toggle look stuck). Admin panel edits
                     # the stored flag; effective access is still role-aware at feature endpoints.
@@ -221,7 +226,7 @@ async def list_users(
                     email=auth_info.get("email"),
                     full_name=profile.get("full_name"),
                     avatar_url=profile.get("avatar_url"),
-                    role=profile.get("role", "USER"),
+                    role=role_value,
                     status=user_status,
                     subscription_plan=sub_plan,
                     ai_interpretations_used=ai_used,
@@ -305,6 +310,7 @@ async def get_user_details(
                     ai_tokens_used = 0
                     cosmetics_enabled = False
                     report_customization_enabled = False
+                    role_value = profile.get("role", "USER")
 
                     if local_user:
                         sub_plan = local_user.subscription_plan.value
@@ -312,6 +318,8 @@ async def get_user_details(
                         ai_remaining = local_user.ai_interpretations_remaining
                         ai_purchased = local_user.ai_tokens_purchased
                         ai_tokens_used = local_user.ai_tokens_used
+                        # Local role is authoritative (drives gating); Supabase role can be stale.
+                        role_value = local_user.role.value.lower()
                         # Raw per-user flags (see note above) — not the role-inflated has_*.
                         cosmetics_enabled = local_user.cosmetics_module_enabled
                         report_customization_enabled = local_user.report_customization_module_enabled
@@ -321,7 +329,7 @@ async def get_user_details(
                         email=email,
                         full_name=profile.get("full_name"),
                         avatar_url=profile.get("avatar_url"),
-                        role=profile.get("role", "USER"),
+                        role=role_value,
                         subscription_plan=sub_plan,
                         ai_interpretations_used=ai_used,
                         ai_interpretations_remaining=ai_remaining,
