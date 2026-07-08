@@ -37,7 +37,8 @@ class UserProfile(BaseModel):
     ai_interpretations_used: int = 0
     ai_tokens_purchased: int = 0
     ai_tokens_used: int = 0
-    ai_interpretations_remaining: int = 0
+    # None = unlimited (TEAM/ON_PREMISE/ADMIN); -1 = no access (STARTER)
+    ai_interpretations_remaining: Optional[int] = None
     cosmetics_module_enabled: bool = False
     report_customization_module_enabled: bool = False
     created_at: Optional[str] = None
