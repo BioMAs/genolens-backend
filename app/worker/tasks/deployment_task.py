@@ -326,7 +326,7 @@ LLM_API_KEY={env.get('LLM_API_KEY', '')}
 LLM_MODEL={env.get('LLM_MODEL', 'google/gemma-4-E4B-it')}
 LICENSE_SERVER_URL=https://{license_domain}
 LICENSE_ADMIN_API_KEY={env.get('ADMIN_API_KEY', '')}
-CORS_ORIGINS=["https://app.genolens.com","https://{backend_domain}","http://localhost:3000"]
+CORS_ORIGINS=["https://app.genolens.com","https://admin.genolens.com","https://{backend_domain}","http://localhost:3000"]
 """
 
 
