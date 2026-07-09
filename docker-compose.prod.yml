@@ -54,6 +54,16 @@ services:
       - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY}
       - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY}
       - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
+      # Email (Resend via SMTP)
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_TLS=${SMTP_TLS:-false}
+      - SMTP_STARTTLS=${SMTP_STARTTLS:-true}
+      - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS}
+      - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-GenoLens}
+      - SALES_EMAIL=${SALES_EMAIL:-contact@scilicium.com}
 
     volumes:
       - genolens_storage:/app/data
@@ -99,6 +109,16 @@ services:
       - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY}
       - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY}
       - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
+      # Email (Resend via SMTP)
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_TLS=${SMTP_TLS:-false}
+      - SMTP_STARTTLS=${SMTP_STARTTLS:-true}
+      - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS}
+      - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-GenoLens}
+      - SALES_EMAIL=${SALES_EMAIL:-contact@scilicium.com}
     volumes:
       - genolens_storage:/app/data
     depends_on:
