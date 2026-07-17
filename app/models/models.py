@@ -386,11 +386,33 @@ class GeneSet(Base, TimestampMixin):
         comment="Organism for this gene set"
     )
 
-    # Indexes for efficient queries
+    # Scoping for user-defined (CUSTOM) gene sets. NULL for built-in databases
+    # (GO/KEGG/... are global). Custom sets are scoped to a project (and owner).
+    project_id: Mapped[Optional[UUID]] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        comment="Owning project for custom gene sets (NULL = built-in/global)"
+    )
+    user_id: Mapped[Optional[UUID]] = mapped_column(
+        nullable=True,
+        comment="Creator of a custom gene set (NULL = built-in)"
+    )
+
+    # Indexes for efficient queries. Uniqueness is split so built-in sets stay
+    # globally unique on (name, database) while custom sets are unique per project
+    # (a nullable project_id would otherwise make NULL rows non-comparable).
     __table_args__ = (
         Index("ix_gene_sets_database_organism", "database", "organism"),
-        Index("ix_gene_sets_name_database", "name", "database", unique=True),
         Index("ix_gene_sets_size", "size"),
+        Index(
+            "ix_gene_sets_name_db_builtin", "name", "database",
+            unique=True, postgresql_where=sa_text("project_id IS NULL"),
+        ),
+        Index(
+            "ix_gene_sets_name_db_project", "name", "database", "project_id",
+            unique=True, postgresql_where=sa_text("project_id IS NOT NULL"),
+        ),
     )
 
     def __repr__(self) -> str:

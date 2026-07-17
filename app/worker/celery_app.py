@@ -47,6 +47,7 @@ celery_app.conf.include = [
     "app.worker.tasks.deployment_task",
     "app.worker.tasks.report_task",
     "app.worker.tasks.intersection_enrichment_task",
+    "app.worker.tasks.gsea_task",
 ]
 
 celery_app.conf.beat_schedule = {

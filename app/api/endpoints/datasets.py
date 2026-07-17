@@ -38,7 +38,7 @@ from app.api.deps.subscription import (
 # from app.db.session import get_db  <-- Removed
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
-from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, UserRole, GOTerm
+from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, UserRole, GOTerm, CachedComputation, GeneList
 from sqlalchemy import select, func, delete, text, or_, desc, asc, and_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -3339,6 +3339,227 @@ async def get_custom_boxplot_data(
     }
 
 
+@router.post("/{dataset_id}/signature-score", dependencies=[Depends(require_active_license)])
+async def signature_score(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    gene_list_id: Optional[UUID] = Body(None, description="Saved GeneList id to score"),
+    genes: Optional[list[str]] = Body(None, description="Explicit gene symbols/ids to score"),
+    method: str = Body("mean_z", description="Scoring method: mean_z | mean_rank"),
+    samples: Optional[list[str]] = Body(None, description="Restrict to these sample columns"),
+    sample_condition_map: Optional[dict] = Body(
+        None, description="{sample: condition} — else derived from sample-name prefix"
+    ),
+) -> dict:
+    """
+    Score a gene signature per sample on an expression MATRIX dataset, then
+    compare scores between conditions.
+
+    Resolve the signature from a saved ``gene_list_id`` or an explicit ``genes``
+    list, compute one score per sample (see signature_scoring), group samples by
+    condition (client-provided ``sample_condition_map`` preferred, else sample-name
+    prefix), and run a non-parametric between-group test.
+    """
+    from app.services.signature_scoring import score_signature, group_and_test, SUPPORTED_METHODS
+
+    if method not in SUPPORTED_METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid method: {method}. Options: {list(SUPPORTED_METHODS)}",
+        )
+
+    # Verify access
+    result = await db.execute(
+        select(Dataset).options(joinedload(Dataset.project)).where(Dataset.id == dataset_id)
+    )
+    dataset = result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    project = dataset.project
+    if project.owner_id != current_user.user_id:
+        member_result = await db.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project.id,
+                ProjectMember.user_id == current_user.user_id,
+            )
+        )
+        if member_result.scalar_one_or_none() is None:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    if dataset.type != DatasetType.MATRIX:
+        raise HTTPException(
+            status_code=400,
+            detail="Signature scoring requires an expression MATRIX dataset",
+        )
+
+    # Resolve the signature genes
+    resolved_genes: list[str] = []
+    signature_name = None
+    if gene_list_id is not None:
+        gl = await db.get(GeneList, gene_list_id)
+        if not gl or gl.project_id != project.id:
+            raise HTTPException(status_code=404, detail="Gene list not found in this project")
+        resolved_genes = [str(g) for g in (gl.genes or [])]
+        signature_name = gl.name
+    elif genes:
+        resolved_genes = [str(g) for g in genes]
+    if not resolved_genes:
+        raise HTTPException(status_code=400, detail="Provide gene_list_id or a non-empty genes list")
+
+    # Load matrix parquet (same read path as the custom boxplot)
+    parquet_path = Path(settings.LOCAL_STORAGE_PATH) / dataset.parquet_file_path
+    if not parquet_path.exists():
+        raise HTTPException(status_code=404, detail="Dataset file not found")
+
+    import pyarrow.parquet as pq
+    df = pq.read_table(str(parquet_path)).to_pandas()
+
+    gene_col = next((c for c in df.columns if "gene" in c.lower() or "symbol" in c.lower()), None)
+    if not gene_col:
+        raise HTTPException(status_code=400, detail="No gene column found in dataset")
+
+    stat_columns = {"log2FoldChange", "logFC", "pvalue", "padj", "baseMean", "lfcSE", "stat"}
+    expression_cols = [
+        c for c in df.columns
+        if df[c].dtype in ["int64", "float64"] and c not in stat_columns and c != gene_col
+    ]
+    if samples:
+        requested = set(samples)
+        expression_cols = [c for c in expression_cols if c in requested]
+    if not expression_cols:
+        raise HTTPException(status_code=400, detail="No expression columns found")
+
+    scored = score_signature(df, gene_col, expression_cols, resolved_genes, method=method)
+    if scored["n_genes_used"] == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="None of the signature genes were found in this matrix (check gene id namespace)",
+        )
+
+    # Resolve sample→condition: prefer client map, else sample-name prefix heuristic
+    cond_map = dict(sample_condition_map or {})
+    if not cond_map:
+        for s in expression_cols:
+            cond_map[s] = s.split("_")[0] if "_" in s else s
+
+    grouped = group_and_test(scored["scores"], cond_map)
+
+    per_sample = [
+        {"sample": s, "score": v, "group": cond_map.get(s)}
+        for s, v in scored["scores"].items()
+        if v is not None
+    ]
+
+    return {
+        "dataset_id": str(dataset_id),
+        "method": method,
+        "signature_name": signature_name,
+        "n_genes_requested": scored["n_genes_requested"],
+        "n_genes_used": scored["n_genes_used"],
+        "n_samples": len(per_sample),
+        "scores": per_sample,
+        "groups": grouped["groups"],
+        "test": grouped["test"],
+        "stat": grouped["stat"],
+        "pvalue": grouped["pvalue"],
+    }
+
+
+@router.get("/{dataset_id}/clustering-quality")
+async def clustering_quality(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    top_n_genes: int = Query(1000, ge=10, le=5000),
+    metric: str = Query("euclidean"),
+    k_min: int = Query(2, ge=2, le=20),
+    k_max: int = Query(10, ge=2, le=20),
+) -> dict:
+    """
+    Sweep K-means over k in [k_min, k_max] on the sample-clustering space and
+    return the silhouette score + inertia for each k, plus the recommended k
+    (highest silhouette). Powers the "Find optimal k" control.
+    """
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+    from sklearn.preprocessing import StandardScaler
+
+    # Access + type checks
+    result = await db.execute(
+        select(Dataset).options(joinedload(Dataset.project)).where(Dataset.id == dataset_id)
+    )
+    dataset = result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    project = dataset.project
+    if project.owner_id != current_user.user_id:
+        member = await db.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project.id,
+                ProjectMember.user_id == current_user.user_id,
+            )
+        )
+        if member.scalar_one_or_none() is None:
+            raise HTTPException(status_code=403, detail="Access denied")
+    if dataset.type != DatasetType.MATRIX:
+        raise HTTPException(status_code=400, detail="Clustering quality requires a MATRIX dataset")
+
+    parquet_path = Path(settings.LOCAL_STORAGE_PATH) / dataset.parquet_file_path
+    if not parquet_path.exists():
+        raise HTTPException(status_code=404, detail="Dataset file not found")
+
+    import pyarrow.parquet as pq
+    df = pq.read_table(str(parquet_path)).to_pandas()
+
+    gene_col = next((c for c in df.columns if "gene" in c.lower() or "symbol" in c.lower()), None)
+    stat_columns = {"log2FoldChange", "logFC", "pvalue", "padj", "baseMean", "lfcSE", "stat"}
+    expression_cols = [
+        c for c in df.columns
+        if df[c].dtype in ["int64", "float64"] and c not in stat_columns and c != gene_col
+    ]
+    if len(expression_cols) < 3:
+        raise HTTPException(status_code=400, detail="Need at least 3 samples for silhouette analysis")
+
+    # Top-N most variable genes, then samples × genes matrix (impute + standardise)
+    expr = df[expression_cols].apply(pd.to_numeric, errors="coerce")
+    variances = expr.var(axis=1).fillna(0)
+    top_idx = variances.sort_values(ascending=False).head(top_n_genes).index
+    matrix = expr.loc[top_idx].fillna(expr.loc[top_idx].mean(axis=1).to_dict()).fillna(0)
+    X = matrix.T.values  # samples × genes
+    X = StandardScaler().fit_transform(X)
+
+    n_samples = X.shape[0]
+    hi = min(k_max, n_samples - 1)
+    if hi < k_min:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough samples ({n_samples}) for k in [{k_min}, {k_max}]",
+        )
+
+    profile = []
+    best_k, best_score = None, -1.0
+    for k in range(k_min, hi + 1):
+        km = KMeans(n_clusters=k, n_init=10, random_state=42)
+        labels = km.fit_predict(X)
+        try:
+            score = float(silhouette_score(X, labels)) if len(set(labels)) > 1 else -1.0
+        except ValueError:
+            score = -1.0
+        profile.append({"k": k, "silhouette_score": score, "inertia": float(km.inertia_)})
+        if score > best_score:
+            best_score, best_k = score, k
+
+    return {
+        "profile": profile,
+        "recommended_k": best_k if best_k is not None else k_min,
+        "recommended_score": best_score if best_score > -1 else 0.0,
+        "n_samples": n_samples,
+        "top_n_genes": int(len(top_idx)),
+    }
+
+
 @router.get("/ai/status")
 async def check_ai_status(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)]
@@ -3731,6 +3952,192 @@ async def apply_advanced_filter(
         raise HTTPException(status_code=500, detail=f"Filter error: {str(e)}")
 
 
+@router.post("/{dataset_id}/logfc-scatter", dependencies=[Depends(require_active_license)])
+async def logfc_scatter(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    comparison_refs: Optional[list[dict]] = Body(
+        None,
+        description="Exactly 2 comparisons: [{dataset_id, comparison_name, label}]",
+    ),
+    comparison_a: Optional[str] = Body(None, description="Legacy: comparison name in path dataset"),
+    comparison_b: Optional[str] = Body(None, description="Legacy: comparison name in path dataset"),
+    padj_threshold: float = Body(0.05, description="Adjusted p-value significance threshold"),
+    logfc_threshold: float = Body(0.58, description="Absolute log2 fold-change significance threshold"),
+) -> dict:
+    """
+    Compare two contrasts gene-by-gene (log2FC vs log2FC).
+
+    Inner-joins the two comparisons' DEG rows on gene, classifies each shared gene
+    into a quadrant (concordant / discordant / specific to A or B / non-significant),
+    and returns Pearson & Spearman correlation of the two log2FC vectors.
+
+    The two comparisons may live in different DEG datasets of the same project
+    (via ``comparison_refs``); the legacy ``comparison_a``/``comparison_b`` refer to
+    the path dataset.
+    """
+    from scipy.stats import pearsonr, spearmanr
+
+    # Verify path dataset + project access (mirrors venn-analysis)
+    query = select(Dataset).options(joinedload(Dataset.project)).where(Dataset.id == dataset_id)
+    result = await db.execute(query)
+    dataset = result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    project = dataset.project
+    if project.owner_id != current_user.user_id:
+        member_result = await db.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project.id,
+                ProjectMember.user_id == current_user.user_id,
+            )
+        )
+        if member_result.scalar_one_or_none() is None:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    # Normalize into exactly two refs {label, dataset_id, comparison_name}
+    refs: list[dict] = []
+    if comparison_refs:
+        for ref in comparison_refs:
+            comp_name = ref.get("comparison_name")
+            ref_dataset_id = ref.get("dataset_id")
+            if not comp_name or not ref_dataset_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Each comparison_ref needs dataset_id and comparison_name",
+                )
+            try:
+                ref_dataset_uuid = UUID(str(ref_dataset_id))
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"Invalid dataset_id: {ref_dataset_id}")
+            refs.append({
+                "label": ref.get("label") or comp_name,
+                "dataset_id": ref_dataset_uuid,
+                "comparison_name": comp_name,
+            })
+    elif comparison_a and comparison_b:
+        refs = [
+            {"label": comparison_a, "dataset_id": dataset_id, "comparison_name": comparison_a},
+            {"label": comparison_b, "dataset_id": dataset_id, "comparison_name": comparison_b},
+        ]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide comparison_refs (2) or comparison_a and comparison_b",
+        )
+
+    if len(refs) != 2:
+        raise HTTPException(status_code=400, detail="Exactly 2 comparisons required")
+    if refs[0]["label"] == refs[1]["label"]:
+        raise HTTPException(status_code=400, detail="Comparison labels must be distinct")
+
+    # Every referenced dataset must belong to the same project
+    referenced_ids = {r["dataset_id"] for r in refs if r["dataset_id"] != dataset_id}
+    if referenced_ids:
+        ds_result = await db.execute(
+            select(Dataset.id, Dataset.project_id).where(Dataset.id.in_(referenced_ids))
+        )
+        project_by_dataset = {row.id: row.project_id for row in ds_result.all()}
+        for ref_id in referenced_ids:
+            if ref_id not in project_by_dataset:
+                raise HTTPException(status_code=404, detail=f"Dataset not found: {ref_id}")
+            if project_by_dataset[ref_id] != project.id:
+                raise HTTPException(
+                    status_code=400, detail="Both comparisons must belong to the same project"
+                )
+
+    # Fetch each comparison's genes → {gene_id: {log_fc, padj, gene_name}}
+    async def _fetch(ref: dict) -> dict[str, dict]:
+        stmt = select(DegGene.gene_id, DegGene.gene_name, DegGene.log_fc, DegGene.padj).where(
+            DegGene.dataset_id == ref["dataset_id"],
+            DegGene.comparison_name == ref["comparison_name"],
+        )
+        rows = (await db.execute(stmt)).all()
+        out: dict[str, dict] = {}
+        for r in rows:
+            out[r.gene_id] = {"gene_name": r.gene_name, "log_fc": r.log_fc, "padj": r.padj}
+        return out
+
+    genes_a = await _fetch(refs[0])
+    genes_b = await _fetch(refs[1])
+    if not genes_a:
+        raise HTTPException(status_code=404, detail=f"No DEG data for: {refs[0]['label']}")
+    if not genes_b:
+        raise HTTPException(status_code=404, detail=f"No DEG data for: {refs[1]['label']}")
+
+    def _is_sig(rec: dict) -> bool:
+        lfc, padj = rec.get("log_fc"), rec.get("padj")
+        if lfc is None or padj is None:
+            return False
+        return padj <= padj_threshold and abs(lfc) >= logfc_threshold
+
+    shared_ids = genes_a.keys() & genes_b.keys()
+    points: list[dict] = []
+    counts = {"concordant": 0, "discordant": 0, "specific_a": 0, "specific_b": 0, "ns": 0}
+    vec_a: list[float] = []
+    vec_b: list[float] = []
+
+    for gid in shared_ids:
+        ra, rb = genes_a[gid], genes_b[gid]
+        lfc_a, lfc_b = ra.get("log_fc"), rb.get("log_fc")
+        if lfc_a is None or lfc_b is None:
+            continue
+        sig_a, sig_b = _is_sig(ra), _is_sig(rb)
+        if sig_a and sig_b:
+            quadrant = "concordant" if (lfc_a > 0) == (lfc_b > 0) else "discordant"
+        elif sig_a:
+            quadrant = "specific_a"
+        elif sig_b:
+            quadrant = "specific_b"
+        else:
+            quadrant = "ns"
+        counts[quadrant] += 1
+        vec_a.append(float(lfc_a))
+        vec_b.append(float(lfc_b))
+        points.append({
+            "gene": ra.get("gene_name") or rb.get("gene_name") or gid,
+            "gene_id": gid,
+            "logfc_a": float(lfc_a),
+            "logfc_b": float(lfc_b),
+            "padj_a": ra.get("padj"),
+            "padj_b": rb.get("padj"),
+            "quadrant": quadrant,
+        })
+
+    pearson_r = pearson_p = spearman_r = spearman_p = None
+    if len(vec_a) >= 3:
+        try:
+            pr, pp = pearsonr(vec_a, vec_b)
+            sr, sp = spearmanr(vec_a, vec_b)
+            pearson_r, pearson_p = float(pr), float(pp)
+            spearman_r, spearman_p = float(sr), float(sp)
+        except Exception as corr_err:  # degenerate input (e.g. zero variance)
+            logger.warning(f"logfc-scatter correlation failed: {corr_err}")
+
+    return {
+        "dataset_id": str(dataset_id),
+        "comparison_a": {"label": refs[0]["label"], "comparison_name": refs[0]["comparison_name"]},
+        "comparison_b": {"label": refs[1]["label"], "comparison_name": refs[1]["comparison_name"]},
+        "thresholds": {"padj": padj_threshold, "logfc": logfc_threshold},
+        "counts": {
+            **counts,
+            "shared": len(points),
+            "only_a": len(genes_a) - len(shared_ids),
+            "only_b": len(genes_b) - len(shared_ids),
+        },
+        "correlation": {
+            "pearson_r": pearson_r,
+            "pearson_p": pearson_p,
+            "spearman_r": spearman_r,
+            "spearman_p": spearman_p,
+            "n": len(vec_a),
+        },
+        "points": points,
+    }
+
+
 @router.post("/{dataset_id}/gsea", dependencies=[Depends(require_active_license)])
 async def run_gsea_analysis(
     dataset_id: UUID,
@@ -3745,23 +4152,16 @@ async def run_gsea_analysis(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)] = None
 ) -> dict:
     """
-    Run Gene Set Enrichment Analysis (GSEA) on a comparison
+    Run Gene Set Enrichment Analysis (GSEA) synchronously on a comparison.
 
-    Args:
-        dataset_id: Dataset UUID
-        comparison_name: Comparison name
-        gene_set_database: Gene set database to use
-        ranking_metric: Method to rank genes (log_fc, signed_pvalue, signal2noise)
-        min_size: Minimum gene set size
-        max_size: Maximum gene set size
-        n_permutations: Number of permutations for null distribution
-        fdr_threshold: FDR q-value threshold for significance
-
-    Returns:
-        GSEA results with enrichment scores, p-values, and visualizations
+    NOTE: GSEA over a full gene-set database with permutations takes minutes and
+    can exceed HTTP timeouts. Prefer the async endpoint (POST /{id}/gsea-async +
+    poll GET /gsea-jobs/{job_id}) from the UI; this synchronous path is kept for
+    small/fast runs and programmatic use.
     """
-    import pandas as pd
-    from sqlalchemy import text
+    from app.services.gsea_runner import (
+        compute_gsea, persist_gsea_result, GSEANoDegError, GSEANoGeneSetsError,
+    )
 
     try:
         # Fetch dataset for auth check and activity logging
@@ -3770,89 +4170,26 @@ async def run_gsea_analysis(
         if not gsea_dataset:
             raise HTTPException(status_code=404, detail="Dataset not found")
 
-        # Fetch all DEG genes for this comparison
-        query = text("""
-            SELECT gene_id, log_fc, padj, gene_name
-            FROM deg_genes
-            WHERE dataset_id = :dataset_id
-            AND comparison_name = :comparison_name
-            ORDER BY padj ASC
-        """)
-
-        result = await db.execute(query, {
-            "dataset_id": str(dataset_id),
-            "comparison_name": comparison_name
-        })
-        rows = result.fetchall()
-
-        if not rows:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No DEG data found for comparison: {comparison_name}"
-            )
-
-        # Convert to DataFrame
-        deg_data = pd.DataFrame(rows, columns=["gene_id", "log_fc", "padj", "gene_name"])
-
-        # Prepare ranked gene list
-        ranked_genes = prepare_ranked_gene_list(deg_data, ranking_metric=ranking_metric)
-
-        # Load gene sets from database
-        logger.info(f"Loading gene sets from database: {gene_set_database}")
-        gene_set_loader = GeneSetLoader(db)
-
         try:
-            # Convert string database name to enum
-            database_enum = GeneSetDatabase(gene_set_database)
+            payload = await compute_gsea(
+                db=db,
+                dataset=gsea_dataset,
+                comparison_name=comparison_name,
+                gene_set_database=gene_set_database,
+                ranking_metric=ranking_metric,
+                min_size=min_size,
+                max_size=max_size,
+                n_permutations=n_permutations,
+                fdr_threshold=fdr_threshold,
+            )
+        except (GSEANoDegError, GSEANoGeneSetsError) as e:
+            raise HTTPException(status_code=404, detail=str(e))
         except ValueError:
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid gene set database: {gene_set_database}. "
                        f"Valid options: {[e.value for e in GeneSetDatabase]}"
             )
-
-        # Retrieve gene sets from database
-        gene_sets_db = await gene_set_loader.get_gene_sets(
-            database=database_enum,
-            organism="Homo sapiens",
-            min_size=min_size,
-            max_size=max_size
-        )
-
-        # Convert to dictionary format expected by GSEA processor
-        if not gene_sets_db:
-            # Fallback to placeholder if no gene sets in database
-            logger.warning(f"No gene sets found for {gene_set_database}, using placeholders")
-            gene_sets = GeneSetsLoader.get_default_gene_sets()
-        else:
-            gene_sets = {gs.name: gs.genes for gs in gene_sets_db}
-            logger.info(f"Loaded {len(gene_sets)} gene sets from database")
-
-        # Initialize GSEA processor
-        gsea_processor = GSEAProcessor(
-            min_size=min_size,
-            max_size=max_size,
-            power=1.0
-        )
-
-        # Run GSEA
-        logger.info(f"Running GSEA with {len(ranked_genes)} genes and {len(gene_sets)} gene sets")
-        results = gsea_processor.run_gsea(
-            ranked_genes=ranked_genes,
-            gene_sets=gene_sets,
-            metric_column="metric",
-            n_permutations=n_permutations
-        )
-
-        # Filter by FDR threshold
-        significant_results = [r for r in results if r.fdr_q_value <= fdr_threshold]
-
-        # Convert to dict for JSON response
-        results_dict = [r.to_dict() for r in significant_results]
-
-        # Calculate summary statistics
-        n_enriched_positive = len([r for r in significant_results if r.normalized_enrichment_score > 0])
-        n_enriched_negative = len([r for r in significant_results if r.normalized_enrichment_score < 0])
 
         if current_user:
             await history_service.log_activity(
@@ -3862,31 +4199,15 @@ async def run_gsea_analysis(
                 entity_name=comparison_name,
                 extra_metadata={
                     "gene_set_database": gene_set_database,
-                    "n_significant": len(significant_results),
+                    "n_significant": payload["summary"]["significant_gene_sets"],
                 },
             )
 
-        return {
-            "dataset_id": str(dataset_id),
-            "comparison_name": comparison_name,
-            "parameters": {
-                "gene_set_database": gene_set_database,
-                "ranking_metric": ranking_metric,
-                "min_size": min_size,
-                "max_size": max_size,
-                "n_permutations": n_permutations,
-                "fdr_threshold": fdr_threshold
-            },
-            "summary": {
-                "total_genes": len(ranked_genes),
-                "total_gene_sets_tested": len(gene_sets),
-                "significant_gene_sets": len(significant_results),
-                "enriched_in_phenotype_pos": n_enriched_positive,
-                "enriched_in_phenotype_neg": n_enriched_negative
-            },
-            "results": results_dict
-        }
+        await persist_gsea_result(db, dataset_id, payload)
+        return payload
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         logger.error(f"GSEA error: {str(e)}")
@@ -3929,6 +4250,12 @@ async def get_enrichment_plot_data(
         deg_data = pd.DataFrame(rows, columns=["gene_id", "log_fc", "padj"])
         ranked_genes = prepare_ranked_gene_list(deg_data, ranking_metric=ranking_metric)
 
+        # Resolve organism from dataset metadata (consistent with run_gsea_analysis)
+        from app.services.gsea_runner import resolve_gsea_organism
+        _ep_ds_result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+        _ep_dataset = _ep_ds_result.scalar_one_or_none()
+        organism = resolve_gsea_organism(_ep_dataset) if _ep_dataset else "Homo sapiens"
+
         # Load gene set from database by name
         # Try to find the gene set across all databases
         gene_set_loader = GeneSetLoader(db)
@@ -3939,7 +4266,7 @@ async def get_enrichment_plot_data(
             gene_set_obj = await gene_set_loader.get_gene_set_by_name(
                 name=gene_set_name,
                 database=database,
-                organism="Homo sapiens"
+                organism=organism
             )
             if gene_set_obj:
                 break
@@ -3973,11 +4300,47 @@ async def get_enrichment_plot_data(
             "gene_set_size": len(gene_set)
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         logger.error(f"Enrichment plot error: {str(e)}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to generate plot data: {str(e)}")
+
+
+@router.get("/{dataset_id}/comparisons/{comparison_name}/gsea-results")
+async def get_cached_gsea_results(
+    dataset_id: UUID,
+    comparison_name: str,
+    db: Annotated[AsyncSession, Depends(get_db)] = None,
+) -> dict:
+    """
+    Return the most recent persisted GSEA run for a comparison, if any.
+
+    Called by the GSEA UI on mount to restore a previous run without
+    recomputing. Returns 404 when no run has been persisted yet.
+    """
+    from sqlalchemy import select as _select
+
+    # Fetch all persisted GSEA runs for this dataset, newest first.
+    stmt = (
+        _select(CachedComputation)
+        .where(
+            CachedComputation.dataset_id == dataset_id,
+            CachedComputation.computation_type == "gsea",
+        )
+        .order_by(CachedComputation.updated_at.desc())
+    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    for cached in rows:
+        data = cached.result_data or {}
+        if data.get("comparison_name") == comparison_name:
+            return data
+
+    raise HTTPException(status_code=404, detail="No cached GSEA results for this comparison")
 
 
 from pydantic import BaseModel
