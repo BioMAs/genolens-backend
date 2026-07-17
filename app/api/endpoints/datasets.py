@@ -3467,6 +3467,119 @@ async def signature_score(
     }
 
 
+@router.post("/{dataset_id}/deg-patterns", dependencies=[Depends(require_active_license)])
+async def deg_patterns(
+    dataset_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    deg_dataset_id: Optional[UUID] = Body(None, description="DEG dataset to pull significant genes from"),
+    comparison_name: Optional[str] = Body(None, description="Comparison whose DEGs to cluster"),
+    gene_list_id: Optional[UUID] = Body(None, description="Alternatively, a saved gene list"),
+    genes: Optional[list[str]] = Body(None, description="Alternatively, explicit genes"),
+    sample_condition_map: Optional[dict] = Body(None, description="{sample: condition}"),
+    group_order: Optional[list[str]] = Body(None, description="Ordered group names (e.g. time course)"),
+    n_clusters: int = Body(6, ge=2, le=20),
+    min_cluster_size: int = Body(15, ge=1, le=500),
+    padj_threshold: float = Body(0.05),
+    logfc_threshold: float = Body(1.0),
+) -> dict:
+    """
+    Cluster the significant DEGs of a comparison by expression trajectory across
+    conditions (DEGreport::degPatterns-style), on this MATRIX dataset.
+
+    Gene source (first match wins): explicit ``genes`` → ``gene_list_id`` →
+    ``deg_dataset_id`` + ``comparison_name`` (significant DEGs).
+    """
+    from app.services.deg_patterns import compute_deg_patterns, DEGPatternsError
+
+    # Access + type checks on the matrix dataset
+    result = await db.execute(
+        select(Dataset).options(joinedload(Dataset.project)).where(Dataset.id == dataset_id)
+    )
+    dataset = result.scalar_one_or_none()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    project = dataset.project
+    if project.owner_id != current_user.user_id:
+        member = await db.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project.id,
+                ProjectMember.user_id == current_user.user_id,
+            )
+        )
+        if member.scalar_one_or_none() is None:
+            raise HTTPException(status_code=403, detail="Access denied")
+    if dataset.type != DatasetType.MATRIX:
+        raise HTTPException(status_code=400, detail="DEG patterns require an expression MATRIX dataset")
+
+    # Resolve gene source
+    resolved_genes: list[str] = []
+    if genes:
+        resolved_genes = [str(g) for g in genes]
+    elif gene_list_id is not None:
+        gl = await db.get(GeneList, gene_list_id)
+        if not gl or gl.project_id != project.id:
+            raise HTTPException(status_code=404, detail="Gene list not found in this project")
+        resolved_genes = [str(g) for g in (gl.genes or [])]
+    elif deg_dataset_id is not None and comparison_name:
+        stmt = select(DegGene.gene_id).where(
+            DegGene.dataset_id == deg_dataset_id,
+            DegGene.comparison_name == comparison_name,
+            DegGene.padj <= padj_threshold,
+            or_(DegGene.log_fc >= logfc_threshold, DegGene.log_fc <= -logfc_threshold),
+        )
+        rows = (await db.execute(stmt)).all()
+        resolved_genes = [r.gene_id for r in rows]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide genes, gene_list_id, or deg_dataset_id + comparison_name",
+        )
+    if not resolved_genes:
+        raise HTTPException(status_code=404, detail="No DEG genes to cluster for the given source/thresholds")
+
+    # Load matrix parquet (same read path as signature-score / clustering-quality)
+    parquet_path = Path(settings.LOCAL_STORAGE_PATH) / dataset.parquet_file_path
+    if not parquet_path.exists():
+        raise HTTPException(status_code=404, detail="Dataset file not found")
+    import pyarrow.parquet as pq
+    df = pq.read_table(str(parquet_path)).to_pandas()
+
+    gene_col = next((c for c in df.columns if "gene" in c.lower() or "symbol" in c.lower()), None)
+    if not gene_col:
+        raise HTTPException(status_code=400, detail="No gene column found in dataset")
+    stat_columns = {"log2FoldChange", "logFC", "pvalue", "padj", "baseMean", "lfcSE", "stat"}
+    expression_cols = [
+        c for c in df.columns
+        if df[c].dtype in ["int64", "float64"] and c not in stat_columns and c != gene_col
+    ]
+    if not expression_cols:
+        raise HTTPException(status_code=400, detail="No expression columns found")
+
+    # Sample→condition: client map preferred, else sample-name prefix
+    cond_map = dict(sample_condition_map or {})
+    if not cond_map:
+        for s in expression_cols:
+            cond_map[s] = s.split("_")[0] if "_" in s else s
+
+    try:
+        result_payload = compute_deg_patterns(
+            matrix_df=df,
+            gene_col=gene_col,
+            expression_cols=expression_cols,
+            genes=resolved_genes,
+            sample_condition_map=cond_map,
+            group_order=group_order,
+            n_clusters=n_clusters,
+            min_cluster_size=min_cluster_size,
+        )
+    except DEGPatternsError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    result_payload["dataset_id"] = str(dataset_id)
+    return result_payload
+
+
 @router.get("/{dataset_id}/clustering-quality")
 async def clustering_quality(
     dataset_id: UUID,
