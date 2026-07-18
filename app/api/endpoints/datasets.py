@@ -3474,6 +3474,10 @@ async def deg_patterns(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     deg_dataset_id: Optional[UUID] = Body(None, description="DEG dataset to pull significant genes from"),
     comparison_name: Optional[str] = Body(None, description="Comparison whose DEGs to cluster"),
+    deg_sources: Optional[list[dict]] = Body(
+        None,
+        description="Analysis-level: [{dataset_id, comparison_name}] — union of significant DEGs",
+    ),
     gene_list_id: Optional[UUID] = Body(None, description="Alternatively, a saved gene list"),
     genes: Optional[list[str]] = Body(None, description="Alternatively, explicit genes"),
     sample_condition_map: Optional[dict] = Body(None, description="{sample: condition}"),
@@ -3512,7 +3516,7 @@ async def deg_patterns(
     if dataset.type != DatasetType.MATRIX:
         raise HTTPException(status_code=400, detail="DEG patterns require an expression MATRIX dataset")
 
-    # Resolve gene source
+    # Resolve gene source (first match wins)
     resolved_genes: list[str] = []
     if genes:
         resolved_genes = [str(g) for g in genes]
@@ -3521,6 +3525,27 @@ async def deg_patterns(
         if not gl or gl.project_id != project.id:
             raise HTTPException(status_code=404, detail="Gene list not found in this project")
         resolved_genes = [str(g) for g in (gl.genes or [])]
+    elif deg_sources:
+        # Analysis-level: union of significant DEGs across several comparisons
+        seen: set[str] = set()
+        for src in deg_sources:
+            try:
+                src_ds = UUID(str(src.get("dataset_id")))
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"Invalid dataset_id in deg_sources: {src}")
+            src_cmp = src.get("comparison_name")
+            if not src_cmp:
+                raise HTTPException(status_code=400, detail="Each deg_source needs a comparison_name")
+            stmt = select(DegGene.gene_id).where(
+                DegGene.dataset_id == src_ds,
+                DegGene.comparison_name == src_cmp,
+                DegGene.padj <= padj_threshold,
+                or_(DegGene.log_fc >= logfc_threshold, DegGene.log_fc <= -logfc_threshold),
+            )
+            for r in (await db.execute(stmt)).all():
+                if r.gene_id not in seen:
+                    seen.add(r.gene_id)
+        resolved_genes = list(seen)
     elif deg_dataset_id is not None and comparison_name:
         stmt = select(DegGene.gene_id).where(
             DegGene.dataset_id == deg_dataset_id,
@@ -3533,7 +3558,7 @@ async def deg_patterns(
     else:
         raise HTTPException(
             status_code=400,
-            detail="Provide genes, gene_list_id, or deg_dataset_id + comparison_name",
+            detail="Provide genes, gene_list_id, deg_sources, or deg_dataset_id + comparison_name",
         )
     if not resolved_genes:
         raise HTTPException(status_code=404, detail="No DEG genes to cluster for the given source/thresholds")
