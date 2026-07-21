@@ -103,22 +103,37 @@ def compute_deg_patterns(
         raise DEGPatternsError("All DEG genes have zero variance across samples.")
     z = expr.sub(row_mean, axis=0).div(row_std, axis=0)
 
+    # Map DataFrame index -> gene label so labels stay aligned through any
+    # filtering / reordering below.
+    label_by_index = dict(zip(z.index, labels))
+
     # Collapse to gene × group median-z matrix
     group_median = pd.DataFrame(
         {g: z[group_to_samples[g]].median(axis=1) for g in groups}, index=z.index
     )
+
+    # Drop genes whose group-median trajectory is non-finite or flat across
+    # groups. Correlation distance is undefined for these (a group where every
+    # sample of a gene is NaN, or a perfectly flat profile), which makes the
+    # hierarchical linkage fail with "NaN dissimilarity value".
+    gm = group_median.values
+    usable = np.isfinite(gm).all(axis=1) & (np.nanstd(gm, axis=1) > 0)
+    group_median = group_median[usable]
+    if group_median.empty:
+        raise DEGPatternsError(
+            "No genes have a usable expression trajectory across the selected "
+            "conditions (all flat or missing). Check the sample→condition mapping."
+        )
 
     # Cap for clustering performance (variance across groups = most informative)
     downsampled = False
     if len(group_median) > max_genes:
         top = group_median.var(axis=1).sort_values(ascending=False).head(max_genes).index
         group_median = group_median.loc[top]
-        keep_idx = set(top)
-        labels = [g for g, idx in zip(labels, z.index) if idx in keep_idx]
         downsampled = True
 
     n_genes = len(group_median)
-    gene_labels = labels
+    gene_labels = [label_by_index[idx] for idx in group_median.index]
 
     data = group_median.values  # genes × groups
     k = max(2, min(n_clusters, n_genes - 1)) if n_genes > 2 else 1
@@ -127,8 +142,13 @@ def compute_deg_patterns(
         cluster_ids = np.ones(n_genes, dtype=int)
     else:
         cs = ClusteringService()
-        linkage = cs._compute_linkage(data, method="average", metric="correlation")
-        cluster_ids = fcluster(linkage, t=k, criterion="maxclust")
+        try:
+            linkage = cs._compute_linkage(data, method="average", metric="correlation")
+            cluster_ids = fcluster(linkage, t=k, criterion="maxclust")
+        except ValueError as e:
+            # Degenerate distance matrix (e.g. residual NaN dissimilarity) — surface
+            # as a clean 4xx rather than a 500.
+            raise DEGPatternsError(f"Could not cluster the DEG trajectories: {e}")
 
     # Build clusters, drop those below min_cluster_size, renumber sequentially
     raw: Dict[int, List[int]] = {}
