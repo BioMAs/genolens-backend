@@ -169,3 +169,46 @@ def test_scilicium_admin_can_use_ai():
     u = make_user(SubscriptionPlan.STARTER)
     u.role = UserRole.SCILICIUM_ADMIN
     assert u.can_use_ai is True
+
+
+def test_no_source_references_retired_plan_members():
+    """Guard against the BASIC/PREMIUM/ADVANCED rename leaving dead enum accesses.
+
+    `SubscriptionPlan.BASIC` raises AttributeError("BASIC") at runtime, which
+    surfaced as "Failed to create user profile: BASIC" in the admin panel.
+    """
+    import re
+    from pathlib import Path
+
+    app_dir = Path(__file__).resolve().parent.parent / "app"
+    pattern = re.compile(r"SubscriptionPlan\.(BASIC|PREMIUM|ADVANCED)\b")
+    offenders = [
+        f"{path.relative_to(app_dir.parent)}:{i}"
+        for path in app_dir.rglob("*.py")
+        for i, line in enumerate(path.read_text().splitlines(), start=1)
+        if pattern.search(line)
+    ]
+    assert offenders == [], f"Retired plan members referenced at: {offenders}"
+
+
+def test_admin_stats_prices_cover_every_plan():
+    """The admin MRR estimate must have a price for every live plan.
+
+    Stale keys made estimated_revenue silently return 0 for all users.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parent.parent / "app/api/endpoints/admin.py").read_text()
+    tree = ast.parse(src)
+    prices = next(
+        ast.literal_eval(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", None) == "PRICES" for t in node.targets)
+    )
+
+    for plan in SubscriptionPlan:
+        assert plan.value in prices, f"No price defined for plan {plan.value}"
+    assert prices["STARTER"] == 100.0
+    assert prices["TEAM"] == 250.0

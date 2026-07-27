@@ -194,7 +194,7 @@ async def list_users(
                 local_user = local_users.get(user_id)
                 
                 # Default values if user not in local DB yet
-                sub_plan = "BASIC"
+                sub_plan = "STARTER"
                 user_status = "active"
                 ai_used = 0
                 ai_purchased = 0
@@ -303,7 +303,7 @@ async def get_user_details(
                         confirmed_at = user_data.get("confirmed_at")
 
                     # Default subscription data
-                    sub_plan = "BASIC"
+                    sub_plan = "STARTER"
                     ai_used = 0
                     ai_remaining = 0
                     ai_purchased = 0
@@ -623,14 +623,17 @@ async def get_system_stats(
         local_users = result.scalars().all()
         
         # Calculate revenue and plan distribution
-        users_by_plan = {"BASIC": 0, "PREMIUM": 0, "ADVANCED": 0}
+        users_by_plan = {"STARTER": 0, "TEAM": 0, "ON_PREMISE": 0}
         estimated_revenue = 0.0
         
-        # Pricing model (for estimation)
+        # Monthly list prices in EUR. Annual commitment is billed at a lower
+        # monthly rate (STARTER 85, TEAM 200) but the billing interval is not
+        # stored on User, so the estimate always uses the monthly rate.
+        # ON_PREMISE is quoted per deal and therefore excluded.
         PRICES = {
-            "BASIC": 0,
-            "PREMIUM": 29.0, # Monthly
-            "ADVANCED": 99.0, # Monthly
+            "STARTER": 100.0,
+            "TEAM": 250.0,
+            "ON_PREMISE": 0.0,
             "TOKEN": 0.10  # Per token
         }
 
@@ -662,10 +665,10 @@ async def get_system_stats(
             if response.status_code == 200:
                 total_users = len(response.json())
         
-        # Adjust BASIC count for users not in local DB
+        # Adjust STARTER count for users not in local DB (model default plan)
         local_users_count = sum(users_by_plan.values())
         if total_users > local_users_count:
-            users_by_plan["BASIC"] += (total_users - local_users_count)
+            users_by_plan["STARTER"] += (total_users - local_users_count)
 
         return SystemStats(
             total_users=total_users,
@@ -740,7 +743,7 @@ async def create_user(
                 email=user_data.email,
                 full_name=user_data.full_name,
                 role=role_enum,
-                subscription_plan=SubscriptionPlan.BASIC
+                subscription_plan=SubscriptionPlan.STARTER
             )
             db.add(local_user)
             await db.commit()
@@ -1099,7 +1102,7 @@ async def update_project(
                                 email=sb_user.get("email"),
                                 full_name=sb_user.get("user_metadata", {}).get("full_name"),
                                 role=UserRoleEnum.USER, # Default to USER
-                                subscription_plan=SubscriptionPlan.BASIC
+                                subscription_plan=SubscriptionPlan.STARTER
                             )
                             db.add(user)
                             # We don't commit here, we'll commit with the project update
