@@ -17,11 +17,17 @@ from app.api.deps import get_db, require_admin
 from app.api.deps.license import require_active_license
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
-from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent
+from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent, UserStatus
+from app.services.account_service import AccountService
 from pydantic import BaseModel
 
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
+
+# Statuses an admin may set directly. PENDING is owned by the invitation flow:
+# it is set when the invite is sent and cleared when the invitee accepts, so
+# setting it by hand would strand an account with no pending magic link.
+_ADMIN_SETTABLE_STATUSES = (UserStatus.ACTIVE, UserStatus.SUSPENDED, UserStatus.CANCELLED)
 
 
 # Pydantic Schemas
@@ -93,6 +99,19 @@ class UserUpdate(BaseModel):
     """Schema for updating user profile."""
     full_name: Optional[str] = None
     role: Optional[str] = None
+
+
+class InviteUserRequest(BaseModel):
+    """Schema for inviting a user. Defaults to the entry-level plan."""
+    email: str
+    full_name: Optional[str] = None
+    plan: SubscriptionPlan = SubscriptionPlan.STARTER
+    subscription_ends_at: Optional[datetime] = None
+
+
+class UserStatusUpdate(BaseModel):
+    """Schema for changing a user's account status."""
+    status: str  # "active" | "suspended" | "cancelled"
 
 
 class SystemStats(BaseModel):
@@ -250,6 +269,97 @@ async def list_users(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to fetch users: {str(e)}"
         )
+
+
+@router.post("/users/invite", status_code=status.HTTP_201_CREATED)
+async def invite_user(
+    body: InviteUserRequest,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a pending account and send the Supabase invitation magic link.
+    Admin only.
+
+    Declared before the parameterised `/users/{user_id}` routes so the literal
+    "invite" segment cannot be captured as a user id.
+    """
+    service = AccountService(db)
+    try:
+        user = await service.invite_user(
+            email=body.email,
+            full_name=body.full_name,
+            plan=body.plan,
+            invited_by_admin_id=current_user.user_id,
+            subscription_ends_at=body.subscription_ends_at,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except RuntimeError as exc:
+        # Supabase rejected the invite (already registered, bad address, email
+        # sending not configured on the project). Surface its own message.
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    return {"id": str(user.id), "email": user.email, "status": user.status.value}
+
+
+@router.post("/users/{user_id}/resend-invite")
+async def resend_invite(
+    user_id: UUID,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-send the invitation magic link to a pending user. Admin only."""
+    service = AccountService(db)
+    try:
+        user = await service.resend_invitation(user_id)
+    except ValueError as exc:
+        message = str(exc)
+        code = (
+            status.HTTP_404_NOT_FOUND
+            if "not found" in message
+            else status.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(status_code=code, detail=message)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    return {"detail": "Invitation email resent", "email": user.email}
+
+
+@router.patch("/users/{user_id}/status")
+async def update_user_status(
+    user_id: UUID,
+    body: UserStatusUpdate,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Activate, suspend or cancel a user account. Admin only."""
+    try:
+        target_status = UserStatus(body.status)
+    except ValueError:
+        allowed = ", ".join(s.value for s in _ADMIN_SETTABLE_STATUSES)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid status '{body.status}'. Must be one of: {allowed}",
+        )
+
+    if target_status not in _ADMIN_SETTABLE_STATUSES:
+        # PENDING is set by the invitation flow and cleared when the invitee
+        # accepts; letting an admin set it by hand would strand the account.
+        allowed = ", ".join(s.value for s in _ADMIN_SETTABLE_STATUSES)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot set status to '{target_status.value}'. Must be one of: {allowed}",
+        )
+
+    service = AccountService(db)
+    try:
+        user = await service.set_status(user_id, target_status)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    return {"id": str(user.id), "email": user.email, "status": user.status.value}
 
 
 @router.get("/users/{user_id}", response_model=UserProfile)
