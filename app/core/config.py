@@ -72,6 +72,30 @@ class Settings(BaseSettings):
         description="Model id served by the LLM endpoint",
     )
 
+    # Drug Discovery service (genolens-dd) — separate service, called over HTTP.
+    #
+    # DD_API_KEY is the plaintext key; genolens-dd only ever stores its SHA-256, so this
+    # backend is the single place the secret exists. Never log it, never return it in a
+    # response body. An empty value means "not configured": the endpoints answer 503 rather
+    # than the backend refusing to boot, because Drug Discovery is an adjacent capability and
+    # not a prerequisite for serving projects.
+    DD_BASE_URL: str = Field(
+        default="https://dd.genolens.com",
+        description="Base URL of the genolens-dd service (no trailing slash)",
+    )
+    DD_API_KEY: str = Field(
+        default="",
+        description="X-API-Key sent to genolens-dd; empty disables the integration",
+    )
+    DD_TIMEOUT_SECONDS: float = Field(
+        default=30.0,
+        description=(
+            "Measured 2026-08-04 against production: a full TCGA-BRCA run costs ~0.43s, "
+            "targets ~0.23s, report ~0.35s. 30s is ~60x headroom for a cold or loaded host, "
+            "not a guess."
+        ),
+    )
+
     # CORS
     CORS_ORIGINS: list[str] = Field(
         default=["http://localhost:3000", "http://localhost:5173"],
