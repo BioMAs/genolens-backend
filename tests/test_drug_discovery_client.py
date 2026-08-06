@@ -276,6 +276,39 @@ async def test_every_endpoint_requires_authentication(method, path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("method", "path"), DD_ROUTES)
+async def test_a_starter_plan_is_refused_on_every_route(method, path):
+    """Le verrou vit ici, pas seulement dans l'UI.
+
+    Une garde posée uniquement côté frontend serait cosmétique : un compte STARTER appellerait
+    ces routes avec son propre jeton et obtiendrait le classement complet. Le module serait
+    « réservé aux plans supérieurs » à l'écran et ouvert à tous par l'API.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from app.api.deps.subscription import get_or_create_user
+    from app.models.models import SubscriptionPlan, User, UserRole
+
+    starter = User(
+        email="starter@example.com",
+        subscription_plan=SubscriptionPlan.STARTER,
+        role=UserRole.USER,
+    )
+    app.dependency_overrides[get_or_create_user] = lambda: starter
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as http:
+            response = await http.request(method, f"/api/v1{path}", json={})
+        assert response.status_code == 403, (
+            f"{method} {path} a répondu {response.status_code} à un STARTER — "
+            "le classement serait accessible hors du plan qui le vend."
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
 async def test_status_distinguishes_unconfigured_from_unreachable(monkeypatch):
     """Both look like "Drug Discovery is down" otherwise, and the wrong thing gets investigated."""
     unconfigured = client_with(json_handler(200, {}), api_key="")
