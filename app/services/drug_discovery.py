@@ -182,6 +182,14 @@ class DrugDiscoveryClient:
         """Per-table readiness. Unauthenticated upstream by design (see genolens-dd)."""
         return await self._request("GET", "/readyz", authenticated=False)
 
+    async def list_indications(self) -> dict:
+        """Catalogue des indications et des profils servables.
+
+        Authentifié : genolens-dd garde cette route, et la liste des indications couvertes
+        renseigne sur le socle de données.
+        """
+        return await self._request("GET", "/indications")
+
     async def create_run(
         self,
         *,

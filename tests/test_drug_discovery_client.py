@@ -228,6 +228,7 @@ async def test_a_trailing_slash_in_the_base_url_does_not_double():
 
 
 DD_ROUTES = [
+    ("GET", "/drug-discovery/indications"),
     ("GET", "/drug-discovery/status"),
     ("POST", "/drug-discovery/runs"),
     ("GET", "/drug-discovery/runs/r1"),
@@ -301,3 +302,30 @@ async def test_status_reports_readiness_when_all_is_well():
         "ready": True,
         "tables": {"safety_profile": "present"},
     }
+
+
+# ---------------------------------------------------------------------------
+# Le catalogue : passe-plat, aucune logique de ce côté
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_indications_are_passed_through_untouched():
+    """Aucune reconstruction ici : genolens-dd possède la table curée.
+
+    Filtrer ou réordonner de ce côté produirait deux catalogues qui divergent, et c'est le
+    catalogue local qui aurait tort en silence.
+    """
+    catalogue = {
+        "indications": [
+            {"tcga_project": "TCGA-BRCA", "disease_name": "breast carcinoma",
+             "excluded": False, "rationale": None},
+            {"tcga_project": "TCGA-PCPG", "disease_name": "pheochromocytoma",
+             "excluded": True, "rationale": "motif curé"},
+        ],
+        "profiles": ["default_oncology", "safety_first"],
+    }
+    seen: list[httpx.Request] = []
+    client = client_with(json_handler(200, catalogue, capture=seen))
+    assert await client.list_indications() == catalogue
+    assert seen[0].url.path == "/indications"

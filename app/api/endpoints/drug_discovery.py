@@ -65,6 +65,21 @@ def _reraise(exc: Exception) -> HTTPException:
     raise exc  # pragma: no cover - unknown type, do not swallow
 
 
+@router.get("/indications")
+async def list_drug_discovery_indications(
+    user: SupabaseUser = Depends(get_current_user),
+    client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
+):
+    """Ce que l'UI a le droit de proposer : 33 indications, exclusions marquées, profils.
+
+    Passe-plat strict — voir le docstring du module.
+    """
+    try:
+        return await client.list_indications()
+    except (DrugDiscoveryRejected, DrugDiscoveryUnavailable) as exc:
+        raise _reraise(exc)
+
+
 @router.get("/status")
 async def drug_discovery_status(
     user: SupabaseUser = Depends(get_current_user),
