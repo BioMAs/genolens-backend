@@ -283,10 +283,18 @@ async def test_a_starter_plan_is_refused_on_every_route(method, path):
     Une garde posée uniquement côté frontend serait cosmétique : un compte STARTER appellerait
     ces routes avec son propre jeton et obtiendrait le classement complet. Le module serait
     « réservé aux plans supérieurs » à l'écran et ouvert à tous par l'API.
+
+    L'authentification elle-même est aussi overridée (`get_current_user`, celui que
+    `get_or_create_user` consomme) : sans ça, une requête sans jeton Bearer est rejetée par
+    `HTTPBearer` avant même d'atteindre le verrou de plan, et un 403 obtenu de cette façon ne
+    prouve rien sur `require_team_plan` — voir `test_every_endpoint_requires_authentication`
+    pour ce cas-là. Ici la requête doit être authentifiée pour que seul le plan puisse encore
+    la refuser.
     """
     from httpx import ASGITransport, AsyncClient
 
-    from app.api.deps.subscription import get_or_create_user
+    from app.api.deps.subscription import get_current_user, get_or_create_user
+    from app.core.supabase_auth import SupabaseUser
     from app.models.models import SubscriptionPlan, User, UserRole
 
     starter = User(
@@ -294,7 +302,12 @@ async def test_a_starter_plan_is_refused_on_every_route(method, path):
         subscription_plan=SubscriptionPlan.STARTER,
         role=UserRole.USER,
     )
+    authenticated = SupabaseUser(
+        user_id="00000000-0000-0000-0000-000000000099",
+        email="starter@example.com",
+    )
     app.dependency_overrides[get_or_create_user] = lambda: starter
+    app.dependency_overrides[get_current_user] = lambda: authenticated
     try:
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
@@ -303,6 +316,11 @@ async def test_a_starter_plan_is_refused_on_every_route(method, path):
         assert response.status_code == 403, (
             f"{method} {path} a répondu {response.status_code} à un STARTER — "
             "le classement serait accessible hors du plan qui le vend."
+        )
+        assert "requires a TEAM or ON_PREMISE plan" in response.text, (
+            f"{method} {path} a répondu 403 sans nommer l'exigence de plan — "
+            f"corps reçu : {response.text!r}. Un 403 dû à l'authentification passerait ce "
+            "test à tort ; c'est précisément la confusion qu'il doit détecter."
         )
     finally:
         app.dependency_overrides.clear()
