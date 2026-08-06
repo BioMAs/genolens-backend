@@ -171,6 +171,29 @@ async def test_a_malformed_body_becomes_502():
     assert caught.value.status_code == 502
 
 
+@pytest.mark.asyncio
+async def test_readyz_preserves_the_body_of_a_business_503():
+    """genolens-dd's `/readyz` answers 503 with a body when the reference socle is
+    incomplete — that is its nominal signal, not an outage, and `tables` says exactly what to
+    rebuild. Before this fix, `_interpret` mapped every >=500 onto `DrugDiscoveryUnavailable`
+    regardless of body, so this legitimate response was indistinguishable from a crash and its
+    `tables` detail was thrown away."""
+    body = {"ready": False, "tables": {"safety_profile": "missing"}}
+    client = client_with(json_handler(503, body))
+    result = await client.readyz()
+    assert result == body
+
+
+@pytest.mark.asyncio
+async def test_a_real_upstream_500_from_readyz_still_becomes_unavailable():
+    """`preserve_503` only special-cases 503 — a genuine crash upstream must still surface as
+    an outage, not be mistaken for an incomplete socle."""
+    client = client_with(json_handler(500, {"detail": "Traceback: ligne 12"}))
+    with pytest.raises(DrugDiscoveryUnavailable) as caught:
+        await client.readyz()
+    assert caught.value.status_code == 502
+
+
 # ---------------------------------------------------------------------------
 # Requests are shaped as genolens-dd expects
 # ---------------------------------------------------------------------------
@@ -352,6 +375,25 @@ async def test_status_reports_readiness_when_all_is_well():
         "reachable": True,
         "ready": True,
         "tables": {"safety_profile": "present"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_reports_reachable_with_an_incomplete_socle_not_unreachable():
+    """A `genolens-dd` that is up but missing a reference table answers `/readyz` with 503 and
+    a body — its nominal way of saying "rebuild these tables". Before the fix, that 503 was
+    indistinguishable from an outage: `/status` reported `reachable: false` and dropped
+    `tables`, sending an operator to check the network on the day a deploy actually needs them
+    to check their data."""
+    incomplete = client_with(
+        json_handler(503, {"ready": False, "tables": {"contrast_disease_normal": "missing"}})
+    )
+    result = await dd_endpoints.drug_discovery_status(user=object(), client=incomplete)
+    assert result == {
+        "configured": True,
+        "reachable": True,
+        "ready": False,
+        "tables": {"contrast_disease_normal": "missing"},
     }
 
 
