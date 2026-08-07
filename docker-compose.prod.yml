@@ -64,6 +64,14 @@ services:
       - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS}
       - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-GenoLens}
       - SALES_EMAIL=${SALES_EMAIL:-contact@scilicium.com}
+      # Drug Discovery (service genolens-dd). La clé vient du .env de l'hôte, jamais de
+      # l'image : un .env embarqué au build est celui du checkout, donc sans secret, et
+      # l'API répondait « non configuré » en production alors que l'hôte avait la clé.
+      # Les valeurs par défaut sont OBLIGATOIRES ici : sans elles, une variable absente du
+      # .env deviendrait une chaîne vide qui écraserait le défaut du code.
+      - DD_BASE_URL=${DD_BASE_URL:-https://dd.genolens.com}
+      - DD_API_KEY=${DD_API_KEY}
+      - DD_TIMEOUT_SECONDS=${DD_TIMEOUT_SECONDS:-30}
 
     volumes:
       - genolens_storage:/app/data
