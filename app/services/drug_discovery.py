@@ -97,6 +97,7 @@ class DrugDiscoveryClient:
         json_body: Optional[dict] = None,
         params: Optional[dict] = None,
         authenticated: bool = True,
+        preserve_503: bool = False,
     ) -> Any:
         """Single exit point to genolens-dd, so the key is attached in exactly one place."""
         if authenticated and not self.is_configured:
@@ -126,9 +127,9 @@ class DrugDiscoveryClient:
                 "Drug Discovery is unreachable.", status_code=502
             ) from exc
 
-        return self._interpret(response)
+        return self._interpret(response, preserve_503=preserve_503)
 
-    def _interpret(self, response: httpx.Response) -> Any:
+    def _interpret(self, response: httpx.Response, *, preserve_503: bool = False) -> Any:
         """Map an upstream status onto ours. The 401 branch is the one that matters."""
         if response.status_code == 401:
             # OUR key is wrong or revoked. Surfacing 401 would blame the logged-in user.
@@ -146,6 +147,21 @@ class DrugDiscoveryClient:
                 status_code=response.status_code,
                 detail=self._detail(response),
             )
+
+        # A 503 from /readyz is genolens-dd's normal answer when the reference socle is
+        # incomplete — its body names exactly which tables are missing via `tables`. That is
+        # a business response, not an outage, and mapping it onto DrugDiscoveryUnavailable like
+        # any other 5xx would throw the body away: /status would then report `reachable: false`
+        # and a caller would go looking for a network problem instead of a data problem. Only
+        # `readyz()` opts into this by passing `preserve_503=True` — every other 5xx, on every
+        # other endpoint, still becomes 502 below, unchanged.
+        if preserve_503 and response.status_code == 503:
+            try:
+                return response.json()
+            except ValueError as exc:
+                raise DrugDiscoveryUnavailable(
+                    "Drug Discovery returned a malformed response.", status_code=502
+                ) from exc
 
         if response.status_code >= 500:
             logger.warning("genolens-dd returned %s", response.status_code)
@@ -179,8 +195,22 @@ class DrugDiscoveryClient:
         return await self._request("GET", "/health", authenticated=False)
 
     async def readyz(self) -> dict:
-        """Per-table readiness. Unauthenticated upstream by design (see genolens-dd)."""
-        return await self._request("GET", "/readyz", authenticated=False)
+        """Per-table readiness. Unauthenticated upstream by design (see genolens-dd).
+
+        `preserve_503=True`: genolens-dd answers 503 here as its nominal signal that the
+        reference socle is incomplete, with a body (`tables`) saying exactly what to rebuild.
+        Losing that body on a legitimate deploy-day state would leave `/status` reporting
+        "unreachable" when the service is up and simply missing data.
+        """
+        return await self._request("GET", "/readyz", authenticated=False, preserve_503=True)
+
+    async def list_indications(self) -> dict:
+        """Catalogue des indications et des profils servables.
+
+        Authentifié : genolens-dd garde cette route, et la liste des indications couvertes
+        renseigne sur le socle de données.
+        """
+        return await self._request("GET", "/indications")
 
     async def create_run(
         self,

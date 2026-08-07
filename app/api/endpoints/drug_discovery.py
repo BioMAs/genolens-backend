@@ -1,23 +1,24 @@
 """Drug Discovery endpoints — thin passthrough to the genolens-dd service.
 
-**EVERY endpoint here requires an authenticated user, and that is the point of the module.**
+**EVERY endpoint here requires an authenticated user on a TEAM or ON_PREMISE plan.**
 genolens-dd is closed by an API key precisely so its rankings are not world-readable. An
-unauthenticated route on this side would hand the same rankings to anyone who can reach
-`api-v2.genolens.com`, re-opening the product through a different door while the key gave the
-appearance of a closed one. That failure would look like a working feature, which is why it is
-stated here rather than left to be noticed.
+unauthenticated — or merely authenticated — route on this side would hand the same rankings to
+anyone who can reach `api-v2.genolens.com`, re-opening the product through a different door while
+the key gave the appearance of a closed one. That failure would look like a working feature, which
+is why it is stated here rather than left to be noticed.
 
 The handlers hold no business logic: genolens-dd owns the scoring contract, and a second
 implementation of anything on this side is how the two services start disagreeing.
 """
+
 import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.api.deps import get_current_user
-from app.core.supabase_auth import SupabaseUser
+from app.api.deps.subscription import require_team_plan
+from app.models.models import User
 from app.services.drug_discovery import (
     DrugDiscoveryClient,
     DrugDiscoveryRejected,
@@ -65,9 +66,24 @@ def _reraise(exc: Exception) -> HTTPException:
     raise exc  # pragma: no cover - unknown type, do not swallow
 
 
+@router.get("/indications")
+async def list_drug_discovery_indications(
+    user: User = Depends(require_team_plan),
+    client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
+):
+    """Ce que l'UI a le droit de proposer : 33 indications, exclusions marquées, profils.
+
+    Passe-plat strict — voir le docstring du module.
+    """
+    try:
+        return await client.list_indications()
+    except (DrugDiscoveryRejected, DrugDiscoveryUnavailable) as exc:
+        raise _reraise(exc)
+
+
 @router.get("/status")
 async def drug_discovery_status(
-    user: SupabaseUser = Depends(get_current_user),
+    user: User = Depends(require_team_plan),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Reachability and per-table readiness of genolens-dd.
@@ -97,7 +113,7 @@ async def drug_discovery_status(
 @router.post("/runs", status_code=201)
 async def create_drug_discovery_run(
     payload: RunRequest,
-    user: SupabaseUser = Depends(get_current_user),
+    user: User = Depends(require_team_plan),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Rank therapeutic targets for an indication."""
@@ -114,7 +130,7 @@ async def create_drug_discovery_run(
 @router.get("/runs/{run_id}")
 async def get_drug_discovery_run(
     run_id: str,
-    user: SupabaseUser = Depends(get_current_user),
+    user: User = Depends(require_team_plan),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     try:
@@ -127,7 +143,7 @@ async def get_drug_discovery_run(
 async def get_drug_discovery_targets(
     run_id: str,
     limit: int = Query(default=50, ge=1, le=1000),
-    user: SupabaseUser = Depends(get_current_user),
+    user: User = Depends(require_team_plan),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Ranked targets. `limit` is capped here as well as upstream.
@@ -144,7 +160,7 @@ async def get_drug_discovery_targets(
 @router.get("/runs/{run_id}/report")
 async def get_drug_discovery_report(
     run_id: str,
-    user: SupabaseUser = Depends(get_current_user),
+    user: User = Depends(require_team_plan),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     try:

@@ -171,6 +171,29 @@ async def test_a_malformed_body_becomes_502():
     assert caught.value.status_code == 502
 
 
+@pytest.mark.asyncio
+async def test_readyz_preserves_the_body_of_a_business_503():
+    """genolens-dd's `/readyz` answers 503 with a body when the reference socle is
+    incomplete — that is its nominal signal, not an outage, and `tables` says exactly what to
+    rebuild. Before this fix, `_interpret` mapped every >=500 onto `DrugDiscoveryUnavailable`
+    regardless of body, so this legitimate response was indistinguishable from a crash and its
+    `tables` detail was thrown away."""
+    body = {"ready": False, "tables": {"safety_profile": "missing"}}
+    client = client_with(json_handler(503, body))
+    result = await client.readyz()
+    assert result == body
+
+
+@pytest.mark.asyncio
+async def test_a_real_upstream_500_from_readyz_still_becomes_unavailable():
+    """`preserve_503` only special-cases 503 — a genuine crash upstream must still surface as
+    an outage, not be mistaken for an incomplete socle."""
+    client = client_with(json_handler(500, {"detail": "Traceback: ligne 12"}))
+    with pytest.raises(DrugDiscoveryUnavailable) as caught:
+        await client.readyz()
+    assert caught.value.status_code == 502
+
+
 # ---------------------------------------------------------------------------
 # Requests are shaped as genolens-dd expects
 # ---------------------------------------------------------------------------
@@ -228,6 +251,7 @@ async def test_a_trailing_slash_in_the_base_url_does_not_double():
 
 
 DD_ROUTES = [
+    ("GET", "/drug-discovery/indications"),
     ("GET", "/drug-discovery/status"),
     ("POST", "/drug-discovery/runs"),
     ("GET", "/drug-discovery/runs/r1"),
@@ -275,6 +299,57 @@ async def test_every_endpoint_requires_authentication(method, path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("method", "path"), DD_ROUTES)
+async def test_a_starter_plan_is_refused_on_every_route(method, path):
+    """Le verrou vit ici, pas seulement dans l'UI.
+
+    Une garde posée uniquement côté frontend serait cosmétique : un compte STARTER appellerait
+    ces routes avec son propre jeton et obtiendrait le classement complet. Le module serait
+    « réservé aux plans supérieurs » à l'écran et ouvert à tous par l'API.
+
+    L'authentification elle-même est aussi overridée (`get_current_user`, celui que
+    `get_or_create_user` consomme) : sans ça, une requête sans jeton Bearer est rejetée par
+    `HTTPBearer` avant même d'atteindre le verrou de plan, et un 403 obtenu de cette façon ne
+    prouve rien sur `require_team_plan` — voir `test_every_endpoint_requires_authentication`
+    pour ce cas-là. Ici la requête doit être authentifiée pour que seul le plan puisse encore
+    la refuser.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from app.api.deps.subscription import get_current_user, get_or_create_user
+    from app.core.supabase_auth import SupabaseUser
+    from app.models.models import SubscriptionPlan, User, UserRole
+
+    starter = User(
+        email="starter@example.com",
+        subscription_plan=SubscriptionPlan.STARTER,
+        role=UserRole.USER,
+    )
+    authenticated = SupabaseUser(
+        user_id="00000000-0000-0000-0000-000000000099",
+        email="starter@example.com",
+    )
+    app.dependency_overrides[get_or_create_user] = lambda: starter
+    app.dependency_overrides[get_current_user] = lambda: authenticated
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as http:
+            response = await http.request(method, f"/api/v1{path}", json={})
+        assert response.status_code == 403, (
+            f"{method} {path} a répondu {response.status_code} à un STARTER — "
+            "le classement serait accessible hors du plan qui le vend."
+        )
+        assert "requires a TEAM or ON_PREMISE plan" in response.text, (
+            f"{method} {path} a répondu 403 sans nommer l'exigence de plan — "
+            f"corps reçu : {response.text!r}. Un 403 dû à l'authentification passerait ce "
+            "test à tort ; c'est précisément la confusion qu'il doit détecter."
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
 async def test_status_distinguishes_unconfigured_from_unreachable(monkeypatch):
     """Both look like "Drug Discovery is down" otherwise, and the wrong thing gets investigated."""
     unconfigured = client_with(json_handler(200, {}), api_key="")
@@ -301,3 +376,49 @@ async def test_status_reports_readiness_when_all_is_well():
         "ready": True,
         "tables": {"safety_profile": "present"},
     }
+
+
+@pytest.mark.asyncio
+async def test_status_reports_reachable_with_an_incomplete_socle_not_unreachable():
+    """A `genolens-dd` that is up but missing a reference table answers `/readyz` with 503 and
+    a body — its nominal way of saying "rebuild these tables". Before the fix, that 503 was
+    indistinguishable from an outage: `/status` reported `reachable: false` and dropped
+    `tables`, sending an operator to check the network on the day a deploy actually needs them
+    to check their data."""
+    incomplete = client_with(
+        json_handler(503, {"ready": False, "tables": {"contrast_disease_normal": "missing"}})
+    )
+    result = await dd_endpoints.drug_discovery_status(user=object(), client=incomplete)
+    assert result == {
+        "configured": True,
+        "reachable": True,
+        "ready": False,
+        "tables": {"contrast_disease_normal": "missing"},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Le catalogue : passe-plat, aucune logique de ce côté
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_indications_are_passed_through_untouched():
+    """Aucune reconstruction ici : genolens-dd possède la table curée.
+
+    Filtrer ou réordonner de ce côté produirait deux catalogues qui divergent, et c'est le
+    catalogue local qui aurait tort en silence.
+    """
+    catalogue = {
+        "indications": [
+            {"tcga_project": "TCGA-BRCA", "disease_name": "breast carcinoma",
+             "excluded": False, "rationale": None},
+            {"tcga_project": "TCGA-PCPG", "disease_name": "pheochromocytoma",
+             "excluded": True, "rationale": "motif curé"},
+        ],
+        "profiles": ["default_oncology", "safety_first"],
+    }
+    seen: list[httpx.Request] = []
+    client = client_with(json_handler(200, catalogue, capture=seen))
+    assert await client.list_indications() == catalogue
+    assert seen[0].url.path == "/indications"
