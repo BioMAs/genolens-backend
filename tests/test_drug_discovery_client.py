@@ -8,6 +8,8 @@ deterministic and runs offline.
 re-open the product that the API key exists to close — and `test_an_upstream_401_becomes_502`,
 because passing a 401 through would blame the logged-in user for our own bad credential.
 """
+import json
+
 import httpx
 import pytest
 
@@ -257,6 +259,11 @@ DD_ROUTES = [
     ("GET", "/drug-discovery/runs/r1"),
     ("GET", "/drug-discovery/runs/r1/targets"),
     ("GET", "/drug-discovery/runs/r1/report"),
+    # Mode B. These carry the user's own gene list, so an unauthenticated one would be worse
+    # than a public ranking: it would let anyone build a signature from someone else's data.
+    ("GET", "/drug-discovery/signature-preview"),
+    ("POST", "/drug-discovery/signature-runs"),
+    ("GET", "/drug-discovery/runs/r1/signature/s1/report"),
 ]
 
 
@@ -272,7 +279,10 @@ def test_the_route_list_covers_every_registered_route():
         for route in app.routes
         if getattr(route, "path", "").startswith("/api/v1/drug-discovery")
     }
-    expected = {path.replace("/r1", "/{run_id}") for _, path in DD_ROUTES}
+    expected = {
+        path.replace("/r1", "/{run_id}").replace("/s1", "/{signature_id}")
+        for _, path in DD_ROUTES
+    }
     assert registered == expected, f"routes non couvertes : {registered ^ expected}"
 
 
@@ -422,3 +432,96 @@ async def test_indications_are_passed_through_untouched():
     client = client_with(json_handler(200, catalogue, capture=seen))
     assert await client.list_indications() == catalogue
     assert seen[0].url.path == "/indications"
+
+
+# ---------------------------------------------------------------------------
+# Mode B — the one call that carries the user's own data
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_signature_payload_matches_the_upstream_contract():
+    """genolens-dd expects `conditions: {name: {genes, replicates}}`, not two parallel dicts.
+
+    Sending the wrong shape would come back as a rule-coded rejection about a missing
+    replicate count — a rejection the user cannot act on, since the fault is ours.
+    """
+    seen: list[httpx.Request] = []
+    client = client_with(json_handler(201, {"signature_id": "s1"}, capture=seen))
+    await client.submit_signature(
+        "r1",
+        client_id="proj-1",
+        genes_by_condition={"treated": ["EGFR", "ERBB2"], "control": ["TP53"]},
+        replicates={"treated": 4, "control": 3},
+        seed=1234,
+    )
+    body = json.loads(seen[0].content)
+    assert body["client_id"] == "proj-1"
+    assert body["seed"] == 1234
+    assert body["conditions"] == {
+        "treated": {"genes": ["EGFR", "ERBB2"], "replicates": 4},
+        "control": {"genes": ["TP53"], "replicates": 3},
+    }
+    assert str(seen[0].url).startswith("https://dd.genolens.com/runs/r1/signature")
+
+
+@pytest.mark.asyncio
+async def test_allow_underpowered_is_only_sent_when_asked():
+    """Same discipline as `allow_excluded`: a permissive flag always present ends up always
+    true, and an underpowered signature would stop being an explicit choice."""
+    seen: list[httpx.Request] = []
+    client = client_with(json_handler(201, {}, capture=seen))
+    await client.submit_signature(
+        "r1", client_id="p", genes_by_condition={"t": ["EGFR"]},
+        replicates={"t": 3}, seed=1,
+    )
+    assert "allow_underpowered" not in json.loads(seen[0].content)
+
+    await client.submit_signature(
+        "r1", client_id="p", genes_by_condition={"t": ["EGFR"]},
+        replicates={"t": 2}, seed=1, allow_underpowered=True,
+    )
+    assert json.loads(seen[1].content)["allow_underpowered"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_rule_coded_rejection_keeps_its_structured_detail():
+    """`rule_id` is the only part of a SIG00x rejection the frontend can route on.
+
+    Flattening it to a string here would force the UI to regex a French sentence, and the
+    upstream carries `rule_id` in attributes precisely so nobody has to.
+    """
+    detail = {"rule_id": "SIG002", "conditions": ["treated"], "message": "…"}
+    client = client_with(json_handler(422, {"detail": detail}))
+    with pytest.raises(DrugDiscoveryRejected) as raised:
+        await client.submit_signature(
+            "r1", client_id="p", genes_by_condition={"treated": ["EGFR"]},
+            replicates={"treated": 2}, seed=1,
+        )
+    assert raised.value.status_code == 422
+    assert raised.value.detail["rule_id"] == "SIG002"
+
+
+@pytest.mark.asyncio
+async def test_a_run_evicted_between_create_and_submit_stays_a_404():
+    """Upstream runs live in memory; a redeploy between the two calls loses one.
+
+    Mapping that to 502 would tell the user the service is broken when the correct action is
+    to run again — which is exactly what the frontend's bounded recovery does on a 404.
+    """
+    client = client_with(json_handler(404, {"detail": "run inconnu : r1"}))
+    with pytest.raises(DrugDiscoveryRejected) as raised:
+        await client.submit_signature(
+            "r1", client_id="p", genes_by_condition={"t": ["EGFR"]},
+            replicates={"t": 3}, seed=1,
+        )
+    assert raised.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_the_signature_report_limit_reaches_the_query_string():
+    seen: list[httpx.Request] = []
+    client = client_with(json_handler(200, {}, capture=seen))
+    await client.get_signature_report("r1", "s1", limit=3)
+    assert seen[0].url.params["limit"] == "3"
+    assert seen[0].url.path == "/runs/r1/signature/s1/report"

@@ -233,6 +233,50 @@ class DrugDiscoveryClient:
     async def get_report(self, run_id: str) -> dict:
         return await self._request("GET", f"/runs/{run_id}/report")
 
+    async def submit_signature(
+        self,
+        run_id: str,
+        *,
+        client_id: str,
+        genes_by_condition: dict[str, list[str]],
+        replicates: dict[str, int],
+        seed: int,
+        allow_underpowered: bool = False,
+        limit: int = 100,
+    ) -> dict:
+        """Dépose une signature cliente sur un run (mode B).
+
+        La **seule** route de ce client qui transmette des données de l'utilisateur. Elle
+        n'envoie que des symboles de gènes et des effectifs — jamais de valeurs d'expression,
+        jamais d'identifiant de projet ou de dataset. `client_id` est un libellé de
+        rattachement, pas une donnée personnelle.
+
+        `allow_underpowered` n'est envoyé que s'il est demandé, comme `allow_excluded` : un
+        drapeau permissif toujours présent finit par être toujours vrai.
+        """
+        body: dict[str, Any] = {
+            "client_id": client_id,
+            "conditions": {
+                name: {"genes": genes, "replicates": replicates.get(name)}
+                for name, genes in genes_by_condition.items()
+            },
+            "seed": seed,
+        }
+        if allow_underpowered:
+            body["allow_underpowered"] = True
+        return await self._request(
+            "POST", f"/runs/{run_id}/signature", json_body=body, params={"limit": limit}
+        )
+
+    async def get_signature_report(
+        self, run_id: str, signature_id: str, *, limit: int = 10
+    ) -> dict:
+        return await self._request(
+            "GET",
+            f"/runs/{run_id}/signature/{signature_id}/report",
+            params={"limit": limit},
+        )
+
 
 def get_drug_discovery_client() -> DrugDiscoveryClient:
     """FastAPI dependency. Built per request; httpx clients are created per call anyway."""

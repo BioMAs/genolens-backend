@@ -1766,6 +1766,69 @@ async def diagnose_deg_filtering(
     }
 
 
+def deg_genes_stmt(
+    dataset_id: UUID,
+    comparison_name: str,
+    *,
+    regulation: Optional[str] = None,
+    padj_max: Optional[float] = None,
+    logfc_min: Optional[float] = None,
+):
+    """Requête de sélection des DEG d'une comparaison, filtres appliqués, sans pagination.
+
+    Extraite de `get_deg_genes` pour que d'autres appelants — le module Drug Discovery, qui
+    construit une signature depuis la même table — n'en réécrivent pas une variante. Une
+    seconde copie finirait par diverger sur un filtre, et deux vues de la « même » comparaison
+    ne compteraient pas les mêmes gènes.
+    """
+    stmt = select(DegGene).where(
+        DegGene.dataset_id == dataset_id,
+        DegGene.comparison_name == comparison_name
+    )
+
+    if regulation:
+        stmt = stmt.where(DegGene.regulation == regulation.upper())
+
+    if padj_max is not None:
+        stmt = stmt.where(DegGene.padj <= padj_max)
+
+    if logfc_min is not None:
+        # ABS(log_fc) >= min  <=>  log_fc >= min OR log_fc <= -min
+        stmt = stmt.where(or_(DegGene.log_fc >= logfc_min, DegGene.log_fc <= -logfc_min))
+
+    return stmt
+
+
+async def select_deg_genes(
+    db: AsyncSession,
+    dataset_id: UUID,
+    comparison_name: str,
+    *,
+    regulation: Optional[str] = None,
+    padj_max: Optional[float] = None,
+    logfc_min: Optional[float] = None,
+    limit: Optional[int] = None,
+    order_by_significance: bool = True,
+) -> list[DegGene]:
+    """Lignes DEG filtrées, triées par significativité puis par effet décroissant.
+
+    `order_by_significance` porte l'ordre `padj ASC, ABS(log_fc) DESC`, qui n'est pas offert
+    par `get_deg_genes` (dont le tri est une colonne simple choisie par l'appelant HTTP).
+    Cet ordre existe pour que **tronquer** une signature à N gènes garde les plus solides :
+    une troncature par `gene_id` jetterait les meilleurs candidats sans le dire.
+    """
+    stmt = deg_genes_stmt(
+        dataset_id, comparison_name,
+        regulation=regulation, padj_max=padj_max, logfc_min=logfc_min,
+    )
+    if order_by_significance:
+        stmt = stmt.order_by(asc(DegGene.padj), desc(func.abs(DegGene.log_fc)))
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
 @router.get("/{dataset_id}/deg-genes/{comparison_name}")
 async def get_deg_genes(
     dataset_id: UUID,
@@ -1800,20 +1863,10 @@ async def get_deg_genes(
     await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     # Build query for DegGene
-    stmt = select(DegGene).where(
-        DegGene.dataset_id == dataset_id,
-        DegGene.comparison_name == comparison_name
+    stmt = deg_genes_stmt(
+        dataset_id, comparison_name,
+        regulation=regulation, padj_max=padj_max, logfc_min=logfc_min,
     )
-
-    if regulation:
-        stmt = stmt.where(DegGene.regulation == regulation.upper())
-
-    if padj_max is not None:
-        stmt = stmt.where(DegGene.padj <= padj_max)
-
-    if logfc_min is not None:
-        # ABS(log_fc) >= min  <=>  log_fc >= min OR log_fc <= -min
-        stmt = stmt.where(or_(DegGene.log_fc >= logfc_min, DegGene.log_fc <= -logfc_min))
 
     # Count total matching genes
     count_stmt = select(func.count()).select_from(stmt.subquery())
