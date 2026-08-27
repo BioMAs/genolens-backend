@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
+from app.api.deps.subscription import require_scientific_access
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import Project, ProjectMember, GeneSet, GeneSetDatabase
 from app.services.gene_set_loader import GMTParser
@@ -70,7 +71,11 @@ async def _assert_project_access(db: AsyncSession, project_id: UUID, user: Supab
     return project
 
 
-@router.get("/projects/{project_id}/gene-sets", response_model=list[GeneSetResponse])
+@router.get(
+    "/projects/{project_id}/gene-sets",
+    response_model=list[GeneSetResponse],
+    dependencies=[Depends(require_scientific_access)],
+)
 async def list_custom_gene_sets(
     project_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -96,7 +101,7 @@ async def list_custom_gene_sets(
     "/projects/{project_id}/gene-sets",
     response_model=GeneSetCreateResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_active_license)],
+    dependencies=[Depends(require_active_license), Depends(require_scientific_access)],
 )
 async def create_custom_gene_set(
     project_id: UUID,
@@ -148,7 +153,7 @@ async def create_custom_gene_set(
 @router.post(
     "/projects/{project_id}/gene-sets/upload-gmt",
     response_model=GMTUploadResponse,
-    dependencies=[Depends(require_active_license)],
+    dependencies=[Depends(require_active_license), Depends(require_scientific_access)],
 )
 async def upload_gmt(
     project_id: UUID,
@@ -214,7 +219,7 @@ async def upload_gmt(
 @router.delete(
     "/projects/{project_id}/gene-sets/{gene_set_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    dependencies=[Depends(require_active_license)],
+    dependencies=[Depends(require_active_license), Depends(require_scientific_access)],
 )
 async def delete_custom_gene_set(
     project_id: UUID,

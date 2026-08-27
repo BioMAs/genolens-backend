@@ -188,6 +188,27 @@ async def require_report_customization_access(
     return user
 
 
+# ── Scientific tools module (per-user add-on) ────────────────────────────────────
+
+async def require_scientific_access(
+    user: Annotated[User, Depends(get_or_create_user)]
+) -> User:
+    """Require the Scientific tools add-on module to be unlocked for this user.
+
+    Covers GSEA, the two-contrast log2FC scatter, per-sample signature scoring,
+    custom gene sets and DEG patterns. Unlocked explicitly per-user by an admin
+    (User.scientific_module_enabled); admins always have access. Mirrors the
+    Cosmetics module pattern — the frontend renders locked cards when access is
+    denied, so a 403 here is expected for users without the module.
+    """
+    if not user.has_scientific_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Scientific tools module is not enabled for this account.",
+        )
+    return user
+
+
 # ── TEAM plan guard ────────────────────────────────────────────────────────────
 
 async def require_team_plan(

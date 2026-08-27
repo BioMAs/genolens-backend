@@ -47,6 +47,7 @@ class UserProfile(BaseModel):
     ai_interpretations_remaining: Optional[int] = None
     cosmetics_module_enabled: bool = False
     report_customization_module_enabled: bool = False
+    scientific_module_enabled: bool = False
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     last_sign_in_at: Optional[str] = None
@@ -62,6 +63,10 @@ class CosmeticsModuleUpdate(BaseModel):
 
 class ReportCustomizationModuleUpdate(BaseModel):
     """Schema for toggling the report customization add-on module for a user."""
+    enabled: bool
+
+class ScientificModuleUpdate(BaseModel):
+    """Schema for toggling the Scientific tools add-on module for a user."""
     enabled: bool
 
 class TokenAdd(BaseModel):
@@ -239,6 +244,7 @@ async def list_users(
                     # the stored flag; effective access is still role-aware at feature endpoints.
                     cosmetics_enabled = local_user.cosmetics_module_enabled
                     report_customization_enabled = local_user.report_customization_module_enabled
+                    scientific_enabled = local_user.scientific_module_enabled
 
                 result.append(UserProfile(
                     id=UUID(user_id),
@@ -254,6 +260,7 @@ async def list_users(
                     ai_tokens_used=ai_tokens_used,
                     cosmetics_module_enabled=cosmetics_enabled,
                     report_customization_module_enabled=report_customization_enabled,
+                    scientific_module_enabled=scientific_enabled,
                     created_at=profile.get("created_at"),
                     updated_at=profile.get("updated_at"),
                     last_sign_in_at=auth_info.get("last_sign_in_at"),
@@ -420,6 +427,7 @@ async def get_user_details(
                     ai_tokens_used = 0
                     cosmetics_enabled = False
                     report_customization_enabled = False
+                    scientific_enabled = False
                     role_value = profile.get("role", "USER")
 
                     if local_user:
@@ -433,6 +441,7 @@ async def get_user_details(
                         # Raw per-user flags (see note above) — not the role-inflated has_*.
                         cosmetics_enabled = local_user.cosmetics_module_enabled
                         report_customization_enabled = local_user.report_customization_module_enabled
+                        scientific_enabled = local_user.scientific_module_enabled
 
                     return UserProfile(
                         id=UUID(profile["id"]),
@@ -447,6 +456,7 @@ async def get_user_details(
                         ai_tokens_used=ai_tokens_used,
                         cosmetics_module_enabled=cosmetics_enabled,
                         report_customization_module_enabled=report_customization_enabled,
+                        scientific_module_enabled=scientific_enabled,
                         created_at=profile.get("created_at"),
                         updated_at=profile.get("updated_at"),
                         last_sign_in_at=last_sign_in,
@@ -566,6 +576,34 @@ async def update_user_report_customization_module(
         )
 
     user.report_customization_module_enabled = update.enabled
+    await db.commit()
+
+    return await get_user_details(user_id, current_user, db)
+
+
+@router.patch("/users/{user_id}/scientific-module", response_model=UserProfile)
+async def update_user_scientific_module(
+    user_id: UUID,
+    update: ScientificModuleUpdate,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Enable or disable the Scientific tools add-on module for a user (GSEA,
+    contrast scatter, signature scoring, custom gene sets, DEG patterns).
+    Admin only.
+    """
+    query = select(User).where(User.id == user_id)
+    result = await db.execute(query)
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not initialized in local database. Please update subscription first.",
+        )
+
+    user.scientific_module_enabled = update.enabled
     await db.commit()
 
     return await get_user_details(user_id, current_user, db)

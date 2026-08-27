@@ -20,6 +20,7 @@ from sqlalchemy.orm import joinedload
 
 from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
+from app.api.deps.subscription import require_scientific_access
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import Dataset, Project, ProjectMember
 from app.models.gsea_job import GSEAJob, GSEAJobStatus
@@ -58,7 +59,7 @@ async def _assert_project_access(db: AsyncSession, project: Project, user: Supab
     "/datasets/{dataset_id}/gsea-async",
     response_model=GSEATriggerResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_active_license)],
+    dependencies=[Depends(require_active_license), Depends(require_scientific_access)],
 )
 async def trigger_gsea(
     dataset_id: UUID,
@@ -117,7 +118,11 @@ async def trigger_gsea(
     return GSEATriggerResponse(job_id=job.id, status=job.status)
 
 
-@router.get("/gsea-jobs/{job_id}", response_model=GSEAJobResponse)
+@router.get(
+    "/gsea-jobs/{job_id}",
+    response_model=GSEAJobResponse,
+    dependencies=[Depends(require_scientific_access)],
+)
 async def get_gsea_job(
     job_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],

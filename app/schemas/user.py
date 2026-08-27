@@ -41,3 +41,4 @@ class UserSelf(User):
     # Add-on modules (unlocked per-user by an admin)
     has_cosmetics_module: bool = False
     has_report_customization: bool = False
+    has_scientific_module: bool = False

@@ -30,6 +30,7 @@ from app.api.deps.license import require_active_license
 from app.api.deps.subscription import (
     get_or_create_user,
     require_ai_access,
+    require_scientific_access,
     check_ai_quota,
     increment_ai_usage,
     check_comparison_quota,
@@ -3392,7 +3393,7 @@ async def get_custom_boxplot_data(
     }
 
 
-@router.post("/{dataset_id}/signature-score", dependencies=[Depends(require_active_license)])
+@router.post("/{dataset_id}/signature-score", dependencies=[Depends(require_active_license), Depends(require_scientific_access)])
 async def signature_score(
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -3520,7 +3521,7 @@ async def signature_score(
     }
 
 
-@router.post("/{dataset_id}/deg-patterns", dependencies=[Depends(require_active_license)])
+@router.post("/{dataset_id}/deg-patterns", dependencies=[Depends(require_active_license), Depends(require_scientific_access)])
 async def deg_patterns(
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -4143,7 +4144,7 @@ async def apply_advanced_filter(
         raise HTTPException(status_code=500, detail=f"Filter error: {str(e)}")
 
 
-@router.post("/{dataset_id}/logfc-scatter", dependencies=[Depends(require_active_license)])
+@router.post("/{dataset_id}/logfc-scatter", dependencies=[Depends(require_active_license), Depends(require_scientific_access)])
 async def logfc_scatter(
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -4329,7 +4330,7 @@ async def logfc_scatter(
     }
 
 
-@router.post("/{dataset_id}/gsea", dependencies=[Depends(require_active_license)])
+@router.post("/{dataset_id}/gsea", dependencies=[Depends(require_active_license), Depends(require_scientific_access)])
 async def run_gsea_analysis(
     dataset_id: UUID,
     comparison_name: str = Body(...),
@@ -4406,7 +4407,10 @@ async def run_gsea_analysis(
         raise HTTPException(status_code=500, detail=f"GSEA analysis failed: {str(e)}")
 
 
-@router.get("/{dataset_id}/gsea/{gene_set_name}/enrichment-plot")
+@router.get(
+    "/{dataset_id}/gsea/{gene_set_name}/enrichment-plot",
+    dependencies=[Depends(require_scientific_access)],
+)
 async def get_enrichment_plot_data(
     dataset_id: UUID,
     gene_set_name: str,
@@ -4500,7 +4504,10 @@ async def get_enrichment_plot_data(
         raise HTTPException(status_code=500, detail=f"Failed to generate plot data: {str(e)}")
 
 
-@router.get("/{dataset_id}/comparisons/{comparison_name}/gsea-results")
+@router.get(
+    "/{dataset_id}/comparisons/{comparison_name}/gsea-results",
+    dependencies=[Depends(require_scientific_access)],
+)
 async def get_cached_gsea_results(
     dataset_id: UUID,
     comparison_name: str,

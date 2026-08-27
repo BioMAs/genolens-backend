@@ -713,6 +713,12 @@ class User(Base, TimestampMixin):
         server_default=sa_text("false"),
         comment="Whether the report customization module (branding, logo, conclusion, M&M) is unlocked for this user",
     )
+    scientific_module_enabled: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        server_default=sa_text("false"),
+        comment="Whether the Scientific tools module (GSEA, contrast scatter, signature scoring, custom gene sets, DEG patterns) is unlocked for this user",
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email}, role={self.role}, plan={self.subscription_plan})>"
@@ -802,6 +808,11 @@ class User(Base, TimestampMixin):
     def has_report_customization(self) -> bool:
         """Report customization add-on: explicitly unlocked per-user by an admin. Admins always have it."""
         return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.report_customization_module_enabled
+
+    @property
+    def has_scientific_module(self) -> bool:
+        """Scientific tools add-on: explicitly unlocked per-user by an admin. Admins always have it."""
+        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.scientific_module_enabled
 
 
 class UserReportSettings(Base, TimestampMixin):
