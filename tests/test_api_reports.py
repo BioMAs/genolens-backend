@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 from httpx import AsyncClient, ASGITransport
 
-from tests.conftest import TEST_USER_ID, make_fake_supabase_user
+from tests.conftest import TEST_USER_ID, make_fake_current_user
 
 FAKE_ANALYSIS_ID = str(uuid4())
 
@@ -23,7 +23,7 @@ async def reports_client():
     from app.api.deps.auth import get_current_user
     from app.api.deps.db import get_db
 
-    fake_user = make_fake_supabase_user(user_id=TEST_USER_ID)
+    fake_user = make_fake_current_user(user_id=TEST_USER_ID)
 
     async def _fake_db():
         mock = AsyncMock()

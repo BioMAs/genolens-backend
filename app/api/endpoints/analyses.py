@@ -15,10 +15,11 @@ from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
+from app.api.deps.project_access import assert_project_access
 from app.api.deps.license import require_active_license
 from app.api.deps.subscription import get_or_create_user
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, OmicsDataType, User, Project, ProjectMember
+from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, OmicsDataType, User, Project
 
 logger = logging.getLogger(__name__)
 
@@ -145,21 +146,7 @@ async def list_analyses(
     project_id: UUID = Query(...),
 ) -> SelfServiceAnalysisListResponse:
     """List all analyses for a project (owner or member)."""
-    # Verify project access: owner or project member
-    proj = await db.scalar(
-        select(Project).where(Project.id == project_id)
-    )
-    if not proj:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if proj.owner_id != current_user.user_id:
-        member = await db.scalar(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id,
-                ProjectMember.user_id == current_user.user_id,
-            )
-        )
-        if not member:
-            raise HTTPException(status_code=404, detail="Project not found")
+    await assert_project_access(db, project_id, current_user.user_id)
 
     result = await db.execute(
         select(SelfServiceAnalysis)
@@ -179,14 +166,13 @@ async def get_analysis(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
 ) -> SelfServiceAnalysisResponse:
-    """Get a single analysis by ID."""
+    """Get a single analysis by ID (project owner or member)."""
     analysis = await db.scalar(
         select(SelfServiceAnalysis).where(SelfServiceAnalysis.id == analysis_id)
     )
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
-    if analysis.user_id != current_user.user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    await assert_project_access(db, analysis.project_id, current_user.user_id)
     return SelfServiceAnalysisResponse.from_orm(analysis)
 
 
@@ -268,8 +254,14 @@ async def delete_analysis(
     )
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
+    # Deleting is destructive: restricted to the launcher and the project owner
+    # (plain members may read the analysis but not remove it).
     if analysis.user_id != current_user.user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+        proj = await db.scalar(
+            select(Project).where(Project.id == analysis.project_id)
+        )
+        if proj is None or proj.owner_id != current_user.user_id:
+            raise HTTPException(status_code=403, detail="Access denied")
 
     # Attempt to revoke the Celery task if still pending/running
     if analysis.celery_task_id and analysis.status in (

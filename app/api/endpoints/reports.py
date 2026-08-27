@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db
+from app.api.deps.project_access import assert_project_access
 from app.api.deps.subscription import get_or_create_user
 from app.core.security import CurrentUser
 from app.models.models import Dataset, SelfServiceAnalysis, User
@@ -36,10 +37,14 @@ router = APIRouter(prefix="/analyses", tags=["reports"])
 comparison_router = APIRouter(prefix="/datasets", tags=["reports"])
 
 
-async def _get_analysis_or_404(analysis_id: UUID, db: AsyncSession) -> SelfServiceAnalysis:
+async def _get_analysis_or_404(
+    analysis_id: UUID, db: AsyncSession, user_id: UUID
+) -> SelfServiceAnalysis:
+    """Fetch an analysis, enforcing project access (owner or member)."""
     analysis = await db.get(SelfServiceAnalysis, analysis_id)
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
+    await assert_project_access(db, analysis.project_id, user_id)
     return analysis
 
 
@@ -54,7 +59,7 @@ async def trigger_report(
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
     """Trigger background SciLicium PDF report generation for an analysis."""
-    analysis = await _get_analysis_or_404(analysis_id, db)
+    analysis = await _get_analysis_or_404(analysis_id, db, current_user.id)
 
     # Return existing in-progress job rather than spawning a duplicate
     stmt = select(ReportJob).where(
@@ -106,6 +111,7 @@ async def report_status(
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
     """Get the status of the latest report job for an analysis."""
+    await _get_analysis_or_404(analysis_id, db, current_user.id)
     stmt = (
         select(ReportJob)
         .where(ReportJob.analysis_id == analysis_id)
@@ -125,6 +131,7 @@ async def download_report(
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
     """Download the generated PDF report for an analysis."""
+    analysis = await _get_analysis_or_404(analysis_id, db, current_user.id)
     stmt = (
         select(ReportJob)
         .where(ReportJob.analysis_id == analysis_id, ReportJob.status == ReportJobStatus.DONE)
@@ -138,8 +145,7 @@ async def download_report(
     from app.services.storage import storage_service
     pdf_bytes = await storage_service.download_file(job.pdf_path)
 
-    analysis = await db.get(SelfServiceAnalysis, analysis_id)
-    name = (analysis.name if analysis else str(analysis_id)) or str(analysis_id)
+    name = analysis.name or str(analysis_id)
     filename = "".join(c if c.isalnum() or c in "-_." else "_" for c in f"report_{name}.pdf")
 
     return Response(
@@ -154,10 +160,12 @@ async def download_report(
 
 # ── Comparison-scoped report ────────────────────────────────────────────────────
 
-async def _get_dataset_or_404(dataset_id: UUID, db: AsyncSession) -> Dataset:
+async def _get_dataset_or_404(dataset_id: UUID, db: AsyncSession, user_id: UUID) -> Dataset:
+    """Fetch a dataset, enforcing project access (owner or member)."""
     dataset = await db.get(Dataset, dataset_id)
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    await assert_project_access(db, dataset.project_id, user_id)
     return dataset
 
 
@@ -178,7 +186,7 @@ async def trigger_comparison_report(
     Per-report customization content (conclusion / materials & methods) is only
     applied when the requesting user has the report customization module.
     """
-    dataset = await _get_dataset_or_404(dataset_id, db)
+    dataset = await _get_dataset_or_404(dataset_id, db, user.id)
 
     # Return existing in-progress job rather than spawning a duplicate — but only
     # if it is *recent*. A job that has been PENDING/RUNNING for too long is stale
@@ -259,6 +267,7 @@ async def comparison_report_status(
     comparison_name: Annotated[str, Query(...)],
 ):
     """Get the status of the latest report job for a comparison."""
+    await _get_dataset_or_404(dataset_id, db, current_user.id)
     stmt = (
         select(ReportJob)
         .where(
@@ -292,6 +301,7 @@ async def download_comparison_report(
     comparison_name: Annotated[str, Query(...)],
 ):
     """Download the generated PDF report for a comparison."""
+    await _get_dataset_or_404(dataset_id, db, current_user.id)
     stmt = (
         select(ReportJob)
         .where(

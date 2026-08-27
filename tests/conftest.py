@@ -190,6 +190,26 @@ def make_fake_supabase_user(
     return SupabaseUser(user_id=user_id, email=email)
 
 
+def make_fake_current_user(
+    user_id: UUID = TEST_USER_ID,
+    email: str = "test@example.com",
+):
+    """Return a CurrentUser suitable for overriding app.api.deps.auth.get_current_user."""
+    from app.core.security import CurrentUser
+    from app.models.models import SubscriptionPlan, UserRole
+    return CurrentUser(
+        id=user_id,
+        email=email,
+        full_name="Test User",
+        role=UserRole.USER,
+        subscription_tier=SubscriptionPlan.TEAM,
+        max_projects=100,
+        current_project_count=0,
+        features_access={},
+        is_active=True,
+    )
+
+
 # ─────────────────────────────────────────────
 # Integration-test client
 # ─────────────────────────────────────────────
