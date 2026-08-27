@@ -226,6 +226,7 @@ async def list_users(
                 ai_remaining = 0
                 cosmetics_enabled = False
                 report_customization_enabled = False
+                scientific_enabled = False
                 role_value = profile.get("role", "USER")
 
                 if local_user:
