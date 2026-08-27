@@ -15,6 +15,7 @@ import pytest
 
 from app.api.endpoints import drug_discovery as dd_endpoints
 from app.main import app
+from app.models.models import SubscriptionPlan
 from app.services.drug_discovery import (
     API_KEY_HEADER,
     DrugDiscoveryClient,
@@ -310,36 +311,46 @@ async def test_every_endpoint_requires_authentication(method, path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("method", "path"), DD_ROUTES)
-async def test_a_starter_plan_is_refused_on_every_route(method, path):
+@pytest.mark.parametrize(
+    "plan",
+    [SubscriptionPlan.STARTER, SubscriptionPlan.TEAM],
+    ids=["starter", "team"],
+)
+async def test_an_account_without_the_module_is_refused_on_every_route(method, path, plan):
     """Le verrou vit ici, pas seulement dans l'UI.
 
-    Une garde posée uniquement côté frontend serait cosmétique : un compte STARTER appellerait
-    ces routes avec son propre jeton et obtiendrait le classement complet. Le module serait
-    « réservé aux plans supérieurs » à l'écran et ouvert à tous par l'API.
+    Une garde posée uniquement côté frontend serait cosmétique : un compte sans le module
+    appellerait ces routes avec son propre jeton et obtiendrait le classement complet. Le
+    module serait « réservé » à l'écran et ouvert à tous par l'API.
+
+    Drug Discovery est un add-on PAR UTILISATEUR depuis la migration
+    `drug_discovery_module_001` : le plan n'accorde plus rien. Le cas `team` est donc le
+    plus important des deux — il échouerait si quelqu'un remettait un verrou de plan
+    (`require_team_plan`) à la place du verrou de module.
 
     L'authentification elle-même est aussi overridée (`get_current_user`, celui que
     `get_or_create_user` consomme) : sans ça, une requête sans jeton Bearer est rejetée par
-    `HTTPBearer` avant même d'atteindre le verrou de plan, et un 403 obtenu de cette façon ne
-    prouve rien sur `require_team_plan` — voir `test_every_endpoint_requires_authentication`
-    pour ce cas-là. Ici la requête doit être authentifiée pour que seul le plan puisse encore
-    la refuser.
+    `HTTPBearer` avant même d'atteindre le verrou, et un 403 obtenu de cette façon ne
+    prouve rien sur `require_drug_discovery_access` — voir
+    `test_every_endpoint_requires_authentication` pour ce cas-là.
     """
     from httpx import ASGITransport, AsyncClient
 
     from app.api.deps.subscription import get_current_user, get_or_create_user
     from app.core.supabase_auth import SupabaseUser
-    from app.models.models import SubscriptionPlan, User, UserRole
+    from app.models.models import User, UserRole
 
-    starter = User(
-        email="starter@example.com",
-        subscription_plan=SubscriptionPlan.STARTER,
+    without_module = User(
+        email="nomodule@example.com",
+        subscription_plan=plan,
         role=UserRole.USER,
+        drug_discovery_module_enabled=False,
     )
     authenticated = SupabaseUser(
         user_id="00000000-0000-0000-0000-000000000099",
-        email="starter@example.com",
+        email="nomodule@example.com",
     )
-    app.dependency_overrides[get_or_create_user] = lambda: starter
+    app.dependency_overrides[get_or_create_user] = lambda: without_module
     app.dependency_overrides[get_current_user] = lambda: authenticated
     try:
         async with AsyncClient(
@@ -347,13 +358,53 @@ async def test_a_starter_plan_is_refused_on_every_route(method, path):
         ) as http:
             response = await http.request(method, f"/api/v1{path}", json={})
         assert response.status_code == 403, (
-            f"{method} {path} a répondu {response.status_code} à un STARTER — "
-            "le classement serait accessible hors du plan qui le vend."
+            f"{method} {path} a répondu {response.status_code} à un compte {plan.value} sans "
+            "le module — le classement serait accessible hors de l'add-on qui le vend."
         )
-        assert "requires a TEAM or ON_PREMISE plan" in response.text, (
-            f"{method} {path} a répondu 403 sans nommer l'exigence de plan — "
+        assert "Drug Discovery module is not enabled" in response.text, (
+            f"{method} {path} a répondu 403 sans nommer l'exigence de module — "
             f"corps reçu : {response.text!r}. Un 403 dû à l'authentification passerait ce "
             "test à tort ; c'est précisément la confusion qu'il doit détecter."
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("method", "path"), DD_ROUTES)
+async def test_the_module_flag_opens_every_route(method, path):
+    """L'add-on doit vraiment ouvrir l'accès — sinon le verrou serait un mur.
+
+    Le pendant du test précédent : un STARTER AVEC le flag ne doit plus être refusé par le
+    verrou de module. On ne vérifie donc que l'absence d'un 403 « module désactivé » ; ce que
+    la route répond ensuite dépend de genolens-dd, hors sujet ici.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from app.api.deps.subscription import get_current_user, get_or_create_user
+    from app.core.supabase_auth import SupabaseUser
+    from app.models.models import User, UserRole
+
+    with_module = User(
+        email="withmodule@example.com",
+        subscription_plan=SubscriptionPlan.STARTER,
+        role=UserRole.USER,
+        drug_discovery_module_enabled=True,
+    )
+    authenticated = SupabaseUser(
+        user_id="00000000-0000-0000-0000-000000000098",
+        email="withmodule@example.com",
+    )
+    app.dependency_overrides[get_or_create_user] = lambda: with_module
+    app.dependency_overrides[get_current_user] = lambda: authenticated
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as http:
+            response = await http.request(method, f"/api/v1{path}", json={})
+        assert "Drug Discovery module is not enabled" not in response.text, (
+            f"{method} {path} refuse encore un compte qui A le module — l'add-on ne "
+            f"donnerait accès à rien. Corps reçu : {response.text!r}"
         )
     finally:
         app.dependency_overrides.clear()
