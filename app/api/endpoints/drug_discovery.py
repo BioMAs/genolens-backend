@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
-from app.api.deps.subscription import require_team_plan
+from app.api.deps.subscription import require_drug_discovery_access
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import Dataset, User
 from app.services.drug_discovery import (
@@ -77,7 +77,7 @@ def _reraise(exc: Exception) -> HTTPException:
 
 @router.get("/indications")
 async def list_drug_discovery_indications(
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Ce que l'UI a le droit de proposer : 33 indications, exclusions marquées, profils.
@@ -92,7 +92,7 @@ async def list_drug_discovery_indications(
 
 @router.get("/status")
 async def drug_discovery_status(
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Reachability and per-table readiness of genolens-dd.
@@ -122,7 +122,7 @@ async def drug_discovery_status(
 @router.post("/runs", status_code=201)
 async def create_drug_discovery_run(
     payload: RunRequest,
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Rank therapeutic targets for an indication."""
@@ -139,7 +139,7 @@ async def create_drug_discovery_run(
 @router.get("/runs/{run_id}")
 async def get_drug_discovery_run(
     run_id: str,
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     try:
@@ -152,7 +152,7 @@ async def get_drug_discovery_run(
 async def get_drug_discovery_targets(
     run_id: str,
     limit: int = Query(default=50, ge=1, le=1000),
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Ranked targets. `limit` is capped here as well as upstream.
@@ -169,7 +169,7 @@ async def get_drug_discovery_targets(
 @router.get("/runs/{run_id}/report")
 async def get_drug_discovery_report(
     run_id: str,
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     try:
@@ -241,7 +241,7 @@ async def _load_owned_dataset(
 ) -> Dataset:
     """Dataset the caller may read, or 404.
 
-    **Two gates, two different questions.** `require_team_plan` asks whether the caller may use
+    **Two gates, two different questions.** `require_drug_discovery_access` asks whether the caller may use
     the module at all; this asks whether the data is theirs. Neither substitutes for the other,
     and a plan check alone would let any TEAM user build a signature from another project's
     comparison.
@@ -266,7 +266,7 @@ async def preview_drug_discovery_signature(
     logfc_min: float = Query(default=1.0, ge=0, le=5),
     directions: Literal["both", "up", "down"] = Query(default="both"),
     max_genes_per_condition: int = Query(default=1000, ge=1, le=2000),
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
 ):
     """What would be sent, before anything is sent. **Makes no upstream call.**
 
@@ -296,7 +296,7 @@ async def create_drug_discovery_signature_run(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     limit: int = Query(default=100, ge=1, le=1000),
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Confront a comparison's DEG signature with the ranking for an indication.
@@ -376,7 +376,7 @@ async def get_drug_discovery_signature_report(
     run_id: str,
     signature_id: str,
     limit: int = Query(default=10, ge=1, le=100),
-    user: User = Depends(require_team_plan),
+    user: User = Depends(require_drug_discovery_access),
     client: DrugDiscoveryClient = Depends(get_drug_discovery_client),
 ):
     """Mode B report. A 422 here means the signature has no gene in the ranked universe."""

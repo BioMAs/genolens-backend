@@ -42,3 +42,4 @@ class UserSelf(User):
     has_cosmetics_module: bool = False
     has_report_customization: bool = False
     has_scientific_module: bool = False
+    has_drug_discovery_module: bool = False

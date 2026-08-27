@@ -209,6 +209,26 @@ async def require_scientific_access(
     return user
 
 
+# ── Drug Discovery module (per-user add-on) ──────────────────────────────────────
+
+async def require_drug_discovery_access(
+    user: Annotated[User, Depends(get_or_create_user)]
+) -> User:
+    """Require the Drug Discovery add-on module to be unlocked for this user.
+
+    Unlocked explicitly per-user by an admin (User.drug_discovery_module_enabled),
+    independent of the subscription plan; admins always have access. Replaces the
+    previous TEAM/ON_PREMISE plan gate, so a TEAM user without the flag now gets
+    a 403 here — the frontend renders a locked card offering to request access.
+    """
+    if not user.has_drug_discovery_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Drug Discovery module is not enabled for this account.",
+        )
+    return user
+
+
 # ── TEAM plan guard ────────────────────────────────────────────────────────────
 
 async def require_team_plan(

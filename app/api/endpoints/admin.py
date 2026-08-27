@@ -48,6 +48,7 @@ class UserProfile(BaseModel):
     cosmetics_module_enabled: bool = False
     report_customization_module_enabled: bool = False
     scientific_module_enabled: bool = False
+    drug_discovery_module_enabled: bool = False
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     last_sign_in_at: Optional[str] = None
@@ -67,6 +68,10 @@ class ReportCustomizationModuleUpdate(BaseModel):
 
 class ScientificModuleUpdate(BaseModel):
     """Schema for toggling the Scientific tools add-on module for a user."""
+    enabled: bool
+
+class DrugDiscoveryModuleUpdate(BaseModel):
+    """Schema for toggling the Drug Discovery add-on module for a user."""
     enabled: bool
 
 class TokenAdd(BaseModel):
@@ -227,6 +232,7 @@ async def list_users(
                 cosmetics_enabled = False
                 report_customization_enabled = False
                 scientific_enabled = False
+                drug_discovery_enabled = False
                 role_value = profile.get("role", "USER")
 
                 if local_user:
@@ -246,6 +252,7 @@ async def list_users(
                     cosmetics_enabled = local_user.cosmetics_module_enabled
                     report_customization_enabled = local_user.report_customization_module_enabled
                     scientific_enabled = local_user.scientific_module_enabled
+                    drug_discovery_enabled = local_user.drug_discovery_module_enabled
 
                 result.append(UserProfile(
                     id=UUID(user_id),
@@ -262,6 +269,7 @@ async def list_users(
                     cosmetics_module_enabled=cosmetics_enabled,
                     report_customization_module_enabled=report_customization_enabled,
                     scientific_module_enabled=scientific_enabled,
+                    drug_discovery_module_enabled=drug_discovery_enabled,
                     created_at=profile.get("created_at"),
                     updated_at=profile.get("updated_at"),
                     last_sign_in_at=auth_info.get("last_sign_in_at"),
@@ -429,6 +437,7 @@ async def get_user_details(
                     cosmetics_enabled = False
                     report_customization_enabled = False
                     scientific_enabled = False
+                    drug_discovery_enabled = False
                     role_value = profile.get("role", "USER")
 
                     if local_user:
@@ -443,6 +452,7 @@ async def get_user_details(
                         cosmetics_enabled = local_user.cosmetics_module_enabled
                         report_customization_enabled = local_user.report_customization_module_enabled
                         scientific_enabled = local_user.scientific_module_enabled
+                        drug_discovery_enabled = local_user.drug_discovery_module_enabled
 
                     return UserProfile(
                         id=UUID(profile["id"]),
@@ -458,6 +468,7 @@ async def get_user_details(
                         cosmetics_module_enabled=cosmetics_enabled,
                         report_customization_module_enabled=report_customization_enabled,
                         scientific_module_enabled=scientific_enabled,
+                        drug_discovery_module_enabled=drug_discovery_enabled,
                         created_at=profile.get("created_at"),
                         updated_at=profile.get("updated_at"),
                         last_sign_in_at=last_sign_in,
@@ -605,6 +616,34 @@ async def update_user_scientific_module(
         )
 
     user.scientific_module_enabled = update.enabled
+    await db.commit()
+
+    return await get_user_details(user_id, current_user, db)
+
+
+@router.patch("/users/{user_id}/drug-discovery-module", response_model=UserProfile)
+async def update_user_drug_discovery_module(
+    user_id: UUID,
+    update: DrugDiscoveryModuleUpdate,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Enable or disable the Drug Discovery add-on module for a user (target
+    ranking, indications, reports). Independent of the subscription plan.
+    Admin only.
+    """
+    query = select(User).where(User.id == user_id)
+    result = await db.execute(query)
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not initialized in local database. Please update subscription first.",
+        )
+
+    user.drug_discovery_module_enabled = update.enabled
     await db.commit()
 
     return await get_user_details(user_id, current_user, db)

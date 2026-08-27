@@ -719,6 +719,12 @@ class User(Base, TimestampMixin):
         server_default=sa_text("false"),
         comment="Whether the Scientific tools module (GSEA, contrast scatter, signature scoring, custom gene sets, DEG patterns) is unlocked for this user",
     )
+    drug_discovery_module_enabled: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        server_default=sa_text("false"),
+        comment="Whether the Drug Discovery module (target ranking, indications, reports) is unlocked for this user",
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email}, role={self.role}, plan={self.subscription_plan})>"
@@ -813,6 +819,12 @@ class User(Base, TimestampMixin):
     def has_scientific_module(self) -> bool:
         """Scientific tools add-on: explicitly unlocked per-user by an admin. Admins always have it."""
         return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.scientific_module_enabled
+
+    @property
+    def has_drug_discovery_module(self) -> bool:
+        """Drug Discovery add-on: explicitly unlocked per-user by an admin (independent of
+        plan). Admins always have it."""
+        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.drug_discovery_module_enabled
 
 
 class UserReportSettings(Base, TimestampMixin):
