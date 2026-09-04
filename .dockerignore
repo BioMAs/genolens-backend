@@ -1,0 +1,64 @@
+# Build context exclusions.
+#
+# The Dockerfile does `COPY . .`, and the production deploy rsyncs onto the server and builds
+# there — so the build context is the *deploy directory*, not a clean checkout. Anything left
+# lying around on the server gets baked into the image, even files that are not in git. That is
+# how 9.2 MB of generated `graphify-out/` cache ended up inside the production image after it had
+# already been removed from the repository.
+#
+# Each entry below is here because it was measured, not on principle. Paths starting with `/` are
+# anchored to the context root, so a same-named directory deeper in the tree is untouched — in
+# particular `app/data/` (which holds `anno_db_categories.json`, read at runtime) is NOT affected
+# by the `/anno_db/` rule.
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
+# Untracked but present in a local checkout: a `docker build` here would bake it into the image.
+# Production passes configuration through the environment, never through a file in the image.
+.env
+.env.*
+!.env.example
+
+# ── Generated caches (measured: 121 MB + 9.2 MB locally) ────────────────────
+/graphify-out/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# ── Version control and tooling (measured: 19 MB) ───────────────────────────
+.git/
+.gitignore
+.gitattributes
+.github/
+.superpowers/
+
+# ── Virtualenvs ─────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Test fixtures (measured: 73 MB, no reference anywhere in app/ or tests/) ─
+# `tests/` itself is deliberately kept: it is only 1.8 MB and `make test` runs pytest inside the
+# container.
+/data_test/
+
+# ── Annotation database (measured: 294 MB in the image, always dead weight) ─
+# Only the r-worker uses it, and it is bind-mounted read-only from the host
+# (`${ANNO_DB_HOST_PATH:-./anno_db}:/app/anno_db:ro`), so the copy inside the image is shadowed at
+# runtime and never read. See the comment at `app/worker/tasks.py` on the r-worker mount.
+/anno_db/
+
+# ── Runtime storage (a volume mount target, never image content) ────────────
+/data/
+
+# ── Editor / OS noise ───────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ── Local compose overrides and backups ─────────────────────────────────────
+docker-compose.override.yml
+*.bak
+*.log

@@ -53,7 +53,8 @@ ollama_data/
 app/data/
 
 # Docker
-.dockerignore
+# (`.dockerignore` used to be ignored here — which is precisely why the image had none and
+#  everything left on the deploy directory got baked in. It is versioned now.)
 
 # Generated code-graph cache (graphify) — never belongs in the repo.
 graphify-out/
