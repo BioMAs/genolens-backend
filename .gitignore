@@ -54,3 +54,6 @@ app/data/
 
 # Docker
 .dockerignore
+
+# Generated code-graph cache (graphify) — never belongs in the repo.
+graphify-out/
