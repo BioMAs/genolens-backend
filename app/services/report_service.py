@@ -23,6 +23,7 @@ from app.models.models import (
     Dataset, DatasetType, DatasetStatus,
     Project, DegGene, EnrichmentPathway,
 )
+from app.services.enrichment_source import deg_comparison_names, match_enrichment_for_deg
 
 logger = logging.getLogger(__name__)
 TEMPLATE_DIR = Path(__file__).parent.parent / "templates" / "report"
@@ -110,20 +111,28 @@ class ReportService:
             self._generate_volcano_plot, all_genes, deg_ds.name
         )
 
-        matching_enrichment = next(
-            (e for e in enrichment_datasets
-             if deg_ds.name in e.name or e.name in deg_ds.name),
-            None,
-        )
+        # Pair via the shared rules (`enrichment_source`). This report iterates datasets rather
+        # than comparisons, so it has no comparison in hand: the helper tries each comparison the
+        # DEG dataset declares, then falls back to the name pairing that used to be the *only*
+        # rule here — which matched 0 of 34 READY DEG datasets on the development database.
+        matching_enrichment = match_enrichment_for_deg(enrichment_datasets, deg_ds)
         enrichment_results = []
         dotplot_b64 = None
         if matching_enrichment:
             stmt_e = (
                 select(EnrichmentPathway)
                 .where(EnrichmentPathway.dataset_id == matching_enrichment.id)
-                .order_by(EnrichmentPathway.padj.asc())
-                .limit(50)
             )
+            # Restrict to this dataset's own comparisons. The query was unfiltered, which was
+            # harmless only while the pairing above never matched: a multi-comparison enrichment
+            # file holds tens of thousands of rows across a hundred comparisons, and the top 50
+            # by padj would be drawn from whichever comparisons happened to score best — printed
+            # under a section named after this one.
+            comparisons = deg_comparison_names(deg_ds)
+            if comparisons:
+                stmt_e = stmt_e.where(EnrichmentPathway.comparison_name.in_(comparisons))
+
+            stmt_e = stmt_e.order_by(EnrichmentPathway.padj.asc()).limit(50)
             enrichment_results = (await db.execute(stmt_e)).scalars().all()
             dotplot_b64 = await asyncio.to_thread(
                 self._generate_enrichment_dotplot, enrichment_results, deg_ds.name

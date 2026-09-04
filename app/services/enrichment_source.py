@@ -54,6 +54,78 @@ def _prefer_ready(candidates: Sequence[Dataset]) -> Optional[Dataset]:
     return candidates[0]
 
 
+def match_enrichment_dataset(
+    candidates: Sequence[Dataset],
+    comparison_name: str,
+) -> Optional[Dataset]:
+    """
+    Pick the enrichment dataset for a comparison out of an already-scoped list.
+
+    Pure, so callers that have their own scoping — the report builders work from an analysis's
+    result datasets, not from a project query — share the matching rules without giving it up.
+
+    A direct name match wins over a multi-comparison enrichment file that merely lists the
+    comparison, matching the client's `byName || byComparisons` precedence.
+    """
+    by_name = [d for d in candidates if _names_match(d, comparison_name)]
+    by_comparisons = [d for d in candidates if _lists_comparison(d, comparison_name)]
+    return _prefer_ready(by_name or by_comparisons)
+
+
+def deg_comparison_names(deg_dataset: Dataset) -> list[str]:
+    """
+    The comparison names a DEG dataset declares, most specific first.
+
+    A per-comparison dataset names one in `comparison_name`; a multi-comparison file lists them
+    under `comparisons`, as a dict keyed by name or as a plain list. Lets a caller with no
+    comparison in hand — the project report iterates datasets, not comparisons — still match on
+    comparison rather than on dataset names.
+    """
+    meta = _metadata(deg_dataset)
+    names: list[str] = []
+
+    named = meta.get("comparison_name")
+    if isinstance(named, str) and named:
+        names.append(named)
+
+    comparisons = meta.get("comparisons")
+    if isinstance(comparisons, dict):
+        names.extend(str(k) for k in comparisons)
+    elif isinstance(comparisons, (list, tuple)):
+        names.extend(str(c) for c in comparisons)
+
+    seen = set()
+    return [n for n in names if not (n in seen or seen.add(n))]
+
+
+def match_enrichment_for_deg(
+    candidates: Sequence[Dataset],
+    deg_dataset: Dataset,
+) -> Optional[Dataset]:
+    """
+    The enrichment dataset paired with a DEG dataset, for callers with no comparison in hand.
+
+    Tries every comparison the DEG dataset declares, then falls back to pairing by dataset name.
+
+    That fallback is the project report's original and *only* rule
+    (``deg.name in enr.name or enr.name in deg.name``). It is kept last because it is fragile —
+    a substring match pairs "X" with "XY" just as happily — and because it matched **0 of 34**
+    READY DEG datasets on the development database, where the comparison rules matched the one
+    pair that existed. Last resort, not first choice.
+    """
+    for comparison_name in deg_comparison_names(deg_dataset):
+        found = match_enrichment_dataset(candidates, comparison_name)
+        if found is not None:
+            return found
+
+    name = deg_dataset.name or ""
+    paired = [
+        d for d in candidates
+        if d.name and (name in d.name or d.name in name)
+    ]
+    return _prefer_ready(paired)
+
+
 async def find_enrichment_dataset(
     db: AsyncSession,
     deg_dataset: Dataset,
@@ -66,9 +138,6 @@ async def find_enrichment_dataset(
     otherwise an enrichment file from a *different* analysis that happens to share a comparison
     name bleeds in. The client hit exactly that bug and fixed it the same way
     (`useComparisonContext.ts`: "mélange entre analyses").
-
-    A direct name match wins over a multi-comparison enrichment file that merely lists the
-    comparison, matching the client's `byName || byComparisons` precedence.
     """
     result = await db.execute(
         select(Dataset).where(
@@ -88,10 +157,7 @@ async def find_enrichment_dataset(
         if same_analysis:
             candidates = same_analysis
 
-    by_name = [d for d in candidates if _names_match(d, comparison_name)]
-    by_comparisons = [d for d in candidates if _lists_comparison(d, comparison_name)]
-
-    return _prefer_ready(by_name or by_comparisons)
+    return match_enrichment_dataset(candidates, comparison_name)
 
 
 async def resolve_pathway_dataset_id(
