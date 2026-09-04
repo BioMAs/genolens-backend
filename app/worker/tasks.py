@@ -418,11 +418,24 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                         # Don't fail the whole task if DEG storage fails
 
                     # Automatically run GO enrichment on the stored DEG genes.
-                    # Skipped for self-service analyses: those get full annoDB enrichment
-                    # (GO + KEGG/Reactome/Hallmark/…) from the R pipeline as a separate
-                    # ENRICHMENT dataset, and the legacy go_service path is very slow
-                    # (get_gene_annotations ~5 min), which left DEG datasets stuck in
-                    # PROCESSING.
+                    #
+                    # Skipped for self-service analyses, and the reason is *not* performance:
+                    # `get_gene_annotations` used to take ~5 min a call and is now ~2 s, so that
+                    # half of the old justification is gone.
+                    #
+                    # What remains is a single-source-of-truth problem. Self-service analyses
+                    # already get full annoDB enrichment (GO + KEGG/Reactome/Hallmark/…) from the
+                    # R pipeline as a separate ENRICHMENT dataset, and the two land in different
+                    # places: `_auto_run_enrichment` writes EnrichmentPathway rows under *this*
+                    # (DEG) dataset's id, while the UI panels only ever read the ENRICHMENT-typed
+                    # dataset (`useComparisonContext.ts`). But the AI does not — `ai_interpreter`
+                    # falls back to `deg_dataset_id` when no enrichment dataset is passed, and the
+                    # chat tools read `ctx.dataset_id`, which on a comparison page is the DEG
+                    # dataset.
+                    #
+                    # So running this for a self-service dataset would leave the panels showing
+                    # annoDB pathways while the AI narrates GO-only ones for the same comparison.
+                    # Removing the skip means first making those readers agree on one source.
                     _meta_enr = dataset.dataset_metadata or {}
                     if _meta_enr.get("analysis_id"):
                         logger.info(
