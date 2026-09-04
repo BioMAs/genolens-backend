@@ -554,9 +554,9 @@ async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparis
     Build the AI context from the DB and generate + persist an AIInterpretation.
 
     Genes come from the DEG dataset; pathways from the (separate) annoDB ENRICHMENT
-    dataset when provided — the legacy interpret endpoint read pathways from the DEG
-    dataset, which no longer holds enrichment rows. Returns the AIInterpretation, or
-    None if the LLM is unavailable / there is no DEG data (graceful for report use).
+    dataset. Pass `enrichment_dataset_id` when the caller already knows it, otherwise it
+    is resolved here — see `app.services.enrichment_source`. Returns the AIInterpretation,
+    or None if the LLM is unavailable / there is no DEG data (graceful for report use).
     """
     from sqlalchemy import select, func
     from app.models.models import DegGene, EnrichmentPathway, AIInterpretation
@@ -575,7 +575,20 @@ async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparis
 
     deg_summary = {"up_count": up, "down_count": down, "total": up + down}
 
-    pathways_ds = enrichment_dataset_id or deg_dataset_id
+    # Resolve rather than assume: `enrichment_dataset_id` is optional, and falling straight back
+    # to the DEG dataset found nothing on a self-service analysis, whose enrichment is a separate
+    # annoDB ENRICHMENT dataset.
+    pathways_ds = enrichment_dataset_id
+    if pathways_ds is None:
+        from app.models.models import Dataset
+        from app.services.enrichment_source import resolve_pathway_dataset_id
+        deg_dataset = await db.get(Dataset, deg_dataset_id)
+        pathways_ds = (
+            await resolve_pathway_dataset_id(db, deg_dataset, comparison_name)
+            if deg_dataset is not None
+            else deg_dataset_id
+        )
+
     pathways_rows = (await db.execute(
         select(EnrichmentPathway)
         .where(EnrichmentPathway.dataset_id == pathways_ds,
