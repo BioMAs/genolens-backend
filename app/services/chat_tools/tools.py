@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 from app.models.models import DegGene, EnrichmentPathway
 from app.services import chart_builder
 from app.services.chat_tools.base import BaseTool, ToolContext, ToolResult
+from app.services.enrichment_source import resolve_pathway_dataset_id
 
 # ── Parameter schemas ────────────────────────────────────────────────────────
 
@@ -77,12 +78,57 @@ class GenerateChartParams(BaseModel):
 
 class PathwaysParams(BaseModel):
     category: Optional[str] = Field(
-        None, description="Filter by category, e.g. 'GO:BP', 'GO:MF', 'GO:CC', 'KEGG', 'Reactome'."
+        None,
+        description=(
+            "Filter by category. The available categories depend on the dataset — call "
+            "get_dataset_summary to read available_pathway_categories rather than guessing. "
+            "annoDB datasets use names like 'biological_process', 'molecular_function', "
+            "'cellular_component', 'matrisome'; older ones use 'GO:BP', 'GO:MF', 'GO:CC'. "
+            "Either spelling of the three GO namespaces is accepted, case-insensitively."
+        ),
     )
     regulation: Optional[str] = Field(
         None, description="Filter by regulation: 'ALL', 'UP' or 'DOWN'."
     )
     top_n: int = Field(15, ge=1, le=50, description="How many pathways to return (max 50).")
+
+
+# ── Pathway category vocabulary ──────────────────────────────────────────────
+#
+# The two enrichment sources name the GO namespaces differently: the legacy Python path writes
+# "GO:BP"/"GO:MF"/"GO:CC", annoDB writes "biological_process"/… (plus families of its own, like
+# "matrisome" or "senescence_signatures"). Now that the tools read whichever source actually holds
+# the comparison's enrichment, a model asking for "GO:BP" must not silently get nothing back.
+
+_GO_CATEGORY_ALIASES = {
+    "go:bp": "biological_process",
+    "go:mf": "molecular_function",
+    "go:cc": "cellular_component",
+    "biological_process": "go:bp",
+    "molecular_function": "go:mf",
+    "cellular_component": "go:cc",
+}
+
+
+def _match_category(requested: str, available: List[str]) -> Optional[str]:
+    """
+    The stored category the request means, or None if the dataset has no such category.
+
+    Tries the literal value, then a case-insensitive match, then the other vocabulary's spelling
+    of the same GO namespace.
+    """
+    if requested in available:
+        return requested
+
+    by_lower = {c.lower(): c for c in available if c}
+    wanted = requested.lower()
+    if wanted in by_lower:
+        return by_lower[wanted]
+
+    alias = _GO_CATEGORY_ALIASES.get(wanted)
+    if alias and alias in by_lower:
+        return by_lower[alias]
+    return None
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────
@@ -117,6 +163,23 @@ class GetDatasetSummaryTool(BaseTool):
             .distinct()
         )).scalars().all()
 
+        # The pathway categories this comparison actually has, so get_enrichment_pathways can be
+        # filtered against real values instead of a guessed vocabulary — annoDB and the legacy
+        # Python path name the GO namespaces differently.
+        pathway_categories: List[str] = []
+        if ctx.dataset is not None and ctx.comparison_name:
+            pathways_dataset_id = await resolve_pathway_dataset_id(
+                db, ctx.dataset, ctx.comparison_name
+            )
+            pathway_categories = sorted(
+                c for c in (await db.execute(
+                    select(EnrichmentPathway.category)
+                    .where(EnrichmentPathway.dataset_id == pathways_dataset_id)
+                    .where(EnrichmentPathway.comparison_name == ctx.comparison_name)
+                    .distinct()
+                )).scalars().all() if c
+            )
+
         summary = {
             "dataset_name": getattr(ctx.dataset, "name", None),
             "comparison_name": ctx.comparison_name,
@@ -124,6 +187,7 @@ class GetDatasetSummaryTool(BaseTool):
             "deg_down": int(down),
             "deg_total": int(up) + int(down),
             "available_comparisons": list(comparisons),
+            "available_pathway_categories": pathway_categories,
         }
         return ToolResult(summary_for_model=summary, params={})
 
@@ -223,20 +287,46 @@ class GetEnrichmentPathwaysTool(BaseTool):
     figure_type = None
 
     async def execute(self, ctx: ToolContext, params: PathwaysParams) -> ToolResult:
-        stmt = (
+        # Enrichment does not live on the DEG dataset the chat is scoped to. On a self-service
+        # analysis it is a separate annoDB ENRICHMENT dataset, so reading `ctx.dataset_id`
+        # returned nothing and the chat would answer "no pathways" while the enrichment panel on
+        # the same page was full of them. Resolve it the way the panel does.
+        pathways_dataset_id = ctx.dataset_id
+        if ctx.dataset is not None and ctx.comparison_name:
+            pathways_dataset_id = await resolve_pathway_dataset_id(
+                ctx.db, ctx.dataset, ctx.comparison_name
+            )
+
+        base = (
             select(EnrichmentPathway)
-            .where(EnrichmentPathway.dataset_id == ctx.dataset_id)
+            .where(EnrichmentPathway.dataset_id == pathways_dataset_id)
             .where(EnrichmentPathway.comparison_name == ctx.comparison_name)
         )
+
+        # Resolve the requested category against what this dataset actually stores, so a model
+        # asking for "GO:BP" against annoDB rows gets biological_process rather than silence.
+        available = [
+            c for c in (await ctx.db.execute(
+                base.with_only_columns(EnrichmentPathway.category).distinct()
+            )).scalars().all() if c
+        ]
+        unknown_category = None
+        stmt = base
         if params.category:
-            stmt = stmt.where(EnrichmentPathway.category == params.category)
+            matched = _match_category(params.category, available)
+            if matched is None:
+                unknown_category = params.category
+            else:
+                stmt = stmt.where(EnrichmentPathway.category == matched)
+
         if params.regulation:
             stmt = stmt.where(EnrichmentPathway.regulation == params.regulation.upper())
         stmt = stmt.order_by(EnrichmentPathway.padj.asc()).limit(params.top_n)
-        rows = (await ctx.db.execute(stmt)).scalars().all()
+        rows = [] if unknown_category else (await ctx.db.execute(stmt)).scalars().all()
 
         summary = {
             "returned": len(rows),
+            "available_categories": sorted(available),
             "pathways": [
                 {
                     "pathway_name": p.pathway_name,
@@ -248,6 +338,12 @@ class GetEnrichmentPathwaysTool(BaseTool):
                 for p in rows
             ],
         }
+        if unknown_category:
+            # Tell the model the vocabulary instead of letting it read an empty list as "none".
+            summary["note"] = (
+                f"No category {unknown_category!r} in this dataset. "
+                f"Available: {', '.join(sorted(available)) or '(none)'}."
+            )
         return ToolResult(summary_for_model=summary, params=params.model_dump(exclude_none=True))
 
 

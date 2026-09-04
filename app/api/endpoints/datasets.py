@@ -57,6 +57,7 @@ from app.schemas.dataset import (
 )
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor, padj_display_floor
+from app.services.enrichment_source import resolve_pathway_dataset_id
 from app.services.cache_service import cache_service
 from app.services.external_integrations import geo_service
 from app.worker.tasks import process_dataset_upload, import_geo_dataset
@@ -2695,8 +2696,14 @@ async def interpret_comparison(
         }
         
         # 2. Get top enriched pathways (top 15 by padj)
+        #
+        # Read them from wherever this comparison's enrichment actually lives. This used to read
+        # `dataset_id` — the DEG dataset — so on a self-service analysis, whose enrichment is a
+        # separate annoDB ENRICHMENT dataset, the interpretation was built with **no pathways at
+        # all** while the enrichment panel beside it was full of them.
+        pathways_dataset_id = await resolve_pathway_dataset_id(db, dataset, comparison_name)
         pathways_query = select(EnrichmentPathway).where(
-            EnrichmentPathway.dataset_id == dataset_id,
+            EnrichmentPathway.dataset_id == pathways_dataset_id,
             EnrichmentPathway.comparison_name == comparison_name
         ).order_by(EnrichmentPathway.padj.asc()).limit(15)
         
