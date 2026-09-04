@@ -8,11 +8,12 @@ Covers (from FIXPLAN.md §3.1):
   DP-04  _detect_comparisons: préfixes Stouffer/Fisher, contrast: strip
   DP-05  calculate_deg_stats: padj < 0.05, logFC → up/down/total correct
   DP-06  calculate_deg_statistics: avec et sans contrast column
-  DP-07  calculate_volcano_plots: données valides + downsample > 5000 + padj=0 exclus
+  DP-07  calculate_volcano_plots: données valides + downsample > 5000 + padj=0 conservés
   DP-08  calculate_pca: 10 gènes × 6 samples → PC1/PC2 + explained_variance
   DP-09  query_parquet: filtrage padj_max + logfc_min + offset > total_rows
   DP-10  _detect_enrichment_comparisons: suffixes _up/_down et colonne absente
 """
+import math
 import io
 import pytest
 import numpy as np
@@ -355,7 +356,7 @@ class TestComparisonsNormalization:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DP-07  calculate_volcano_plots — valid data, downsampling, zero padj
+# DP-07  calculate_volcano_plots — valid data, downsampling, zero padj (kept, y clamped)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestCalculateVolcanoPlots:
@@ -381,21 +382,75 @@ class TestCalculateVolcanoPlots:
             assert "negLogPadj" in p
 
     @pytest.mark.asyncio
-    async def test_dp07_zero_padj_excluded(self):
-        """Genes with padj == 0 are excluded from volcano output."""
+    async def test_dp07_zero_padj_kept_with_finite_y(self):
+        """
+        padj == 0 is underflow on the *most* significant genes, not missing data.
+
+        These used to be dropped, which hid the top of the plot and made every count derived from
+        the cloud fall short of the counts taken from the Parquet file. They are now kept, with the
+        true padj preserved and only the plotted y clamped.
+        """
         svc = _make_service()
         comp = "A_vs_B"
         df = pd.DataFrame({
             "gene_id": ["G1", "G2", "G3"],
             f"log2FoldChange:{comp}": [1.0, -1.0, 2.0],
-            f"padj:{comp}": [0.0, 0.01, 0.05],  # G1 has padj=0 → excluded
+            f"padj:{comp}": [0.0, 0.01, 0.05],
         })
         result = await svc.calculate_volcano_plots(
             _df_to_parquet_bytes(df), self._make_comparisons(comp)
         )
-        gene_ids = [p["gene_id"] for p in result.get(comp, [])]
-        assert "G1" not in gene_ids
-        assert "G2" in gene_ids
+        points = {p["gene_id"]: p for p in result[comp]}
+        assert set(points) == {"G1", "G2", "G3"}
+
+        g1 = points["G1"]
+        # True padj survives, so downstream significance comparisons stay exact.
+        assert g1["padj"] == 0.0
+        # y is finite and sits at the top of the cloud, not at an arbitrary 300.
+        assert math.isfinite(g1["negLogPadj"])
+        assert g1["negLogPadj"] == pytest.approx(-math.log10(0.01), abs=1e-4)
+        assert g1["negLogPadj"] >= points["G2"]["negLogPadj"]
+
+    @pytest.mark.asyncio
+    async def test_dp07_all_zero_padj_falls_back_to_absolute_floor(self):
+        """With no strictly positive padj to borrow, the y floor is the absolute one."""
+        from app.services.data_processor import ABSOLUTE_PADJ_FLOOR
+        svc = _make_service()
+        comp = "A_vs_B"
+        df = pd.DataFrame({
+            "gene_id": ["G1", "G2"],
+            f"log2FoldChange:{comp}": [1.0, -1.0],
+            f"padj:{comp}": [0.0, 0.0],
+        })
+        result = await svc.calculate_volcano_plots(
+            _df_to_parquet_bytes(df), self._make_comparisons(comp)
+        )
+        points = result[comp]
+        assert len(points) == 2
+        for p in points:
+            assert math.isfinite(p["negLogPadj"])
+            assert p["negLogPadj"] == pytest.approx(-math.log10(ABSOLUTE_PADJ_FLOOR), abs=1e-4)
+
+    @pytest.mark.asyncio
+    async def test_dp07_zero_padj_counts_as_significant(self):
+        """
+        The regression this guards: a padj == 0 gene must reach the significant bucket.
+
+        The counters on the results page are derived from this cloud, so a gene missing here is a
+        gene missing from every DEG count on the page.
+        """
+        svc = _make_service()
+        comp = "A_vs_B"
+        df = pd.DataFrame({
+            "gene_id": ["ZERO", "NS"],
+            f"log2FoldChange:{comp}": [3.0, 0.01],
+            f"padj:{comp}": [0.0, 0.9],
+        })
+        result = await svc.calculate_volcano_plots(
+            _df_to_parquet_bytes(df), self._make_comparisons(comp)
+        )
+        significant = [p for p in result[comp] if p["padj"] < 0.05]
+        assert [p["gene_id"] for p in significant] == ["ZERO"]
 
     @pytest.mark.asyncio
     async def test_dp07_downsampling_limits_to_5000(self):

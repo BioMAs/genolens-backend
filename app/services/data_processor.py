@@ -26,6 +26,28 @@ logger = logging.getLogger(__name__)
 DEG_LOGFC_THRESHOLD: float = 0.58
 DEG_PADJ_THRESHOLD: float = 0.05
 
+#: Last-resort floor for -log10(padj) when a comparison has no strictly positive padj at all.
+ABSOLUTE_PADJ_FLOOR: float = 1e-300
+
+
+def padj_display_floor(padj: "pd.Series") -> float:
+    """
+    Y-axis floor for a volcano's `-log10(padj)`.
+
+    DESeq2 and edgeR underflow the most significant genes to exactly ``0``. Those genes used to be
+    dropped from the cloud, which both hid the top of the plot and made every count derived from
+    the cloud disagree with the counts derived from the Parquet file.
+
+    Clamping to the comparison's own smallest strictly positive padj places them just at the top of
+    the real data. A fixed ``1e-300`` would instead put them at ``y = 300`` and flatten every other
+    point against the axis.
+
+    Only the plotted ``y`` is clamped — the padj carried alongside stays the true value (``0.0``),
+    so every significance comparison remains exact.
+    """
+    positive = padj[padj > 0]
+    return float(positive.min()) if not positive.empty else ABSOLUTE_PADJ_FLOOR
+
 
 class DataProcessorService:
     """Service for data processing operations (CSV/Excel -> Parquet)."""
@@ -894,12 +916,14 @@ class DataProcessorService:
 
             # Drop rows with NaN in key columns
             work = work.dropna(subset=[logfc_col, padj_col])
-            zero_pval_count = int((work[padj_col] == 0).sum())
-            work = work[work[padj_col] > 0]
+            # padj == 0 is underflow on the *most* significant genes: keep them, and only clamp
+            # the plotted y. See padj_display_floor.
+            zero_padj_count = int((work[padj_col] == 0).sum())
+            y_floor = padj_display_floor(work[padj_col])
             valid_count = len(work)
 
             work['logFC'] = work[logfc_col].round(4)
-            work['negLogPadj'] = (-np.log10(work[padj_col])).round(4)
+            work['negLogPadj'] = (-np.log10(work[padj_col].clip(lower=y_floor))).round(4)
             work['padj_val'] = work[padj_col]
 
             sig_mask = work['padj_val'] < 0.05
@@ -951,7 +975,11 @@ class DataProcessorService:
             for p in plot_data:
                 p['padj'] = float(f"{p['padj']:.6g}")
 
-            logger.debug(f"[VOLCANO] Comparison '{comp_name}': {valid_count} valid genes, {zero_pval_count} excluded (p-value=0). Keeping {len(plot_data)} points.")
+            logger.debug(
+                f"[VOLCANO] Comparison '{comp_name}': {valid_count} valid genes, "
+                f"{zero_padj_count} with padj=0 clamped to y={-np.log10(y_floor):.4g}. "
+                f"Keeping {len(plot_data)} points."
+            )
             volcano_plots[comp_name] = plot_data
         
         return volcano_plots

@@ -112,6 +112,16 @@ class CacheService:
         
         # Hash to fixed-length key
         return hashlib.md5(key_str.encode()).hexdigest()
+
+    def _scoped_cache_key(self, dataset_id: str, *args, **kwargs) -> str:
+        """
+        Cache key namespaced by dataset, as `<dataset_id>:<hash of the rest>`.
+
+        The hash alone is one-way, so `clear_dataset_cache` had no way to find a dataset's entries
+        and silently left them in place — a reprocessed dataset kept serving its old volcano until
+        the TTL expired. Keeping the dataset id in the clear makes eviction a prefix scan.
+        """
+        return f"{dataset_id}:{self._generate_cache_key(dataset_id, *args, **kwargs)}"
     
     # ===== Clustering Cache =====
     
@@ -134,7 +144,7 @@ class CacheService:
         Returns:
             Cached result or None if not found
         """
-        cache_key = self._generate_cache_key(
+        cache_key = self._scoped_cache_key(
             dataset_id,
             tuple(sorted(gene_list)),  # Sort for stable key
             method,
@@ -169,7 +179,7 @@ class CacheService:
             method: Clustering method
             **params: Additional clustering parameters
         """
-        cache_key = self._generate_cache_key(
+        cache_key = self._scoped_cache_key(
             dataset_id,
             tuple(sorted(gene_list)),
             method,
@@ -203,7 +213,7 @@ class CacheService:
         Returns:
             Cached result or None if not found
         """
-        cache_key = self._generate_cache_key(
+        cache_key = self._scoped_cache_key(
             dataset_id, comparison_name, max_points, padj_threshold, logfc_threshold
         )
         
@@ -243,7 +253,7 @@ class CacheService:
             padj_threshold: P-value threshold used
             logfc_threshold: Log fold change threshold used
         """
-        cache_key = self._generate_cache_key(
+        cache_key = self._scoped_cache_key(
             dataset_id, comparison_name, max_points, padj_threshold, logfc_threshold
         )
         
@@ -273,7 +283,7 @@ class CacheService:
         Returns:
             Cached result or None if not found
         """
-        cache_key = self._generate_cache_key(dataset_id, comparison_name, **params)
+        cache_key = self._scoped_cache_key(dataset_id, comparison_name, **params)
         
         with self._stats_lock:
             result = self.stats_cache.get(cache_key)
@@ -301,7 +311,7 @@ class CacheService:
             comparison_name: Optional comparison name
             **params: Additional parameters
         """
-        cache_key = self._generate_cache_key(dataset_id, comparison_name, **params)
+        cache_key = self._scoped_cache_key(dataset_id, comparison_name, **params)
         
         with self._stats_lock:
             self.stats_cache[cache_key] = result
@@ -355,14 +365,27 @@ class CacheService:
         with self._dataframe_lock:
             if dataset_id in self.dataframe_cache:
                 del self.dataframe_cache[dataset_id]
-        logger.info(f"Cleared DataFrame cache for {dataset_id[:8]}...")
-        
-        # For other caches, we'd need to iterate and remove matching keys
-        # (More expensive, but necessary for correctness)
-        # This is a limitation of simple dict-based caches
-        # Redis would handle this better with key patterns
-        
-        logger.info(f"Cache cleared for dataset {dataset_id[:8]}...")
+
+        # Keys are namespaced `<dataset_id>:<hash>` (see _scoped_cache_key), so the dataset's
+        # entries are a prefix scan. Snapshot the keys before deleting: mutating a TTLCache while
+        # iterating it raises.
+        prefix = f"{dataset_id}:"
+        evicted = 0
+        for lock, cache in (
+            (self._clustering_lock, self.clustering_cache),
+            (self._volcano_lock, self.volcano_cache),
+            (self._stats_lock, self.stats_cache),
+        ):
+            with lock:
+                stale = [
+                    k for k in list(cache.keys())
+                    if isinstance(k, str) and k.startswith(prefix)
+                ]
+                for key in stale:
+                    cache.pop(key, None)
+                evicted += len(stale)
+
+        logger.info(f"Cache cleared for dataset {dataset_id[:8]}... ({evicted} keyed entries)")
     
     def get_cache_stats(self) -> dict:
         """

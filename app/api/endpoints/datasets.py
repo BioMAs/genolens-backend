@@ -56,7 +56,7 @@ from app.schemas.dataset import (
     GeoImportResponse,
 )
 from app.services.storage import storage_service
-from app.services.data_processor import data_processor
+from app.services.data_processor import data_processor, padj_display_floor
 from app.services.cache_service import cache_service
 from app.services.external_integrations import geo_service
 from app.worker.tasks import process_dataset_upload, import_geo_dataset
@@ -531,6 +531,10 @@ async def reprocess_dataset(
     dataset.error_message = None
     db.add(dataset)
     await db.commit()
+
+    # Drop the in-memory caches first: without this a reprocessed dataset keeps serving its old
+    # volcano cloud and stats until the TTL expires, so the recomputed numbers never show up.
+    cache_service.clear_dataset_cache(str(dataset_id))
 
     # Trigger reprocessing with is_reprocess=True flag
     process_dataset_upload.delay(
@@ -2060,7 +2064,6 @@ async def get_volcano_plot_data(
     
     # Level 3: If no cache or force_recalculate, compute from Parquet file
     # Check if we have parquet file path in metadata
-    import math
     from pathlib import Path
     
     # For volcano plot, we MUST load from Parquet to get ALL genes (not just DEGs)
@@ -2114,12 +2117,15 @@ async def get_volcano_plot_data(
         
         gene_col = next((c for c in df.columns if "gene" in c.lower() or "symbol" in c.lower() or c.lower() == "id"), None)
         
-        # Filter out padj = 0 or NaN
-        valid_mask = (df[padj_col] > 0) & (df[padj_col].notna()) & (df[logfc_col].notna())
+        # Keep padj == 0 (underflow on the most significant genes) — dropping it both hid the top
+        # of the plot and made this path disagree with every count taken from the Parquet file.
+        valid_mask = (df[padj_col] >= 0) & (df[padj_col].notna()) & (df[logfc_col].notna())
         df_valid = df[valid_mask].copy()
-        
-        # Calculate -log10(padj)
-        df_valid["y"] = -df_valid[padj_col].apply(lambda x: math.log10(x if x > 0 else 1e-300))
+
+        # Calculate -log10(padj), clamping only the plotted y — same floor as the ingestion path,
+        # so a cold response and a cached one place these genes identically.
+        y_floor = padj_display_floor(df_valid[padj_col])
+        df_valid["y"] = -np.log10(df_valid[padj_col].clip(lower=y_floor))
         df_valid["x"] = df_valid[logfc_col]
         df_valid["is_significant"] = (df_valid[padj_col] < padj_threshold) & (df_valid[logfc_col].abs() > logfc_threshold)
         
