@@ -37,6 +37,23 @@ def _all_rows(rows):
     return r
 
 
+def _parent_rows(graph: dict):
+    """
+    Mock for `_load_parent_map`'s single bulk read.
+
+    `select(GOTerm.go_id, GOTerm.is_a, GOTerm.part_of)` yields row tuples, so the whole GO parent
+    graph arrives in one result. Pass `{go_id: [parents]}` or `{go_id: ([is_a], [part_of])}`.
+    """
+    rows = []
+    for go_id, parents in graph.items():
+        if isinstance(parents, tuple):
+            is_a, part_of = parents
+        else:
+            is_a, part_of = parents, []
+        rows.append((go_id, list(is_a), list(part_of)))
+    return _all_rows(rows)
+
+
 def make_go_term(
     go_id: str = "GO:0006915",
     name: str = "apoptotic process",
@@ -402,15 +419,10 @@ class TestGetAncestors:
         """Should traverse is_a relationships to find parent terms."""
         from app.services.go_service import GOService
 
-        # GO:0006915 is_a GO:0008219
-        child = make_go_term(go_id="GO:0006915", is_a=["GO:0008219"])
-        parent = make_go_term(go_id="GO:0008219", is_a=[])
-
-        # Mock execute: first call returns child, second returns parent, third returns None
-        mock_db.execute.side_effect = [
-            _scalar_one_or_none(child),
-            _scalar_one_or_none(parent),
-        ]
+        mock_db.execute.return_value = _parent_rows({
+            "GO:0006915": ["GO:0008219"],
+            "GO:0008219": [],
+        })
 
         service = GOService()
         ancestors = await service._get_ancestors(mock_db, "GO:0006915")
@@ -422,13 +434,116 @@ class TestGetAncestors:
         """A root term with no parents should have no ancestors."""
         from app.services.go_service import GOService
 
-        root = make_go_term(go_id="GO:0003674", is_a=[], part_of=[])
-        mock_db.execute.return_value = _scalar_one_or_none(root)
+        mock_db.execute.return_value = _parent_rows({"GO:0003674": ([], [])})
 
         service = GOService()
         ancestors = await service._get_ancestors(mock_db, "GO:0003674")
 
         assert ancestors == []
+
+    @pytest.mark.asyncio
+    async def test_reads_the_hierarchy_in_a_single_query(self, mock_db):
+        """
+        One bulk read, not one SELECT per node.
+
+        The old traversal queried each node it visited, so propagation across a real gene set
+        issued ~1.16 million sequential SELECTs and took 384 s.
+        """
+        from app.services.go_service import GOService
+
+        mock_db.execute.return_value = _parent_rows({
+            "GO:1": ["GO:2"], "GO:2": ["GO:3"], "GO:3": ["GO:4"], "GO:4": [],
+        })
+
+        service = GOService()
+        ancestors = await service._get_ancestors(mock_db, "GO:1")
+
+        assert set(ancestors) == {"GO:2", "GO:3", "GO:4"}
+        assert mock_db.execute.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_follows_part_of_as_well_as_is_a(self, mock_db):
+        """Both relationship kinds are parents, as the previous traversal treated them."""
+        from app.services.go_service import GOService
+
+        mock_db.execute.return_value = _parent_rows({
+            "GO:0006915": (["GO:0008219"], ["GO:0012501"]),
+            "GO:0008219": ([], []),
+            "GO:0012501": ([], []),
+        })
+
+        service = GOService()
+        ancestors = await service._get_ancestors(mock_db, "GO:0006915")
+
+        assert set(ancestors) == {"GO:0008219", "GO:0012501"}
+
+    @pytest.mark.asyncio
+    async def test_terminates_on_a_cycle(self, mock_db):
+        """A cycle in the graph must not hang the traversal."""
+        from app.services.go_service import GOService
+
+        mock_db.execute.return_value = _parent_rows({
+            "GO:A": ["GO:B"], "GO:B": ["GO:A"],
+        })
+
+        service = GOService()
+        ancestors = await service._get_ancestors(mock_db, "GO:A")
+
+        assert set(ancestors) == {"GO:A", "GO:B"}
+
+
+class TestAncestorsFromMap:
+    """The pure, memoised traversal that both callers share."""
+
+    def test_memoises_across_calls(self):
+        """A GO id is expanded once however many genes carry it."""
+        from app.services.go_service import GOService
+
+        parent_map = {"GO:1": ("GO:2",), "GO:2": ("GO:3",), "GO:3": ()}
+        cache = {}
+
+        first = GOService._ancestors_from_map("GO:1", parent_map, cache)
+        assert first == {"GO:2", "GO:3"}
+        assert "GO:1" in cache
+
+        # Second call is served from the cache — same object, no re-walk.
+        assert GOService._ancestors_from_map("GO:1", parent_map, cache) is first
+
+    def test_reuses_a_cached_subtree(self):
+        """Hitting a node whose closure is known stops the walk there."""
+        from app.services.go_service import GOService
+
+        parent_map = {"GO:1": ("GO:2",), "GO:2": ("GO:3",), "GO:3": ()}
+        cache = {"GO:2": {"GO:3"}}
+
+        assert GOService._ancestors_from_map("GO:1", parent_map, cache) == {"GO:2", "GO:3"}
+
+    def test_shared_ancestor_counted_once(self):
+        """A diamond yields each ancestor once."""
+        from app.services.go_service import GOService
+
+        parent_map = {
+            "GO:child": ("GO:l", "GO:r"),
+            "GO:l": ("GO:root",),
+            "GO:r": ("GO:root",),
+            "GO:root": (),
+        }
+        assert GOService._ancestors_from_map("GO:child", parent_map, {}) == {
+            "GO:l", "GO:r", "GO:root"
+        }
+
+    def test_excludes_the_term_itself(self):
+        """Matches the previous behaviour: a term is not its own ancestor."""
+        from app.services.go_service import GOService
+
+        parent_map = {"GO:1": ("GO:2",), "GO:2": ()}
+        assert "GO:1" not in GOService._ancestors_from_map("GO:1", parent_map, {})
+
+    def test_unknown_term_has_no_ancestors(self):
+        """A GO id absent from the graph yields nothing rather than raising."""
+        from app.services.go_service import GOService
+
+        assert GOService._ancestors_from_map("GO:missing", {"GO:1": ()}, {}) == set()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -473,33 +588,30 @@ class TestGetDescendants:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestPropagateAnnotations:
-    """Tests for GOService._propagate_annotations."""
+    """
+    Tests for GOService._propagate_annotations.
+
+    These used to patch `_get_ancestors` out, so the traversal itself was never exercised. Now
+    the GO parent graph is fed through the single bulk read the implementation performs, which
+    means the real closure logic runs.
+    """
 
     @pytest.mark.asyncio
     async def test_direct_annotation_preserved(self, mock_db):
         """Gene should retain its direct annotation after propagation."""
         from app.services.go_service import GOService
-        from unittest.mock import patch
 
         service = GOService()
-
-        term = make_go_term(go_id="GO:0006915", is_a=[])
-        terms = {"GO:0006915": term}
-
+        terms = {"GO:0006915": make_go_term(go_id="GO:0006915", is_a=[])}
         gene_annots = {
-            "TP53": [
-                {
-                    "go_id": "GO:0006915",
-                    "evidence_code": "IDA",
-                    "source_db": "UniProt",
-                    "qualifier": "involved_in",
-                }
-            ]
+            "TP53": [{
+                "go_id": "GO:0006915", "evidence_code": "IDA",
+                "source_db": "UniProt", "qualifier": "involved_in",
+            }]
         }
+        mock_db.execute.return_value = _parent_rows({"GO:0006915": ([], [])})
 
-        # No ancestors for this term
-        with patch.object(service, "_get_ancestors", return_value=[]):
-            result = await service._propagate_annotations(mock_db, gene_annots, terms)
+        result = await service._propagate_annotations(mock_db, gene_annots, terms)
 
         assert "TP53" in result
         assert any(a["go_id"] == "GO:0006915" for a in result["TP53"])
@@ -508,51 +620,118 @@ class TestPropagateAnnotations:
     async def test_ancestor_annotations_added(self, mock_db):
         """When term has ancestors, propagated annotations must include them."""
         from app.services.go_service import GOService
-        from unittest.mock import patch
 
         service = GOService()
-
-        child_term = make_go_term(go_id="GO:0006915", is_a=["GO:0008219"])
-        parent_term = make_go_term(go_id="GO:0008219", name="cell death", is_a=[])
-        terms = {"GO:0006915": child_term, "GO:0008219": parent_term}
-
-        gene_annots = {
-            "TP53": [
-                {
-                    "go_id": "GO:0006915",
-                    "evidence_code": "IDA",
-                    "source_db": "UniProt",
-                    "qualifier": "involved_in",
-                }
-            ]
+        terms = {
+            "GO:0006915": make_go_term(go_id="GO:0006915", is_a=["GO:0008219"]),
+            "GO:0008219": make_go_term(go_id="GO:0008219", name="cell death", is_a=[]),
         }
+        gene_annots = {
+            "TP53": [{
+                "go_id": "GO:0006915", "evidence_code": "IDA",
+                "source_db": "UniProt", "qualifier": "involved_in",
+            }]
+        }
+        mock_db.execute.return_value = _parent_rows({
+            "GO:0006915": ["GO:0008219"],
+            "GO:0008219": [],
+        })
 
-        # Mock _get_ancestors to return parent GO ID for child
-        async def fake_get_ancestors(db, go_id):
-            if go_id == "GO:0006915":
-                return ["GO:0008219"]
-            return []
+        result = await service._propagate_annotations(mock_db, gene_annots, terms)
 
-        with patch.object(service, "_get_ancestors", side_effect=fake_get_ancestors):
-            result = await service._propagate_annotations(mock_db, gene_annots, terms)
-
-        assert "TP53" in result
         go_ids = {a["go_id"] for a in result["TP53"]}
-        assert "GO:0006915" in go_ids
-        assert "GO:0008219" in go_ids
+        assert go_ids == {"GO:0006915", "GO:0008219"}
+
+        inherited = next(a for a in result["TP53"] if a["go_id"] == "GO:0008219")
+        assert inherited["evidence_code"] == "IEA"
+        assert inherited["source_db"] == "propagated"
+        assert inherited["qualifier"] == "inherited from GO:0006915"
+        assert inherited["term_name"] == "cell death"
+
+    @pytest.mark.asyncio
+    async def test_propagates_transitively(self, mock_db):
+        """A grandparent is inherited too, not just the direct parent."""
+        from app.services.go_service import GOService
+
+        service = GOService()
+        terms = {
+            "GO:child": make_go_term(go_id="GO:child", is_a=["GO:parent"]),
+            "GO:parent": make_go_term(go_id="GO:parent", is_a=["GO:root"]),
+            "GO:root": make_go_term(go_id="GO:root", is_a=[]),
+        }
+        gene_annots = {"TP53": [{"go_id": "GO:child", "evidence_code": "IDA",
+                                 "source_db": "UniProt", "qualifier": "involved_in"}]}
+        mock_db.execute.return_value = _parent_rows({
+            "GO:child": ["GO:parent"], "GO:parent": ["GO:root"], "GO:root": [],
+        })
+
+        result = await service._propagate_annotations(mock_db, gene_annots, terms)
+
+        assert {a["go_id"] for a in result["TP53"]} == {"GO:child", "GO:parent", "GO:root"}
+
+    @pytest.mark.asyncio
+    async def test_reads_the_hierarchy_once_for_many_genes(self, mock_db):
+        """
+        The regression this fix is about: one bulk read for the whole gene set.
+
+        The old code awaited a fresh hierarchy walk per (gene, annotation) pair, each issuing a
+        SELECT per node visited. Here 50 genes share one annotation, so the old code would have
+        walked 50 times; the closure is now computed once and memoised.
+        """
+        from app.services.go_service import GOService
+
+        service = GOService()
+        terms = {
+            "GO:child": make_go_term(go_id="GO:child", is_a=["GO:parent"]),
+            "GO:parent": make_go_term(go_id="GO:parent", is_a=[]),
+        }
+        gene_annots = {
+            f"GENE{i}": [{"go_id": "GO:child", "evidence_code": "IDA",
+                          "source_db": "UniProt", "qualifier": "involved_in"}]
+            for i in range(50)
+        }
+        mock_db.execute.return_value = _parent_rows({
+            "GO:child": ["GO:parent"], "GO:parent": [],
+        })
+
+        result = await service._propagate_annotations(mock_db, gene_annots, terms)
+
+        assert mock_db.execute.await_count == 1
+        assert len(result) == 50
+        for i in range(50):
+            assert {a["go_id"] for a in result[f"GENE{i}"]} == {"GO:child", "GO:parent"}
+
+    @pytest.mark.asyncio
+    async def test_ancestor_absent_from_terms_is_skipped(self, mock_db):
+        """
+        Preserved quirk: only ancestors that are themselves directly annotated get emitted.
+
+        `terms` holds just the directly annotated ids, so propagation is narrower than the true
+        path rule implies. Documented in `get_gene_annotations`; widening it would change every
+        enrichment result.
+        """
+        from app.services.go_service import GOService
+
+        service = GOService()
+        # GO:parent is a real ancestor but is NOT in `terms`.
+        terms = {"GO:child": make_go_term(go_id="GO:child", is_a=["GO:parent"])}
+        gene_annots = {"TP53": [{"go_id": "GO:child", "evidence_code": "IDA",
+                                 "source_db": "UniProt", "qualifier": "involved_in"}]}
+        mock_db.execute.return_value = _parent_rows({
+            "GO:child": ["GO:parent"], "GO:parent": [],
+        })
+
+        result = await service._propagate_annotations(mock_db, gene_annots, terms)
+
+        assert {a["go_id"] for a in result["TP53"]} == {"GO:child"}
 
     @pytest.mark.asyncio
     async def test_no_duplicate_annotations(self, mock_db):
         """Same GO ID should not appear twice in propagated annotations."""
         from app.services.go_service import GOService
-        from unittest.mock import patch
 
         service = GOService()
-
-        term = make_go_term(go_id="GO:0006915", is_a=[])
-        terms = {"GO:0006915": term}
-
-        # Two identical direct annotations for same gene/term
+        terms = {"GO:0006915": make_go_term(go_id="GO:0006915", is_a=[])}
         gene_annots = {
             "EGFR": [
                 {"go_id": "GO:0006915", "evidence_code": "IDA",
@@ -561,11 +740,10 @@ class TestPropagateAnnotations:
                  "source_db": "UniProt", "qualifier": "involved_in"},
             ]
         }
+        mock_db.execute.return_value = _parent_rows({"GO:0006915": ([], [])})
 
-        with patch.object(service, "_get_ancestors", return_value=[]):
-            result = await service._propagate_annotations(mock_db, gene_annots, terms)
+        result = await service._propagate_annotations(mock_db, gene_annots, terms)
 
-        # Even if there are two annotations for the same term, they should be de-duped
         go_entries = [a["go_id"] for a in result["EGFR"]]
         assert go_entries.count("GO:0006915") == 1
 
@@ -575,5 +753,6 @@ class TestPropagateAnnotations:
         from app.services.go_service import GOService
 
         service = GOService()
+        mock_db.execute.return_value = _parent_rows({})
         result = await service._propagate_annotations(mock_db, {}, {})
         assert result == {}
