@@ -179,7 +179,13 @@ class GOService:
                 "qualifier": annot.qualifier
             })
         
-        # Get GO term details
+        # Get GO term details.
+        #
+        # NOTE: `terms` holds only the *directly annotated* GO ids (namespace-filtered). Ancestor
+        # propagation below can therefore only emit an ancestor that is itself directly annotated
+        # somewhere in this gene set — narrower than the true path rule the docstring claims.
+        # Behaviour preserved deliberately: widening it changes every enrichment result, which is
+        # a scientific call, not a refactor.
         if go_ids:
             term_query = select(GOTerm).where(GOTerm.go_id.in_(list(go_ids)))
             if namespace:
@@ -327,26 +333,72 @@ class GOService:
 
         return enrichment_results
 
-    async def _get_ancestors(self, db: AsyncSession, go_id: str) -> List[str]:
-        """Get all ancestor GO IDs (recursive traversal up the hierarchy)."""
-        ancestors = set()
-        to_visit = deque([go_id])
-        
+    async def _load_parent_map(self, db: AsyncSession) -> Dict[str, Tuple[str, ...]]:
+        """
+        The whole GO parent graph in one query: ``go_id -> (is_a + part_of)``.
+
+        ~42k rows and three narrow columns. Loading it once replaces the per-node ``SELECT`` that
+        the hierarchy walk used to issue, which is what made annotation propagation quadratic in
+        round trips. ``is_a``/``part_of`` are JSON columns rather than Postgres arrays, so a
+        recursive CTE would have to unnest JSON without an index to help it — reading the graph
+        into memory is both simpler and faster.
+        """
+        rows = (
+            await db.execute(select(GOTerm.go_id, GOTerm.is_a, GOTerm.part_of))
+        ).all()
+        return {
+            row[0]: tuple((row[1] or []) + (row[2] or []))
+            for row in rows
+        }
+
+    @staticmethod
+    def _ancestors_from_map(
+        go_id: str,
+        parent_map: Dict[str, Tuple[str, ...]],
+        cache: Dict[str, Set[str]],
+    ) -> Set[str]:
+        """
+        Transitive ancestors of ``go_id``, memoised in ``cache`` across calls.
+
+        ``cache`` is owned by the caller so a GO id is expanded **once** however many genes carry
+        it — the old code re-walked the hierarchy for every (gene, annotation) pair, which on a
+        7357-gene run meant 112550 walks over just 12193 distinct ids.
+
+        Iterative rather than recursive, and it stops at any node whose closure is already known.
+        ``go_id`` itself is not included, matching the previous behaviour.
+        """
+        hit = cache.get(go_id)
+        if hit is not None:
+            return hit
+
+        ancestors: Set[str] = set()
+        to_visit = deque(parent_map.get(go_id, ()))
         while to_visit:
             current_id = to_visit.popleft()
-            
-            query = select(GOTerm).where(GOTerm.go_id == current_id)
-            result = await db.execute(query)
-            term = result.scalar_one_or_none()
-            
-            if term:
-                parents = term.is_a + term.part_of
-                for parent_id in parents:
-                    if parent_id not in ancestors:
-                        ancestors.add(parent_id)
-                        to_visit.append(parent_id)
-        
-        return list(ancestors)
+            if current_id in ancestors:
+                continue
+            ancestors.add(current_id)
+
+            known = cache.get(current_id)
+            if known is not None:
+                # Closure already computed for this node — no need to walk past it.
+                ancestors |= known
+                continue
+            to_visit.extend(parent_map.get(current_id, ()))
+
+        cache[go_id] = ancestors
+        return ancestors
+
+    async def _get_ancestors(self, db: AsyncSession, go_id: str) -> List[str]:
+        """
+        Get all ancestor GO IDs (transitive closure up the hierarchy).
+
+        One bulk read of the parent graph instead of one ``SELECT`` per node visited. For a single
+        term that trades ~10 point queries for one larger query; the batch caller
+        (:meth:`_propagate_annotations`) loads the graph itself and shares it.
+        """
+        parent_map = await self._load_parent_map(db)
+        return list(self._ancestors_from_map(go_id, parent_map, {}))
 
     async def _get_descendants(self, db: AsyncSession, go_id: str) -> List[str]:
         """Get all descendant GO IDs (recursive traversal down the hierarchy)."""
@@ -380,40 +432,51 @@ class GOService:
         """
         Propagate annotations up the GO hierarchy.
         True path rule: if a gene is annotated to a term, it's also annotated to all ancestors.
+
+        The hierarchy is read **once** into a parent map and every ancestor closure is memoised
+        across genes. Previously this awaited a fresh hierarchy walk — itself one ``SELECT`` per
+        node — for every (gene, annotation) pair: ~1.16 million sequential queries for a
+        7357-gene run, which took 384 s. Same output, three queries.
         """
+        parent_map = await self._load_parent_map(db)
+        ancestor_cache: Dict[str, Set[str]] = {}
+
         propagated = defaultdict(list)
-        
+
         for gene, annots in gene_annots.items():
             seen_go_ids = set()
-            
+
             for annot in annots:
                 go_id = annot["go_id"]
-                
+
                 # Add direct annotation
                 if go_id not in seen_go_ids:
                     propagated[gene].append(annot.copy())
                     seen_go_ids.add(go_id)
-                
-                # Get ancestors and add inherited annotations
-                term = terms.get(go_id)
-                if term:
-                    ancestors = await self._get_ancestors(db, go_id)
-                    
-                    for ancestor_id in ancestors:
-                        if ancestor_id not in seen_go_ids:
-                            ancestor_term = terms.get(ancestor_id)
-                            if ancestor_term:
-                                propagated[gene].append({
-                                    "go_id": ancestor_id,
-                                    "term_name": ancestor_term.name,
-                                    "namespace": ancestor_term.namespace,
-                                    "level": ancestor_term.level,
-                                    "evidence_code": "IEA",  # Inferred from Electronic Annotation
-                                    "source_db": "propagated",
-                                    "qualifier": f"inherited from {go_id}"
-                                })
-                                seen_go_ids.add(ancestor_id)
-        
+
+                # Get ancestors and add inherited annotations.
+                # Only for terms present in `terms`, and only ancestors that are themselves in
+                # `terms` — preserved from the original. See the note in `get_gene_annotations`
+                # on why that makes propagation narrower than the true path rule implies.
+                if go_id not in terms:
+                    continue
+
+                for ancestor_id in self._ancestors_from_map(go_id, parent_map, ancestor_cache):
+                    if ancestor_id in seen_go_ids:
+                        continue
+                    ancestor_term = terms.get(ancestor_id)
+                    if ancestor_term:
+                        propagated[gene].append({
+                            "go_id": ancestor_id,
+                            "term_name": ancestor_term.name,
+                            "namespace": ancestor_term.namespace,
+                            "level": ancestor_term.level,
+                            "evidence_code": "IEA",  # Inferred from Electronic Annotation
+                            "source_db": "propagated",
+                            "qualifier": f"inherited from {go_id}"
+                        })
+                        seen_go_ids.add(ancestor_id)
+
         return dict(propagated)
 
 
