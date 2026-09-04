@@ -226,6 +226,48 @@ class TestCacheManagement:
         svc.clear_dataset_cache("ds1")
         assert svc.get_dataframe("ds1") is None
 
+    def test_clear_dataset_cache_evicts_keyed_caches(self):
+        """
+        The volcano, clustering and stats entries must go too.
+
+        These keys are MD5 hashes, so clear_dataset_cache had no way to find them and left them
+        behind: a reprocessed dataset kept serving its stale volcano cloud until the TTL expired.
+        """
+        svc = self._make_service()
+        svc.set_clustering_result("ds1", ["A"], {"x": 1})
+        svc.set_volcano_data("ds1", "cmp", {"y": 2})
+        svc.set_stats("ds1", {"z": 3})
+
+        svc.clear_dataset_cache("ds1")
+
+        assert svc.get_clustering_result("ds1", ["A"]) is None
+        assert svc.get_volcano_data("ds1", "cmp") is None
+        assert svc.get_stats("ds1") is None
+
+    def test_clear_dataset_cache_spares_other_datasets(self):
+        """Eviction is scoped to one dataset — a prefix scan, not a flush."""
+        svc = self._make_service()
+        svc.set_volcano_data("ds1", "cmp", {"y": 1})
+        svc.set_volcano_data("ds2", "cmp", {"y": 2})
+        svc.set_stats("ds2", {"z": 3})
+
+        svc.clear_dataset_cache("ds1")
+
+        assert svc.get_volcano_data("ds1", "cmp") is None
+        assert svc.get_volcano_data("ds2", "cmp") == {"y": 2}
+        assert svc.get_stats("ds2") == {"z": 3}
+
+    def test_clear_dataset_cache_keeps_other_thresholds_of_same_dataset_out(self):
+        """All threshold variants of a dataset's volcano go, not just the default one."""
+        svc = self._make_service()
+        svc.set_volcano_data("ds1", "cmp", {"y": 1}, padj_threshold=0.05, logfc_threshold=0.58)
+        svc.set_volcano_data("ds1", "cmp", {"y": 2}, padj_threshold=0.01, logfc_threshold=1.0)
+
+        svc.clear_dataset_cache("ds1")
+
+        assert svc.get_volcano_data("ds1", "cmp", padj_threshold=0.05, logfc_threshold=0.58) is None
+        assert svc.get_volcano_data("ds1", "cmp", padj_threshold=0.01, logfc_threshold=1.0) is None
+
     def test_clear_all_empties_all_caches(self):
         """clear_all should remove all entries from all caches."""
         import pandas as pd
