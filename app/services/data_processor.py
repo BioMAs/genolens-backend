@@ -922,7 +922,12 @@ class DataProcessorService:
             y_floor = padj_display_floor(work[padj_col])
             valid_count = len(work)
 
-            work['logFC'] = work[logfc_col].round(4)
+            # 6 decimals, not 4: the client compares `abs(logFC) > threshold` on this stored value,
+            # and at 4 decimals a gene at 0.580028 rounded to exactly 0.58 — failing a strict `>`
+            # against the 0.58 threshold and dropping out of the counts. 23 genes across this
+            # dataset's 20 comparisons landed in that window; at 6 decimals, none do. log2FC
+            # resolution of 1e-6 is far below anything the measurement supports.
+            work['logFC'] = work[logfc_col].round(6)
             work['negLogPadj'] = (-np.log10(work[padj_col].clip(lower=y_floor))).round(4)
             work['padj_val'] = work[padj_col]
 
@@ -940,34 +945,36 @@ class DataProcessorService:
             sig_genes = _df_to_points(sig_df)
             non_sig_genes = _df_to_points(non_sig_df)
             
-            # Downsample if too many points (limit to ~5000 points total for good visualization)
+            # Downsampling budget for the grey backdrop. Significant genes are never subject to it.
             MAX_POINTS = 5000
-            
-            if valid_count > MAX_POINTS:
-                # Prioritize significant genes
-                if len(sig_genes) >= MAX_POINTS:
-                    # If too many significant genes, take top most significant
-                    sig_genes.sort(key=lambda x: x['padj'])
-                    plot_data = sig_genes[:MAX_POINTS]
+            # Guaranteed backdrop so a DEG-rich comparison still reads as a volcano rather than
+            # two bare wings.
+            MIN_NON_SIG_POINTS = 1000
+
+            # Every significant gene is kept, always.
+            #
+            # This used to truncate to the 5000 most significant whenever there were more, which
+            # silently capped the cloud — and the results page derives all of its DEG counts from
+            # this cloud, so the cap became an undercount. Measured on a 13k-gene dataset it lost
+            # up to 2478 significant genes in a single comparison.
+            #
+            # Keeping them all is also what makes client-side recounting exact: the UI can only
+            # *tighten* thresholds from the ingestion defaults used for `sig_mask`, so a cloud
+            # holding every gene at `padj < 0.05` is a superset of anything a tightened threshold
+            # can select. Matches the cold Parquet path, which never dropped a significant point.
+            plot_data = list(sig_genes)
+
+            # Fill what is left of the budget with a stratified sample across the logFC range.
+            remaining_slots = max(MAX_POINTS - len(plot_data), MIN_NON_SIG_POINTS)
+            if non_sig_genes:
+                if len(non_sig_genes) > remaining_slots:
+                    # Sort by absolute logFC to get diverse representation
+                    non_sig_genes.sort(key=lambda x: abs(x['logFC']))
+                    step = len(non_sig_genes) / remaining_slots
+                    indices = [int(i * step) for i in range(remaining_slots)]
+                    plot_data.extend([non_sig_genes[i] for i in indices])
                 else:
-                    # Take all significant genes
-                    plot_data = sig_genes
-                    # Fill remaining slots with stratified sample of non-significant genes
-                    remaining_slots = MAX_POINTS - len(sig_genes)
-                    if remaining_slots > 0 and non_sig_genes:
-                        import random
-                        # Use stratified sampling for better distribution across logFC range
-                        if len(non_sig_genes) > remaining_slots:
-                            # Sort by absolute logFC to get diverse representation
-                            non_sig_genes.sort(key=lambda x: abs(x['logFC']))
-                            # Take evenly spaced samples
-                            step = len(non_sig_genes) / remaining_slots
-                            indices = [int(i * step) for i in range(remaining_slots)]
-                            plot_data.extend([non_sig_genes[i] for i in indices])
-                        else:
-                            plot_data.extend(non_sig_genes)
-            else:
-                plot_data = sig_genes + non_sig_genes
+                    plot_data.extend(non_sig_genes)
                 
             # Remove 'padj' from final output if not needed for display to save space, 
             # but usually it's useful for tooltips. We'll keep it but maybe round it?
