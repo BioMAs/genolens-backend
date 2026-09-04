@@ -37,6 +37,7 @@ from app.models.models import (
     Dataset, DatasetType, DegGene, EnrichmentPathway, AIInterpretation,
     Project, SelfServiceAnalysis,
 )
+from app.services.enrichment_source import match_enrichment_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -558,12 +559,12 @@ class ReportLatexService:
         n_up = sum(1 for g in all_genes if (g.regulation or "").upper() == "UP")
         n_down = sum(1 for g in all_genes if (g.regulation or "").upper() == "DOWN")
 
-        # matched enrichment dataset (by comparison_name metadata)
-        enr_ds = next(
-            (e for e in enr_datasets
-             if (e.dataset_metadata or {}).get("comparison_name") == comp_name),
-            None,
-        )
+        # Matched enrichment dataset, via the shared rules (`enrichment_source`) rather than a
+        # local `comparison_name` check — which missed an enrichment file that names the
+        # comparison in `enrichment_comparisons` or in its own dataset name, and could pick a
+        # FAILED duplicate over a READY one. Candidates stay scoped to this analysis's result
+        # datasets, so the pure matcher is the right entry point.
+        enr_ds = match_enrichment_dataset(enr_datasets, comp_name)
         enr_all, enr_up, enr_down = [], [], []
         if enr_ds:
             enr_stmt = select(EnrichmentPathway).where(EnrichmentPathway.dataset_id == enr_ds.id)

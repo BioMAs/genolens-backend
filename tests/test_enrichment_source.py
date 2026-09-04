@@ -235,3 +235,124 @@ class TestResolvePathwayDatasetId:
         deg = deg_dataset()
 
         assert await resolve_pathway_dataset_id(db, deg, "KO_vs_WT") == deg.id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# deg_comparison_names
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDegComparisonNames:
+
+    def test_reads_a_single_comparison_name(self):
+        from app.services.enrichment_source import deg_comparison_names
+        deg = deg_dataset({"comparison_name": "KO_vs_WT"})
+        assert deg_comparison_names(deg) == ["KO_vs_WT"]
+
+    def test_reads_the_keys_of_a_comparisons_dict(self):
+        """Multi-comparison DEG files key `comparisons` by name."""
+        from app.services.enrichment_source import deg_comparison_names
+        deg = deg_dataset({"comparisons": {"A_vs_B": {}, "C_vs_D": {}}})
+        assert set(deg_comparison_names(deg)) == {"A_vs_B", "C_vs_D"}
+
+    def test_reads_a_comparisons_list(self):
+        from app.services.enrichment_source import deg_comparison_names
+        deg = deg_dataset({"comparisons": ["A_vs_B", "C_vs_D"]})
+        assert deg_comparison_names(deg) == ["A_vs_B", "C_vs_D"]
+
+    def test_the_named_comparison_comes_first(self):
+        """Most specific first, so a per-comparison name beats the file's whole list."""
+        from app.services.enrichment_source import deg_comparison_names
+        deg = deg_dataset({"comparison_name": "KO_vs_WT", "comparisons": ["A_vs_B"]})
+        assert deg_comparison_names(deg)[0] == "KO_vs_WT"
+
+    def test_deduplicates(self):
+        from app.services.enrichment_source import deg_comparison_names
+        deg = deg_dataset({"comparison_name": "KO_vs_WT", "comparisons": ["KO_vs_WT"]})
+        assert deg_comparison_names(deg) == ["KO_vs_WT"]
+
+    def test_empty_when_nothing_is_declared(self):
+        from app.services.enrichment_source import deg_comparison_names
+        assert deg_comparison_names(deg_dataset(None)) == []
+        assert deg_comparison_names(deg_dataset({"comparisons": "not-a-list"})) == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# match_enrichment_for_deg — the project report, which has no comparison in hand
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMatchEnrichmentForDeg:
+
+    def test_matches_on_a_declared_comparison(self):
+        from app.services.enrichment_source import match_enrichment_for_deg
+
+        enr = make_dataset(name="enr", metadata={"comparison_name": "KO_vs_WT"})
+        deg = deg_dataset({"comparison_name": "KO_vs_WT"})
+
+        assert match_enrichment_for_deg([enr], deg) is enr
+
+    def test_matches_a_multi_comparison_enrichment_file(self):
+        """
+        The pair the old rule missed: names that do not contain one another, but the enrichment
+        file lists the comparison. 'All DEG' / 'All enrichment' on the dev database.
+        """
+        from app.services.enrichment_source import match_enrichment_for_deg
+
+        enr = make_dataset(
+            name="All enrichment",
+            metadata={"enrichment_comparisons": ["KO_vs_WT", "A_vs_B"]},
+        )
+        deg = deg_dataset({"comparisons": {"KO_vs_WT": {}}})
+
+        assert match_enrichment_for_deg([enr], deg) is enr
+
+    def test_comparison_rules_win_over_name_pairing(self):
+        """
+        Precedence matters: the name fallback is fragile and must never pre-empt a real match.
+        """
+        from app.services.enrichment_source import match_enrichment_for_deg
+
+        # `paired` would win on substring alone — its name contains the DEG's.
+        paired = make_dataset(name="KO_vs_WT enrichment", metadata={})
+        correct = make_dataset(name="unrelated", metadata={"comparison_name": "KO_vs_WT"})
+        deg = deg_dataset({"comparison_name": "KO_vs_WT"})
+        deg.name = "KO_vs_WT"
+
+        assert match_enrichment_for_deg([paired, correct], deg) is correct
+
+    def test_falls_back_to_name_pairing(self):
+        """The project report's original and only rule, kept as a last resort."""
+        from app.services.enrichment_source import match_enrichment_for_deg
+
+        enr = make_dataset(name="KO_vs_WT enrichment", metadata={})
+        deg = deg_dataset(None)
+        deg.name = "KO_vs_WT"
+
+        assert match_enrichment_for_deg([enr], deg) is enr
+
+    def test_returns_none_when_nothing_pairs(self):
+        from app.services.enrichment_source import match_enrichment_for_deg
+
+        enr = make_dataset(name="totally other", metadata={})
+        deg = deg_dataset(None)
+        deg.name = "KO_vs_WT"
+
+        assert match_enrichment_for_deg([enr], deg) is None
+
+    def test_prefers_ready_in_the_name_fallback_too(self):
+        from app.services.enrichment_source import match_enrichment_for_deg
+
+        failed = make_dataset(name="KO_vs_WT a", status=DatasetStatus.FAILED, metadata={})
+        ready = make_dataset(name="KO_vs_WT b", status=DatasetStatus.READY, metadata={})
+        deg = deg_dataset(None)
+        deg.name = "KO_vs_WT"
+
+        assert match_enrichment_for_deg([failed, ready], deg) is ready
+
+    def test_tolerates_a_nameless_candidate(self):
+        from app.services.enrichment_source import match_enrichment_for_deg
+
+        nameless = make_dataset(name=None, metadata={})
+        deg = deg_dataset(None)
+        deg.name = "KO_vs_WT"
+
+        assert match_enrichment_for_deg([nameless], deg) is None
