@@ -490,6 +490,68 @@ class TestCalculateVolcanoPlots:
         sig_in_output = [p for p in result[comp] if p["padj"] < 0.05]
         assert len(sig_in_output) == n_sig
 
+    @pytest.mark.asyncio
+    async def test_dp07_keeps_every_significant_gene_past_the_cap(self):
+        """
+        More than MAX_POINTS significant genes: all of them are still kept.
+
+        The cloud used to truncate to the 5000 most significant, and since every DEG count on the
+        results page is derived from it, that cap became a silent undercount — measured at up to
+        2478 lost genes in one comparison of a real 13k-gene dataset. It also broke the invariant
+        the client relies on: thresholds can only tighten from the ingestion defaults, so the
+        cloud must hold every gene at `padj < 0.05` for a tightened recount to be exact.
+        """
+        svc = _make_service()
+        comp = "MANY_vs_FEW"
+        rng = np.random.default_rng(11)
+        n_sig, n_nonsig = 6500, 5000
+        df = pd.DataFrame({
+            "gene_id": [f"G{i}" for i in range(n_sig + n_nonsig)],
+            f"log2FoldChange:{comp}": np.concatenate([
+                rng.normal(0, 3, n_sig),
+                rng.normal(0, 0.1, n_nonsig),
+            ]),
+            f"padj:{comp}": np.concatenate([
+                rng.uniform(1e-8, 0.04, n_sig),
+                rng.uniform(0.06, 0.99, n_nonsig),
+            ]),
+        })
+        result = await svc.calculate_volcano_plots(
+            _df_to_parquet_bytes(df), self._make_comparisons(comp)
+        )
+        points = result[comp]
+        kept_sig = [p for p in points if p["padj"] < 0.05]
+        assert len(kept_sig) == n_sig
+        # And a grey backdrop survives, so the plot still reads as a volcano.
+        assert len(points) - len(kept_sig) > 0
+
+    @pytest.mark.asyncio
+    async def test_dp07_logfc_precision_survives_the_threshold_boundary(self):
+        """
+        A gene just past a selectable threshold must not be rounded back onto it.
+
+        The client compares `abs(logFC) > threshold` against the *stored* value, so rounding to 4
+        decimals turned 0.580028 into exactly 0.58, which fails a strict `>` and silently dropped
+        the gene from every count on the page. Real case: FBXO38-DT at logFC 0.580027862808085.
+        """
+        svc = _make_service()
+        comp = "A_vs_B"
+        df = pd.DataFrame({
+            "gene_id": ["JUST_OVER", "JUST_UNDER", "EXACTLY_ON"],
+            f"log2FoldChange:{comp}": [0.580027862808085, 0.579971, 0.58],
+            f"padj:{comp}": [5.06945302416443e-07, 1e-7, 1e-7],
+        })
+        result = await svc.calculate_volcano_plots(
+            _df_to_parquet_bytes(df), self._make_comparisons(comp)
+        )
+        points = {p["gene_id"]: p for p in result[comp]}
+
+        # Counted exactly as an unrounded comparison would count it.
+        assert abs(points["JUST_OVER"]["logFC"]) > 0.58
+        assert abs(points["JUST_UNDER"]["logFC"]) <= 0.58
+        # Strict `>` on both sides: a gene sitting exactly on the threshold is out.
+        assert not abs(points["EXACTLY_ON"]["logFC"]) > 0.58
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DP-08  calculate_pca — structure + explained variance
