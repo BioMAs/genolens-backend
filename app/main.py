@@ -13,7 +13,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
 from app.db.session import close_db
-from app.api.endpoints import projects, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, billing, reports, report_settings, analyses, cosmetics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
+from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, billing, reports, report_settings, analyses, cosmetics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -218,6 +218,11 @@ async def database_test(current_user=Depends(get_current_user)):
 # Include API Routers
 app.include_router(
     projects.router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    comparisons.router,
     prefix=settings.API_V1_PREFIX,
 )
 
