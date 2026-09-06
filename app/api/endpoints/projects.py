@@ -2,7 +2,7 @@
 Project API endpoints using SQLAlchemy.
 """
 from uuid import UUID
-from typing import Optional, Annotated
+from typing import Optional, Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy import select, func, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +14,7 @@ from app.api.deps.subscription import get_or_create_user
 from app.core.supabase_auth import SupabaseUser, lookup_user_by_email
 from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, UserRole, User
 from app.services import email_service, history_service
+from app.services.comparison_catalog import build_comparisons_from_datasets
 from app.schemas.project import (
     ProjectCreate,
     ProjectUpdate,
@@ -21,7 +22,6 @@ from app.schemas.project import (
     ProjectListResponse,
     ProjectSummaryResponse,
     ProjectStats,
-    ComparisonSummary,
     PaginatedComparisonsResponse,
     ProjectMemberCreate,
     ProjectMemberUpdate,
@@ -102,7 +102,10 @@ async def list_projects(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     page: int = Query(default=1, ge=1, description="Page number"),
-    page_size: int = Query(default=20, ge=1, le=100, description="Items per page")
+    page_size: int = Query(default=20, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(default=None, max_length=200, description="Match name or description"),
+    sort_by: Literal["created_at", "updated_at", "name"] = Query(default="created_at"),
+    sort_order: Literal["asc", "desc"] = Query(default="desc"),
 ) -> dict:
     """
     List all projects owned by or shared with the current user (paginated).
@@ -110,16 +113,29 @@ async def list_projects(
     member_subquery = select(ProjectMember.project_id).where(ProjectMember.user_id == current_user.user_id)
     access_filter = or_(Project.owner_id == current_user.user_id, Project.id.in_(member_subquery))
 
+    filters = [access_filter]
+    if search:
+        needle = f"%{search.strip()}%"
+        filters.append(or_(Project.name.ilike(needle), Project.description.ilike(needle)))
+
     # Get total count
-    count_query = select(func.count()).select_from(Project).where(access_filter)
+    count_query = select(func.count()).select_from(Project).where(*filters)
     total = await db.scalar(count_query)
+
+    # Sort on a whitelisted column so the parameter can never reach SQL as-is.
+    sort_column = {
+        "created_at": Project.created_at,
+        "updated_at": Project.updated_at,
+        "name": Project.name,
+    }[sort_by]
+    ordering = sort_column.asc() if sort_order == "asc" else sort_column.desc()
 
     # Get paginated projects
     offset = (page - 1) * page_size
-    query = select(Project).where(access_filter)\
-        .order_by(Project.created_at.desc())\
+    query = select(Project).where(*filters)\
+        .order_by(ordering)\
         .offset(offset).limit(page_size)
-    
+
     result = await db.execute(query)
     projects = result.scalars().all()
 
@@ -208,73 +224,6 @@ async def update_project(
     return project
 
 
-def _build_comparisons_from_datasets(datasets: list) -> list[ComparisonSummary]:
-    """
-    Build the list of ComparisonSummary from a list of Dataset objects.
-    """
-    comparisons_dict: dict[str, ComparisonSummary] = {}
-
-    for d in datasets:
-        metadata = d.dataset_metadata or {}
-
-        # Skip datasets that never finished processing. A FAILED/PROCESSING DEG
-        # dataset carries no counts (deg_up_count NULL, no `comparisons` metadata);
-        # because entries are keyed by comparison name and the loop is ordered
-        # newest-first, a stale failed dataset from an earlier run is processed
-        # last and would overwrite a good comparison's counts with zeros.
-        if d.status != "READY":
-            continue
-
-        # Single file per comparison (old way)
-        if d.type == "DEG":
-            # Prefer explicit comparison_name; fall back to first item in list; then dataset name
-            comp_name = metadata.get('comparison_name') if metadata else None
-            if not comp_name and isinstance(metadata.get('comparisons'), list) and metadata['comparisons']:
-                comp_name = metadata['comparisons'][0]
-            if not comp_name:
-                comp_name = d.name
-            # Use pre-calculated DB counts as primary source, metadata as fallback
-            deg_up = d.deg_up_count or (metadata.get('deg_up', 0) if metadata else 0)
-            deg_down = d.deg_down_count or (metadata.get('deg_down', 0) if metadata else 0)
-            deg_total = d.deg_significant_count or (metadata.get('deg_total', deg_up + deg_down) if metadata else deg_up + deg_down)
-            comparisons_dict[comp_name] = ComparisonSummary(
-                name=comp_name,
-                deg_up=deg_up,
-                deg_down=deg_down,
-                deg_total=deg_total,
-                has_enrichment=False,
-                dataset_id=d.id,
-                dataset_type='SINGLE'
-            )
-
-        # Global DEG file (new way)
-        if metadata and 'comparisons' in metadata and isinstance(metadata['comparisons'], dict):
-            for comp_name, comp_info in metadata['comparisons'].items():
-                deg_up = comp_info.get('deg_up', 0)
-                deg_down = comp_info.get('deg_down', 0)
-                deg_total = comp_info.get('deg_total', deg_up + deg_down)
-                comparisons_dict[comp_name] = ComparisonSummary(
-                    name=comp_name,
-                    deg_up=deg_up,
-                    deg_down=deg_down,
-                    deg_total=deg_total,
-                    has_enrichment=False,
-                    dataset_id=d.id,
-                    dataset_type='GLOBAL'
-                )
-
-    # Mark comparisons with enrichment (check both ENRICHMENT datasets and DEG datasets)
-    for d in datasets:
-        metadata = d.dataset_metadata or {}
-        if metadata:
-            enrichment_comparisons = metadata.get('enrichment_comparisons', [])
-            for comp_name in enrichment_comparisons:
-                if comp_name in comparisons_dict:
-                    comparisons_dict[comp_name].has_enrichment = True
-
-    return list(comparisons_dict.values())
-
-
 @router.get("/{project_id}/comparisons", response_model=PaginatedComparisonsResponse)
 async def list_project_comparisons(
     project_id: UUID,
@@ -312,7 +261,7 @@ async def list_project_comparisons(
     result = await db.execute(datasets_query)
     datasets = result.scalars().all()
 
-    all_comparisons = _build_comparisons_from_datasets(datasets)
+    all_comparisons = build_comparisons_from_datasets(datasets)
     total = len(all_comparisons)
     total_pages = max(1, (total + page_size - 1) // page_size)
     offset = (page - 1) * page_size
@@ -372,7 +321,7 @@ async def get_project_summary(
     original_files_count = sum(1 for d in datasets if d.raw_file_path)
 
     # Count comparisons using the shared helper (no need to return them here)
-    all_comparisons = _build_comparisons_from_datasets(datasets)
+    all_comparisons = build_comparisons_from_datasets(datasets)
     total_comparisons = len(all_comparisons)
 
     # Get original file names
