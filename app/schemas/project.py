@@ -69,6 +69,28 @@ class PaginatedComparisonsResponse(BaseModel):
     total_pages: int
 
 
+class UserComparisonItem(ComparisonSummary):
+    """
+    A comparison seen from outside its project.
+
+    The cross-project listing has to say where each comparison comes from, which
+    the project-scoped `ComparisonSummary` never needed to carry.
+    """
+    project_id: UUID
+    project_name: str
+    dataset_name: str
+    updated_at: Optional[datetime] = None
+
+
+class PaginatedUserComparisonsResponse(BaseModel):
+    """Paginated list of every comparison the current user can reach."""
+    comparisons: list[UserComparisonItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
 class ProjectStats(BaseModel):
     """Project statistics."""
     total_datasets: int
