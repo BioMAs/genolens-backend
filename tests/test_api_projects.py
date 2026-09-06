@@ -147,6 +147,35 @@ class TestListProjects:
         assert "page" in data
         assert "page_size" in data
 
+    @pytest.mark.asyncio
+    async def test_search_reaches_the_query(self, projects_client):
+        """`search` used to be accepted by the client and dropped by the server."""
+        client, mock_db = projects_client
+        response = await client.get("/api/v1/projects/", params={"search": "tumor"})
+
+        assert response.status_code == 200
+        # ilike renders as lower(col) LIKE lower(:param) on the default dialect.
+        rendered = " ".join(str(call.args[0]) for call in mock_db.execute.await_args_list)
+        assert "lower(projects.name) LIKE" in rendered
+        assert "lower(projects.description) LIKE" in rendered
+
+    @pytest.mark.asyncio
+    async def test_sort_order_reaches_the_query(self, projects_client):
+        client, mock_db = projects_client
+        response = await client.get(
+            "/api/v1/projects/", params={"sort_by": "name", "sort_order": "asc"}
+        )
+
+        assert response.status_code == 200
+        rendered = " ".join(str(call.args[0]) for call in mock_db.execute.await_args_list)
+        assert "ORDER BY projects.name ASC" in rendered
+
+    @pytest.mark.asyncio
+    async def test_rejects_unknown_sort_field(self, projects_client):
+        client, _ = projects_client
+        response = await client.get("/api/v1/projects/", params={"sort_by": "owner_id"})
+        assert response.status_code == 422
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GET /projects/{project_id}
