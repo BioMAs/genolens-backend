@@ -4,7 +4,8 @@ Billing endpoints — Stripe checkout, portal, subscription info, and webhook.
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Any
+from datetime import datetime, timezone
+from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
@@ -48,6 +49,36 @@ class SubscriptionResponse(BaseModel):
     comparisons_remaining: int | None
     can_use_ai: bool
     can_use_multi_comparison: bool
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _subscription_period_end(subscription: dict) -> Optional[int]:
+    """Unix timestamp at which the subscription's current billing period ends.
+
+    Read from two places on purpose. Stripe moved `current_period_end` off the
+    Subscription object and onto its items in API version 2025-03-31.basil, and
+    nothing here pins an API version — the shape therefore depends on the
+    account's default, which can change under us. Reading only the top level
+    (as the abandoned feature/stripe-integration branch did) silently yields
+    None on a modern account, leaving the renewal date empty: exactly the bug
+    this is meant to fix.
+
+    With several items (a plan plus add-ons) the periods can differ; access
+    ends at the latest of them.
+    """
+    top_level = subscription.get("current_period_end")
+    if top_level:
+        return int(top_level)
+
+    per_item = [
+        int(item["current_period_end"])
+        for item in subscription.get("items", {}).get("data", [])
+        if item.get("current_period_end")
+    ]
+    return max(per_item) if per_item else None
 
 
 # ---------------------------------------------------------------------------
@@ -179,20 +210,11 @@ async def stripe_webhook(
     if event_type in ("customer.subscription.created", "customer.subscription.updated"):
         subscription = event["data"]["object"]
         customer_id: str = subscription["customer"]
-        items = subscription.get("items", {}).get("data", [])
 
-        if not items:
-            return {"status": "ok"}
-
-        price_id: str = items[0]["price"]["id"]
-        price_to_plan = _get_price_to_plan()
-        plan_key = price_to_plan.get(price_id)
-
-        if not plan_key:
-            logger.warning("Unknown price_id in webhook: %s", price_id)
-            return {"status": "ok", "note": f"Unknown price_id: {price_id}"}
-
-        # Find user by stripe_customer_id
+        # Resolve the user FIRST. The plan lookup used to come first and bailed
+        # out early on an empty item list or an unrecognised price, so nothing
+        # downstream ran — including the renewal-date sync below, which must
+        # happen whether or not we recognise what was bought.
         result = await db.execute(
             select(User).where(User.stripe_customer_id == customer_id)
         )
@@ -209,17 +231,46 @@ async def stripe_webhook(
                 except ValueError:
                     pass
 
-        if user:
+        if not user:
+            logger.warning("No user found for Stripe customer: %s", customer_id)
+            return {"status": "ok", "note": "no matching user"}
+
+        # Renewal date. Nothing populated this from Stripe before, so the
+        # "Renewal Date" row the profile page renders was blank for every
+        # Stripe customer and only ever filled in by an admin by hand.
+        # subscription_ends_at is a String(50) column holding ISO 8601, per
+        # app/services/account_service.py.
+        period_end = _subscription_period_end(subscription)
+        if period_end:
+            user.subscription_ends_at = datetime.fromtimestamp(
+                period_end, tz=timezone.utc
+            ).isoformat()
+        else:
+            logger.warning(
+                "No current_period_end on subscription for customer %s "
+                "(neither top-level nor on items)",
+                customer_id,
+            )
+
+        # Plan, when we recognise the price.
+        items = subscription.get("items", {}).get("data", [])
+        plan_key = None
+        if items:
+            price_id: str = items[0]["price"]["id"]
+            plan_key = _get_price_to_plan().get(price_id)
+            if not plan_key:
+                logger.warning("Unknown price_id in webhook: %s", price_id)
+
+        if plan_key:
             try:
                 user.subscription_plan = SubscriptionPlan(plan_key)
-                user.stripe_customer_id = customer_id
-                db.add(user)
-                await db.commit()
                 logger.info("Updated user %s plan to %s", user.id, plan_key)
             except ValueError:
                 logger.error("Invalid plan key from webhook: %s", plan_key)
-        else:
-            logger.warning("No user found for Stripe customer: %s", customer_id)
+
+        user.stripe_customer_id = customer_id
+        db.add(user)
+        await db.commit()
 
     elif event_type == "customer.subscription.deleted":
         subscription = event["data"]["object"]
