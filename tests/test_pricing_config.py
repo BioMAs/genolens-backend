@@ -251,23 +251,40 @@ def test_no_hard_coded_plan_prices_in_app_code():
     assert offenders == [], f"plan-keyed numeric literals outside the grid: {offenders}"
 
 
-def test_grid_files_are_not_gitignored():
+def test_grid_files_are_tracked_by_git():
     """The grid must ship with the code.
 
     It first lived under app/data/, which .gitignore excludes wholesale for
-    runtime data artifacts — so it would never have been committed and would
-    have gone missing on deploy, taking every price and quota with it.
+    runtime data artifacts. It loaded fine locally and would have passed every
+    other test here — then gone missing on deploy, taking every price and
+    quota with it.
+
+    Asserts the files are *tracked*, not merely "not ignored": `git
+    check-ignore` skips anything already in the index, so an ignore-based check
+    would have gone inert the moment these files were first committed and would
+    never catch the next grid file added to an excluded directory.
+
+    Repo hygiene, so it only runs in a checkout. CI executes pytest *inside the
+    container*, where .dockerignore has stripped .git and git is not installed.
+    That the grid is present and parses wherever the app runs — container
+    included — is covered by the other tests in this file.
     """
+    import shutil
     import subprocess
 
     repo = APP_DIR.parent
+    if shutil.which("git") is None or not (repo / ".git").exists():
+        pytest.skip("not a git checkout (running inside the container)")
+
     for path in (ACTIVE_GRID, DRAFT_GRID):
         result = subprocess.run(
-            ["git", "check-ignore", str(path)],
+            ["git", "ls-files", "--error-unmatch", str(path)],
             cwd=repo, capture_output=True, text=True,
         )
-        assert result.returncode != 0, (
-            f"{path.relative_to(repo)} is gitignored; it would not ship"
+        assert result.returncode == 0, (
+            f"{path.relative_to(repo)} is not tracked by git; it would not "
+            f"ship on deploy. Is it under an ignored directory? "
+            f"({result.stderr.strip()})"
         )
 
 
