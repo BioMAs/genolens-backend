@@ -1,0 +1,323 @@
+{
+  "$comment": "GenoLens — grille ACTIVE. Source de vérité unique pour les plans, quotas et entitlements, servie par GET /api/v1/pricing. Aucun prix, quota ou entitlement ne doit être codé en dur ailleurs. Montants en euros HT. Ce fichier décrit délibérément le comportement RÉELLEMENT appliqué aujourd'hui, pas la grille cible : voir pricing.2026-09-draft.json pour la proposition. tests/test_pricing_config.py échoue si une valeur ici diverge de la propriété correspondante sur le modèle User.",
+  "version": "2026.09-active",
+  "status": "ACTIF — reflète le comportement en production. Toute divergence avec app/models/models.py est un bug de test.",
+  "currency": "EUR",
+  "tax_mode": "HT",
+  "billable_unit": {
+    "id": "deg_dataset_upload",
+    "label_fr": "analyse",
+    "label_en": "analysis",
+    "definition": "Un dépôt de dataset DEG. Le compteur s'incrémente de +1 par fichier accepté, indépendamment du nombre de contrastes qu'il contient.",
+    "identity_hash": null,
+    "identity_excludes": [],
+    "not_billable": [
+      "consultation des résultats déjà déposés",
+      "analyse self-service lancée via POST /analyses (non compté aujourd'hui)"
+    ],
+    "rationale": "État des lieux, pas une intention. Le libellé « comparaison » employé dans le code et l'UI est trompeur : l'unité mesurée est le fichier déposé. Voir pricing.2026-09-draft.json pour l'unité cible (contraste interprété)."
+  },
+  "a_la_carte": {
+    "interpreted_contrast": null
+  },
+  "plans": [
+    {
+      "id": "STARTER",
+      "name_fr": "Starter",
+      "name_en": "Starter",
+      "order": 1,
+      "price_monthly": 100.0,
+      "price_annual": 1000.0,
+      "billing": [
+        "monthly",
+        "annual"
+      ],
+      "commitment_months": 0,
+      "contrast_quota": 30,
+      "quota_period": "monthly",
+      "seats": null,
+      "max_projects": 15,
+      "datasets_limit_per_project": 5,
+      "entitlements": {
+        "ai_interpretation": "none",
+        "multi_comparison": false,
+        "advanced_export": false
+      },
+      "note": "Le tarif annuel affiché sur /pricing est 1 000 €. L'estimation MRR de l'admin porte un commentaire contradictoire (85 €/mois en annuel, soit 1 020 €) : écart à trancher, hors périmètre. La page de prix annonce « 5 datasets » pour le compte entier alors que la limite appliquée est de 5 datasets DEG PAR PROJET (donc jusqu'à 75 avec 15 projets).",
+      "description_en": "Get started with RNA-seq analysis and all the essential features you need.",
+      "engagement_en": "Monthly or annual billing",
+      "cta_label_en": "Request Starter",
+      "marketing_features": [
+        {
+          "label": "5 datasets",
+          "included": true
+        },
+        {
+          "label": "Differential expression analysis",
+          "included": true
+        },
+        {
+          "label": "Basic clustering (K-means)",
+          "included": true
+        },
+        {
+          "label": "GO enrichment (Biological Process)",
+          "included": true
+        },
+        {
+          "label": "Volcano plot & heatmap export",
+          "included": true
+        },
+        {
+          "label": "6-month data retention",
+          "included": true
+        },
+        {
+          "label": "Community forum support",
+          "included": true
+        },
+        {
+          "label": "AI interpretation",
+          "included": false
+        },
+        {
+          "label": "GSEA",
+          "included": false
+        },
+        {
+          "label": "API access",
+          "included": false
+        },
+        {
+          "label": "Team collaboration",
+          "included": false
+        }
+      ]
+    },
+    {
+      "id": "TEAM",
+      "name_fr": "Pro",
+      "name_en": "Pro",
+      "order": 2,
+      "most_popular": true,
+      "price_monthly": 250.0,
+      "price_annual": 2500.0,
+      "billing": [
+        "monthly",
+        "annual"
+      ],
+      "commitment_months": 0,
+      "contrast_quota": 150,
+      "quota_period": "monthly",
+      "seats": null,
+      "max_projects": "unlimited",
+      "datasets_limit_per_project": "unlimited",
+      "entitlements": {
+        "ai_interpretation": "quota",
+        "multi_comparison": true,
+        "advanced_export": true
+      },
+      "note": "L'identifiant technique est TEAM, l'affichage commercial est « Pro » — les deux coexistent, d'où name_fr/name_en. La page annonce « 25 datasets » et « AI interpretation (50 reports / month) » : ni l'un ni l'autre n'est appliqué (datasets illimités, volume IA non compté).",
+      "description_en": "For researchers and postdocs with advanced analytical needs and higher data volumes.",
+      "engagement_en": "Monthly or annual billing",
+      "cta_label_en": "Request Pro",
+      "marketing_features": [
+        {
+          "label": "25 datasets",
+          "included": true
+        },
+        {
+          "label": "Multi-contrast differential analysis",
+          "included": true
+        },
+        {
+          "label": "Full clustering suite (K-means, hierarchical)",
+          "included": true
+        },
+        {
+          "label": "GO + KEGG + Reactome enrichment",
+          "included": true
+        },
+        {
+          "label": "GSEA with leading-edge analysis",
+          "included": true
+        },
+        {
+          "label": "AI interpretation (50 reports / month)",
+          "included": true
+        },
+        {
+          "label": "REST API (120 req/min)",
+          "included": true
+        },
+        {
+          "label": "1-year data retention",
+          "included": true
+        },
+        {
+          "label": "Email support (48h)",
+          "included": true
+        },
+        {
+          "label": "Team collaboration",
+          "included": true
+        },
+        {
+          "label": "Custom gene sets",
+          "included": true
+        }
+      ]
+    },
+    {
+      "id": "ON_PREMISE",
+      "name_fr": "Enterprise",
+      "name_en": "Enterprise",
+      "order": 3,
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual",
+        "custom"
+      ],
+      "commitment_months": 12,
+      "contrast_quota": "unlimited",
+      "quota_period": "monthly",
+      "seats": "unlimited",
+      "max_projects": "unlimited",
+      "datasets_limit_per_project": "unlimited",
+      "entitlements": {
+        "ai_interpretation": "quota",
+        "multi_comparison": true,
+        "advanced_export": true
+      },
+      "note": "Attribué par un administrateur, sans prix Stripe. La grille interne licencie l'on-premise à 15 000 €/an ; ce montant n'est pas encore porté ici faute d'arbitrage.",
+      "description_en": "For labs, institutions and organisations with specific requirements. Fully custom.",
+      "engagement_en": "Fully custom terms",
+      "cta_label_en": "Contact sales",
+      "marketing_features": [
+        {
+          "label": "Custom users & datasets",
+          "included": true
+        },
+        {
+          "label": "On-premise or private cloud",
+          "included": true
+        },
+        {
+          "label": "SSO / SAML",
+          "included": true
+        },
+        {
+          "label": "Advanced integrations",
+          "included": true
+        },
+        {
+          "label": "Team collaboration",
+          "included": true
+        },
+        {
+          "label": "Priority support",
+          "included": true
+        }
+      ],
+      "pricing_display_en": "On request"
+    }
+  ],
+  "addons": [
+    {
+      "id": "scientific",
+      "name_fr": "Outils scientifiques",
+      "name_en": "Scientific tools",
+      "order": 1,
+      "module_flag": "scientific_module_enabled",
+      "entitlements": {
+        "gsea": true,
+        "gsea_leading_edge": true,
+        "custom_gene_sets": true,
+        "signature_score": true,
+        "contrast_scatter": true,
+        "deg_patterns": true
+      },
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual"
+      ],
+      "positioning_fr": "GSEA et analyses de second niveau : scatter de deux contrastes, score de signature par échantillon, gene sets personnalisés, patrons de DEG.",
+      "note": "Appliqué par require_scientific_access. Attention : la page de prix présente GSEA comme un palier de plan (exclu de Starter, inclus dans Pro) alors que la garde réelle est ce module — un Starter avec le module y accède, un Pro sans le module en est exclu."
+    },
+    {
+      "id": "report_customization",
+      "name_fr": "Personnalisation de rapport",
+      "name_en": "Report customization",
+      "order": 2,
+      "module_flag": "report_customization_module_enabled",
+      "entitlements": {
+        "report_customization": true
+      },
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual"
+      ],
+      "positioning_fr": "Logo, couleurs, adresse de l'institut, conclusion et Matériel & Méthodes par défaut sur les rapports générés.",
+      "note": "Appliqué par require_report_customization_access, et à nouveau dans le service (report_latex_service) : sans le module, les rapports retombent sur les valeurs SciLicium. La génération de rapport de base n'est pas gatée."
+    },
+    {
+      "id": "cosmetics",
+      "name_fr": "Allégations cosmétiques",
+      "name_en": "Skin claims",
+      "order": 3,
+      "module_flag": "cosmetics_module_enabled",
+      "entitlements": {
+        "cosmetic_claims": true
+      },
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual"
+      ],
+      "positioning_fr": "Mise en correspondance des voies enrichies avec des allégations cosmétiques opposables.",
+      "note": "Appliqué par require_cosmetics_access. L'onglet reste visible pour tous et affiche une démonstration verrouillée."
+    },
+    {
+      "id": "drug_discovery",
+      "name_fr": "Drug Discovery",
+      "name_en": "Drug Discovery",
+      "order": 4,
+      "module_flag": "drug_discovery_module_enabled",
+      "entitlements": {
+        "drug_discovery": true
+      },
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual"
+      ],
+      "positioning_fr": "Classement de cibles, indications et rapports associés, via le service genolens-dd.",
+      "note": "Appliqué par require_drug_discovery_access, indépendamment du plan. Remplace une ancienne garde TEAM/ON_PREMISE : la spec 2026-08-06-drug-discovery-frontend-design.md:47 dit encore « réservé aux plans TEAM et ON_PREMISE » et doit être corrigée."
+    }
+  ],
+  "overage": {
+    "policy": "block",
+    "unit_price_rule": null,
+    "note": "Comportement actuel : le quota est bloquant. check_comparison_quota lève un 429 à l'épuisement et increment_comparison_usage refuse l'incrément au-delà du quota. La grille cible prévoit l'inverse (allow_and_bill).",
+    "soft_warning_at_pct": 80,
+    "hard_block": true,
+    "invoice_cadence": null
+  },
+  "rollover": {
+    "enabled": false,
+    "rationale": "Le compteur est remis à zéro le 1er de chaque mois, sans report."
+  },
+  "data_rights": {
+    "delivered_dossier": "Aucune garantie de conservation n'est implémentée. ReportJob cascade sur le projet et sur le dataset (ondelete=CASCADE), donc la suppression de l'un détruit le PDF livré.",
+    "raw_data": "Aucune fenêtre de rétention n'est implémentée ; rien n'est purgé automatiquement.",
+    "on_subscription_end": "La résiliation Stripe rebascule l'utilisateur sur STARTER, qui est un plan payant. Il n'existe aucun palier gratuit ni suspendu."
+  }
+}

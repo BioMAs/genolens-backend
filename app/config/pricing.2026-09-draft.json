@@ -1,0 +1,382 @@
+{
+  "$comment": "GenoLens — grille PROPOSÉE (contraste interprété, quota annuel, 5 plans). Validée par le même schéma Pydantic que la grille active mais NON SERVIE : voir app/core/pricing.py. Deux écarts assumés par rapport au fichier d'origine de Thomas : (1) une section `addons` tarife les 4 modules réellement livrés, absents du fichier source ; (2) gsea, gsea_leading_edge et custom_gene_sets ont été retirés des entitlements de plan et déplacés sous l'add-on `scientific`, sans quoi un client lens_12 aurait GSEA par son plan alors que require_scientific_access exige le module. GenoLens — modèle tarifaire canonique. SOURCE DE VÉRITÉ UNIQUE pour le site marketing ET l'application. Aucun prix, quota ou entitlement ne doit être codé en dur ailleurs. Tous les montants sont en euros HT.",
+  "version": "2026.09-draft",
+  "status": "PROPOSITION — non validée par Thomas Darde. Ne pas déployer en production sans validation explicite.",
+  "currency": "EUR",
+  "tax_mode": "HT",
+  "derived_from": "Grille tarifaire SciLicium, édition 16/08/2026 (§2 analyses complémentaires 900 €/j, §6 retainers, §7 GenoLens SaaS, §8 coûts de revient)",
+  "billable_unit": {
+    "id": "interpreted_contrast",
+    "label_fr": "contraste interprété",
+    "label_en": "interpreted contrast",
+    "definition": "Génération d'un livrable interprété (narratif IA + graphe de connaissances + dossier d'enrichissement) pour un triplet (dataset, groupe A, groupe B) donné.",
+    "identity_hash": "sha256(dataset_id + '|' + sorted(sample_ids_group_A) + '|' + sorted(sample_ids_group_B))",
+    "identity_excludes": [
+      "seuils de log2FC et de p-value ajustée",
+      "méthode de correction des tests multiples",
+      "filtres de gènes",
+      "version du référentiel / du graphe",
+      "version du modèle d'interprétation"
+    ],
+    "not_billable": [
+      "analyse différentielle brute, volcano plot, heatmap, clustering, enrichissement automatique sans narratif interprété",
+      "toute régénération d'un contraste dont le hash a déjà été facturé (illimitée, à vie)",
+      "changement de seuil ou de filtre sur un contraste déjà facturé",
+      "re-interprétation d'un contraste déjà facturé avec un référentiel plus récent"
+    ],
+    "rationale": "Facturer l'itération tuerait le comportement de retour sur les données qui fait la valeur du produit. Le compteur mesure les questions biologiques nouvelles, pas le nombre de clics."
+  },
+  "economics": {
+    "cost_per_interpreted_contrast_automated": 101,
+    "cost_per_interpreted_contrast_manual": 251,
+    "margin_floor_pct": 55,
+    "min_contrast_price_at_floor": 225,
+    "min_contrast_price_formula": "ceil(cost_per_interpreted_contrast_automated / (1 - margin_floor_pct/100))",
+    "daily_rate_catalogue": 900,
+    "a_la_carte_anchor_rationale": "450 € = 0,5 j au TJM catalogue de 900 €, cohérent avec la ligne « analyses complémentaires (contrastes additionnels) » du §2 de la grille.",
+    "assumption_to_validate": "1 contraste ≈ 0,5 jour de travail. Si la réalité est 0,3 j, toute la grille descend proportionnellement.",
+    "prerequisite": "Toute la grille suppose le coût automatisé de 101 €. Au coût manuel de 251 €, aucun palier ne respecte le plancher de 55 % et portfolio (250 €) est vendu à perte (marge -0,4 %). L'automatisation du rapport est un prérequis de déploiement, pas une optimisation ultérieure.",
+    "margins_at_manual_cost_pct": {
+      "450": 44.2,
+      "360": 30.3,
+      "290": 13.4,
+      "250": -0.4
+    }
+  },
+  "a_la_carte": {
+    "interpreted_contrast": 450,
+    "margin_pct": 77.6,
+    "note": "Prix hors abonnement. Sert de prix de référence pour rendre lisible la dégressivité des plans."
+  },
+  "plans": [
+    {
+      "id": "access",
+      "name_fr": "Socle Accès",
+      "name_en": "Access",
+      "order": 1,
+      "replaces": "Starter (100 €/mois)",
+      "price_monthly": 100,
+      "price_annual": 1200,
+      "billing": [
+        "monthly",
+        "annual"
+      ],
+      "commitment_months": 0,
+      "contrast_quota": 0,
+      "quota_period": "annual",
+      "contrast_unit_price": 450,
+      "contrast_margin_pct": 77.6,
+      "seats": 1,
+      "datasets_limit": 5,
+      "storage_mb_per_dataset": 200,
+      "raw_data_retention_months": 12,
+      "delivered_dossier_retention": "unlimited",
+      "entitlements": {
+        "differential_expression": true,
+        "clustering_basic": true,
+        "clustering_full": false,
+        "enrichment_go_bp": true,
+        "enrichment_go_kegg_reactome": false,
+        "plot_export": true,
+        "ai_interpretation": "metered_a_la_carte",
+        "knowledge_graph": "metered_a_la_carte",
+        "cross_project_comparison": false,
+        "rest_api": false,
+        "api_rate_limit_per_min": 0,
+        "sso_saml": false,
+        "on_premise": false,
+        "support": "community_forum"
+      },
+      "positioning_fr": "Accès au corpus et maintien du référentiel. Aucun contraste inclus : le client consulte ses dossiers passés à vie et explore ses données, et achète l'interprétation à l'acte.",
+      "note": "Le prix ne change pas par rapport au Starter actuel. Ce qui change est le périmètre : l'interprétation IA sort du forfait."
+    },
+    {
+      "id": "lens_12",
+      "name_fr": "Lens 12",
+      "name_en": "Lens 12",
+      "order": 2,
+      "replaces": "aucun — comble le vide entre 1 200 €/an et le retainer Discovery à 20 520 €/an",
+      "price_annual": 5520,
+      "price_monthly_equivalent": 460,
+      "price_annual_breakdown": "1 200 € (socle) + 12 × 360 €",
+      "billing": [
+        "annual"
+      ],
+      "commitment_months": 12,
+      "contrast_quota": 12,
+      "quota_period": "annual",
+      "contrast_unit_price": 360,
+      "discount_vs_a_la_carte_pct": 20,
+      "contrast_margin_pct": 71.9,
+      "seats": 3,
+      "datasets_limit": 25,
+      "storage_mb_per_dataset": 1024,
+      "raw_data_retention_months": 24,
+      "delivered_dossier_retention": "unlimited",
+      "entitlements": {
+        "differential_expression": true,
+        "clustering_basic": true,
+        "clustering_full": true,
+        "enrichment_go_bp": true,
+        "enrichment_go_kegg_reactome": true,
+        "plot_export": true,
+        "ai_interpretation": "quota",
+        "knowledge_graph": true,
+        "cross_project_comparison": false,
+        "rest_api": false,
+        "api_rate_limit_per_min": 0,
+        "sso_saml": false,
+        "on_premise": false,
+        "support": "email_5_business_days"
+      },
+      "positioning_fr": "Un à deux actifs par an. Cible : fournisseur d'actifs cosmétiques avec un pipeline régulier mais restreint."
+    },
+    {
+      "id": "lens_40",
+      "name_fr": "Lens 40",
+      "name_en": "Lens 40",
+      "order": 3,
+      "most_popular": true,
+      "replaces": "Pro (250 €/mois)",
+      "price_annual": 12800,
+      "price_monthly_equivalent": 1067,
+      "price_annual_breakdown": "1 200 € (socle) + 40 × 290 €",
+      "billing": [
+        "annual"
+      ],
+      "commitment_months": 12,
+      "contrast_quota": 40,
+      "quota_period": "annual",
+      "contrast_unit_price": 290,
+      "discount_vs_a_la_carte_pct": 36,
+      "contrast_margin_pct": 65.2,
+      "seats": 10,
+      "datasets_limit": 100,
+      "storage_mb_per_dataset": 1024,
+      "raw_data_retention_months": 36,
+      "delivered_dossier_retention": "unlimited",
+      "entitlements": {
+        "differential_expression": true,
+        "clustering_basic": true,
+        "clustering_full": true,
+        "enrichment_go_bp": true,
+        "enrichment_go_kegg_reactome": true,
+        "plot_export": true,
+        "ai_interpretation": "quota",
+        "knowledge_graph": true,
+        "cross_project_comparison": true,
+        "rest_api": true,
+        "api_rate_limit_per_min": 120,
+        "sso_saml": false,
+        "on_premise": false,
+        "support": "email_48h"
+      },
+      "positioning_fr": "R&D structurée. Premier palier ouvrant la comparaison inter-projets — c'est le différenciateur qui justifie la montée depuis Lens 12."
+    },
+    {
+      "id": "portfolio",
+      "name_fr": "Portefeuille",
+      "name_en": "Portfolio",
+      "order": 4,
+      "price_annual": 26200,
+      "price_monthly_equivalent": 2183,
+      "price_annual_breakdown": "1 200 € (socle) + 100 × 250 €",
+      "billing": [
+        "annual"
+      ],
+      "commitment_months": 12,
+      "contrast_quota": 100,
+      "quota_period": "annual",
+      "contrast_unit_price": 250,
+      "discount_vs_a_la_carte_pct": 44,
+      "contrast_margin_pct": 59.6,
+      "seats": "unlimited",
+      "datasets_limit": "unlimited",
+      "storage_mb_per_dataset": 4096,
+      "raw_data_retention_months": "unlimited",
+      "delivered_dossier_retention": "unlimited",
+      "entitlements": {
+        "differential_expression": true,
+        "clustering_basic": true,
+        "clustering_full": true,
+        "enrichment_go_bp": true,
+        "enrichment_go_kegg_reactome": true,
+        "plot_export": true,
+        "ai_interpretation": "quota",
+        "knowledge_graph": true,
+        "cross_project_comparison": true,
+        "rest_api": true,
+        "api_rate_limit_per_min": 600,
+        "sso_saml": true,
+        "on_premise": false,
+        "support": "email_24h"
+      },
+      "positioning_fr": "Portefeuille d'actifs. Le verrou est la comparaison de chaque nouvel actif contre l'intégralité du corpus historique du client."
+    },
+    {
+      "id": "enterprise",
+      "name_fr": "Enterprise",
+      "name_en": "Enterprise",
+      "order": 5,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual",
+        "custom"
+      ],
+      "contrast_quota": "custom",
+      "quota_period": "annual",
+      "contrast_unit_price_floor": 225,
+      "contrast_unit_price_floor_note": "Plancher absolu : 101 € de coût / 0,45 = 224,44 €. Aucune négociation sous 225 € le contraste sans dérogation explicite de Thomas.",
+      "seats": "unlimited",
+      "entitlements": {
+        "cross_project_comparison": true,
+        "sso_saml": true,
+        "on_premise": true,
+        "rest_api": true,
+        "support": "priority"
+      },
+      "on_premise_licence_annual": 15000,
+      "beta_testing_contract_annual": 9000,
+      "positioning_fr": "Seul plan portant l'on-premise et le SSO/SAML."
+    }
+  ],
+  "addons": [
+    {
+      "id": "scientific",
+      "name_fr": "Outils scientifiques",
+      "name_en": "Scientific tools",
+      "order": 1,
+      "module_flag": "scientific_module_enabled",
+      "entitlements": {
+        "gsea": true,
+        "gsea_leading_edge": true,
+        "custom_gene_sets": true,
+        "signature_score": true,
+        "contrast_scatter": true,
+        "deg_patterns": true
+      },
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual"
+      ],
+      "positioning_fr": "GSEA et analyses de second niveau : scatter de deux contrastes, score de signature par échantillon, gene sets personnalisés, patrons de DEG.",
+      "note": "Reprend les 3 clés retirées des entitlements de plan. Prix à arbitrer."
+    },
+    {
+      "id": "report_customization",
+      "name_fr": "Personnalisation de rapport",
+      "name_en": "Report customization",
+      "order": 2,
+      "module_flag": "report_customization_module_enabled",
+      "entitlements": {
+        "report_customization": true
+      },
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual"
+      ],
+      "positioning_fr": "Logo, couleurs, adresse de l'institut, conclusion et Matériel & Méthodes par défaut.",
+      "note": "Absent du fichier source alors que le module est livré et vendu. Prix à arbitrer."
+    },
+    {
+      "id": "cosmetics",
+      "name_fr": "Allégations cosmétiques",
+      "name_en": "Skin claims",
+      "order": 3,
+      "module_flag": "cosmetics_module_enabled",
+      "entitlements": {
+        "cosmetic_claims": true
+      },
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual"
+      ],
+      "positioning_fr": "Mise en correspondance des voies enrichies avec des allégations cosmétiques opposables.",
+      "note": "Absent du fichier source alors que le module est livré et vendu. Prix à arbitrer."
+    },
+    {
+      "id": "drug_discovery",
+      "name_fr": "Drug Discovery",
+      "name_en": "Drug Discovery",
+      "order": 4,
+      "module_flag": "drug_discovery_module_enabled",
+      "entitlements": {
+        "drug_discovery": true
+      },
+      "price_monthly": null,
+      "price_annual": null,
+      "pricing_display": "Sur devis",
+      "billing": [
+        "annual"
+      ],
+      "positioning_fr": "Classement de cibles, indications et rapports associés, via le service genolens-dd.",
+      "note": "Absent du fichier source alors que le module est livré et vendu. Prix à arbitrer."
+    }
+  ],
+  "overage": {
+    "policy": "allow_and_bill",
+    "unit_price_rule": "plan.contrast_unit_price",
+    "note": "Le dépassement est facturé au prix unitaire du plan du client, jamais au tarif à l'acte de 450 €. Pénaliser le dépassement pousse le client à sous-consommer, ce qui est l'inverse de l'objectif.",
+    "soft_warning_at_pct": 80,
+    "hard_block": false,
+    "invoice_cadence": "trimestrielle, à terme échu"
+  },
+  "rollover": {
+    "enabled": false,
+    "rationale": "Volume client trop faible pour justifier une mécanique de crédits reportables (péremption, paliers, banque de crédits). Le quota annuel est un compteur simple ; le dépassement est facturé à l'unité. À rouvrir au-delà de ~30 comptes actifs."
+  },
+  "data_rights": {
+    "delivered_dossier": "Acquis à vie par le client, quel que soit l'état de l'abonnement. Jamais supprimé, jamais rendu inaccessible en lecture ni en export PDF.",
+    "raw_data": "Soumis à la fenêtre de rétention du plan. Purge possible après préavis.",
+    "on_subscription_end": "Lecture et export des dossiers livrés conservés. Perte de la re-interprétation, de la comparaison inter-projets, de l'API et de la génération de nouveaux contrastes.",
+    "rationale": "Les dossiers servent de preuve d'allégation opposable à un service réglementaire. Conditionner leur accès au paiement serait perçu comme abusif et constitue un risque commercial supérieur au gain de rétention."
+  },
+  "retainer_mapping": {
+    "$comment": "Résout l'incohérence du §6 de la grille, qui promet des « sièges » que ni le site ni le §7 ne définissent.",
+    "discovery": {
+      "plan_id": "access",
+      "seats": 1
+    },
+    "momentum": {
+      "plan_id": "lens_40",
+      "seats": 10
+    },
+    "embedded": {
+      "plan_id": "portfolio",
+      "seats": "unlimited"
+    },
+    "open_issue": "Avec ce mapping, la valeur GenoLens incluse ramène le TJM effectif affiché des retainers sous les 810 €/765 € annoncés (Momentum : 48 600 − 12 800 = 35 800 € pour 60 j, soit 597 €/j). Décision commerciale à trancher par Thomas — hors périmètre de la modification du code."
+  },
+  "migration": {
+    "grandfather_existing_subscribers": true,
+    "grandfather_duration_months": 12,
+    "starter_existing": {
+      "action": "Basculer vers access au même prix. L'interprétation IA sort du forfait : maintenir un crédit de transition de 6 contrastes offerts sur 12 mois, puis à l'acte.",
+      "reason": "L'interprétation IA est actuellement affichée comme incluse dans Starter sur la page de prix. La retirer sans compensation est une régression contractuelle."
+    },
+    "pro_existing": {
+      "action": "Basculer vers lens_40 au tarif actuel (3 000 €/an) pendant 12 mois, puis au tarif Lens 40 (12 800 €/an) au renouvellement, avec préavis écrit de 90 jours.",
+      "reason": "Le Pro actuel autorise 50 interprétations/mois à 250 €/mois. Le passage au tarif cible est un facteur 4,3 : il ne peut se faire qu'à l'échéance et avec préavis."
+    },
+    "on_premise_existing": {
+      "action": "Identifier tout client Pro ayant activé l'on-premise et traiter le cas individuellement.",
+      "reason": "La page annonce l'on-premise inclus dans Pro à 3 000 €/an alors que la grille le licencie à 15 000 €/an. Tout client l'ayant activé sur cette base a un droit acquis à défendre au cas par cas."
+    }
+  },
+  "known_inconsistencies_to_fix": [
+    "La carte du plan Pro affiche 25 datasets, le tableau comparatif de la même page en affiche 50, la grille interne §7 en affiche 50. Trois valeurs pour un même plan.",
+    "L'interprétation IA est présentée comme incluse dans Starter sur le site, exclue dans la grille interne §7.",
+    "L'on-premise est listé dans la colonne Pro (3 000 €/an) alors que la grille le licencie 15 000 €/an.",
+    "Le SSO/SAML est listé dans la colonne Pro sans contrepartie tarifaire.",
+    "Le Pro à 250 €/mois autorise 50 interprétations/mois à 101 € de coût unitaire : la marge devient négative dès le 3e rapport du mois.",
+    "La comparaison inter-projets, seul différenciateur réellement défendable, n'apparaît nulle part sur la page de prix.",
+    "Le §6 de la grille promet des sièges GenoLens (1, 10, illimité) qu'aucune définition produit ne porte."
+  ]
+}
