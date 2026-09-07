@@ -194,21 +194,33 @@ def test_no_source_references_retired_plan_members():
 def test_admin_stats_prices_cover_every_plan():
     """The admin MRR estimate must have a price for every live plan.
 
-    Stale keys made estimated_revenue silently return 0 for all users.
+    Stale keys made estimated_revenue silently return 0 for all users. The
+    prices now live in the pricing grid rather than in a literal dict inside
+    admin.py, so this checks the grid — and that admin.py no longer carries a
+    hard-coded one.
     """
-    import ast
+    import re
     from pathlib import Path
 
-    src = (Path(__file__).resolve().parent.parent / "app/api/endpoints/admin.py").read_text()
-    tree = ast.parse(src)
-    prices = next(
-        ast.literal_eval(node.value)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
-        and any(getattr(t, "id", None) == "PRICES" for t in node.targets)
-    )
+    from app.core.pricing import get_pricing
 
+    grid = get_pricing()
     for plan in SubscriptionPlan:
-        assert plan.value in prices, f"No price defined for plan {plan.value}"
-    assert prices["STARTER"] == 100.0
-    assert prices["TEAM"] == 250.0
+        # raises KeyError with the known ids if a plan is missing
+        grid.get_plan(plan.value)
+
+    assert grid.get_plan("STARTER").price_monthly == 100.0
+    assert grid.get_plan("TEAM").price_monthly == 250.0
+
+    admin_src = (Path(__file__).resolve().parent.parent / "app/api/endpoints/admin.py").read_text()
+    assert "get_pricing()" in admin_src, (
+        "admin.py must read prices from app/core/pricing.get_pricing()"
+    )
+    hard_coded = re.findall(
+        r'"(?:' + "|".join(p.value for p in SubscriptionPlan) + r')"\s*:\s*\d',
+        admin_src,
+    )
+    assert hard_coded == [], (
+        f"admin.py reintroduced hard-coded plan prices ({hard_coded}); "
+        "the pricing grid is the single source of truth"
+    )

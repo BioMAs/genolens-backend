@@ -1,10 +1,8 @@
 from typing import Any, Annotated, Optional, Literal
-from fastapi import APIRouter, Depends, Body
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps.subscription import get_or_create_user
-from app.api.deps import get_db
-from app.models.models import User, SubscriptionPlan
+from app.models.models import User
 from app.schemas import user as user_schemas
 from app.services import email_service
 
@@ -26,21 +24,13 @@ async def read_user_me(
     """
     return current_user
 
-@router.patch("/me/subscription", response_model=user_schemas.UserSelf)
-async def update_my_subscription(
-    plan: Annotated[SubscriptionPlan, Body(embed=True)],
-    current_user: Annotated[User, Depends(get_or_create_user)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> Any:
-    """
-    Update own subscription plan (Demo/Testing purpose).
-    In production, this would be handled via Stripe webhooks.
-    """
-    current_user.subscription_plan = plan
-    db.add(current_user)
-    await db.commit()
-    await db.refresh(current_user)
-    return current_user
+# NOTE: PATCH /me/subscription was removed deliberately. It let any authenticated
+# caller set their own subscription_plan, which nullified every plan-keyed limit
+# (comparison quota, project/dataset caps, AI access, advanced export). A plan
+# change now has exactly two legitimate paths, both of them privileged:
+#   - the Stripe webhook           -> app/api/endpoints/billing.py
+#   - PATCH /admin/users/{id}/subscription (Depends(require_admin))
+# Do not reintroduce a self-service variant without require_admin.
 
 
 @router.post("/requests")

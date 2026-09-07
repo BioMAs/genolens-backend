@@ -13,7 +13,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
 from app.db.session import close_db
-from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, billing, reports, report_settings, analyses, cosmetics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
+from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmetics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -291,6 +291,13 @@ app.include_router(
 
 app.include_router(
     license.router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+# Public on purpose: the pricing grid must be readable before sign-in, by the
+# pricing page and the marketing site alike.
+app.include_router(
+    pricing.router,
     prefix=settings.API_V1_PREFIX,
 )
 

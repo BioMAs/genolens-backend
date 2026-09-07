@@ -29,6 +29,7 @@ from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
 from app.api.deps.subscription import (
     get_or_create_user,
+    require_admin,
     require_ai_access,
     require_scientific_access,
     check_ai_quota,
@@ -5617,7 +5618,7 @@ async def get_go_term_genes(
 # Admin Endpoints - Performance & Cache Monitoring
 # ============================================================================
 
-@router.get("/admin/performance-stats")
+@router.get("/admin/performance-stats", dependencies=[Depends(require_admin)])
 async def get_performance_statistics(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)]
 ):
@@ -5631,7 +5632,7 @@ async def get_performance_statistics(
     stats = get_performance_stats()
     
     # Add cache statistics
-    cache_stats = cache_service.get_stats()
+    cache_stats = cache_service.get_cache_stats()
     
     return {
         "performance": stats,
@@ -5640,7 +5641,7 @@ async def get_performance_statistics(
     }
 
 
-@router.get("/admin/cache-stats")
+@router.get("/admin/cache-stats", dependencies=[Depends(require_admin)])
 async def get_cache_statistics(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)]
@@ -5652,7 +5653,7 @@ async def get_cache_statistics(
     import time
     
     # In-memory cache stats
-    memory_cache = cache_service.get_stats()
+    memory_cache = cache_service.get_cache_stats()
     
     # Persistent cache stats
     persistent_cache = await persistent_cache_service.get_cache_stats(db)
@@ -5664,7 +5665,7 @@ async def get_cache_statistics(
     }
 
 
-@router.post("/admin/cache-cleanup")
+@router.post("/admin/cache-cleanup", dependencies=[Depends(require_admin)])
 async def cleanup_expired_cache(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)]

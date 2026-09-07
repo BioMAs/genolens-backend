@@ -810,20 +810,21 @@ async def get_system_stats(
         result = await db.execute(select(User))
         local_users = result.scalars().all()
         
-        # Calculate revenue and plan distribution
-        users_by_plan = {"STARTER": 0, "TEAM": 0, "ON_PREMISE": 0}
+        # Calculate revenue and plan distribution.
+        # Both the plan list and the monthly prices come from the pricing grid
+        # (app/config/pricing.json), the single source of truth — never hard-code
+        # a plan or a price here again, or adding a plan would silently report
+        # zero users and zero revenue for it.
+        # The billing interval is not stored on User, so the estimate always
+        # uses the monthly rate; a plan quoted per deal (price_monthly null,
+        # e.g. ON_PREMISE) contributes 0 to the estimate.
+        from app.core.pricing import get_pricing
+
+        _grid = get_pricing()
+        users_by_plan = {p.id: 0 for p in _grid.plans_ordered}
         estimated_revenue = 0.0
-        
-        # Monthly list prices in EUR. Annual commitment is billed at a lower
-        # monthly rate (STARTER 85, TEAM 200) but the billing interval is not
-        # stored on User, so the estimate always uses the monthly rate.
-        # ON_PREMISE is quoted per deal and therefore excluded.
-        PRICES = {
-            "STARTER": 100.0,
-            "TEAM": 250.0,
-            "ON_PREMISE": 0.0,
-            "TOKEN": 0.10  # Per token
-        }
+        PRICES = {p.id: (p.price_monthly or 0.0) for p in _grid.plans}
+        PRICES["TOKEN"] = 0.10  # Per token
 
         for u in local_users:
             plan = u.subscription_plan.value if hasattr(u.subscription_plan, 'value') else u.subscription_plan
