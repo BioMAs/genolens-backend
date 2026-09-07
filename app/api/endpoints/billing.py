@@ -22,6 +22,19 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/billing", tags=["billing"])
 
+#: Environments where an unsigned Stripe webhook may be processed.
+#:
+#: The webhook is unauthenticated by design — Stripe proves itself with a
+#: signature, not a token. The fallback that parses the payload when
+#: STRIPE_WEBHOOK_SECRET is unset used to apply EVERYWHERE, so with the secret
+#: missing in production anyone could forge an event and grant themselves a
+#: plan. That is worse than the self-service plan endpoint that was removed:
+#: it needs no account at all.
+#:
+#: An allowlist rather than `not is_production`, so admitting a new environment
+#: is a deliberate edit. Staging handles real Stripe traffic and must verify.
+_UNVERIFIED_WEBHOOK_ENVIRONMENTS = frozenset({"development", "test"})
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -190,8 +203,25 @@ async def stripe_webhook(
     sig_header = request.headers.get("stripe-signature", "")
 
     if not settings.STRIPE_WEBHOOK_SECRET:
-        logger.warning("STRIPE_WEBHOOK_SECRET not set — webhook verification skipped")
-        # In dev without webhook secret, parse raw JSON
+        if settings.ENVIRONMENT.lower() not in _UNVERIFIED_WEBHOOK_ENVIRONMENTS:
+            # Fail closed. An unverifiable event must never reach the handler:
+            # it can change a subscription plan and a renewal date.
+            logger.error(
+                "STRIPE_WEBHOOK_SECRET is not configured in environment %r — "
+                "refusing the webhook rather than trusting an unsigned payload",
+                settings.ENVIRONMENT,
+            )
+            # 503, not 400: the payload may well be genuine and the fault is
+            # ours, so Stripe should keep retrying until the secret is set
+            # instead of giving up on a real event.
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Webhook verification is not configured.",
+            )
+        logger.warning(
+            "STRIPE_WEBHOOK_SECRET not set — signature verification skipped "
+            "(allowed in %r only)", settings.ENVIRONMENT,
+        )
         import json
         try:
             event = json.loads(payload)
