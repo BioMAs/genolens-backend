@@ -856,6 +856,31 @@ def health_check() -> dict:
     return {"status": "healthy", "message": "Celery worker is running"}
 
 
+async def _count_pipeline_comparison(user, db, comp_id: str) -> None:
+    """
+    Décompte une comparaison produite par le pipeline sur le quota mensuel.
+
+    Ne fait jamais échouer l'analyse : le calcul est déjà terminé et les
+    résultats existent, les jeter pour un dépassement de quota serait un
+    gâchis pur. Quand le quota bloque, on log et le compteur plafonne — c'est
+    le contrôle au lancement (`POST /analyses`) qui empêche la
+    surconsommation ; ici on ne fait que de la comptabilité.
+
+    `user` à None (ligne locale introuvable) est un no-op silencieux.
+    """
+    if user is None:
+        return
+    from app.api.deps.subscription import try_increment_comparison_usage
+
+    if not await try_increment_comparison_usage(user, db):
+        logger.warning(
+            "[ANALYSIS] Comparison quota exhausted for user %s — "
+            "comparison %s registered without counting",
+            user.id,
+            comp_id,
+        )
+
+
 @celery_app.task(bind=True, base=DatabaseTask, name="app.worker.tasks.run_self_service_analysis", queue="r_analysis")
 def run_self_service_analysis(self, analysis_id: str) -> dict:
     """
@@ -1035,6 +1060,22 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     pending_dispatch.append((str(vst_ds.id), vst_storage))
                     logger.info("[ANALYSIS] Registered VST dataset %s", vst_ds.id)
 
+                # Utilisateur local pour la comptabilisation du quota. Résolu
+                # une fois hors boucle : une requête par comparaison serait
+                # inutile, l'objet ne servant qu'à lire plan et rôle.
+                quota_user = None
+                if analysis.user_id:
+                    from app.models.models import User as _User
+                    quota_user = await db.scalar(
+                        select(_User).where(_User.id == analysis.user_id)
+                    )
+                    if quota_user is None:
+                        logger.warning(
+                            "[ANALYSIS] No local user row for %s — "
+                            "comparisons will not be counted",
+                            analysis.user_id,
+                        )
+
                 # DEG result datasets (one per comparison)
                 comparisons_dir = Path(outdir) / "comparisons"
                 if comparisons_dir.exists():
@@ -1069,6 +1110,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                         await db.flush()
                         result_dataset_ids.append(str(deg_ds.id))
                         deg_comparison_ids.append(comp_id)
+                        await _count_pipeline_comparison(quota_user, db, comp_id)
                         pending_dispatch.append((str(deg_ds.id), deg_storage))
                         logger.info("[ANALYSIS] Registered DEG dataset %s for comparison %s", deg_ds.id, comp_id)
 
