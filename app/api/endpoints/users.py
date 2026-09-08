@@ -1,8 +1,11 @@
 from typing import Any, Annotated, Optional, Literal
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.api.deps import get_db
 from app.api.deps.subscription import get_or_create_user
-from app.models.models import User
+from app.models.models import Project, User
 from app.schemas import user as user_schemas
 from app.services import email_service
 
@@ -18,10 +21,18 @@ class AccessRequest(BaseModel):
 @router.get("/me", response_model=user_schemas.UserSelf)
 async def read_user_me(
     current_user: Annotated[User, Depends(get_or_create_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> Any:
     """
     Get current user profile and subscription details.
     """
+    # Same predicate as the limit enforced in create_project
+    # (app/api/endpoints/projects.py) — owned projects only, not shared ones.
+    # GET /projects counts owned-or-shared, which is the wrong number for a
+    # client trying to show "used/max" against the plan's project cap.
+    current_user.project_count = await db.scalar(
+        select(func.count()).select_from(Project).where(Project.owner_id == current_user.id)
+    )
     return current_user
 
 # NOTE: PATCH /me/subscription was removed deliberately. It let any authenticated

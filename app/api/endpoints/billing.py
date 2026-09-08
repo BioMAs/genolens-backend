@@ -1,6 +1,7 @@
 """
 Billing endpoints — Stripe checkout, portal, subscription info, and webhook.
 """
+
 from __future__ import annotations
 
 import logging
@@ -16,7 +17,7 @@ from app.api.deps import get_current_user, get_db
 from app.api.deps.subscription import get_or_create_user
 from app.core.config import settings
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import User, SubscriptionPlan
+from app.models.models import SubscriptionPlan, User
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ _UNVERIFIED_WEBHOOK_ENVIRONMENTS = frozenset({"development", "test"})
 # Request / Response models
 # ---------------------------------------------------------------------------
 
+
 class CheckoutRequest(BaseModel):
     plan: str
     billing_cycle: str = "monthly"
@@ -57,6 +59,11 @@ class SubscriptionResponse(BaseModel):
     plan: str
     is_active: bool
     stripe_customer_id: str | None
+    # Colonnes String(50) portant de l'ISO 8601, pas des DateTime — le client
+    # les formate. Elles existaient sur le modèle sans être servies, ce qui
+    # rendait invisible le bloc « Renews » du dashboard.
+    subscription_starts_at: str | None
+    subscription_ends_at: str | None
     comparisons_used_this_month: int
     comparisons_quota: int | None
     comparisons_remaining: int | None
@@ -67,6 +74,7 @@ class SubscriptionResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _subscription_period_end(subscription: dict) -> Optional[int]:
     """Unix timestamp at which the subscription's current billing period ends.
@@ -97,6 +105,7 @@ def _subscription_period_end(subscription: dict) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
 
 @router.post("/checkout", response_model=CheckoutResponse)
 async def create_checkout(
@@ -178,6 +187,8 @@ async def get_subscription(
         "plan": db_user.subscription_plan.value,
         "is_active": db_user.is_active,
         "stripe_customer_id": db_user.stripe_customer_id,
+        "subscription_starts_at": db_user.subscription_starts_at,
+        "subscription_ends_at": db_user.subscription_ends_at,
         "comparisons_used_this_month": db_user.comparisons_used_this_month,
         "comparisons_quota": db_user.comparisons_quota,
         "comparisons_remaining": db_user.comparisons_remaining,
@@ -196,8 +207,9 @@ async def stripe_webhook(
     Updates subscription_plan and stripe_customer_id on the User when a
     subscription is created or updated.
     """
-    from app.services.stripe_service import handle_webhook_event, _get_price_to_plan
     import stripe as stripe_lib
+
+    from app.services.stripe_service import _get_price_to_plan, handle_webhook_event
 
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
@@ -223,6 +235,7 @@ async def stripe_webhook(
             "(allowed in %r only)", settings.ENVIRONMENT,
         )
         import json
+
         try:
             event = json.loads(payload)
         except Exception:
@@ -245,9 +258,7 @@ async def stripe_webhook(
         # out early on an empty item list or an unrecognised price, so nothing
         # downstream ran — including the renewal-date sync below, which must
         # happen whether or not we recognise what was bought.
-        result = await db.execute(
-            select(User).where(User.stripe_customer_id == customer_id)
-        )
+        result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
         user = result.scalar_one_or_none()
 
         if not user:
@@ -255,6 +266,7 @@ async def stripe_webhook(
             client_ref = subscription.get("metadata", {}).get("client_reference_id")
             if client_ref:
                 from uuid import UUID
+
                 try:
                     result = await db.execute(select(User).where(User.id == UUID(client_ref)))
                     user = result.scalar_one_or_none()
@@ -305,9 +317,7 @@ async def stripe_webhook(
     elif event_type == "customer.subscription.deleted":
         subscription = event["data"]["object"]
         customer_id = subscription["customer"]
-        result = await db.execute(
-            select(User).where(User.stripe_customer_id == customer_id)
-        )
+        result = await db.execute(select(User).where(User.stripe_customer_id == customer_id))
         user = result.scalar_one_or_none()
         if user:
             user.subscription_plan = SubscriptionPlan.STARTER
