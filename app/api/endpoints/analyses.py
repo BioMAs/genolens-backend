@@ -17,9 +17,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db
 from app.api.deps.project_access import assert_project_access
 from app.api.deps.license import require_active_license
-from app.api.deps.subscription import get_or_create_user
+from app.api.deps.subscription import check_comparison_quota, get_or_create_user
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, OmicsDataType, User, Project
+from app.models.models import (
+    SelfServiceAnalysis,
+    SelfServiceAnalysisStatus,
+    OmicsDataType,
+    User,
+    Project,
+    Dataset,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +200,30 @@ async def create_analysis(
     )
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # ── Quota de comparaisons ────────────────────────────────────────────────
+    # Le pipeline crée un dataset DEG par contraste. On refuse ici, avant tout
+    # calcul : une fois l'analyse lancée on ne l'annule plus pour un quota.
+    db_user = await check_comparison_quota(db_user, db)
+    remaining = db_user.comparisons_remaining
+    if remaining is not None:
+        comparisons_ds = await db.scalar(
+            select(Dataset).where(Dataset.id == payload.comparisons_dataset_id)
+        )
+        requested = None
+        if comparisons_ds and isinstance(comparisons_ds.dataset_metadata, dict):
+            requested = comparisons_ds.dataset_metadata.get("total_rows")
+        # `requested` à None = dataset encore en traitement. On se contente du
+        # contrôle « au moins une comparaison restante » fait juste au-dessus.
+        if isinstance(requested, int) and requested > remaining:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"This analysis requests {requested} comparisons but only "
+                    f"{remaining} remain this month. Quota resets on the 1st of "
+                    "next month. Upgrade your plan for more comparisons."
+                ),
+            )
 
     analysis = SelfServiceAnalysis(
         id=uuid4(),
