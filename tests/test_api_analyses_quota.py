@@ -4,8 +4,13 @@ par contraste, donc lancer une analyse à 20 contrastes avec 5 comparaisons
 restantes doit être refusé au lancement — après, le calcul a déjà tourné et on
 ne l'annule pas.
 
-Le nombre de contrastes vit dans `dataset_metadata["total_rows"]` du dataset de
-comparaisons ; il n'est pas dans la charge utile de la requête.
+Le nombre de contrastes vit dans `dataset_metadata["rows"]` du dataset de
+comparaisons — la clé qu'écrit `DataProcessor.get_file_metadata` à
+l'ingestion ; il n'est pas dans la charge utile de la requête.
+`test_gate_reads_the_key_real_ingestion_writes` épingle ce contrat en passant
+par le vrai producteur de métadonnées : la première version de ce contrôle
+lisait `total_rows`, que la production n'émet jamais, et la barrière était
+donc inerte.
 """
 
 from datetime import datetime, timezone
@@ -47,10 +52,22 @@ def make_user(
     return u
 
 
-def make_comparisons_dataset(total_rows: int | None) -> Dataset:
+def make_comparisons_dataset(declared: int | None, *, key: str = "rows") -> Dataset:
+    """Dataset de comparaisons dont la métadonnée déclare `declared` lignes.
+
+    `key` par défaut à `rows` : c'est celle que l'ingestion écrit réellement.
+    """
     ds = MagicMock(spec=Dataset)
     ds.id = uuid4()
-    ds.dataset_metadata = {} if total_rows is None else {"total_rows": total_rows}
+    ds.dataset_metadata = {} if declared is None else {key: declared}
+    return ds
+
+
+def make_metadata_dataset(metadata: dict) -> Dataset:
+    """Dataset dont la métadonnée est fournie telle quelle (non fabriquée)."""
+    ds = MagicMock(spec=Dataset)
+    ds.id = uuid4()
+    ds.dataset_metadata = metadata
     return ds
 
 
@@ -137,7 +154,7 @@ async def _clear_overrides():
 
 async def test_refuses_when_requested_contrasts_exceed_remaining():
     user = make_user(used=25)  # STARTER: 30 - 25 = 5 restantes
-    ds = make_comparisons_dataset(total_rows=12)
+    ds = make_comparisons_dataset(declared=12)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
 
     async with client:
@@ -155,7 +172,7 @@ async def test_refuses_when_requested_contrasts_exceed_remaining():
 
 async def test_allows_when_requested_contrasts_fit():
     user = make_user(used=25)  # 5 restantes
-    ds = make_comparisons_dataset(total_rows=5)
+    ds = make_comparisons_dataset(declared=5)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
 
     async with client:
@@ -166,7 +183,7 @@ async def test_allows_when_requested_contrasts_fit():
 
 async def test_refuses_when_quota_already_exhausted():
     user = make_user(used=30)
-    ds = make_comparisons_dataset(total_rows=1)
+    ds = make_comparisons_dataset(declared=1)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
 
     async with client:
@@ -175,11 +192,11 @@ async def test_refuses_when_quota_already_exhausted():
     assert res.status_code == 429
 
 
-async def test_allows_when_total_rows_metadata_is_absent():
+async def test_allows_when_rows_metadata_is_absent():
     """Dataset encore en traitement : on se rabat sur « au moins une
     comparaison restante ». Le worker plafonnera le compteur."""
     user = make_user(used=25)
-    ds = make_comparisons_dataset(total_rows=None)
+    ds = make_comparisons_dataset(declared=None)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
 
     async with client:
@@ -190,7 +207,7 @@ async def test_allows_when_total_rows_metadata_is_absent():
 
 async def test_no_quota_check_for_admin_role():
     user = make_user(role=UserRole.ADMIN, used=999)
-    ds = make_comparisons_dataset(total_rows=500)
+    ds = make_comparisons_dataset(declared=500)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
 
     async with client:
@@ -201,10 +218,60 @@ async def test_no_quota_check_for_admin_role():
 
 async def test_unlimited_plan_is_never_refused():
     user = make_user(plan=SubscriptionPlan.ON_PREMISE, used=999)
-    ds = make_comparisons_dataset(total_rows=500)
+    ds = make_comparisons_dataset(declared=500)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
 
     async with client:
         res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
 
     assert res.status_code == 201
+
+
+async def test_gate_reads_the_key_real_ingestion_writes():
+    """Test d'intégration du contrat ingestion → barrière.
+
+    Les autres tests fabriquent la métadonnée à la main : ils passeraient
+    même si la barrière lisait une clé que la production n'écrit jamais —
+    c'est exactement le défaut qu'ils n'ont pas attrapé. Celui-ci construit un
+    vrai fichier de comparaisons, le fait passer par le vrai producteur de
+    métadonnées (`DataProcessor.get_file_metadata`) et donne le dict obtenu
+    tel quel au dataset. Il échoue donc si la clé change d'un côté ou de
+    l'autre.
+    """
+    # Le singleton, pas une instance ad hoc : c'est l'objet que
+    # `app/worker/tasks.py` utilise pour produire la métadonnée d'ingestion.
+    from app.services.data_processor import data_processor
+
+    # Fichier de comparaisons au format attendu par
+    # r_scripts/run_multimethod_pipeline.R : comparison / condition1 /
+    # condition2. 12 lignes.
+    lines = ["comparison\tcondition1\tcondition2"]
+    lines += [f"c{i}_vs_ctrl\tcond{i}\tctrl" for i in range(1, 13)]
+    tsv = ("\n".join(lines) + "\n").encode()
+
+    metadata = await data_processor.get_file_metadata(tsv, ".tsv")
+    assert metadata["rows"] == 12, "le producteur de métadonnées a changé de forme"
+
+    user = make_user(used=25)  # STARTER: 30 - 25 = 5 restantes
+    ds = make_metadata_dataset(metadata)
+    client, db, project = make_client(as_user=user, comparisons_dataset=ds)
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 429
+    detail = res.json()["detail"]
+    assert "12" in detail and "5" in detail
+
+
+async def test_total_rows_is_still_honoured_as_a_fallback():
+    """`total_rows` n'est plus la clé lue en premier, mais un dataset qui la
+    porterait resterait couvert par la barrière."""
+    user = make_user(used=25)  # 5 restantes
+    ds = make_comparisons_dataset(declared=12, key="total_rows")
+    client, db, project = make_client(as_user=user, comparisons_dataset=ds)
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 429

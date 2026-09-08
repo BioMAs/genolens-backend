@@ -116,6 +116,39 @@ class SelfServiceAnalysisListResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Quota helpers
+# ---------------------------------------------------------------------------
+
+
+def _declared_comparisons(metadata: Optional[dict]) -> Optional[int]:
+    """Nombre de comparaisons déclarées par un fichier de comparaisons.
+
+    La clé est `rows`, écrite à l'ingestion par
+    `DataProcessor.get_file_metadata` (app/services/data_processor.py) puis
+    fusionnée dans `dataset_metadata` par le worker. `total_rows` n'est jamais
+    persisté — c'est un champ de réponse paginée de `query_dataset` — et n'est
+    gardé ici qu'en second choix, au cas où un dataset l'aurait porté.
+
+    On ne lit pas la colonne facultative `perform_analysis` / `run` / `include`
+    que `run_multimethod_pipeline.R` honore : le pipeline peut donc exécuter
+    moins de contrastes qu'il y a de lignes. Les refus formulés à partir de ce
+    nombre parlent pour cette raison de ce que le *fichier déclare*, ce qui est
+    exact, et non de ce que le pipeline exécutera.
+
+    None quand la métadonnée est absente : dataset encore en traitement.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("rows", "total_rows"):
+        value = metadata.get(key)
+        # `isinstance(True, int)` vaut True en Python — un booléen n'est pas
+        # un décompte de lignes.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -210,18 +243,18 @@ async def create_analysis(
         comparisons_ds = await db.scalar(
             select(Dataset).where(Dataset.id == payload.comparisons_dataset_id)
         )
-        requested = None
-        if comparisons_ds and isinstance(comparisons_ds.dataset_metadata, dict):
-            requested = comparisons_ds.dataset_metadata.get("total_rows")
+        requested = _declared_comparisons(
+            comparisons_ds.dataset_metadata if comparisons_ds else None
+        )
         # `requested` à None = dataset encore en traitement. On se contente du
         # contrôle « au moins une comparaison restante » fait juste au-dessus.
-        if isinstance(requested, int) and requested > remaining:
+        if requested is not None and requested > remaining:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=(
-                    f"This analysis requests {requested} comparisons but only "
-                    f"{remaining} remain this month. Quota resets on the 1st of "
-                    "next month. Upgrade your plan for more comparisons."
+                    f"This comparisons file declares {requested} comparisons but "
+                    f"only {remaining} remain this month. Quota resets on the 1st "
+                    "of next month. Upgrade your plan for more comparisons."
                 ),
             )
 
