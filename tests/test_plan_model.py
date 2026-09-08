@@ -13,7 +13,7 @@ def make_user(plan: SubscriptionPlan) -> User:
     u.ai_interpretations_used = 0
     u.ai_tokens_purchased = 0
     u.ai_tokens_used = 0
-    u.comparisons_used_this_month = 0
+    u.analyses_used_this_month = 0
     u.status = UserStatus.ACTIVE
     return u
 
@@ -58,40 +58,40 @@ def test_team_can_launch_analyses():
 
 def test_starter_quota_is_30():
     u = make_user(SubscriptionPlan.STARTER)
-    assert u.comparisons_quota == 30
+    assert u.analyses_quota == 30
 
 def test_team_quota_is_150():
     u = make_user(SubscriptionPlan.TEAM)
-    assert u.comparisons_quota == 150
+    assert u.analyses_quota == 150
 
 def test_on_premise_quota_is_none():
     u = make_user(SubscriptionPlan.ON_PREMISE)
-    assert u.comparisons_quota is None
+    assert u.analyses_quota is None
 
 def test_admin_quota_is_none():
     u = make_user(SubscriptionPlan.STARTER)
     u.role = UserRole.ADMIN
-    assert u.comparisons_quota is None
+    assert u.analyses_quota is None
 
-def test_comparisons_remaining_full():
+def test_analyses_remaining_full():
     u = make_user(SubscriptionPlan.STARTER)
-    u.comparisons_used_this_month = 0
-    assert u.comparisons_remaining == 30
+    u.analyses_used_this_month = 0
+    assert u.analyses_remaining == 30
 
-def test_comparisons_remaining_partial():
+def test_analyses_remaining_partial():
     u = make_user(SubscriptionPlan.STARTER)
-    u.comparisons_used_this_month = 20
-    assert u.comparisons_remaining == 10
+    u.analyses_used_this_month = 20
+    assert u.analyses_remaining == 10
 
-def test_comparisons_remaining_exhausted():
+def test_analyses_remaining_exhausted():
     u = make_user(SubscriptionPlan.STARTER)
-    u.comparisons_used_this_month = 30
-    assert u.comparisons_remaining == 0
+    u.analyses_used_this_month = 30
+    assert u.analyses_remaining == 0
 
-def test_comparisons_remaining_unlimited():
+def test_analyses_remaining_unlimited():
     u = make_user(SubscriptionPlan.ON_PREMISE)
-    u.comparisons_used_this_month = 9999
-    assert u.comparisons_remaining is None
+    u.analyses_used_this_month = 9999
+    assert u.analyses_remaining is None
 
 def test_starter_cannot_use_multi_comparison():
     u = make_user(SubscriptionPlan.STARTER)
@@ -137,11 +137,11 @@ def test_starter_ai_interpretations_remaining_is_minus_one():
     assert u.ai_interpretations_remaining == -1
 
 
-def test_comparisons_remaining_clamps_at_zero():
+def test_analyses_remaining_clamps_at_zero():
     """If used > quota (e.g., data inconsistency), remaining clamps to 0."""
     u = make_user(SubscriptionPlan.STARTER)
-    u.comparisons_used_this_month = 35  # over the 30 quota
-    assert u.comparisons_remaining == 0
+    u.analyses_used_this_month = 35  # over the 30 quota
+    assert u.analyses_remaining == 0
 
 
 def test_on_premise_can_launch_analyses():
@@ -162,7 +162,7 @@ def test_on_premise_can_export_advanced():
 def test_scilicium_admin_has_no_quota():
     u = make_user(SubscriptionPlan.STARTER)
     u.role = UserRole.SCILICIUM_ADMIN
-    assert u.comparisons_quota is None
+    assert u.analyses_quota is None
 
 
 def test_scilicium_admin_can_use_ai():
@@ -224,3 +224,46 @@ def test_admin_stats_prices_cover_every_plan():
         f"admin.py reintroduced hard-coded plan prices ({hard_coded}); "
         "the pricing grid is the single source of truth"
     )
+
+
+# ── Le nom de la colonne Postgres ne doit pas suivre celui de l'attribut ─────
+
+
+def test_the_analyses_counter_still_maps_to_its_original_column():
+    """L'attribut s'appelle `analyses_used_this_month`, la colonne PAS.
+
+    La colonne Postgres garde son nom d'origine, `comparisons_used_this_month`,
+    et c'est délibéré : la renommer imposerait une migration, et le déploiement
+    applique les migrations AVANT de redémarrer les conteneurs — l'ancien code
+    interrogerait donc une colonne disparue, et chaque appel touchant au quota
+    répondrait 500 le temps du redémarrage.
+
+    Ce test échoue si quelqu'un « nettoie » le premier argument de
+    `mapped_column`, ce qui produirait un SQL visant une colonne inexistante :
+    une panne totale des quotas, invisible pour toute la suite de tests, qui
+    n'ouvre aucune connexion Postgres.
+    """
+    from sqlalchemy import select, update
+
+    from app.models.models import User
+
+    select_sql = str(select(User.analyses_used_this_month))
+    assert "comparisons_used_this_month" in select_sql, select_sql
+    assert "analyses_used_this_month" not in select_sql, select_sql
+
+    update_sql = str(update(User).values(analyses_used_this_month=3))
+    assert "comparisons_used_this_month" in update_sql, update_sql
+
+
+def test_deprecated_quota_aliases_read_through_to_the_new_names():
+    """Les trois alias servis à l'ancien frontend lisent bien la nouvelle source."""
+    from app.models.models import SubscriptionPlan, User, UserRole
+
+    u = User()
+    u.role = UserRole.USER
+    u.subscription_plan = SubscriptionPlan.STARTER
+    u.analyses_used_this_month = 4
+
+    assert u.comparisons_used_this_month == 4
+    assert u.comparisons_quota == u.analyses_quota == 30
+    assert u.comparisons_remaining == u.analyses_remaining == 26

@@ -34,8 +34,8 @@ from app.api.deps.subscription import (
     require_scientific_access,
     check_ai_quota,
     increment_ai_usage,
-    check_comparison_quota,
-    increment_comparison_usage,
+    check_analysis_quota,
+    increment_analysis_usage,
 )
 # from app.db.session import get_db  <-- Removed
 from app.core.supabase_auth import SupabaseUser
@@ -163,7 +163,7 @@ async def upload_dataset(
     # ── Quota checks for DEG uploads ──────────────────────────────────────────
     if dataset_type == DatasetType.DEG:
         # Check monthly comparison quota (auto-resets if new month, raises 429 if exhausted)
-        db_user = await check_comparison_quota(db_user, db)
+        db_user = await check_analysis_quota(db_user, db)
 
         # Check dataset limit per project
         if db_user.max_datasets_per_project is not None:
@@ -218,7 +218,7 @@ async def upload_dataset(
 
     # Increment comparison counter AFTER successful DB commit
     if dataset_type == DatasetType.DEG:
-        await increment_comparison_usage(db_user, db)
+        await increment_analysis_usage(db_user, db)
 
     # Trigger Celery task
     process_dataset_upload.delay(str(dataset.id), uploaded_path)

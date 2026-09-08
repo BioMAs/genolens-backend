@@ -25,7 +25,7 @@ Limit conventions
 -----------------
 A limit is `int | "unlimited" | "custom" | None`. `resolve_limit()` normalises
 it to `int | None`, where **None means unlimited** — the same convention the
-`User` properties already use (`comparisons_quota` returns None for
+`User` properties already use (`analyses_quota` returns None for
 ON_PREMISE). `0` means "none included", which is not the same thing: the Access
 plan of the draft grid bundles zero contrasts and sells them a la carte.
 """

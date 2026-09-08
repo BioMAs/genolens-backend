@@ -21,18 +21,29 @@ from app.models.models import SubscriptionPlan, User, UserRole, UserStatus
 
 ENDPOINT = "/api/v1/billing/subscription"
 
-EXPECTED_KEYS = {
+CURRENT_KEYS = {
     "plan",
     "is_active",
     "stripe_customer_id",
     "subscription_starts_at",
     "subscription_ends_at",
-    "comparisons_used_this_month",
-    "comparisons_quota",
-    "comparisons_remaining",
+    "analyses_used_this_month",
+    "analyses_quota",
+    "analyses_remaining",
     "can_use_ai",
     "can_use_multi_comparison",
 }
+
+#: Anciens noms, servis le temps que le frontend deploye bascule. Ce test est
+#: ce qui forcera leur retrait a etre explicite : supprimer les champs sans
+#: toucher a cet ensemble fait echouer la suite.
+DEPRECATED_KEYS = {
+    "comparisons_used_this_month",
+    "comparisons_quota",
+    "comparisons_remaining",
+}
+
+EXPECTED_KEYS = CURRENT_KEYS | DEPRECATED_KEYS
 
 
 def make_user() -> User:
@@ -42,7 +53,7 @@ def make_user() -> User:
     u.role = UserRole.USER
     u.subscription_plan = SubscriptionPlan.TEAM
     u.status = UserStatus.ACTIVE
-    u.comparisons_used_this_month = 12
+    u.analyses_used_this_month = 12
     u.stripe_customer_id = "cus_123"
     u.subscription_starts_at = "2026-01-15T00:00:00+00:00"
     u.subscription_ends_at = "2027-01-15T00:00:00+00:00"
@@ -102,3 +113,20 @@ async def test_dates_are_null_when_absent():
 
     assert res.json()["subscription_starts_at"] is None
     assert res.json()["subscription_ends_at"] is None
+
+
+async def test_deprecated_aliases_mirror_the_current_fields():
+    """Les deux vocabulaires doivent dire la meme chose.
+
+    Servir deux noms pour une meme valeur n'est tenable que s'ils ne peuvent
+    pas divulguer : ce test echoue si un alias est cable sur autre chose que le
+    champ qu'il remplace.
+    """
+    user = make_user()
+    async with make_client(user) as client:
+        res = await client.get(ENDPOINT)
+
+    body = res.json()
+    assert body["comparisons_used_this_month"] == body["analyses_used_this_month"]
+    assert body["comparisons_quota"] == body["analyses_quota"]
+    assert body["comparisons_remaining"] == body["analyses_remaining"]

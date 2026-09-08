@@ -245,31 +245,31 @@ async def require_team_plan(user: Annotated[User, Depends(get_or_create_user)]) 
 # ── Comparison quota ───────────────────────────────────────────────────────────
 
 
-def _has_unlimited_comparisons(user: User) -> bool:
+def _has_unlimited_analyses(user: User) -> bool:
     """True when no comparison quota applies: privileged roles and plans whose
-    `comparisons_quota` is None. The single place this condition is expressed —
+    `analyses_quota` is None. The single place this condition is expressed —
     a new privileged role must not have to be added twice."""
-    return user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or user.comparisons_quota is None
+    return user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or user.analyses_quota is None
 
 
 def _reset_quota_if_new_month(user: User) -> bool:
     """
-    Reset comparisons_used_this_month if we're in a new calendar month.
+    Reset analyses_used_this_month if we're in a new calendar month.
     Returns True if a reset was performed.
     """
     now = datetime.now(timezone.utc)
     if user.quota_reset_at is None:
-        user.comparisons_used_this_month = 0
+        user.analyses_used_this_month = 0
         user.quota_reset_at = now
         return True
     if now.year != user.quota_reset_at.year or now.month != user.quota_reset_at.month:
-        user.comparisons_used_this_month = 0
+        user.analyses_used_this_month = 0
         user.quota_reset_at = now
         return True
     return False
 
 
-async def check_comparison_quota(
+async def check_analysis_quota(
     user: Annotated[User, Depends(get_or_create_user)], db: Annotated[AsyncSession, Depends(get_db)]
 ) -> User:
     """
@@ -282,13 +282,13 @@ async def check_comparison_quota(
 
     reset_happened = _reset_quota_if_new_month(user)
 
-    remaining = user.comparisons_remaining
+    remaining = user.analyses_remaining
     if remaining is not None and remaining <= 0:
         # Persist any reset even when blocking, so next request doesn't re-reset
         if reset_happened:
             db.add(user)
             await db.commit()
-        quota = user.comparisons_quota
+        quota = user.analyses_quota
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
@@ -304,7 +304,7 @@ async def check_comparison_quota(
     return user
 
 
-async def try_increment_comparison_usage(user: User, db: AsyncSession) -> bool:
+async def try_increment_analysis_usage(user: User, db: AsyncSession) -> bool:
     """
     Incrémente le compteur de comparaisons si le quota le permet.
 
@@ -317,21 +317,21 @@ async def try_increment_comparison_usage(user: User, db: AsyncSession) -> bool:
     Retourne True si le compteur a été incrémenté, ou si l'utilisateur est
     illimité (rien n'est alors écrit). False si le quota a bloqué l'incrément.
     """
-    if _has_unlimited_comparisons(user):
+    if _has_unlimited_analyses(user):
         return True  # Illimité — rien à compter
 
-    quota = user.comparisons_quota
+    quota = user.analyses_quota
     result = await db.execute(
         update(User)
         .where(User.id == user.id)
-        .where(User.comparisons_used_this_month < quota)
-        .values(comparisons_used_this_month=User.comparisons_used_this_month + 1)
-        .returning(User.comparisons_used_this_month)
+        .where(User.analyses_used_this_month < quota)
+        .values(analyses_used_this_month=User.analyses_used_this_month + 1)
+        .returning(User.analyses_used_this_month)
     )
     return result.scalar() is not None
 
 
-async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
+async def increment_analysis_usage(user: User, db: AsyncSession) -> None:
     """
     Incrémente le compteur après un import DEG réussi, côté HTTP.
     Lève 429 si le quota est épuisé — y compris quand une requête concurrente
@@ -339,11 +339,11 @@ async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
     Envoie un avertissement par email au franchissement des 80 %.
     À appeler APRÈS le commit du dataset.
     """
-    if _has_unlimited_comparisons(user):
+    if _has_unlimited_analyses(user):
         return  # Illimité — rien à faire
 
-    quota = user.comparisons_quota
-    if not await try_increment_comparison_usage(user, db):
+    quota = user.analyses_quota
+    if not await try_increment_analysis_usage(user, db):
         # Quota épuisé par une requête concurrente — on annule le dataset
         await db.rollback()
         raise HTTPException(
@@ -357,8 +357,8 @@ async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
     await db.refresh(user)
 
     # Avertissement à 80 % — au mieux, ne bloque jamais l'import
-    quota = user.comparisons_quota
-    used = user.comparisons_used_this_month
+    quota = user.analyses_quota
+    used = user.analyses_used_this_month
     if quota and used == int(quota * 0.8):
         try:
             from app.services.email_service import send_quota_warning_email
@@ -379,5 +379,5 @@ async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
 async def require_analysis_access(user: Annotated[User, Depends(get_or_create_user)]) -> User:
     """Backward-compat alias — previously required ADVANCED plan.
     Now all paid plans can launch analyses (subject to quota).
-    Use check_comparison_quota for new code."""
+    Use check_analysis_quota for new code."""
     return user

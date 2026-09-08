@@ -29,10 +29,16 @@ class User(UserInDBBase):
 class UserSelf(User):
     """Schema for returning the user's own profile with quota details."""
     # Monthly quota tracking (column on User model)
-    comparisons_used_this_month: int = 0
+    analyses_used_this_month: int = 0
     # Computed from @property methods on User model
-    comparisons_quota: Optional[int] = None       # None = unlimited
-    comparisons_remaining: Optional[int] = None   # None = unlimited
+    analyses_quota: Optional[int] = None       # None = unlimited
+    analyses_remaining: Optional[int] = None   # None = unlimited
+    # Anciens noms, servis le temps que le frontend deploye bascule. Ils sont
+    # alimentes par des proprietes d'alias sur le modele User. A retirer avec
+    # elles. Ne pas ecrire de nouveau code contre ces trois champs.
+    comparisons_used_this_month: int = 0
+    comparisons_quota: Optional[int] = None
+    comparisons_remaining: Optional[int] = None
     max_projects: Optional[int] = None
     # Projets POSSÉDÉS uniquement (pas partagés) — même prédicat que la limite
     # appliquée par create_project, pour que le client puisse afficher "used/max"

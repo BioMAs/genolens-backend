@@ -1,14 +1,14 @@
 """
 Tests de la comptabilisation du quota de comparaisons.
 
-`increment_comparison_usage` fusionnait trois responsabilités : l'UPDATE
+`increment_analysis_usage` fusionnait trois responsabilités : l'UPDATE
 conditionnel atomique, la politique HTTP (`raise HTTPException(429)`) et le
 contrôle de transaction (`rollback`/`commit`). Rien de tout cela n'est
 utilisable depuis un worker Celery : une HTTPException levée là abandonnerait
 une analyse dont le calcul coûteux a déjà tourné, et annulerait les datasets
 DEG déjà enregistrés.
 
-`try_increment_comparison_usage` isole l'UPDATE : pas de raise, pas de commit,
+`try_increment_analysis_usage` isole l'UPDATE : pas de raise, pas de commit,
 pas de rollback. La politique appartient à l'appelant.
 """
 
@@ -19,8 +19,8 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.deps.subscription import (
-    increment_comparison_usage,
-    try_increment_comparison_usage,
+    increment_analysis_usage,
+    try_increment_analysis_usage,
 )
 from app.models.models import SubscriptionPlan, User, UserRole
 
@@ -30,7 +30,7 @@ def make_user(
     role: UserRole = UserRole.USER,
     used: int = 0,
 ) -> User:
-    """Utilisateur non persisté. `comparisons_quota` est une property calculée
+    """Utilisateur non persisté. `analyses_quota` est une property calculée
     depuis `subscription_plan` et `role` : STARTER=30, TEAM=150,
     ON_PREMISE=None, rôles admin=None."""
     u = User()
@@ -38,7 +38,7 @@ def make_user(
     u.email = "quota@example.com"
     u.role = role
     u.subscription_plan = plan
-    u.comparisons_used_this_month = used
+    u.analyses_used_this_month = used
     return u
 
 
@@ -56,14 +56,14 @@ def db_returning(new_count: int | None) -> AsyncMock:
     return db
 
 
-# ── try_increment_comparison_usage ──────────────────────────────────────────
+# ── try_increment_analysis_usage ──────────────────────────────────────────
 
 
 async def test_try_increment_returns_true_and_writes_when_under_quota():
     user = make_user(used=5)
     db = db_returning(6)
 
-    assert await try_increment_comparison_usage(user, db) is True
+    assert await try_increment_analysis_usage(user, db) is True
     db.execute.assert_awaited_once()
 
 
@@ -71,14 +71,14 @@ async def test_try_increment_returns_false_when_quota_blocks():
     user = make_user(used=30)  # STARTER: quota 30, saturé
     db = db_returning(None)
 
-    assert await try_increment_comparison_usage(user, db) is False
+    assert await try_increment_analysis_usage(user, db) is False
 
 
 async def test_try_increment_skips_write_for_unlimited_plan():
     user = make_user(plan=SubscriptionPlan.ON_PREMISE, used=999)
     db = db_returning(None)
 
-    assert await try_increment_comparison_usage(user, db) is True
+    assert await try_increment_analysis_usage(user, db) is True
     db.execute.assert_not_awaited()
 
 
@@ -86,7 +86,7 @@ async def test_try_increment_skips_write_for_admin_role():
     user = make_user(role=UserRole.ADMIN, used=999)
     db = db_returning(None)
 
-    assert await try_increment_comparison_usage(user, db) is True
+    assert await try_increment_analysis_usage(user, db) is True
     db.execute.assert_not_awaited()
 
 
@@ -97,7 +97,7 @@ async def test_try_increment_never_controls_the_transaction():
         user = make_user(used=used)
         db = db_returning(new_count)
 
-        await try_increment_comparison_usage(user, db)
+        await try_increment_analysis_usage(user, db)
 
         db.commit.assert_not_awaited()
         db.rollback.assert_not_awaited()
@@ -108,10 +108,10 @@ async def test_try_increment_never_raises_when_quota_blocks():
     db = db_returning(None)
 
     # Ne doit pas lever : un raise ici abandonnerait une analyse déjà calculée.
-    assert await try_increment_comparison_usage(user, db) is False
+    assert await try_increment_analysis_usage(user, db) is False
 
 
-# ── increment_comparison_usage (politique HTTP, inchangée) ──────────────────
+# ── increment_analysis_usage (politique HTTP, inchangée) ──────────────────
 
 
 async def test_http_increment_raises_429_and_rolls_back_when_blocked():
@@ -119,7 +119,7 @@ async def test_http_increment_raises_429_and_rolls_back_when_blocked():
     db = db_returning(None)
 
     with pytest.raises(HTTPException) as exc:
-        await increment_comparison_usage(user, db)
+        await increment_analysis_usage(user, db)
 
     assert exc.value.status_code == 429
     db.rollback.assert_awaited_once()
@@ -129,7 +129,7 @@ async def test_http_increment_commits_when_allowed():
     user = make_user(used=5)
     db = db_returning(6)
 
-    await increment_comparison_usage(user, db)
+    await increment_analysis_usage(user, db)
 
     db.commit.assert_awaited_once()
     db.refresh.assert_awaited_once_with(user)
@@ -139,7 +139,7 @@ async def test_http_increment_is_noop_for_unlimited_plan():
     user = make_user(plan=SubscriptionPlan.ON_PREMISE, used=999)
     db = db_returning(None)
 
-    await increment_comparison_usage(user, db)
+    await increment_analysis_usage(user, db)
 
     db.execute.assert_not_awaited()
     db.commit.assert_not_awaited()

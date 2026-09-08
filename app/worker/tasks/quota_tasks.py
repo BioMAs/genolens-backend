@@ -1,6 +1,21 @@
 """
 Periodic tasks for quota management.
-Scheduled via Celery Beat — runs on the 1st of each month at 00:05 UTC.
+
+ATTENTION : cette tache est declaree dans le `beat_schedule` de
+`app/worker/celery_app.py` (1er du mois, 00:05 UTC) mais **aucun service
+`celery beat` n'existe dans `docker-compose.prod.yml`** — seuls `api`, `worker`
+et `r-worker` tournent. Elle n'est donc jamais declenchee en production.
+
+La remise a zero effective vient du chemin paresseux :
+`_reset_quota_if_new_month` (app/api/deps/subscription.py) remet le compteur a
+zero au premier appel touchant au quota que fait l'utilisateur dans le mois.
+C'est suffisant fonctionnellement — un compteur n'a d'importance qu'au moment
+ou on le lit — mais ca veut dire qu'aucun etat en base n'est remis a zero pour
+un utilisateur inactif, et que les statistiques lues directement en base
+peuvent montrer un compteur du mois precedent.
+
+Ajouter un service `beat` rendrait cette tache reelle. En attendant, ne pas
+compter sur elle.
 """
 import asyncio
 import logging
@@ -21,10 +36,10 @@ def _run_async(coro):
         loop.close()
 
 
-@celery_app.task(name="app.worker.tasks.quota_tasks.reset_monthly_comparison_quotas")
-def reset_monthly_comparison_quotas() -> dict:
+@celery_app.task(name="app.worker.tasks.quota_tasks.reset_monthly_analysis_quotas")
+def reset_monthly_analysis_quotas() -> dict:
     """
-    Reset comparisons_used_this_month to 0 for all users.
+    Reset analyses_used_this_month to 0 for all users.
     Updates quota_reset_at to now.
     Runs via async session (asyncpg) — no psycopg2 required.
     """
@@ -41,7 +56,7 @@ async def _async_reset() -> dict:
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             update(User)
-            .values(comparisons_used_this_month=0, quota_reset_at=now)
+            .values(analyses_used_this_month=0, quota_reset_at=now)
         )
         await db.commit()
         row_count = result.rowcount

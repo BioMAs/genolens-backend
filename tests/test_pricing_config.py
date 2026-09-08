@@ -45,7 +45,7 @@ def make_user(plan: SubscriptionPlan) -> User:
     u.ai_interpretations_used = 0
     u.ai_tokens_purchased = 0
     u.ai_tokens_used = 0
-    u.comparisons_used_this_month = 0
+    u.analyses_used_this_month = 0
     u.status = UserStatus.ACTIVE
     return u
 
@@ -140,7 +140,7 @@ def test_active_grid_matches_user_model(plan):
     p = cfg.get_plan(plan.value)
     u = make_user(plan)
 
-    assert p.resolved_contrast_quota == u.comparisons_quota, "comparisons_quota"
+    assert p.resolved_contrast_quota == u.analyses_quota, "analyses_quota"
     assert p.resolved_max_projects == u.max_projects, "max_projects"
     assert p.resolved_datasets_limit_per_project == u.max_datasets_per_project, \
         "max_datasets_per_project"
@@ -166,7 +166,7 @@ def test_active_quota_period_is_monthly_everywhere():
 
 
 def test_active_overage_is_blocking():
-    """check_comparison_quota raises 429 today. The grid must not promise
+    """check_analysis_quota raises 429 today. The grid must not promise
     otherwise while that is still true."""
     overage = get_pricing().overage
     assert overage.hard_block is True

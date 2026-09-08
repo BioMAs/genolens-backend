@@ -47,10 +47,10 @@ def make_user(
     u.email = "quota@example.com"
     u.role = role
     u.subscription_plan = plan
-    u.comparisons_used_this_month = used
+    u.analyses_used_this_month = used
     u.status = UserStatus.ACTIVE
     # DOIT etre dans le mois courant. `_reset_quota_if_new_month` remet
-    # `comparisons_used_this_month` A ZERO quand `quota_reset_at` est None
+    # `analyses_used_this_month` A ZERO quand `quota_reset_at` est None
     # (app/api/deps/subscription.py:257), ce qui annulerait chaque assertion
     # de quota de ce fichier : `used` serait toujours relu a 0.
     u.quota_reset_at = datetime.now(timezone.utc)
@@ -205,7 +205,7 @@ async def test_refuses_when_quota_already_exhausted():
         res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
 
     assert res.status_code == 429
-    # Pas `db.add.assert_not_called()` : `check_comparison_quota` peut
+    # Pas `db.add.assert_not_called()` : `check_analysis_quota` peut
     # legitimement ajouter l'utilisateur pour persister une remise a zero
     # mensuelle. On verifie ce qui compte -- aucune analyse creee.
     added = [type(call.args[0]).__name__ for call in db.add.call_args_list]

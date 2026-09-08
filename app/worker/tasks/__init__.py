@@ -27,12 +27,12 @@ run_self_service_analysis = _legacy_mod.run_self_service_analysis  # noqa: F401
 _count_pipeline_analysis = _legacy_mod._count_pipeline_analysis  # noqa: F401
 
 # ── New periodic quota task ───────────────────────────────────────────────────
-from app.worker.tasks.quota_tasks import reset_monthly_comparison_quotas  # noqa: F401
+from app.worker.tasks.quota_tasks import reset_monthly_analysis_quotas  # noqa: F401
 
 __all__ = [
     "process_dataset_upload",
     "import_geo_dataset",
     "health_check",
     "run_self_service_analysis",
-    "reset_monthly_comparison_quotas",
+    "reset_monthly_analysis_quotas",
 ]
