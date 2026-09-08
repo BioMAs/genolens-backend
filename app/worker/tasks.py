@@ -856,6 +856,66 @@ def health_check() -> dict:
     return {"status": "healthy", "message": "Celery worker is running"}
 
 
+async def _count_pipeline_comparisons(user, db, count: int) -> None:
+    """
+    Décompte en un seul UPDATE les comparaisons produites par le pipeline.
+
+    Ne fait jamais échouer l'analyse : le calcul est déjà terminé et les
+    résultats existent, les jeter pour un dépassement de quota serait un
+    gâchis pur. Le compteur est donc plafonné au quota (`least`) au lieu d'être
+    incrémenté conditionnellement — c'est le contrôle au lancement
+    (`POST /analyses`) qui empêche la surconsommation ; ici on ne fait que de
+    la comptabilité. Le compteur ne dépasse jamais le quota, et aucune analyse
+    déjà calculée n'est annulée.
+
+    Un seul UPDATE, émis juste avant le commit final, et non un par
+    comparaison : l'UPDATE conditionnel prend un verrou de ligne sur `users`,
+    et la boucle DEG peut passer jusqu'à 1800 s par contraste dans
+    `subprocess.run` (enrichissement annoDB). Un verrou pris au premier
+    contraste bloquait donc jusqu'au commit toute écriture concurrente sur
+    cette ligne — l'incrément de l'import DEG manuel, la remise à zéro
+    mensuelle de `check_comparison_quota`, la synchro de rôle de
+    `get_or_create_user` — depuis des requêtes FastAPI qui tiennent une
+    connexion du pool, que le moindre `lock_timeout` transformait en 500.
+
+    `user` à None (ligne locale introuvable) ou `count` nul : no-op silencieux.
+    Ne commit pas, ne rollback pas : le contrôle de la transaction reste à
+    l'appelant.
+    """
+    if user is None or count <= 0:
+        return
+    from sqlalchemy import func
+
+    from app.api.deps.subscription import _has_unlimited_comparisons
+    from app.models.models import User as _User
+
+    if _has_unlimited_comparisons(user):
+        return  # Illimité — rien à compter
+
+    quota = user.comparisons_quota
+    result = await db.execute(
+        update(_User)
+        .where(_User.id == user.id)
+        .values(
+            comparisons_used_this_month=func.least(quota, _User.comparisons_used_this_month + count)
+        )
+        .returning(_User.comparisons_used_this_month)
+    )
+    new_used = result.scalar()
+    if new_used is not None and new_used >= quota:
+        # Le plafond a mordu : le quota est saturé et une partie des
+        # comparaisons enregistrées n'est pas comptée. On garde la trace, la
+        # saturation doit rester visible.
+        logger.warning(
+            "[ANALYSIS] Comparison quota saturated for user %s — %d comparison(s) "
+            "registered, counter capped at %d/%d",
+            user.id,
+            count,
+            new_used,
+            quota,
+        )
+
+
 @celery_app.task(bind=True, base=DatabaseTask, name="app.worker.tasks.run_self_service_analysis", queue="r_analysis")
 def run_self_service_analysis(self, analysis_id: str) -> dict:
     """
@@ -1035,6 +1095,21 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     pending_dispatch.append((str(vst_ds.id), vst_storage))
                     logger.info("[ANALYSIS] Registered VST dataset %s", vst_ds.id)
 
+                # Utilisateur local pour la comptabilisation du quota. Résolu
+                # une fois hors boucle : une requête par comparaison serait
+                # inutile, l'objet ne servant qu'à lire plan et rôle.
+                quota_user = None
+                if analysis.user_id:
+                    from app.models.models import User as _User
+
+                    quota_user = await db.scalar(select(_User).where(_User.id == analysis.user_id))
+                    if quota_user is None:
+                        logger.warning(
+                            "[ANALYSIS] No local user row for %s — "
+                            "comparisons will not be counted",
+                            analysis.user_id,
+                        )
+
                 # DEG result datasets (one per comparison)
                 comparisons_dir = Path(outdir) / "comparisons"
                 if comparisons_dir.exists():
@@ -1163,6 +1238,13 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 analysis.status = SelfServiceAnalysisStatus.DONE
                 analysis.current_step = "done"
                 _log("done", f"Pipeline completed. Registered {len(deg_comparison_ids)} DEG comparison(s).")
+
+                # Quota : un seul UPDATE plafonné, juste avant le commit, pour
+                # ne pas tenir un verrou sur la ligne `users` pendant toute la
+                # boucle DEG (jusqu'à 1800 s par contraste dans subprocess.run).
+                # Voir _count_pipeline_comparisons.
+                await _count_pipeline_comparisons(quota_user, db, len(deg_comparison_ids))
+
                 db.add(analysis)
                 await db.commit()
 

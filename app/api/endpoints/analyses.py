@@ -17,9 +17,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db
 from app.api.deps.project_access import assert_project_access
 from app.api.deps.license import require_active_license
-from app.api.deps.subscription import get_or_create_user
+from app.api.deps.subscription import check_comparison_quota, get_or_create_user
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus, OmicsDataType, User, Project
+from app.models.models import (
+    Dataset,
+    OmicsDataType,
+    Project,
+    SelfServiceAnalysis,
+    SelfServiceAnalysisStatus,
+    User,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +116,70 @@ class SelfServiceAnalysisListResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Quota helpers
+# ---------------------------------------------------------------------------
+
+
+def _declared_comparisons(metadata: Optional[dict]) -> Optional[int]:
+    """Nombre de comparaisons déclarées par un fichier de comparaisons.
+
+    La clé est `rows`, écrite à l'ingestion par
+    `DataProcessor.get_file_metadata` (app/services/data_processor.py) puis
+    fusionnée dans `dataset_metadata` par le worker. `total_rows` n'est jamais
+    persisté — c'est un champ de réponse paginée de `query_dataset` — et n'est
+    gardé ici qu'en second choix, au cas où un dataset l'aurait porté.
+
+    On ne lit pas la colonne facultative `perform_analysis` / `run` / `include`
+    que `run_multimethod_pipeline.R` honore : le pipeline peut donc exécuter
+    moins de contrastes qu'il y a de lignes. Les refus formulés à partir de ce
+    nombre parlent pour cette raison de ce que le *fichier déclare*, ce qui est
+    exact, et non de ce que le pipeline exécutera.
+
+    None quand la métadonnée est absente : dataset encore en traitement.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("rows", "total_rows"):
+        value = metadata.get(key)
+        # `isinstance(True, int)` vaut True en Python — un booléen n'est pas
+        # un décompte de lignes.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+async def _in_flight_comparisons(db: AsyncSession, user_id: UUID) -> int:
+    """Comparaisons déjà admises mais pas encore comptées, pour cet utilisateur.
+
+    `comparisons_used_this_month` n'avance qu'à la *fin* du worker. Sans cette
+    déduction, un compte à 30 restantes peut poster dix analyses de 5
+    contrastes en quelques secondes : chacune voit 30 restantes, les dix sont
+    admises, 50 comparaisons sont calculées et le compteur plafonne à 30. Avec
+    `--concurrency=1` sur la file `r_analysis` la file d'attente les absorbe,
+    donc ce n'est pas une course étroite.
+
+    On somme les lignes déclarées par les fichiers de comparaisons des analyses
+    PENDING / RUNNING de l'appelant. Jointure externe et non interne : une
+    analyse dont le dataset de comparaisons a disparu (`ON DELETE SET NULL`)
+    doit compter, pas s'évaporer. Un fichier dont `rows` est inconnu compte
+    pour 1 et non pour 0 — sous-estimer la demande en vol est précisément ce
+    que ce contrôle existe pour empêcher.
+    """
+    result = await db.execute(
+        select(Dataset.dataset_metadata)
+        .select_from(SelfServiceAnalysis)
+        .outerjoin(Dataset, Dataset.id == SelfServiceAnalysis.comparisons_dataset_id)
+        .where(
+            SelfServiceAnalysis.user_id == user_id,
+            SelfServiceAnalysis.status.in_(
+                (SelfServiceAnalysisStatus.PENDING, SelfServiceAnalysisStatus.RUNNING)
+            ),
+        )
+    )
+    return sum(_declared_comparisons(meta) or 1 for meta in result.scalars())
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -193,6 +264,56 @@ async def create_analysis(
     )
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    # Dataset de comparaisons, porté au projet. C'est la seule validation que
+    # cet endpoint fasse des trois ids de datasets qu'il reçoit, et la barrière
+    # de quota juste en dessous lit sa métadonnée : accepter un id appartenant à
+    # un autre projet reviendrait à la priver de son entrée. On refuse donc,
+    # plutôt que de retomber sur le repli permissif.
+    comparisons_ds = await db.scalar(
+        select(Dataset).where(
+            Dataset.id == payload.comparisons_dataset_id,
+            Dataset.project_id == payload.project_id,
+        )
+    )
+    if comparisons_ds is None:
+        raise HTTPException(status_code=404, detail="Comparisons dataset not found in this project")
+
+    # ── Quota de comparaisons ────────────────────────────────────────────────
+    # Le pipeline crée un dataset DEG par contraste. On refuse ici, avant tout
+    # calcul : une fois l'analyse lancée on ne l'annule plus pour un quota.
+    db_user = await check_comparison_quota(db_user, db)
+    counter_remaining = db_user.comparisons_remaining
+    if counter_remaining is not None:
+        # Réservation : le compteur ne bouge qu'à la fin du worker, donc on
+        # retire d'abord la demande des analyses déjà admises et pas encore
+        # comptées. Sans ça dix analyses postées coup sur coup voient toutes le
+        # même reste et passent toutes.
+        in_flight = await _in_flight_comparisons(db, current_user.user_id)
+        remaining = max(0, counter_remaining - in_flight)
+
+        requested = _declared_comparisons(comparisons_ds.dataset_metadata)
+        if requested is not None and requested > remaining:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"This comparisons file declares {requested} comparisons but "
+                    f"only {remaining} remain this month. Quota resets on the 1st "
+                    "of next month. Upgrade your plan for more comparisons."
+                ),
+            )
+        # `requested` à None = dataset encore en traitement : on se rabat sur
+        # « au moins une comparaison restante », en vol déduit.
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Analyses already queued claim the {counter_remaining} "
+                    f"comparison(s) left this month ({in_flight} pending). Wait "
+                    "for them to finish, or upgrade your plan for more "
+                    "comparisons."
+                ),
+            )
 
     analysis = SelfServiceAnalysis(
         id=uuid4(),

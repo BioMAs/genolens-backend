@@ -1,11 +1,11 @@
 """
 Subscription and quota dependencies for API endpoints.
 """
-from typing import Annotated
-from uuid import UUID
-from datetime import datetime, timezone
 
 import logging
+from datetime import datetime, timezone
+from typing import Annotated
+from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 from sqlalchemy import select, update
@@ -15,7 +15,7 @@ from app.api.deps.supabase_deps import get_current_user
 from app.core.config import settings
 from app.core.supabase_auth import SupabaseUser
 from app.db.session import get_db
-from app.models.models import User, UserRole, SubscriptionPlan
+from app.models.models import SubscriptionPlan, User, UserRole
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +25,10 @@ _PROTECTED_ROLES = {UserRole.ADMIN, UserRole.SCILICIUM_ADMIN}
 
 # ── User resolution ────────────────────────────────────────────────────────────
 
+
 async def get_or_create_user(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
-    db: Annotated[AsyncSession, Depends(get_db)]
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
     """Get or create User profile from Supabase auth. Defaults to STARTER plan."""
     query = select(User).where(User.id == current_user.user_id)
@@ -52,12 +53,16 @@ async def get_or_create_user(
                 logger.warning(
                     "Blocked role downgrade attempt for user %s: "
                     "local=%s → supabase=%s (keeping local role)",
-                    user.id, user.role, current_user.role,
+                    user.id,
+                    user.role,
+                    current_user.role,
                 )
             else:
                 logger.info(
                     "Updating role for user %s: %s → %s",
-                    user.id, user.role, current_user.role,
+                    user.id,
+                    user.role,
+                    current_user.role,
                 )
                 user.role = current_user.role
                 db.add(user)
@@ -69,23 +74,18 @@ async def get_or_create_user(
 
 # ── Admin guard ────────────────────────────────────────────────────────────────
 
-async def require_admin(
-    user: Annotated[User, Depends(get_or_create_user)]
-) -> User:
+
+async def require_admin(user: Annotated[User, Depends(get_or_create_user)]) -> User:
     """Require ADMIN or SCILICIUM_ADMIN role."""
     if user.role not in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
     return user
 
 
 # ── AI access ──────────────────────────────────────────────────────────────────
 
-async def require_ai_access(
-    user: Annotated[User, Depends(get_or_create_user)]
-) -> User:
+
+async def require_ai_access(user: Annotated[User, Depends(get_or_create_user)]) -> User:
     """Require TEAM or ON_PREMISE plan for AI interpretation."""
     if not user.can_use_ai:
         raise HTTPException(
@@ -93,14 +93,13 @@ async def require_ai_access(
             detail=(
                 f"AI interpretation requires TEAM or ON_PREMISE plan. "
                 f"Current plan: {user.subscription_plan.value}"
-            )
+            ),
         )
     return user
 
 
 async def check_ai_quota(
-    user: Annotated[User, Depends(get_or_create_user)],
-    db: Annotated[AsyncSession, Depends(get_db)]
+    user: Annotated[User, Depends(get_or_create_user)], db: Annotated[AsyncSession, Depends(get_db)]
 ) -> User:
     """
     AI quota check.
@@ -114,8 +113,7 @@ async def check_ai_quota(
     if user.subscription_plan in (SubscriptionPlan.ON_PREMISE, SubscriptionPlan.TEAM):
         return user
     raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="AI features not available on STARTER plan"
+        status_code=status.HTTP_403_FORBIDDEN, detail="AI features not available on STARTER plan"
     )
 
 
@@ -135,6 +133,7 @@ async def increment_ai_usage(
     Falls back to 1 when the caller has no token count (keeps a per-action tally).
     """
     from app.models.models import AIUsageLog
+
     log = AIUsageLog(
         user_id=user.id,
         dataset_id=dataset_id,
@@ -150,9 +149,8 @@ async def increment_ai_usage(
 
 # ── Cosmetics module (per-user add-on) ───────────────────────────────────────────
 
-async def require_cosmetics_access(
-    user: Annotated[User, Depends(get_or_create_user)]
-) -> User:
+
+async def require_cosmetics_access(user: Annotated[User, Depends(get_or_create_user)]) -> User:
     """Require the Cosmetics add-on module to be unlocked for this user.
 
     Unlocked explicitly per-user by an admin (User.cosmetics_module_enabled);
@@ -169,6 +167,7 @@ async def require_cosmetics_access(
 
 
 # ── Report customization module (per-user add-on) ────────────────────────────────
+
 
 async def require_report_customization_access(
     user: Annotated[User, Depends(get_or_create_user)]
@@ -190,9 +189,8 @@ async def require_report_customization_access(
 
 # ── Scientific tools module (per-user add-on) ────────────────────────────────────
 
-async def require_scientific_access(
-    user: Annotated[User, Depends(get_or_create_user)]
-) -> User:
+
+async def require_scientific_access(user: Annotated[User, Depends(get_or_create_user)]) -> User:
     """Require the Scientific tools add-on module to be unlocked for this user.
 
     Covers GSEA, the two-contrast log2FC scatter, per-sample signature scoring,
@@ -211,9 +209,8 @@ async def require_scientific_access(
 
 # ── Drug Discovery module (per-user add-on) ──────────────────────────────────────
 
-async def require_drug_discovery_access(
-    user: Annotated[User, Depends(get_or_create_user)]
-) -> User:
+
+async def require_drug_discovery_access(user: Annotated[User, Depends(get_or_create_user)]) -> User:
     """Require the Drug Discovery add-on module to be unlocked for this user.
 
     Unlocked explicitly per-user by an admin (User.drug_discovery_module_enabled),
@@ -231,9 +228,8 @@ async def require_drug_discovery_access(
 
 # ── TEAM plan guard ────────────────────────────────────────────────────────────
 
-async def require_team_plan(
-    user: Annotated[User, Depends(get_or_create_user)]
-) -> User:
+
+async def require_team_plan(user: Annotated[User, Depends(get_or_create_user)]) -> User:
     """Require TEAM or ON_PREMISE plan (multi-comparison, export PDF, API access)."""
     if not user.can_use_multi_comparison:
         raise HTTPException(
@@ -241,12 +237,20 @@ async def require_team_plan(
             detail=(
                 f"This feature requires a TEAM or ON_PREMISE plan. "
                 f"Current plan: {user.subscription_plan.value}"
-            )
+            ),
         )
     return user
 
 
 # ── Comparison quota ───────────────────────────────────────────────────────────
+
+
+def _has_unlimited_comparisons(user: User) -> bool:
+    """True when no comparison quota applies: privileged roles and plans whose
+    `comparisons_quota` is None. The single place this condition is expressed —
+    a new privileged role must not have to be added twice."""
+    return user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or user.comparisons_quota is None
+
 
 def _reset_quota_if_new_month(user: User) -> bool:
     """
@@ -258,10 +262,7 @@ def _reset_quota_if_new_month(user: User) -> bool:
         user.comparisons_used_this_month = 0
         user.quota_reset_at = now
         return True
-    if (
-        now.year != user.quota_reset_at.year
-        or now.month != user.quota_reset_at.month
-    ):
+    if now.year != user.quota_reset_at.year or now.month != user.quota_reset_at.month:
         user.comparisons_used_this_month = 0
         user.quota_reset_at = now
         return True
@@ -269,8 +270,7 @@ def _reset_quota_if_new_month(user: User) -> bool:
 
 
 async def check_comparison_quota(
-    user: Annotated[User, Depends(get_or_create_user)],
-    db: Annotated[AsyncSession, Depends(get_db)]
+    user: Annotated[User, Depends(get_or_create_user)], db: Annotated[AsyncSession, Depends(get_db)]
 ) -> User:
     """
     Check that the user has remaining comparison quota for this month.
@@ -295,7 +295,7 @@ async def check_comparison_quota(
                 f"Monthly comparison quota exhausted ({quota}/{quota}). "
                 f"Quota resets on the 1st of next month. "
                 f"Upgrade to a higher plan for more comparisons."
-            )
+            ),
         )
 
     if reset_happened:
@@ -304,19 +304,23 @@ async def check_comparison_quota(
     return user
 
 
-async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
+async def try_increment_comparison_usage(user: User, db: AsyncSession) -> bool:
     """
-    Atomically increment the comparison counter after a successful DEG upload.
-    Uses a conditional UPDATE (comparisons_used < quota) to prevent race conditions
-    where two concurrent requests both pass check_comparison_quota but only one
-    should succeed. Raises HTTP 429 if the atomic check fails.
-    Also sends a warning email at 80% quota.
-    Call this AFTER the dataset has been committed.
-    """
-    quota = user.comparisons_quota
-    if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or quota is None:
-        return  # Unlimited — skip
+    Incrémente le compteur de comparaisons si le quota le permet.
 
+    Contrat volontairement sans effet de bord : ne commit pas, ne rollback pas,
+    ne lève rien. C'est ce qui rend la fonction appelable depuis un worker
+    Celery, où une HTTPException abandonnerait une analyse dont le calcul
+    coûteux a déjà abouti. La politique (répondre 429, ou logger et continuer)
+    appartient à l'appelant, de même que le contrôle de la transaction.
+
+    Retourne True si le compteur a été incrémenté, ou si l'utilisateur est
+    illimité (rien n'est alors écrit). False si le quota a bloqué l'incrément.
+    """
+    if _has_unlimited_comparisons(user):
+        return True  # Illimité — rien à compter
+
+    quota = user.comparisons_quota
     result = await db.execute(
         update(User)
         .where(User.id == user.id)
@@ -324,9 +328,23 @@ async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
         .values(comparisons_used_this_month=User.comparisons_used_this_month + 1)
         .returning(User.comparisons_used_this_month)
     )
-    new_count = result.scalar()
-    if new_count is None:
-        # Quota was exhausted by a concurrent request — roll back the dataset commit
+    return result.scalar() is not None
+
+
+async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
+    """
+    Incrémente le compteur après un import DEG réussi, côté HTTP.
+    Lève 429 si le quota est épuisé — y compris quand une requête concurrente
+    l'a épuisé entre-temps, auquel cas le commit du dataset est annulé.
+    Envoie un avertissement par email au franchissement des 80 %.
+    À appeler APRÈS le commit du dataset.
+    """
+    if _has_unlimited_comparisons(user):
+        return  # Illimité — rien à faire
+
+    quota = user.comparisons_quota
+    if not await try_increment_comparison_usage(user, db):
+        # Quota épuisé par une requête concurrente — on annule le dataset
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -338,12 +356,13 @@ async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
     await db.commit()
     await db.refresh(user)
 
-    # 80% warning — fire and forget, never block the upload
+    # Avertissement à 80 % — au mieux, ne bloque jamais l'import
     quota = user.comparisons_quota
     used = user.comparisons_used_this_month
     if quota and used == int(quota * 0.8):
         try:
             from app.services.email_service import send_quota_warning_email
+
             await send_quota_warning_email(
                 to=user.email,
                 used=used,
@@ -351,17 +370,13 @@ async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
                 plan=user.subscription_plan.value,
             )
         except Exception:
-            import logging
-            logging.getLogger(__name__).warning(
-                "Failed to send 80%% quota warning email to %s", user.email
-            )
+            logger.warning("Failed to send 80%% quota warning email to %s", user.email)
 
 
 # ── Legacy alias (backward compat with existing callers) ─────────────────────
 
-async def require_analysis_access(
-    user: Annotated[User, Depends(get_or_create_user)]
-) -> User:
+
+async def require_analysis_access(user: Annotated[User, Depends(get_or_create_user)]) -> User:
     """Backward-compat alias — previously required ADVANCED plan.
     Now all paid plans can launch analyses (subject to quota).
     Use check_comparison_quota for new code."""
