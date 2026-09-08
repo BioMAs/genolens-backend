@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from uuid import UUID
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 import asyncio
 from fastapi import (
     APIRouter,
@@ -365,6 +365,90 @@ async def get_dataset(
     return dataset
 
 
+# Clés de `dataset_metadata` que le serveur calcule ou pose lui-même, et qu'un
+# client ne doit donc pas pouvoir écrire par PATCH.
+#
+# Deux raisons. La première est une barrière : `POST /analyses` refuse une
+# analyse dont le fichier de comparaisons déclare plus de lignes (`rows`) qu'il
+# ne reste de quota — un contrôle dont la seule entrée serait modifiable par le
+# client n'en serait pas un, `PATCH {"dataset_metadata": {"rows": 1}}` suffirait
+# à le contourner. La seconde est indépendante du quota : ces clés sont lues par
+# toute l'application (comptages DEG, chemins de figures, provenance), et les
+# laisser écrasables laissait un client corrompre les métadonnées calculées.
+#
+# Liste établie en relisant ce qu'écrit réellement l'ingestion —
+# `DataProcessor.get_file_metadata` (app/services/data_processor.py) et la fusion
+# `final_metadata` de `app/worker/tasks.py` — plus la provenance posée à la
+# création du dataset.
+#
+# Déni de liste et non liste blanche : le seul client connu à écrire ce champ est
+# `frontend/src/components/EditDatasetModal.tsx`, qui n'envoie que
+# `is_normalized` et `contains_all_genes`. Une liste blanche serait plus stricte
+# mais casserait un appelant non recensé (outillage admin, scripts) ; le déni de
+# liste ferme le contournement et la corruption tout en laissant passer les clés
+# descriptives inconnues.
+_CLIENT_PROTECTED_METADATA_KEYS = frozenset(
+    {
+        # Forme du fichier — get_file_metadata
+        "rows",
+        "columns",
+        "column_names",
+        "dtypes",
+        "memory_usage_bytes",
+        # Comparaisons et enrichissements détectés, statistiques DEG
+        "comparisons",
+        "columns_info",
+        "enrichment_comparisons",
+        "deg_stats",
+        # Artefacts calculés par le worker : ACP, figures, avertissements, QC
+        "pca",
+        "pca_results",
+        "pca_2d_path",
+        "pca_3d_path",
+        "plots",
+        "plot_results",
+        "volcano_plots_path",
+        "volcano_error",
+        "heatmaps_path",
+        "heatmap_error",
+        "enrichment_dotplots_path",
+        "dotplot_error",
+        "validation_warnings",
+        "qc_report",
+        # Provenance posée à la création du dataset
+        "analysis_id",
+        "comparison_name",
+        "source",
+        "geo_accession",
+    }
+)
+
+
+def _merge_client_metadata(
+    existing: Optional[dict[str, Any]],
+    incoming: dict[str, Any],
+    dataset_id: UUID,
+) -> dict[str, Any]:
+    """Fusionne la métadonnée fournie par un client dans celle du dataset.
+
+    Les clés de `_CLIENT_PROTECTED_METADATA_KEYS` sont écartées de l'apport du
+    client et conservent leur valeur serveur ; on log ce qui a été écarté plutôt
+    que de répondre 4xx, pour ne pas casser un appelant qui renverrait le dict
+    complet qu'il vient de lire.
+    """
+    merged = dict(existing or {})
+    dropped = sorted(k for k in incoming if k in _CLIENT_PROTECTED_METADATA_KEYS)
+    merged.update({k: v for k, v in incoming.items() if k not in _CLIENT_PROTECTED_METADATA_KEYS})
+    if dropped:
+        logger.warning(
+            "[DATASETS] Ignored client-supplied server-computed metadata key(s) "
+            "%s on dataset %s",
+            ", ".join(dropped),
+            dataset_id,
+        )
+    return merged
+
+
 @router.patch("/{dataset_id}", response_model=DatasetResponse)
 async def update_dataset(
     dataset_id: UUID,
@@ -398,10 +482,9 @@ async def update_dataset(
     update_data = dataset_in.model_dump(exclude_unset=True)
 
     if "dataset_metadata" in update_data:
-        # Merge existing metadata with new metadata
-        current_metadata = dict(dataset.dataset_metadata or {})
-        current_metadata.update(update_data["dataset_metadata"])
-        update_data["dataset_metadata"] = current_metadata
+        update_data["dataset_metadata"] = _merge_client_metadata(
+            dataset.dataset_metadata, update_data["dataset_metadata"], dataset_id
+        )
 
     if not update_data:
         return dataset
