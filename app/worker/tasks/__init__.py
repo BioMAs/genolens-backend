@@ -24,7 +24,7 @@ process_dataset_upload = _legacy_mod.process_dataset_upload  # noqa: F401
 import_geo_dataset = _legacy_mod.import_geo_dataset  # noqa: F401
 health_check = _legacy_mod.health_check  # noqa: F401
 run_self_service_analysis = _legacy_mod.run_self_service_analysis  # noqa: F401
-_count_pipeline_comparisons = _legacy_mod._count_pipeline_comparisons  # noqa: F401
+_count_pipeline_analysis = _legacy_mod._count_pipeline_analysis  # noqa: F401
 
 # ── New periodic quota task ───────────────────────────────────────────────────
 from app.worker.tasks.quota_tasks import reset_monthly_comparison_quotas  # noqa: F401

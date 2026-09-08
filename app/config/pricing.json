@@ -8,14 +8,14 @@
     "id": "deg_dataset_upload",
     "label_fr": "analyse",
     "label_en": "analysis",
-    "definition": "Un dépôt de dataset DEG. Le compteur s'incrémente de +1 par fichier accepté, indépendamment du nombre de contrastes qu'il contient.",
+    "definition": "Une analyse. Le compteur s'incrémente de +1 par dépôt de dataset DEG accepté, et de +1 par analyse self-service terminée ayant produit au moins un résultat — indépendamment, dans les deux cas, du nombre de contrastes que le fichier contient.",
     "identity_hash": null,
     "identity_excludes": [],
     "not_billable": [
       "consultation des résultats déjà déposés",
-      "analyse self-service lancée via POST /analyses (non compté aujourd'hui)"
+      "analyse self-service qui ne produit aucun résultat (mapping de conditions invalide)"
     ],
-    "rationale": "État des lieux, pas une intention. Le libellé « comparaison » employé dans le code et l'UI est trompeur : l'unité mesurée est le fichier déposé. Voir pricing.2026-09-draft.json pour l'unité cible (contraste interprété)."
+    "rationale": "L'unité est le dépôt, pas le contraste. Le chemin self-service comptait +1 par contraste produit depuis le 2026-09-08 : une analyse à 12 contrastes consommait 12 unités, et un STARTER à 30/mois épuisait son quota en 5 analyses. Corrigé le même jour. Le libellé « comparaison » employé dans le code et l'UI reste trompeur — le renommage en « analyse » est en cours. Voir pricing.2026-09-draft.json pour l'unité CIBLE (contraste interprété), qui est un autre modèle d'affaires et n'est pas adopté."
   },
   "a_la_carte": {
     "interpreted_contrast": null

@@ -856,9 +856,20 @@ def health_check() -> dict:
     return {"status": "healthy", "message": "Celery worker is running"}
 
 
-async def _count_pipeline_comparisons(user, db, count: int) -> None:
+async def _count_pipeline_analysis(user, db, produced_comparisons: int) -> None:
     """
-    Décompte en un seul UPDATE les comparaisons produites par le pipeline.
+    Décompte UNE unité de quota pour l'analyse que le pipeline vient de finir.
+
+    UNE unité, quel que soit le nombre de contrastes produits. C'est l'unité
+    que déclare la grille tarifaire (`app/config/pricing.json`,
+    `billable_unit`) : « +1 par fichier accepté, indépendamment du nombre de
+    contrastes qu'il contient ». La première version ajoutait une unité par
+    comparaison : une analyse à 12 contrastes consommait alors 12 unités, et un
+    STARTER à 30/mois épuisait son quota en 5 analyses.
+
+    `produced_comparisons` ne sert donc qu'à distinguer l'analyse qui a produit
+    quelque chose de celle qui n'a rien produit — on ne facture pas un résultat
+    vide.
 
     Ne fait jamais échouer l'analyse : le calcul est déjà terminé et les
     résultats existent, les jeter pour un dépassement de quota serait un
@@ -868,8 +879,8 @@ async def _count_pipeline_comparisons(user, db, count: int) -> None:
     la comptabilité. Le compteur ne dépasse jamais le quota, et aucune analyse
     déjà calculée n'est annulée.
 
-    Un seul UPDATE, émis juste avant le commit final, et non un par
-    comparaison : l'UPDATE conditionnel prend un verrou de ligne sur `users`,
+    Un seul UPDATE, émis juste avant le commit final : l'UPDATE conditionnel
+    prend un verrou de ligne sur `users`,
     et la boucle DEG peut passer jusqu'à 1800 s par contraste dans
     `subprocess.run` (enrichissement annoDB). Un verrou pris au premier
     contraste bloquait donc jusqu'au commit toute écriture concurrente sur
@@ -878,11 +889,11 @@ async def _count_pipeline_comparisons(user, db, count: int) -> None:
     `get_or_create_user` — depuis des requêtes FastAPI qui tiennent une
     connexion du pool, que le moindre `lock_timeout` transformait en 500.
 
-    `user` à None (ligne locale introuvable) ou `count` nul : no-op silencieux.
-    Ne commit pas, ne rollback pas : le contrôle de la transaction reste à
-    l'appelant.
+    `user` à None (ligne locale introuvable) ou aucune comparaison produite :
+    no-op silencieux. Ne commit pas, ne rollback pas : le contrôle de la
+    transaction reste à l'appelant.
     """
-    if user is None or count <= 0:
+    if user is None or produced_comparisons <= 0:
         return
     from sqlalchemy import func
 
@@ -897,20 +908,21 @@ async def _count_pipeline_comparisons(user, db, count: int) -> None:
         update(_User)
         .where(_User.id == user.id)
         .values(
-            comparisons_used_this_month=func.least(quota, _User.comparisons_used_this_month + count)
+            comparisons_used_this_month=func.least(
+                quota, _User.comparisons_used_this_month + 1
+            )
         )
         .returning(_User.comparisons_used_this_month)
     )
     new_used = result.scalar()
     if new_used is not None and new_used >= quota:
-        # Le plafond a mordu : le quota est saturé et une partie des
-        # comparaisons enregistrées n'est pas comptée. On garde la trace, la
-        # saturation doit rester visible.
+        # Le plafond a mordu : l'analyse est livrée mais n'a pas pu être
+        # décomptée. On garde la trace, la saturation doit rester visible.
         logger.warning(
-            "[ANALYSIS] Comparison quota saturated for user %s — %d comparison(s) "
-            "registered, counter capped at %d/%d",
+            "[ANALYSIS] Analysis quota saturated for user %s — analysis delivered "
+            "with %d comparison(s), counter capped at %d/%d",
             user.id,
-            count,
+            produced_comparisons,
             new_used,
             quota,
         )
@@ -1242,8 +1254,8 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 # Quota : un seul UPDATE plafonné, juste avant le commit, pour
                 # ne pas tenir un verrou sur la ligne `users` pendant toute la
                 # boucle DEG (jusqu'à 1800 s par contraste dans subprocess.run).
-                # Voir _count_pipeline_comparisons.
-                await _count_pipeline_comparisons(quota_user, db, len(deg_comparison_ids))
+                # Une unité par analyse. Voir _count_pipeline_analysis.
+                await _count_pipeline_analysis(quota_user, db, len(deg_comparison_ids))
 
                 db.add(analysis)
                 await db.commit()
