@@ -34,6 +34,10 @@ class UserSelf(User):
     comparisons_quota: Optional[int] = None       # None = unlimited
     comparisons_remaining: Optional[int] = None   # None = unlimited
     max_projects: Optional[int] = None
+    # Projets POSSÉDÉS uniquement (pas partagés) — même prédicat que la limite
+    # appliquée par create_project, pour que le client puisse afficher "used/max"
+    # sans se tromper sur ce qui est compté. Un GET /projects mêle owned+shared.
+    project_count: int = 0
     max_datasets_per_project: Optional[int] = None
     can_use_ai: bool = False
     can_use_multi_comparison: bool = False
