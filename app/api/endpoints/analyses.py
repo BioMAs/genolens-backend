@@ -148,6 +148,37 @@ def _declared_comparisons(metadata: Optional[dict]) -> Optional[int]:
     return None
 
 
+async def _in_flight_comparisons(db: AsyncSession, user_id: UUID) -> int:
+    """Comparaisons déjà admises mais pas encore comptées, pour cet utilisateur.
+
+    `comparisons_used_this_month` n'avance qu'à la *fin* du worker. Sans cette
+    déduction, un compte à 30 restantes peut poster dix analyses de 5
+    contrastes en quelques secondes : chacune voit 30 restantes, les dix sont
+    admises, 50 comparaisons sont calculées et le compteur plafonne à 30. Avec
+    `--concurrency=1` sur la file `r_analysis` la file d'attente les absorbe,
+    donc ce n'est pas une course étroite.
+
+    On somme les lignes déclarées par les fichiers de comparaisons des analyses
+    PENDING / RUNNING de l'appelant. Jointure externe et non interne : une
+    analyse dont le dataset de comparaisons a disparu (`ON DELETE SET NULL`)
+    doit compter, pas s'évaporer. Un fichier dont `rows` est inconnu compte
+    pour 1 et non pour 0 — sous-estimer la demande en vol est précisément ce
+    que ce contrôle existe pour empêcher.
+    """
+    result = await db.execute(
+        select(Dataset.dataset_metadata)
+        .select_from(SelfServiceAnalysis)
+        .outerjoin(Dataset, Dataset.id == SelfServiceAnalysis.comparisons_dataset_id)
+        .where(
+            SelfServiceAnalysis.user_id == user_id,
+            SelfServiceAnalysis.status.in_(
+                (SelfServiceAnalysisStatus.PENDING, SelfServiceAnalysisStatus.RUNNING)
+            ),
+        )
+    )
+    return sum(_declared_comparisons(meta) or 1 for meta in result.scalars())
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -238,16 +269,21 @@ async def create_analysis(
     # Le pipeline crée un dataset DEG par contraste. On refuse ici, avant tout
     # calcul : une fois l'analyse lancée on ne l'annule plus pour un quota.
     db_user = await check_comparison_quota(db_user, db)
-    remaining = db_user.comparisons_remaining
-    if remaining is not None:
+    counter_remaining = db_user.comparisons_remaining
+    if counter_remaining is not None:
+        # Réservation : le compteur ne bouge qu'à la fin du worker, donc on
+        # retire d'abord la demande des analyses déjà admises et pas encore
+        # comptées. Sans ça dix analyses postées coup sur coup voient toutes le
+        # même reste et passent toutes.
+        in_flight = await _in_flight_comparisons(db, current_user.user_id)
+        remaining = max(0, counter_remaining - in_flight)
+
         comparisons_ds = await db.scalar(
             select(Dataset).where(Dataset.id == payload.comparisons_dataset_id)
         )
         requested = _declared_comparisons(
             comparisons_ds.dataset_metadata if comparisons_ds else None
         )
-        # `requested` à None = dataset encore en traitement. On se contente du
-        # contrôle « au moins une comparaison restante » fait juste au-dessus.
         if requested is not None and requested > remaining:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -255,6 +291,18 @@ async def create_analysis(
                     f"This comparisons file declares {requested} comparisons but "
                     f"only {remaining} remain this month. Quota resets on the 1st "
                     "of next month. Upgrade your plan for more comparisons."
+                ),
+            )
+        # `requested` à None = dataset encore en traitement : on se rabat sur
+        # « au moins une comparaison restante », en vol déduit.
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Analyses already queued claim the {counter_remaining} "
+                    f"comparison(s) left this month ({in_flight} pending). Wait "
+                    "for them to finish, or upgrade your plan for more "
+                    "comparisons."
                 ),
             )
 

@@ -71,12 +71,23 @@ def make_metadata_dataset(metadata: dict) -> Dataset:
     return ds
 
 
-def make_client(*, as_user: User, comparisons_dataset: Dataset, project_owned: bool = True):
+def make_client(
+    *,
+    as_user: User,
+    comparisons_dataset: Dataset,
+    project_owned: bool = True,
+    in_flight: tuple = (),
+):
     """Client dont l'utilisateur résolu est `as_user`.
 
     `db.scalar` est appelé deux fois par la route : d'abord pour le projet,
     ensuite (après notre ajout) pour le dataset de comparaisons. On répond dans
     cet ordre. Sans l'override de get_db la route toucherait une vraie base.
+
+    `in_flight` est la liste des `dataset_metadata` que renvoie la requête de
+    réservation (`_in_flight_comparisons`) : une entrée par analyse PENDING /
+    RUNNING de l'appelant, `None` pour une analyse dont le dataset de
+    comparaisons a disparu.
     """
     from app.api.deps.license import require_active_license
     from app.api.deps.subscription import get_or_create_user
@@ -106,7 +117,11 @@ def make_client(*, as_user: User, comparisons_dataset: Dataset, project_owned: b
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock(side_effect=_refresh)
-    db.execute = AsyncMock()
+    # `_in_flight_comparisons` itère `result.scalars()` ; un MagicMock nu n'est
+    # pas itérable et ferait echouer la route avant le controle de quota.
+    in_flight_result = MagicMock()
+    in_flight_result.scalars = MagicMock(return_value=list(in_flight))
+    db.execute = AsyncMock(return_value=in_flight_result)
     db.scalar = AsyncMock(side_effect=[project if project_owned else None, comparisons_dataset])
 
     async def _fake_db():
@@ -275,3 +290,120 @@ async def test_total_rows_is_still_honoured_as_a_fallback():
         res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
 
     assert res.status_code == 429
+
+
+# ── Réservation de la demande en vol ────────────────────────────────────────
+
+
+async def test_refuses_when_queued_analyses_already_claim_the_quota():
+    """`comparisons_used_this_month` ne bouge qu'à la fin du worker : sans
+    réservation, dix analyses postées coup sur coup voient toutes le même reste
+    et sont toutes admises."""
+    user = make_user(used=25)  # STARTER: 30 - 25 = 5 restantes
+    ds = make_comparisons_dataset(declared=5)
+    client, db, project = make_client(
+        as_user=user,
+        comparisons_dataset=ds,
+        # Une analyse de 5 contrastes déjà en file : les 5 restantes sont prises.
+        in_flight=({"rows": 5},),
+    )
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 429
+    added = [type(call.args[0]).__name__ for call in db.add.call_args_list]
+    assert "SelfServiceAnalysis" not in added
+
+
+async def test_in_flight_demand_is_subtracted_before_comparing():
+    user = make_user(used=20)  # 10 restantes
+    ds = make_comparisons_dataset(declared=6)
+    client, db, project = make_client(
+        as_user=user,
+        comparisons_dataset=ds,
+        in_flight=({"rows": 5},),  # reste effectif : 10 - 5 = 5 < 6
+    )
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 429
+    detail = res.json()["detail"]
+    assert "6" in detail and "5" in detail
+
+
+async def test_allows_when_the_request_fits_after_reservation():
+    user = make_user(used=20)  # 10 restantes
+    ds = make_comparisons_dataset(declared=5)
+    client, db, project = make_client(
+        as_user=user,
+        comparisons_dataset=ds,
+        in_flight=({"rows": 5},),  # reste effectif : 5, la demande tient pile
+    )
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 201
+
+
+async def test_in_flight_analysis_without_rows_counts_as_one():
+    """Sous-estimer la demande en vol est ce que cette réservation empêche :
+    une métadonnée absente compte pour 1, pas pour 0."""
+    user = make_user(used=29)  # 1 restante
+    ds = make_comparisons_dataset(declared=1)
+    client, db, project = make_client(
+        as_user=user,
+        comparisons_dataset=ds,
+        in_flight=({},),  # `rows` inconnu → 1 en vol → reste effectif 0
+    )
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 429
+
+
+async def test_in_flight_analysis_with_a_deleted_dataset_still_counts():
+    """`comparisons_dataset_id` est `ON DELETE SET NULL` : la jointure externe
+    rend `None`, l'analyse doit compter pour 1 et non s'évaporer."""
+    user = make_user(used=29)  # 1 restante
+    ds = make_comparisons_dataset(declared=1)
+    client, db, project = make_client(as_user=user, comparisons_dataset=ds, in_flight=(None,))
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 429
+
+
+async def test_reservation_refuses_even_when_rows_is_unknown():
+    """Dataset encore en traitement : plus de repli permissif dès que la
+    demande en vol a déjà consommé le reste."""
+    user = make_user(used=25)  # 5 restantes
+    ds = make_comparisons_dataset(declared=None)
+    client, db, project = make_client(
+        as_user=user, comparisons_dataset=ds, in_flight=({"rows": 5},)
+    )
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 429
+    detail = res.json()["detail"]
+    assert "5" in detail
+
+
+async def test_no_reservation_query_for_unlimited_users():
+    """Un plan illimité ne doit pas payer la requête de réservation."""
+    user = make_user(plan=SubscriptionPlan.ON_PREMISE, used=999)
+    ds = make_comparisons_dataset(declared=500)
+    client, db, project = make_client(as_user=user, comparisons_dataset=ds)
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    assert res.status_code == 201
+    # Le seul `db.execute` de la route est celui qui pose `celery_task_id`.
+    assert db.execute.await_count <= 1
