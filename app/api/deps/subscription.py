@@ -245,6 +245,13 @@ async def require_team_plan(user: Annotated[User, Depends(get_or_create_user)]) 
 # ── Comparison quota ───────────────────────────────────────────────────────────
 
 
+def _has_unlimited_comparisons(user: User) -> bool:
+    """True when no comparison quota applies: privileged roles and plans whose
+    `comparisons_quota` is None. The single place this condition is expressed —
+    a new privileged role must not have to be added twice."""
+    return user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or user.comparisons_quota is None
+
+
 def _reset_quota_if_new_month(user: User) -> bool:
     """
     Reset comparisons_used_this_month if we're in a new calendar month.
@@ -310,10 +317,10 @@ async def try_increment_comparison_usage(user: User, db: AsyncSession) -> bool:
     Retourne True si le compteur a été incrémenté, ou si l'utilisateur est
     illimité (rien n'est alors écrit). False si le quota a bloqué l'incrément.
     """
-    quota = user.comparisons_quota
-    if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or quota is None:
+    if _has_unlimited_comparisons(user):
         return True  # Illimité — rien à compter
 
+    quota = user.comparisons_quota
     result = await db.execute(
         update(User)
         .where(User.id == user.id)
@@ -332,10 +339,10 @@ async def increment_comparison_usage(user: User, db: AsyncSession) -> None:
     Envoie un avertissement par email au franchissement des 80 %.
     À appeler APRÈS le commit du dataset.
     """
-    quota = user.comparisons_quota
-    if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or quota is None:
+    if _has_unlimited_comparisons(user):
         return  # Illimité — rien à faire
 
+    quota = user.comparisons_quota
     if not await try_increment_comparison_usage(user, db):
         # Quota épuisé par une requête concurrente — on annule le dataset
         await db.rollback()
