@@ -1066,9 +1066,8 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 quota_user = None
                 if analysis.user_id:
                     from app.models.models import User as _User
-                    quota_user = await db.scalar(
-                        select(_User).where(_User.id == analysis.user_id)
-                    )
+
+                    quota_user = await db.scalar(select(_User).where(_User.id == analysis.user_id))
                     if quota_user is None:
                         logger.warning(
                             "[ANALYSIS] No local user row for %s — "

@@ -8,12 +8,12 @@ Le nombre de contrastes vit dans `dataset_metadata["total_rows"]` du dataset de
 comparaisons ; il n'est pas dans la charge utile de la requête.
 """
 
-import pytest
-import pytest_asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import pytest
+import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from app.models.models import (
