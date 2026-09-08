@@ -789,30 +789,6 @@ class User(Base, TimestampMixin):
             return None
         return max(0, quota - self.analyses_used_this_month)
 
-    # ── Alias depreciés, a retirer ────────────────────────────────────────
-    #
-    # Servis le temps que le frontend deploye bascule sur les noms en
-    # `analyses_*`. Le backend et le frontend se deploient separement : retirer
-    # les anciens noms dans le meme lot que leur remplacement casserait la
-    # version deja en ligne pendant la fenetre entre les deux deploiements.
-    # A supprimer, avec les champs correspondants des schemas, une fois le
-    # frontend passe.
-
-    @property
-    def comparisons_used_this_month(self) -> int:
-        """Deprecié : lire `analyses_used_this_month`."""
-        return self.analyses_used_this_month
-
-    @property
-    def comparisons_quota(self) -> Optional[int]:
-        """Deprecié : lire `analyses_quota`."""
-        return self.analyses_quota
-
-    @property
-    def comparisons_remaining(self) -> Optional[int]:
-        """Deprecié : lire `analyses_remaining`."""
-        return self.analyses_remaining
-
     @property
     def max_projects(self) -> Optional[int]:
         """Max number of projects. None = unlimited."""
