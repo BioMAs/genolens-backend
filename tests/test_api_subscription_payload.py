@@ -21,7 +21,7 @@ from app.models.models import SubscriptionPlan, User, UserRole, UserStatus
 
 ENDPOINT = "/api/v1/billing/subscription"
 
-CURRENT_KEYS = {
+EXPECTED_KEYS = {
     "plan",
     "is_active",
     "stripe_customer_id",
@@ -33,17 +33,6 @@ CURRENT_KEYS = {
     "can_use_ai",
     "can_use_multi_comparison",
 }
-
-#: Anciens noms, servis le temps que le frontend deploye bascule. Ce test est
-#: ce qui forcera leur retrait a etre explicite : supprimer les champs sans
-#: toucher a cet ensemble fait echouer la suite.
-DEPRECATED_KEYS = {
-    "comparisons_used_this_month",
-    "comparisons_quota",
-    "comparisons_remaining",
-}
-
-EXPECTED_KEYS = CURRENT_KEYS | DEPRECATED_KEYS
 
 
 def make_user() -> User:
@@ -115,18 +104,22 @@ async def test_dates_are_null_when_absent():
     assert res.json()["subscription_ends_at"] is None
 
 
-async def test_deprecated_aliases_mirror_the_current_fields():
-    """Les deux vocabulaires doivent dire la meme chose.
+async def test_payload_no_longer_carries_the_old_comparison_names():
+    """Les trois alias servis pendant la transition ont bien disparu.
 
-    Servir deux noms pour une meme valeur n'est tenable que s'ils ne peuvent
-    pas divulguer : ce test echoue si un alias est cable sur autre chose que le
-    champ qu'il remplace.
+    Ils existaient pour que le frontend deja deploye continue de fonctionner
+    entre les deux deploiements, qui sont independants. Le frontend lit les
+    noms en `analyses_*` depuis le 08/09 ; ce test verrouille le retrait pour
+    qu'aucun code neuf ne se recable dessus.
     """
     user = make_user()
     async with make_client(user) as client:
         res = await client.get(ENDPOINT)
 
     body = res.json()
-    assert body["comparisons_used_this_month"] == body["analyses_used_this_month"]
-    assert body["comparisons_quota"] == body["analyses_quota"]
-    assert body["comparisons_remaining"] == body["analyses_remaining"]
+    for gone in (
+        "comparisons_used_this_month",
+        "comparisons_quota",
+        "comparisons_remaining",
+    ):
+        assert gone not in body, gone

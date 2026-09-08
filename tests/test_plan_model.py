@@ -253,17 +253,3 @@ def test_the_analyses_counter_still_maps_to_its_original_column():
 
     update_sql = str(update(User).values(analyses_used_this_month=3))
     assert "comparisons_used_this_month" in update_sql, update_sql
-
-
-def test_deprecated_quota_aliases_read_through_to_the_new_names():
-    """Les trois alias servis à l'ancien frontend lisent bien la nouvelle source."""
-    from app.models.models import SubscriptionPlan, User, UserRole
-
-    u = User()
-    u.role = UserRole.USER
-    u.subscription_plan = SubscriptionPlan.STARTER
-    u.analyses_used_this_month = 4
-
-    assert u.comparisons_used_this_month == 4
-    assert u.comparisons_quota == u.analyses_quota == 30
-    assert u.comparisons_remaining == u.analyses_remaining == 26

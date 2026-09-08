@@ -67,13 +67,6 @@ class SubscriptionResponse(BaseModel):
     analyses_used_this_month: int
     analyses_quota: int | None
     analyses_remaining: int | None
-    # Anciens noms, servis le temps que le frontend deploye bascule. Backend et
-    # frontend se deploient separement : les retirer dans le meme lot que leur
-    # remplacement casserait la version en ligne entre les deux deploiements.
-    # A retirer une fois le frontend passe.
-    comparisons_used_this_month: int
-    comparisons_quota: int | None
-    comparisons_remaining: int | None
     can_use_ai: bool
     can_use_multi_comparison: bool
 
@@ -199,10 +192,6 @@ async def get_subscription(
         "analyses_used_this_month": db_user.analyses_used_this_month,
         "analyses_quota": db_user.analyses_quota,
         "analyses_remaining": db_user.analyses_remaining,
-        # Alias depreciés — voir SubscriptionResponse.
-        "comparisons_used_this_month": db_user.analyses_used_this_month,
-        "comparisons_quota": db_user.analyses_quota,
-        "comparisons_remaining": db_user.analyses_remaining,
         "can_use_ai": db_user.can_use_ai,
         "can_use_multi_comparison": db_user.can_use_multi_comparison,
     }
