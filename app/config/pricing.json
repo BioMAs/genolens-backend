@@ -1,7 +1,7 @@
 {
-  "$comment": "GenoLens — grille ACTIVE. Source de vérité unique pour les plans, quotas et entitlements, servie par GET /api/v1/pricing. Aucun prix, quota ou entitlement ne doit être codé en dur ailleurs. Montants en euros HT. Ce fichier décrit délibérément le comportement RÉELLEMENT appliqué aujourd'hui, pas la grille cible : voir pricing.2026-09-draft.json pour la proposition. tests/test_pricing_config.py échoue si une valeur ici diverge de la propriété correspondante sur le modèle User.",
+  "$comment": "GenoLens — grille ACTIVE. Source de vérité unique pour les plans, quotas et entitlements, servie par GET /api/v1/pricing. Aucun prix, quota ou entitlement ne doit être codé en dur ailleurs. Montants en euros HT. Les champs STRUCTURELS (contrast_quota, max_projects, datasets_limit_per_project, entitlements, overage) décrivent délibérément le comportement RÉELLEMENT appliqué : tests/test_pricing_config.py échoue si l'un d'eux diverge de la propriété correspondante sur le modèle User. Les champs COMMERCIAUX (price_*, marketing_features, description_en) sont, depuis le 2026-09-08, un miroir de genolens.com/pricing — donc une promesse, pas une garde ; les écarts connus entre les deux sont listés dans le `note` de chaque plan. Voir pricing.2026-09-draft.json pour la grille cible.",
   "version": "2026.09-active",
-  "status": "ACTIF — reflète le comportement en production. Toute divergence avec app/models/models.py est un bug de test.",
+  "status": "ACTIF — champs structurels alignés sur le code, cartes publiques alignées sur genolens.com/pricing au 2026-09-08. Toute divergence entre un champ structurel et app/models/models.py est un bug de test.",
   "currency": "EUR",
   "tax_mode": "HT",
   "billable_unit": {
@@ -27,7 +27,7 @@
       "name_en": "Starter",
       "order": 1,
       "price_monthly": 100.0,
-      "price_annual": 1000.0,
+      "price_annual": 1020.0,
       "billing": [
         "monthly",
         "annual"
@@ -43,7 +43,7 @@
         "multi_comparison": false,
         "advanced_export": false
       },
-      "note": "Le tarif annuel affiché sur /pricing est 1 000 €. L'estimation MRR de l'admin porte un commentaire contradictoire (85 €/mois en annuel, soit 1 020 €) : écart à trancher, hors périmètre. La page de prix annonce « 5 datasets » pour le compte entier alors que la limite appliquée est de 5 datasets DEG PAR PROJET (donc jusqu'à 75 avec 15 projets).",
+      "note": "Carte alignée sur genolens.com/pricing (relevé 2026-09-08). price_annual = 1 020 € (85 €/mois facturés annuellement), ce qui tranche l'écart précédemment noté ici. Écarts vitrine/application ASSUMÉS et non résolus par cet alignement : « 5 datasets » est annoncé pour le compte entier alors que la limite appliquée est de 5 datasets DEG PAR PROJET (jusqu'à 75 avec 15 projets) ; « API access : non inclus » est faux — le limiteur est global (1000/hour, middleware/rate_limit.py:73) et un STARTER appelle l'API comme les autres ; « 6-month data retention » n'est pas appliqué, aucune purge n'est implémentée.",
       "description_en": "Get started with RNA-seq analysis and all the essential features you need.",
       "engagement_en": "Monthly or annual billing",
       "cta_label_en": "Request Starter",
@@ -89,6 +89,10 @@
           "included": false
         },
         {
+          "label": "Priority support",
+          "included": false
+        },
+        {
           "label": "Team collaboration",
           "included": false
         }
@@ -101,7 +105,7 @@
       "order": 2,
       "most_popular": true,
       "price_monthly": 250.0,
-      "price_annual": 2500.0,
+      "price_annual": 2400.0,
       "billing": [
         "monthly",
         "annual"
@@ -117,13 +121,13 @@
         "multi_comparison": true,
         "advanced_export": true
       },
-      "note": "L'identifiant technique est TEAM, l'affichage commercial est « Pro » — les deux coexistent, d'où name_fr/name_en. La page annonce « 25 datasets » et « AI interpretation (50 reports / month) » : ni l'un ni l'autre n'est appliqué (datasets illimités, volume IA non compté).",
+      "note": "L'identifiant technique est TEAM, l'affichage commercial est « Pro » — d'où name_fr/name_en. Carte alignée sur genolens.com/pricing (relevé 2026-09-08). price_annual = 2 400 € (200 €/mois facturés annuellement). Écarts vitrine/application ASSUMÉS, à corriger côté site ou côté code, pas par cette grille : « 50 datasets » n'est pas appliqué (aucun plafond pour TEAM) ; « AI interpretation (50 reports / month) » est un booléen, pas un quota (ai_interpretations_used n'est jamais incrémenté) ; « REST API (120 req / min) » vaut 1000/hour pour tout le monde ; « Multi-contrast » n'est gardé nulle part (require_team_plan est du code mort, cf. subscription.py:232) ; « GSEA : inclus » est le point le plus exposé — la garde réelle est l'add-on scientific, donc un TEAM sans le module n'a pas GSEA alors que la vitrine le lui vend. « Team collaboration » et « Custom gene sets » passent à non inclus pour suivre le site : la première n'est gardée par aucun plan (POST /projects/{id}/members ne teste que la propriété du projet), la seconde appartient à l'add-on scientific.",
       "description_en": "For researchers and postdocs with advanced analytical needs and higher data volumes.",
       "engagement_en": "Monthly or annual billing",
       "cta_label_en": "Request Pro",
       "marketing_features": [
         {
-          "label": "25 datasets",
+          "label": "50 datasets",
           "included": true
         },
         {
@@ -147,7 +151,7 @@
           "included": true
         },
         {
-          "label": "REST API (120 req/min)",
+          "label": "REST API (120 req / min)",
           "included": true
         },
         {
@@ -155,16 +159,24 @@
           "included": true
         },
         {
-          "label": "Email support (48h)",
+          "label": "Email support (48 h)",
           "included": true
         },
         {
           "label": "Team collaboration",
-          "included": true
+          "included": false
         },
         {
           "label": "Custom gene sets",
-          "included": true
+          "included": false
+        },
+        {
+          "label": "SSO / SAML",
+          "included": false
+        },
+        {
+          "label": "On-premise deployment",
+          "included": false
         }
       ]
     },
@@ -191,7 +203,7 @@
         "multi_comparison": true,
         "advanced_export": true
       },
-      "note": "Attribué par un administrateur, sans prix Stripe. La grille interne licencie l'on-premise à 15 000 €/an ; ce montant n'est pas encore porté ici faute d'arbitrage.",
+      "note": "Attribué par un administrateur, sans prix Stripe. Carte alignée sur genolens.com/pricing (relevé 2026-09-08) : cinq bullets, SSO / SAML retiré parce que le site ne l'annonce pas sur cette carte et que rien ne l'implémente (auth = Supabase). La grille interne licencie l'on-premise à 15 000 €/an ; ce montant n'est pas encore porté ici faute d'arbitrage.",
       "description_en": "For labs, institutions and organisations with specific requirements. Fully custom.",
       "engagement_en": "Fully custom terms",
       "cta_label_en": "Contact sales",
@@ -205,11 +217,7 @@
           "included": true
         },
         {
-          "label": "SSO / SAML",
-          "included": true
-        },
-        {
-          "label": "Advanced integrations",
+          "label": "Priority support",
           "included": true
         },
         {
@@ -217,7 +225,7 @@
           "included": true
         },
         {
-          "label": "Priority support",
+          "label": "Advanced integrations",
           "included": true
         }
       ],
