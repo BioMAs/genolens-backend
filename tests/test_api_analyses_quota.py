@@ -1,16 +1,21 @@
 """
-`POST /analyses` ne vérifiait aucun quota. Le pipeline R produit un dataset DEG
-par contraste, donc lancer une analyse à 20 contrastes avec 5 comparaisons
-restantes doit être refusé au lancement — après, le calcul a déjà tourné et on
-ne l'annule pas.
+Quota au lancement d'une analyse, **une unité par analyse**.
 
-Le nombre de contrastes vit dans `dataset_metadata["rows"]` du dataset de
-comparaisons — la clé qu'écrit `DataProcessor.get_file_metadata` à
-l'ingestion ; il n'est pas dans la charge utile de la requête.
-`test_gate_reads_the_key_real_ingestion_writes` épingle ce contrat en passant
-par le vrai producteur de métadonnées : la première version de ce contrôle
-lisait `total_rows`, que la production n'émet jamais, et la barrière était
-donc inerte.
+L'unité facturable est celle que déclare la grille tarifaire
+(`app/config/pricing.json`, `billable_unit.id = deg_dataset_upload`) : « +1 par
+fichier accepté, **indépendamment du nombre de contrastes qu'il contient** ».
+Une analyse à 20 contrastes coûte donc autant qu'une analyse à 1.
+
+La première version de cette barrière comptait les contrastes : elle refusait
+une analyse à 12 contrastes à un compte qui avait 5 unités restantes, et un
+STARTER à 30/mois atteignait son plafond en 5 analyses au lieu de 30. Les tests
+d'alors épinglaient ce comptage ; ils épinglent maintenant son inverse, et
+`test_allows_an_analysis_declaring_more_contrasts_than_remain` est là pour que
+la régression ne puisse pas revenir sans être vue.
+
+Reste la réservation en vol : le compteur n'avance qu'à la fin du worker, donc
+la route déduit les analyses déjà admises et pas encore comptées — une unité
+chacune.
 """
 
 from datetime import datetime, timezone
@@ -76,19 +81,18 @@ def make_client(
     as_user: User,
     comparisons_dataset: Dataset | None,
     project_owned: bool = True,
-    in_flight: tuple = (),
+    in_flight: int = 0,
 ):
     """Client dont l'utilisateur résolu est `as_user`.
 
-    `db.scalar` est appelé deux fois par la route : d'abord pour le projet,
-    ensuite pour le dataset de comparaisons. On répond dans cet ordre.
+    `db.scalar` est appelé trois fois par la route : le projet, le dataset de
+    comparaisons, puis le COUNT des analyses en vol. On répond dans cet ordre.
     `comparisons_dataset=None` simule un id absent du projet. Sans l'override
     de get_db la route toucherait une vraie base.
 
-    `in_flight` est la liste des `dataset_metadata` que renvoie la requête de
-    réservation (`_in_flight_comparisons`) : une entrée par analyse PENDING /
-    RUNNING de l'appelant, `None` pour une analyse dont le dataset de
-    comparaisons a disparu.
+    `in_flight` est le nombre d'analyses PENDING / RUNNING de l'appelant, que
+    renvoie le COUNT de `_in_flight_analyses` — troisième et dernier appel à
+    `db.scalar` de la route.
     """
     from app.api.deps.license import require_active_license
     from app.api.deps.subscription import get_or_create_user
@@ -118,12 +122,10 @@ def make_client(
     db.add = MagicMock()
     db.commit = AsyncMock()
     db.refresh = AsyncMock(side_effect=_refresh)
-    # `_in_flight_comparisons` itère `result.scalars()` ; un MagicMock nu n'est
-    # pas itérable et ferait echouer la route avant le controle de quota.
-    in_flight_result = MagicMock()
-    in_flight_result.scalars = MagicMock(return_value=list(in_flight))
-    db.execute = AsyncMock(return_value=in_flight_result)
-    db.scalar = AsyncMock(side_effect=[project if project_owned else None, comparisons_dataset])
+    db.execute = AsyncMock(return_value=MagicMock())
+    db.scalar = AsyncMock(
+        side_effect=[project if project_owned else None, comparisons_dataset, in_flight]
+    )
 
     async def _fake_db():
         yield db
@@ -168,25 +170,22 @@ async def _clear_overrides():
     app.dependency_overrides.clear()
 
 
-async def test_refuses_when_requested_contrasts_exceed_remaining():
-    user = make_user(used=25)  # STARTER: 30 - 25 = 5 restantes
+async def test_allows_an_analysis_declaring_more_contrasts_than_remain():
+    """Le nombre de contrastes n'entre pas dans le quota : une analyse à 12
+    contrastes passe avec une seule unité restante."""
+    user = make_user(used=29)  # STARTER: 30 - 29 = 1 restante
     ds = make_comparisons_dataset(declared=12)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
 
     async with client:
         res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
 
-    assert res.status_code == 429
-    detail = res.json()["detail"]
-    assert "12" in detail and "5" in detail
-    # Pas `db.add.assert_not_called()` : `check_comparison_quota` peut
-    # legitimement ajouter l'utilisateur pour persister une remise a zero
-    # mensuelle. On verifie ce qui compte -- aucune analyse creee.
+    assert res.status_code == 201
     added = [type(call.args[0]).__name__ for call in db.add.call_args_list]
-    assert "SelfServiceAnalysis" not in added
+    assert "SelfServiceAnalysis" in added
 
 
-async def test_allows_when_requested_contrasts_fit():
+async def test_allows_when_a_unit_remains():
     user = make_user(used=25)  # 5 restantes
     ds = make_comparisons_dataset(declared=5)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
@@ -206,11 +205,16 @@ async def test_refuses_when_quota_already_exhausted():
         res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
 
     assert res.status_code == 429
+    # Pas `db.add.assert_not_called()` : `check_comparison_quota` peut
+    # legitimement ajouter l'utilisateur pour persister une remise a zero
+    # mensuelle. On verifie ce qui compte -- aucune analyse creee.
+    added = [type(call.args[0]).__name__ for call in db.add.call_args_list]
+    assert "SelfServiceAnalysis" not in added
 
 
 async def test_allows_when_rows_metadata_is_absent():
-    """Dataset encore en traitement : on se rabat sur « au moins une
-    comparaison restante ». Le worker plafonnera le compteur."""
+    """La métadonnée de lignes n'est plus lue du tout par la barrière : un
+    dataset encore en traitement ne change donc rien au verdict."""
     user = make_user(used=25)
     ds = make_comparisons_dataset(declared=None)
     client, db, project = make_client(as_user=user, comparisons_dataset=ds)
@@ -243,71 +247,20 @@ async def test_unlimited_plan_is_never_refused():
     assert res.status_code == 201
 
 
-async def test_gate_reads_the_key_real_ingestion_writes():
-    """Test d'intégration du contrat ingestion → barrière.
+async def test_in_flight_analyses_count_one_unit_each():
+    """La réservation compte les analyses en vol, pas leurs contrastes.
 
-    Les autres tests fabriquent la métadonnée à la main : ils passeraient
-    même si la barrière lisait une clé que la production n'écrit jamais —
-    c'est exactement le défaut qu'ils n'ont pas attrapé. Celui-ci construit un
-    vrai fichier de comparaisons, le fait passer par le vrai producteur de
-    métadonnées (`DataProcessor.get_file_metadata`) et donne le dict obtenu
-    tel quel au dataset. Il échoue donc si la clé change d'un côté ou de
-    l'autre.
+    Le compteur n'avance qu'à la fin du worker : sans déduction, dix analyses
+    postées coup sur coup voient toutes le même reste et passent toutes. Mais
+    la déduction se fait à raison d'une unité par analyse — sommer les
+    contrastes déclarés, comme le faisait la première version, refusait des
+    lancements légitimes.
     """
-    # Le singleton, pas une instance ad hoc : c'est l'objet que
-    # `app/worker/tasks.py` utilise pour produire la métadonnée d'ingestion.
-    from app.services.data_processor import data_processor
-
-    # Fichier de comparaisons au format attendu par
-    # r_scripts/run_multimethod_pipeline.R : comparison / condition1 /
-    # condition2. 12 lignes.
-    lines = ["comparison\tcondition1\tcondition2"]
-    lines += [f"c{i}_vs_ctrl\tcond{i}\tctrl" for i in range(1, 13)]
-    tsv = ("\n".join(lines) + "\n").encode()
-
-    metadata = await data_processor.get_file_metadata(tsv, ".tsv")
-    assert metadata["rows"] == 12, "le producteur de métadonnées a changé de forme"
-
-    user = make_user(used=25)  # STARTER: 30 - 25 = 5 restantes
-    ds = make_metadata_dataset(metadata)
-    client, db, project = make_client(as_user=user, comparisons_dataset=ds)
-
-    async with client:
-        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
-
-    assert res.status_code == 429
-    detail = res.json()["detail"]
-    assert "12" in detail and "5" in detail
-
-
-async def test_total_rows_is_still_honoured_as_a_fallback():
-    """`total_rows` n'est plus la clé lue en premier, mais un dataset qui la
-    porterait resterait couvert par la barrière."""
-    user = make_user(used=25)  # 5 restantes
-    ds = make_comparisons_dataset(declared=12, key="total_rows")
-    client, db, project = make_client(as_user=user, comparisons_dataset=ds)
-
-    async with client:
-        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
-
-    assert res.status_code == 429
-
-
-# ── Réservation de la demande en vol ────────────────────────────────────────
-
-
-async def test_refuses_when_queued_analyses_already_claim_the_quota():
-    """`comparisons_used_this_month` ne bouge qu'à la fin du worker : sans
-    réservation, dix analyses postées coup sur coup voient toutes le même reste
-    et sont toutes admises."""
-    user = make_user(used=25)  # STARTER: 30 - 25 = 5 restantes
-    ds = make_comparisons_dataset(declared=5)
-    client, db, project = make_client(
-        as_user=user,
-        comparisons_dataset=ds,
-        # Une analyse de 5 contrastes déjà en file : les 5 restantes sont prises.
-        in_flight=({"rows": 5},),
-    )
+    user = make_user(used=28)  # STARTER: 2 restantes
+    ds = make_comparisons_dataset(declared=1)
+    # Deux analyses en vol, chacune déclarant 10 contrastes : 2 unités
+    # réservées, donc 0 restante.
+    client, db, project = make_client(as_user=user, comparisons_dataset=ds, in_flight=2)
 
     async with client:
         res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
@@ -317,126 +270,13 @@ async def test_refuses_when_queued_analyses_already_claim_the_quota():
     assert "SelfServiceAnalysis" not in added
 
 
-async def test_in_flight_demand_is_subtracted_before_comparing():
-    user = make_user(used=20)  # 10 restantes
-    ds = make_comparisons_dataset(declared=6)
-    client, db, project = make_client(
-        as_user=user,
-        comparisons_dataset=ds,
-        in_flight=({"rows": 5},),  # reste effectif : 10 - 5 = 5 < 6
-    )
-
-    async with client:
-        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
-
-    assert res.status_code == 429
-    detail = res.json()["detail"]
-    assert "6" in detail and "5" in detail
-
-
-async def test_allows_when_the_request_fits_after_reservation():
-    user = make_user(used=20)  # 10 restantes
-    ds = make_comparisons_dataset(declared=5)
-    client, db, project = make_client(
-        as_user=user,
-        comparisons_dataset=ds,
-        in_flight=({"rows": 5},),  # reste effectif : 5, la demande tient pile
-    )
+async def test_in_flight_analyses_leave_room_when_under_the_quota():
+    user = make_user(used=27)  # 3 restantes
+    ds = make_comparisons_dataset(declared=40)
+    # 2 unités réservées, 1 libre
+    client, db, project = make_client(as_user=user, comparisons_dataset=ds, in_flight=2)
 
     async with client:
         res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
 
     assert res.status_code == 201
-
-
-async def test_in_flight_analysis_without_rows_counts_as_one():
-    """Sous-estimer la demande en vol est ce que cette réservation empêche :
-    une métadonnée absente compte pour 1, pas pour 0."""
-    user = make_user(used=29)  # 1 restante
-    ds = make_comparisons_dataset(declared=1)
-    client, db, project = make_client(
-        as_user=user,
-        comparisons_dataset=ds,
-        in_flight=({},),  # `rows` inconnu → 1 en vol → reste effectif 0
-    )
-
-    async with client:
-        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
-
-    assert res.status_code == 429
-
-
-async def test_in_flight_analysis_with_a_deleted_dataset_still_counts():
-    """`comparisons_dataset_id` est `ON DELETE SET NULL` : la jointure externe
-    rend `None`, l'analyse doit compter pour 1 et non s'évaporer."""
-    user = make_user(used=29)  # 1 restante
-    ds = make_comparisons_dataset(declared=1)
-    client, db, project = make_client(as_user=user, comparisons_dataset=ds, in_flight=(None,))
-
-    async with client:
-        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
-
-    assert res.status_code == 429
-
-
-async def test_reservation_refuses_even_when_rows_is_unknown():
-    """Dataset encore en traitement : plus de repli permissif dès que la
-    demande en vol a déjà consommé le reste."""
-    user = make_user(used=25)  # 5 restantes
-    ds = make_comparisons_dataset(declared=None)
-    client, db, project = make_client(
-        as_user=user, comparisons_dataset=ds, in_flight=({"rows": 5},)
-    )
-
-    async with client:
-        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
-
-    assert res.status_code == 429
-    detail = res.json()["detail"]
-    assert "5" in detail
-
-
-async def test_no_reservation_query_for_unlimited_users():
-    """Un plan illimité ne doit pas payer la requête de réservation."""
-    user = make_user(plan=SubscriptionPlan.ON_PREMISE, used=999)
-    ds = make_comparisons_dataset(declared=500)
-    client, db, project = make_client(as_user=user, comparisons_dataset=ds)
-
-    async with client:
-        res = await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
-
-    assert res.status_code == 201
-    # Le seul `db.execute` de la route est celui qui pose `celery_task_id`.
-    assert db.execute.await_count <= 1
-
-
-# ── Portée au projet du dataset de comparaisons ─────────────────────────────
-
-
-async def test_comparisons_dataset_lookup_is_scoped_to_the_project():
-    """La requête doit filtrer sur `project_id` : sans ça un id de dataset
-    d'un autre projet priverait la barrière de son entrée."""
-    user = make_user(used=25)
-    ds = make_comparisons_dataset(declared=1)
-    client, db, project = make_client(as_user=user, comparisons_dataset=ds)
-
-    async with client:
-        await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
-
-    # Le second `db.scalar` est la recherche du dataset de comparaisons.
-    sql = str(db.scalar.await_args_list[1].args[0]).lower()
-    assert "datasets.project_id" in sql, sql
-
-
-async def test_refuses_a_comparisons_dataset_from_another_project():
-    """Refus explicite plutôt que repli permissif : un id hors projet ne doit
-    pas devenir un moyen de lancer sans decompte connu."""
-    user = make_user(used=25)
-    client, db, project = make_client(as_user=user, comparisons_dataset=None)
-
-    async with client:
-        res = await client.post(ENDPOINT, json=payload_for(project.id, uuid4()))
-
-    assert res.status_code == 404
-    added = [type(call.args[0]).__name__ for call in db.add.call_args_list]
-    assert "SelfServiceAnalysis" not in added

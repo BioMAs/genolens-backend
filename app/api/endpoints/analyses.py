@@ -11,12 +11,12 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update, delete
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
-from app.api.deps.project_access import assert_project_access
 from app.api.deps.license import require_active_license
+from app.api.deps.project_access import assert_project_access
 from app.api.deps.subscription import check_comparison_quota, get_or_create_user
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import (
@@ -120,63 +120,33 @@ class SelfServiceAnalysisListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _declared_comparisons(metadata: Optional[dict]) -> Optional[int]:
-    """Nombre de comparaisons déclarées par un fichier de comparaisons.
-
-    La clé est `rows`, écrite à l'ingestion par
-    `DataProcessor.get_file_metadata` (app/services/data_processor.py) puis
-    fusionnée dans `dataset_metadata` par le worker. `total_rows` n'est jamais
-    persisté — c'est un champ de réponse paginée de `query_dataset` — et n'est
-    gardé ici qu'en second choix, au cas où un dataset l'aurait porté.
-
-    On ne lit pas la colonne facultative `perform_analysis` / `run` / `include`
-    que `run_multimethod_pipeline.R` honore : le pipeline peut donc exécuter
-    moins de contrastes qu'il y a de lignes. Les refus formulés à partir de ce
-    nombre parlent pour cette raison de ce que le *fichier déclare*, ce qui est
-    exact, et non de ce que le pipeline exécutera.
-
-    None quand la métadonnée est absente : dataset encore en traitement.
-    """
-    if not isinstance(metadata, dict):
-        return None
-    for key in ("rows", "total_rows"):
-        value = metadata.get(key)
-        # `isinstance(True, int)` vaut True en Python — un booléen n'est pas
-        # un décompte de lignes.
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-    return None
-
-
-async def _in_flight_comparisons(db: AsyncSession, user_id: UUID) -> int:
-    """Comparaisons déjà admises mais pas encore comptées, pour cet utilisateur.
+async def _in_flight_analyses(db: AsyncSession, user_id: UUID) -> int:
+    """Analyses déjà admises mais pas encore décomptées, pour cet utilisateur.
 
     `comparisons_used_this_month` n'avance qu'à la *fin* du worker. Sans cette
-    déduction, un compte à 30 restantes peut poster dix analyses de 5
-    contrastes en quelques secondes : chacune voit 30 restantes, les dix sont
-    admises, 50 comparaisons sont calculées et le compteur plafonne à 30. Avec
-    `--concurrency=1` sur la file `r_analysis` la file d'attente les absorbe,
-    donc ce n'est pas une course étroite.
+    déduction, un compte à 3 unités restantes peut poster dix analyses en
+    quelques secondes : chacune voit 3 restantes, les dix sont admises, et le
+    compteur plafonne à 3. Avec `--concurrency=1` sur la file `r_analysis` la
+    file d'attente les absorbe, donc ce n'est pas une course étroite.
 
-    On somme les lignes déclarées par les fichiers de comparaisons des analyses
-    PENDING / RUNNING de l'appelant. Jointure externe et non interne : une
-    analyse dont le dataset de comparaisons a disparu (`ON DELETE SET NULL`)
-    doit compter, pas s'évaporer. Un fichier dont `rows` est inconnu compte
-    pour 1 et non pour 0 — sous-estimer la demande en vol est précisément ce
-    que ce contrôle existe pour empêcher.
+    UNE unité par analyse en vol, quel que soit le nombre de contrastes de son
+    fichier. La première version sommait les lignes déclarées par les fichiers
+    de comparaisons, ce qui réservait 50 unités pour dix analyses et refusait
+    des lancements légitimes.
     """
-    result = await db.execute(
-        select(Dataset.dataset_metadata)
-        .select_from(SelfServiceAnalysis)
-        .outerjoin(Dataset, Dataset.id == SelfServiceAnalysis.comparisons_dataset_id)
-        .where(
-            SelfServiceAnalysis.user_id == user_id,
-            SelfServiceAnalysis.status.in_(
-                (SelfServiceAnalysisStatus.PENDING, SelfServiceAnalysisStatus.RUNNING)
-            ),
+    return (
+        await db.scalar(
+            select(func.count())
+            .select_from(SelfServiceAnalysis)
+            .where(
+                SelfServiceAnalysis.user_id == user_id,
+                SelfServiceAnalysis.status.in_(
+                    (SelfServiceAnalysisStatus.PENDING, SelfServiceAnalysisStatus.RUNNING)
+                ),
+            )
         )
+        or 0
     )
-    return sum(_declared_comparisons(meta) or 1 for meta in result.scalars())
 
 
 # ---------------------------------------------------------------------------
@@ -289,30 +259,25 @@ async def create_analysis(
         # retire d'abord la demande des analyses déjà admises et pas encore
         # comptées. Sans ça dix analyses postées coup sur coup voient toutes le
         # même reste et passent toutes.
-        in_flight = await _in_flight_comparisons(db, current_user.user_id)
+        in_flight = await _in_flight_analyses(db, current_user.user_id)
         remaining = max(0, counter_remaining - in_flight)
 
-        requested = _declared_comparisons(comparisons_ds.dataset_metadata)
-        if requested is not None and requested > remaining:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=(
-                    f"This comparisons file declares {requested} comparisons but "
-                    f"only {remaining} remain this month. Quota resets on the 1st "
-                    "of next month. Upgrade your plan for more comparisons."
-                ),
-            )
-        # `requested` à None = dataset encore en traitement : on se rabat sur
-        # « au moins une comparaison restante », en vol déduit.
+        # Une analyse coûte UNE unité : il suffit donc qu'il en reste une. Le
+        # nombre de contrastes du fichier n'entre pas dans le calcul — le
+        # compter refusait une analyse à 12 contrastes à un compte qui avait
+        # 5 unités, alors que la grille tarifaire facture le dépôt, pas le
+        # contraste.
         if remaining <= 0:
+            detail = (
+                f"No analysis left this month ({counter_remaining} on the counter"
+                f", {in_flight} already queued). Quota resets on the 1st of next "
+                "month. Upgrade your plan for more analyses."
+                if in_flight
+                else "No analysis left this month. Quota resets on the 1st of "
+                "next month. Upgrade your plan for more analyses."
+            )
             raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=(
-                    f"Analyses already queued claim the {counter_remaining} "
-                    f"comparison(s) left this month ({in_flight} pending). Wait "
-                    "for them to finish, or upgrade your plan for more "
-                    "comparisons."
-                ),
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail
             )
 
     analysis = SelfServiceAnalysis(
