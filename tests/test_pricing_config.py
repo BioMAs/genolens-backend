@@ -203,9 +203,15 @@ def test_active_grid_carries_the_public_card_copy():
     Locked as a count rather than as text: the point is that porting the page
     to the grid did not silently drop bullets. The wording itself is expected
     to change when the unenforced promises are corrected.
+
+    Counts bumped on 2026-09-08 when the cards were aligned on
+    genolens.com/pricing: Starter gained the "Priority support" exclusion, Pro
+    gained "SSO / SAML" and "On-premise deployment", and Enterprise dropped
+    "SSO / SAML" — which the public card does not advertise and nothing
+    implements.
     """
     cfg = get_pricing()
-    expected = {"STARTER": 11, "TEAM": 11, "ON_PREMISE": 6}
+    expected = {"STARTER": 12, "TEAM": 13, "ON_PREMISE": 5}
     for plan_id, count in expected.items():
         plan = cfg.get_plan(plan_id)
         assert len(plan.marketing_features) == count, plan_id
@@ -218,7 +224,7 @@ def test_marketing_bullets_are_not_entitlements():
     """A bullet is a commercial promise; access comes from `entitlements`.
 
     Starter advertises "5 datasets" as an account total while the enforced cap
-    is 5 per project, and Pro advertises "25 datasets" and "50 reports / month"
+    is 5 per project, and Pro advertises "50 datasets" and "50 reports / month"
     that nothing enforces. This test exists so nobody wires access decisions to
     the marketing list by mistake.
     """
@@ -230,11 +236,20 @@ def test_marketing_bullets_are_not_entitlements():
     assert starter.resolved_datasets_limit is None
 
     team = cfg.get_plan("TEAM")
-    assert any("25 datasets" in f.label for f in team.marketing_features)
+    assert any("50 datasets" in f.label for f in team.marketing_features)
     assert team.resolved_datasets_limit_per_project is None, (
-        "Pro advertises 25 datasets but enforces no cap; if that changes, "
+        "Pro advertises 50 datasets but enforces no cap; if that changes, "
         "update the grid and the page together"
     )
+
+    # Aligning the cards on the website widened this gap rather than closing
+    # it: the site sells Team collaboration and Custom gene sets as excluded
+    # from Pro, while neither is gated by the plan — the first is gated by
+    # nothing at all, the second by the `scientific` add-on. Asserted so the
+    # bullets cannot be mistaken for the guard.
+    excluded = {f.label for f in team.marketing_features if not f.included}
+    assert {"Team collaboration", "Custom gene sets"} <= excluded
+    assert "custom_gene_sets" not in team.entitlements.stated()
 
 
 # ── No price may live outside the grid ───────────────────────────────────────
