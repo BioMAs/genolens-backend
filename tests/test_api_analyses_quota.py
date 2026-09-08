@@ -74,15 +74,16 @@ def make_metadata_dataset(metadata: dict) -> Dataset:
 def make_client(
     *,
     as_user: User,
-    comparisons_dataset: Dataset,
+    comparisons_dataset: Dataset | None,
     project_owned: bool = True,
     in_flight: tuple = (),
 ):
     """Client dont l'utilisateur résolu est `as_user`.
 
     `db.scalar` est appelé deux fois par la route : d'abord pour le projet,
-    ensuite (après notre ajout) pour le dataset de comparaisons. On répond dans
-    cet ordre. Sans l'override de get_db la route toucherait une vraie base.
+    ensuite pour le dataset de comparaisons. On répond dans cet ordre.
+    `comparisons_dataset=None` simule un id absent du projet. Sans l'override
+    de get_db la route toucherait une vraie base.
 
     `in_flight` est la liste des `dataset_metadata` que renvoie la requête de
     réservation (`_in_flight_comparisons`) : une entrée par analyse PENDING /
@@ -407,3 +408,35 @@ async def test_no_reservation_query_for_unlimited_users():
     assert res.status_code == 201
     # Le seul `db.execute` de la route est celui qui pose `celery_task_id`.
     assert db.execute.await_count <= 1
+
+
+# ── Portée au projet du dataset de comparaisons ─────────────────────────────
+
+
+async def test_comparisons_dataset_lookup_is_scoped_to_the_project():
+    """La requête doit filtrer sur `project_id` : sans ça un id de dataset
+    d'un autre projet priverait la barrière de son entrée."""
+    user = make_user(used=25)
+    ds = make_comparisons_dataset(declared=1)
+    client, db, project = make_client(as_user=user, comparisons_dataset=ds)
+
+    async with client:
+        await client.post(ENDPOINT, json=payload_for(project.id, ds.id))
+
+    # Le second `db.scalar` est la recherche du dataset de comparaisons.
+    sql = str(db.scalar.await_args_list[1].args[0]).lower()
+    assert "datasets.project_id" in sql, sql
+
+
+async def test_refuses_a_comparisons_dataset_from_another_project():
+    """Refus explicite plutôt que repli permissif : un id hors projet ne doit
+    pas devenir un moyen de lancer sans decompte connu."""
+    user = make_user(used=25)
+    client, db, project = make_client(as_user=user, comparisons_dataset=None)
+
+    async with client:
+        res = await client.post(ENDPOINT, json=payload_for(project.id, uuid4()))
+
+    assert res.status_code == 404
+    added = [type(call.args[0]).__name__ for call in db.add.call_args_list]
+    assert "SelfServiceAnalysis" not in added

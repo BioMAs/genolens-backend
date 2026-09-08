@@ -20,12 +20,12 @@ from app.api.deps.license import require_active_license
 from app.api.deps.subscription import check_comparison_quota, get_or_create_user
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import (
+    Dataset,
+    OmicsDataType,
+    Project,
     SelfServiceAnalysis,
     SelfServiceAnalysisStatus,
-    OmicsDataType,
     User,
-    Project,
-    Dataset,
 )
 
 logger = logging.getLogger(__name__)
@@ -265,6 +265,20 @@ async def create_analysis(
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
 
+    # Dataset de comparaisons, porté au projet. C'est la seule validation que
+    # cet endpoint fasse des trois ids de datasets qu'il reçoit, et la barrière
+    # de quota juste en dessous lit sa métadonnée : accepter un id appartenant à
+    # un autre projet reviendrait à la priver de son entrée. On refuse donc,
+    # plutôt que de retomber sur le repli permissif.
+    comparisons_ds = await db.scalar(
+        select(Dataset).where(
+            Dataset.id == payload.comparisons_dataset_id,
+            Dataset.project_id == payload.project_id,
+        )
+    )
+    if comparisons_ds is None:
+        raise HTTPException(status_code=404, detail="Comparisons dataset not found in this project")
+
     # ── Quota de comparaisons ────────────────────────────────────────────────
     # Le pipeline crée un dataset DEG par contraste. On refuse ici, avant tout
     # calcul : une fois l'analyse lancée on ne l'annule plus pour un quota.
@@ -278,12 +292,7 @@ async def create_analysis(
         in_flight = await _in_flight_comparisons(db, current_user.user_id)
         remaining = max(0, counter_remaining - in_flight)
 
-        comparisons_ds = await db.scalar(
-            select(Dataset).where(Dataset.id == payload.comparisons_dataset_id)
-        )
-        requested = _declared_comparisons(
-            comparisons_ds.dataset_metadata if comparisons_ds else None
-        )
+        requested = _declared_comparisons(comparisons_ds.dataset_metadata)
         if requested is not None and requested > remaining:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
