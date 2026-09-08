@@ -52,7 +52,7 @@ celery_app.conf.include = [
 
 celery_app.conf.beat_schedule = {
     "reset-monthly-comparison-quotas": {
-        "task": "app.worker.tasks.quota_tasks.reset_monthly_comparison_quotas",
+        "task": "app.worker.tasks.quota_tasks.reset_monthly_analysis_quotas",
         "schedule": crontab(minute=5, hour=0, day_of_month=1),
         # Runs at 00:05 UTC on the 1st of each month
     },

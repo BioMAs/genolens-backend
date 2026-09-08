@@ -47,7 +47,7 @@ def make_user() -> User:
     u.ai_interpretations_used = 0
     u.ai_tokens_purchased = 0
     u.ai_tokens_used = 0
-    u.comparisons_used_this_month = 0
+    u.analyses_used_this_month = 0
     u.cosmetics_module_enabled = False
     u.report_customization_module_enabled = False
     u.scientific_module_enabled = False

@@ -46,7 +46,7 @@ def make_user() -> User:
     u.ai_interpretations_used = 0
     u.ai_tokens_purchased = 0
     u.ai_tokens_used = 0
-    u.comparisons_used_this_month = 0
+    u.analyses_used_this_month = 0
     u.stripe_customer_id = "cus_forged"
     u.subscription_ends_at = None
     return u

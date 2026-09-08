@@ -690,10 +690,18 @@ class User(Base, TimestampMixin):
     stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, unique=True)
     stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
-    # Comparison quota (resets monthly)
-    comparisons_used_this_month: Mapped[int] = mapped_column(
+    # Quota d'analyses (remis a zero chaque mois).
+    #
+    # La colonne Postgres garde son nom d'origine, `analyses_used_this_month`,
+    # et c'est deliberé : la renommer imposerait une migration, et le deploiement
+    # applique les migrations AVANT de redemarrer les conteneurs — l'ancien code
+    # interrogerait donc une colonne disparue, et chaque appel touchant au quota
+    # repondrait 500 le temps du redemarrage. L'attribut Python porte le bon
+    # vocabulaire, la colonne reste le seul endroit ou survit l'ancien.
+    analyses_used_this_month: Mapped[int] = mapped_column(
+        "comparisons_used_this_month",
         Integer, nullable=False, default=0,
-        comment="Counter reset on the 1st of each month"
+        comment="Analyses used this month. Counter reset on the 1st of each month."
     )
     quota_reset_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
@@ -758,8 +766,13 @@ class User(Base, TimestampMixin):
         )
 
     @property
-    def comparisons_quota(self) -> Optional[int]:
-        """Monthly comparison quota. None = unlimited."""
+    def analyses_quota(self) -> Optional[int]:
+        """Quota mensuel d'analyses. None = illimite.
+
+        L'unite est l'analyse : un depot de dataset DEG accepte, ou une analyse
+        self-service terminee. Le nombre de contrastes du fichier n'entre pas
+        dans le compte (voir `billable_unit` dans app/config/pricing.json).
+        """
         if self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
         return {
@@ -769,12 +782,36 @@ class User(Base, TimestampMixin):
         }.get(self.subscription_plan, 30)
 
     @property
-    def comparisons_remaining(self) -> Optional[int]:
-        """Remaining comparisons this month. None = unlimited."""
-        quota = self.comparisons_quota
+    def analyses_remaining(self) -> Optional[int]:
+        """Analyses restantes ce mois-ci. None = illimite."""
+        quota = self.analyses_quota
         if quota is None:
             return None
-        return max(0, quota - self.comparisons_used_this_month)
+        return max(0, quota - self.analyses_used_this_month)
+
+    # ── Alias depreciés, a retirer ────────────────────────────────────────
+    #
+    # Servis le temps que le frontend deploye bascule sur les noms en
+    # `analyses_*`. Le backend et le frontend se deploient separement : retirer
+    # les anciens noms dans le meme lot que leur remplacement casserait la
+    # version deja en ligne pendant la fenetre entre les deux deploiements.
+    # A supprimer, avec les champs correspondants des schemas, une fois le
+    # frontend passe.
+
+    @property
+    def comparisons_used_this_month(self) -> int:
+        """Deprecié : lire `analyses_used_this_month`."""
+        return self.analyses_used_this_month
+
+    @property
+    def comparisons_quota(self) -> Optional[int]:
+        """Deprecié : lire `analyses_quota`."""
+        return self.analyses_quota
+
+    @property
+    def comparisons_remaining(self) -> Optional[int]:
+        """Deprecié : lire `analyses_remaining`."""
+        return self.analyses_remaining
 
     @property
     def max_projects(self) -> Optional[int]:

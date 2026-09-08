@@ -41,7 +41,7 @@ def make_user(
     u.email = "worker@example.com"
     u.role = role
     u.subscription_plan = plan
-    u.comparisons_used_this_month = used
+    u.analyses_used_this_month = used
     return u
 
 

@@ -885,7 +885,7 @@ async def _count_pipeline_analysis(user, db, produced_comparisons: int) -> None:
     `subprocess.run` (enrichissement annoDB). Un verrou pris au premier
     contraste bloquait donc jusqu'au commit toute écriture concurrente sur
     cette ligne — l'incrément de l'import DEG manuel, la remise à zéro
-    mensuelle de `check_comparison_quota`, la synchro de rôle de
+    mensuelle de `check_analysis_quota`, la synchro de rôle de
     `get_or_create_user` — depuis des requêtes FastAPI qui tiennent une
     connexion du pool, que le moindre `lock_timeout` transformait en 500.
 
@@ -897,22 +897,22 @@ async def _count_pipeline_analysis(user, db, produced_comparisons: int) -> None:
         return
     from sqlalchemy import func
 
-    from app.api.deps.subscription import _has_unlimited_comparisons
+    from app.api.deps.subscription import _has_unlimited_analyses
     from app.models.models import User as _User
 
-    if _has_unlimited_comparisons(user):
+    if _has_unlimited_analyses(user):
         return  # Illimité — rien à compter
 
-    quota = user.comparisons_quota
+    quota = user.analyses_quota
     result = await db.execute(
         update(_User)
         .where(_User.id == user.id)
         .values(
-            comparisons_used_this_month=func.least(
-                quota, _User.comparisons_used_this_month + 1
+            analyses_used_this_month=func.least(
+                quota, _User.analyses_used_this_month + 1
             )
         )
-        .returning(_User.comparisons_used_this_month)
+        .returning(_User.analyses_used_this_month)
     )
     new_used = result.scalar()
     if new_used is not None and new_used >= quota:

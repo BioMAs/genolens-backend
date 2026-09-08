@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
 from app.api.deps.project_access import assert_project_access
-from app.api.deps.subscription import check_comparison_quota, get_or_create_user
+from app.api.deps.subscription import check_analysis_quota, get_or_create_user
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import (
     Dataset,
@@ -123,7 +123,7 @@ class SelfServiceAnalysisListResponse(BaseModel):
 async def _in_flight_analyses(db: AsyncSession, user_id: UUID) -> int:
     """Analyses déjà admises mais pas encore décomptées, pour cet utilisateur.
 
-    `comparisons_used_this_month` n'avance qu'à la *fin* du worker. Sans cette
+    `analyses_used_this_month` n'avance qu'à la *fin* du worker. Sans cette
     déduction, un compte à 3 unités restantes peut poster dix analyses en
     quelques secondes : chacune voit 3 restantes, les dix sont admises, et le
     compteur plafonne à 3. Avec `--concurrency=1` sur la file `r_analysis` la
@@ -252,8 +252,8 @@ async def create_analysis(
     # ── Quota de comparaisons ────────────────────────────────────────────────
     # Le pipeline crée un dataset DEG par contraste. On refuse ici, avant tout
     # calcul : une fois l'analyse lancée on ne l'annule plus pour un quota.
-    db_user = await check_comparison_quota(db_user, db)
-    counter_remaining = db_user.comparisons_remaining
+    db_user = await check_analysis_quota(db_user, db)
+    counter_remaining = db_user.analyses_remaining
     if counter_remaining is not None:
         # Réservation : le compteur ne bouge qu'à la fin du worker, donc on
         # retire d'abord la demande des analyses déjà admises et pas encore

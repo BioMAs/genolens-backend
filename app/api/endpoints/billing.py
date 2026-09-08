@@ -64,6 +64,13 @@ class SubscriptionResponse(BaseModel):
     # rendait invisible le bloc « Renews » du dashboard.
     subscription_starts_at: str | None
     subscription_ends_at: str | None
+    analyses_used_this_month: int
+    analyses_quota: int | None
+    analyses_remaining: int | None
+    # Anciens noms, servis le temps que le frontend deploye bascule. Backend et
+    # frontend se deploient separement : les retirer dans le meme lot que leur
+    # remplacement casserait la version en ligne entre les deux deploiements.
+    # A retirer une fois le frontend passe.
     comparisons_used_this_month: int
     comparisons_quota: int | None
     comparisons_remaining: int | None
@@ -189,9 +196,13 @@ async def get_subscription(
         "stripe_customer_id": db_user.stripe_customer_id,
         "subscription_starts_at": db_user.subscription_starts_at,
         "subscription_ends_at": db_user.subscription_ends_at,
-        "comparisons_used_this_month": db_user.comparisons_used_this_month,
-        "comparisons_quota": db_user.comparisons_quota,
-        "comparisons_remaining": db_user.comparisons_remaining,
+        "analyses_used_this_month": db_user.analyses_used_this_month,
+        "analyses_quota": db_user.analyses_quota,
+        "analyses_remaining": db_user.analyses_remaining,
+        # Alias depreciés — voir SubscriptionResponse.
+        "comparisons_used_this_month": db_user.analyses_used_this_month,
+        "comparisons_quota": db_user.analyses_quota,
+        "comparisons_remaining": db_user.analyses_remaining,
         "can_use_ai": db_user.can_use_ai,
         "can_use_multi_comparison": db_user.can_use_multi_comparison,
     }
