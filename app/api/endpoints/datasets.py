@@ -1026,14 +1026,13 @@ async def rerun_enrichment(
             detail="Admin access required for this project",
         )
 
-    # L'import vient APRES la barriere, et deliberement : `app/worker/tasks/`
-    # (package) masque `app/worker/tasks.py` et ne re-exporte pas
-    # `_auto_run_enrichment`, donc cette ligne leve ImportError -> 500. Place
-    # en tete comme avant, elle court-circuitait le controle d'acces : la route
-    # repondait 500 a tout le monde sans jamais verifier a qui appartient le
-    # dataset. Le 500 subsiste pour un appelant legitime — c'est un bug
-    # anterieur, distinct, a traiter en decidant si la route doit revivre ou
-    # disparaitre.
+    # L'import reste SOUS la barriere, deliberement. Il etait en tete du corps,
+    # et il levait alors ImportError — `app/worker/tasks/` (package) masque
+    # `app/worker/tasks.py` et ne re-exportait pas `_auto_run_enrichment` — si
+    # bien que la route rendait 500 a tout le monde sans jamais regarder a qui
+    # appartient le dataset. Le re-export est retabli, mais garder l'import ici
+    # evite qu'une future rupture du meme genre ne redevienne un contournement
+    # du controle d'acces : au pire elle casse la route, jamais sa barriere.
     from app.worker.tasks import _auto_run_enrichment
 
     meta = dataset.dataset_metadata or {}
