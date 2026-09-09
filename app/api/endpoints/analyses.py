@@ -3,6 +3,7 @@ Self-service analysis endpoints.
 Allows users to launch DESeq2 / multi-method differential expression pipelines
 from existing datasets (matrix + samples + comparisons).
 """
+
 import json
 import logging
 from pathlib import Path
@@ -18,6 +19,7 @@ from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
 from app.api.deps.project_access import assert_project_access
 from app.api.deps.subscription import check_analysis_quota, get_or_create_user
+from app.api.endpoints.datasets import _check_project_admin
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import (
     Dataset,
@@ -33,12 +35,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analyses", tags=["analyses"])
 
 # Path to the pre-generated anno_db categories JSON
-_ANNO_DB_JSON = Path(__file__).parent.parent.parent.parent / "app" / "data" / "anno_db_categories.json"
+_ANNO_DB_JSON = (
+    Path(__file__).parent.parent.parent.parent / "app" / "data" / "anno_db_categories.json"
+)
 
 
 # ---------------------------------------------------------------------------
 # Pydantic schemas (inline — avoids circular import with schemas package)
 # ---------------------------------------------------------------------------
+
 
 class AnalysisParams(BaseModel):
     design: str = "auto"
@@ -153,6 +158,7 @@ async def _in_flight_analyses(db: AsyncSession, user_id: UUID) -> int:
 # Routes
 # ---------------------------------------------------------------------------
 
+
 @router.get("/anno-db-categories")
 async def get_anno_db_categories(
     species: str = Query(..., description="Species name (e.g. 'human', 'mouse')"),
@@ -217,7 +223,12 @@ async def get_analysis(
     return SelfServiceAnalysisResponse.from_orm(analysis)
 
 
-@router.post("", response_model=SelfServiceAnalysisResponse, status_code=201, dependencies=[Depends(require_active_license)])
+@router.post(
+    "",
+    response_model=SelfServiceAnalysisResponse,
+    status_code=201,
+    dependencies=[Depends(require_active_license)],
+)
 async def create_analysis(
     payload: SelfServiceAnalysisCreate,
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -225,14 +236,12 @@ async def create_analysis(
     db_user: Annotated[User, Depends(get_or_create_user)],
 ) -> SelfServiceAnalysisResponse:
     """Create and launch a self-service analysis job."""
-    # Verify project ownership
-    proj = await db.scalar(
-        select(Project).where(
-            Project.id == payload.project_id,
-            Project.owner_id == current_user.user_id,
-        )
-    )
-    if not proj:
+    # Droit de lancer : proprietaire OU membre ADMIN, comme /datasets/upload.
+    # Les deux boutons de l'interface pointent vers le meme ecran ; les separer
+    # ici laisserait « New Analysis » casse pour un membre qui peut deposer.
+    # Le quota decompte plus bas reste celui de l'appelant.
+    proj = await db.scalar(select(Project).where(Project.id == payload.project_id))
+    if not proj or not await _check_project_admin(proj, current_user.user_id, db):
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Dataset de comparaisons, porté au projet. C'est la seule validation que
@@ -276,9 +285,7 @@ async def create_analysis(
                 else "No analysis left this month. Quota resets on the 1st of "
                 "next month. Upgrade your plan for more analyses."
             )
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail
-            )
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail)
 
     analysis = SelfServiceAnalysis(
         id=uuid4(),
@@ -302,6 +309,7 @@ async def create_analysis(
     # Dispatch Celery task
     try:
         from app.worker.tasks import run_self_service_analysis
+
         task = run_self_service_analysis.delay(str(analysis.id))
         await db.execute(
             update(SelfServiceAnalysis)
@@ -343,9 +351,7 @@ async def delete_analysis(
     # Deleting is destructive: restricted to the launcher and the project owner
     # (plain members may read the analysis but not remove it).
     if analysis.user_id != current_user.user_id:
-        proj = await db.scalar(
-            select(Project).where(Project.id == analysis.project_id)
-        )
+        proj = await db.scalar(select(Project).where(Project.id == analysis.project_id))
         if proj is None or proj.owner_id != current_user.user_id:
             raise HTTPException(status_code=403, detail="Access denied")
 
@@ -356,6 +362,7 @@ async def delete_analysis(
     ):
         try:
             from app.worker.celery_app import celery_app
+
             celery_app.control.revoke(analysis.celery_task_id, terminate=True)
         except Exception as exc:
             logger.warning("[ANALYSES] Could not revoke task %s: %s", analysis.celery_task_id, exc)

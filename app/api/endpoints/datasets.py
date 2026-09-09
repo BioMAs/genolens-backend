@@ -147,15 +147,18 @@ async def upload_dataset(
                    f"Allowed: {', '.join(settings.ALLOWED_FILE_EXTENSIONS)}"
         )
 
-    # Check project ownership
-    query = select(Project).where(
-        Project.id == project_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
+    # Droit de deposer : proprietaire OU membre ADMIN.
+    #
+    # Le filtre etait `Project.owner_id == current_user.user_id`, si bien qu'un
+    # membre ADMIN — a qui le partage donne pourtant le droit d'editer, de
+    # reprocesser et de supprimer les datasets du projet — recevait 404 sur un
+    # projet qu'il avait sous les yeux. Le quota consomme plus bas reste celui
+    # de l'APPELANT (`db_user`), pas du proprietaire : un invite depense ses
+    # propres unites, il ne peut pas vider le compteur de son hote.
+    result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
-    
-    if not project:
+
+    if not project or not await _check_project_admin(project, current_user.user_id, db):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
@@ -270,14 +273,11 @@ async def import_from_geo(
     metadata, then ingests them as a MATRIX + METADATA_SAMPLE dataset pair
     (processed asynchronously, same pipeline as manual uploads).
     """
-    # Check project ownership (same pattern as /upload)
-    query = select(Project).where(
-        Project.id == payload.project_id,
-        Project.owner_id == current_user.user_id,
-    )
-    result = await db.execute(query)
+    # Meme regle que /upload : proprietaire ou membre ADMIN. L'import GEO est
+    # une porte d'entree de donnees comme une autre.
+    result = await db.execute(select(Project).where(Project.id == payload.project_id))
     project = result.scalar_one_or_none()
-    if not project:
+    if not project or not await _check_project_admin(project, current_user.user_id, db):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found",
