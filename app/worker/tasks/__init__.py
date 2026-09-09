@@ -6,6 +6,7 @@ shadows it). We load it explicitly via ``importlib`` so existing callers
 such as ``app.worker.__init__`` and ``app.api.endpoints.datasets`` continue
 to work without changes.
 """
+
 import importlib.util
 import os as _os
 import sys as _sys
@@ -25,6 +26,11 @@ import_geo_dataset = _legacy_mod.import_geo_dataset  # noqa: F401
 health_check = _legacy_mod.health_check  # noqa: F401
 run_self_service_analysis = _legacy_mod.run_self_service_analysis  # noqa: F401
 _count_pipeline_analysis = _legacy_mod._count_pipeline_analysis  # noqa: F401
+# Appele par POST /datasets/{id}/rerun-enrichment. Son absence de cette liste
+# faisait lever ImportError a la route, donc 500 pour tout appelant : le
+# package masque `tasks.py`, et un symbole non repris ici n'existe plus pour
+# personne. `tests/test_rerun_enrichment_route.py` epingle le re-export.
+_auto_run_enrichment = _legacy_mod._auto_run_enrichment  # noqa: F401
 
 # ── New periodic quota task ───────────────────────────────────────────────────
 from app.worker.tasks.quota_tasks import reset_monthly_analysis_quotas  # noqa: F401

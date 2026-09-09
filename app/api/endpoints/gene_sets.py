@@ -21,10 +21,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
+from app.api.deps.project_access import assert_project_read_access
 from app.api.deps.license import require_active_license
 from app.api.deps.subscription import require_scientific_access
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import Project, ProjectMember, GeneSet, GeneSetDatabase
+from app.models.models import GeneSet, GeneSetDatabase
 from app.services.gene_set_loader import GMTParser
 
 logger = logging.getLogger(__name__)
@@ -54,21 +55,6 @@ class GMTUploadResponse(BaseModel):
     updated: int
 
 
-async def _assert_project_access(db: AsyncSession, project_id: UUID, user: SupabaseUser) -> Project:
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if project.owner_id == user.user_id:
-        return project
-    member = await db.execute(
-        select(ProjectMember).where(
-            ProjectMember.project_id == project_id,
-            ProjectMember.user_id == user.user_id,
-        )
-    )
-    if member.scalar_one_or_none() is None:
-        raise HTTPException(status_code=403, detail="Access denied")
-    return project
 
 
 @router.get(
@@ -81,7 +67,7 @@ async def list_custom_gene_sets(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
 ) -> list[GeneSetResponse]:
-    await _assert_project_access(db, project_id, current_user)
+    await assert_project_read_access(db, project_id, current_user.user_id)
     result = await db.execute(
         select(GeneSet)
         .where(GeneSet.database == GeneSetDatabase.CUSTOM, GeneSet.project_id == project_id)
@@ -111,7 +97,7 @@ async def create_custom_gene_set(
     genes: list[str] = Body(...),
     description: Optional[str] = Body(None),
 ) -> GeneSetCreateResponse:
-    await _assert_project_access(db, project_id, current_user)
+    await assert_project_read_access(db, project_id, current_user.user_id)
 
     name = name.strip()
     if not name:
@@ -161,7 +147,7 @@ async def upload_gmt(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     file: UploadFile = File(...),
 ) -> GMTUploadResponse:
-    await _assert_project_access(db, project_id, current_user)
+    await assert_project_read_access(db, project_id, current_user.user_id)
 
     content = await file.read()
     with tempfile.NamedTemporaryFile("wb", suffix=".gmt", delete=True) as tmp:
@@ -227,7 +213,7 @@ async def delete_custom_gene_set(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
 ) -> None:
-    await _assert_project_access(db, project_id, current_user)
+    await assert_project_read_access(db, project_id, current_user.user_id)
     gs = await db.get(GeneSet, gene_set_id)
     if not gs or gs.project_id != project_id or gs.database != GeneSetDatabase.CUSTOM:
         raise HTTPException(status_code=404, detail="Custom gene set not found in this project")

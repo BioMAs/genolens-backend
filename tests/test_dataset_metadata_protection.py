@@ -6,7 +6,7 @@ La première est un contournement : `POST /analyses` refuse une analyse dont le
 fichier de comparaisons déclare plus de lignes (`rows`) qu'il ne reste de
 quota. Un contrôle dont la seule entrée est modifiable par le client n'en est
 pas un — un `PATCH {"dataset_metadata": {"rows": 1}}` suffisait, et un admin de
-projet passe `_check_project_admin`.
+projet passe `is_project_admin`.
 
 La seconde est indépendante du quota : ces clés (comptages DEG, chemins de
 figures, provenance) sont lues par toute l'application, et un client pouvait

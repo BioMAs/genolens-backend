@@ -7,12 +7,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
 from app.api.deps.db import get_db
 from app.api.deps.auth import get_current_user
+from app.api.deps.project_access import assert_project_read_access
 from app.core.security import CurrentUser
-from app.models.models import Project, ProjectMember, ActivityEventType
+from app.models.models import ActivityEventType
 from app.schemas.history import ActivityLogListResponse
 from app.services import history_service
 
@@ -21,34 +21,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-async def _require_project_access(project_id: UUID, user_id: UUID, db: AsyncSession) -> Project:
-    """
-    Verify that the project exists and the user has access (owner or member).
-    Raises 404 if project not found, 403 if no access.
-    """
-    project_result = await db.execute(select(Project).where(Project.id == project_id))
-    project = project_result.scalar_one_or_none()
-
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    # Owner always has access
-    if project.owner_id == user_id:
-        return project
-
-    # Check member access
-    member_result = await db.execute(
-        select(ProjectMember).where(
-            ProjectMember.project_id == project_id,
-            ProjectMember.user_id == user_id,
-        )
-    )
-    member = member_result.scalar_one_or_none()
-
-    if not member:
-        raise HTTPException(status_code=403, detail="Access denied to this project")
-
-    return project
 
 
 @router.get(
@@ -76,7 +48,7 @@ async def get_project_history(
     """
     try:
         user_id = current_user.id
-        await _require_project_access(project_id, user_id, db)
+        await assert_project_read_access(db, project_id, user_id)
 
         result = await history_service.get_activity_log(
             db,

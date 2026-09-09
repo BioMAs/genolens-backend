@@ -36,11 +36,13 @@ from app.api.deps.subscription import (
     increment_ai_usage,
     check_analysis_quota,
     increment_analysis_usage,
+    warn_if_quota_threshold_crossed,
 )
 # from app.db.session import get_db  <-- Removed
+from app.api.deps.project_access import assert_project_read_access, is_project_admin
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
-from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, UserRole, GOTerm, CachedComputation, GeneList
+from app.models.models import Project, Dataset, DatasetStatus, DatasetType, GeneSetDatabase, DegGene, EnrichmentPathway, ProjectMember, AIConversation, AIInterpretation, User, GOTerm, CachedComputation, GeneList
 from sqlalchemy import select, func, delete, text, or_, desc, asc, and_
 from sqlalchemy.orm import joinedload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -80,41 +82,6 @@ go_service = GOService()
 logger = logging.getLogger(__name__)
 
 
-async def _check_project_admin(project: Project, current_user_id: UUID, db: AsyncSession) -> bool:
-    """
-    Returns True if current_user_id is the project owner OR a member with access_level == ADMIN.
-    """
-    if project.owner_id == current_user_id:
-        return True
-    member_query = select(ProjectMember).where(
-        ProjectMember.project_id == project.id,
-        ProjectMember.user_id == current_user_id,
-        ProjectMember.access_level == UserRole.ADMIN,
-    )
-    result = await db.execute(member_query)
-    return result.scalar_one_or_none() is not None
-
-
-
-async def _check_project_read_access(project_id: UUID, current_user_id: UUID, db: AsyncSession) -> Project:
-    """
-    Returns the project if current_user_id is the owner or any member.
-    Raises HTTP 404 otherwise.
-    """
-    result = await db.execute(select(Project).where(Project.id == project_id))
-    project = result.scalar_one_or_none()
-    if not project:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-    if project.owner_id != current_user_id:
-        member_result = await db.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id,
-                ProjectMember.user_id == current_user_id,
-            )
-        )
-        if not member_result.scalar_one_or_none():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
-    return project
 
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
@@ -146,15 +113,18 @@ async def upload_dataset(
                    f"Allowed: {', '.join(settings.ALLOWED_FILE_EXTENSIONS)}"
         )
 
-    # Check project ownership
-    query = select(Project).where(
-        Project.id == project_id,
-        Project.owner_id == current_user.user_id
-    )
-    result = await db.execute(query)
+    # Droit de deposer : proprietaire OU membre ADMIN.
+    #
+    # Le filtre etait `Project.owner_id == current_user.user_id`, si bien qu'un
+    # membre ADMIN — a qui le partage donne pourtant le droit d'editer, de
+    # reprocesser et de supprimer les datasets du projet — recevait 404 sur un
+    # projet qu'il avait sous les yeux. Le quota consomme plus bas reste celui
+    # de l'APPELANT (`db_user`), pas du proprietaire : un invite depense ses
+    # propres unites, il ne peut pas vider le compteur de son hote.
+    result = await db.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
-    
-    if not project:
+
+    if not project or not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
@@ -213,12 +183,23 @@ async def upload_dataset(
     )
     
     db.add(dataset)
+    await db.flush()
+
+    # Le décompte du quota partage la transaction de l'insert : c'est ce qui
+    # permet à son rollback d'annuler réellement le dataset quand une requête
+    # concurrente a épuisé le quota entre le contrôle d'entrée et ici. Décompter
+    # après le commit, comme avant, rendait un 429 pour un dataset bel et bien
+    # créé.
+    if dataset_type == DatasetType.DEG:
+        await increment_analysis_usage(db_user, db)
+
     await db.commit()
     await db.refresh(dataset)
 
-    # Increment comparison counter AFTER successful DB commit
+    # Après le commit seulement : l'avertissement annonce une consommation
+    # devenue durable.
     if dataset_type == DatasetType.DEG:
-        await increment_analysis_usage(db_user, db)
+        await warn_if_quota_threshold_crossed(db_user, db)
 
     # Trigger Celery task
     process_dataset_upload.delay(str(dataset.id), uploaded_path)
@@ -258,14 +239,11 @@ async def import_from_geo(
     metadata, then ingests them as a MATRIX + METADATA_SAMPLE dataset pair
     (processed asynchronously, same pipeline as manual uploads).
     """
-    # Check project ownership (same pattern as /upload)
-    query = select(Project).where(
-        Project.id == payload.project_id,
-        Project.owner_id == current_user.user_id,
-    )
-    result = await db.execute(query)
+    # Meme regle que /upload : proprietaire ou membre ADMIN. L'import GEO est
+    # une porte d'entree de donnees comme une autre.
+    result = await db.execute(select(Project).where(Project.id == payload.project_id))
     project = result.scalar_one_or_none()
-    if not project:
+    if not project or not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found",
@@ -360,7 +338,7 @@ async def get_dataset(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     return dataset
 
@@ -473,7 +451,7 @@ async def update_dataset(
     proj_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
     project = proj_result.scalar_one_or_none()
 
-    if not project or not await _check_project_admin(project, current_user.user_id, db):
+    if not project or not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only project admins can update datasets"
@@ -531,7 +509,7 @@ async def delete_dataset(
     proj_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
     project = proj_result.scalar_one_or_none()
 
-    if not project or not await _check_project_admin(project, current_user.user_id, db):
+    if not project or not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only project admins can delete datasets"
@@ -599,7 +577,7 @@ async def reprocess_dataset(
     proj_result = await db.execute(select(Project).where(Project.id == dataset.project_id))
     project = proj_result.scalar_one_or_none()
 
-    if not project or not await _check_project_admin(project, current_user.user_id, db):
+    if not project or not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only project admins can reprocess datasets"
@@ -660,7 +638,7 @@ async def query_dataset(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     # Check if dataset is ready
     if dataset.status != DatasetStatus.READY:
@@ -738,7 +716,7 @@ async def get_dataset_columns(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if dataset.status != DatasetStatus.READY:
         raise HTTPException(
@@ -791,7 +769,7 @@ async def get_dataset_stats(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if dataset.status != DatasetStatus.READY:
         raise HTTPException(
@@ -884,7 +862,7 @@ async def get_deg_stats_multimethod(
     dataset = result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset.parquet_file_path:
         raise HTTPException(status_code=400, detail="Dataset has no Parquet file")
@@ -945,7 +923,7 @@ async def export_deg_stats_csv(
     dataset = result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset.parquet_file_path:
         raise HTTPException(status_code=400, detail="Dataset has no Parquet file")
@@ -999,11 +977,29 @@ async def rerun_enrichment(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
 ) -> dict:
     """Re-run GO + ORA enrichment for a DEG dataset with updated thresholds."""
-    from app.worker.tasks import _auto_run_enrichment
-
     dataset = await db.scalar(select(Dataset).where(Dataset.id == dataset_id))
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
+
+    # La route n'avait AUCUN controle : n'importe quel compte authentifie
+    # pouvait ecraser l'enrichissement du dataset d'un autre client en
+    # connaissant son id. C'est une reecriture, donc meme barriere que
+    # /reprocess : proprietaire ou membre ADMIN.
+    project = await db.scalar(select(Project).where(Project.id == dataset.project_id))
+    if not project or not await is_project_admin(db, project, current_user.user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required for this project",
+        )
+
+    # L'import reste SOUS la barriere, deliberement. Il etait en tete du corps,
+    # et il levait alors ImportError — `app/worker/tasks/` (package) masque
+    # `app/worker/tasks.py` et ne re-exportait pas `_auto_run_enrichment` — si
+    # bien que la route rendait 500 a tout le monde sans jamais regarder a qui
+    # appartient le dataset. Le re-export est retabli, mais garder l'import ici
+    # evite qu'une future rupture du meme genre ne redevienne un contournement
+    # du controle d'acces : au pire elle casse la route, jamais sa barriere.
+    from app.worker.tasks import _auto_run_enrichment
 
     meta = dataset.dataset_metadata or {}
     min_log2fc = float(meta.get("min_log2fc", 1.0))
@@ -1034,7 +1030,7 @@ async def get_gene_list(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if dataset.status != DatasetStatus.READY:
         raise HTTPException(
@@ -1091,7 +1087,7 @@ async def get_gene_map(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if dataset.status != DatasetStatus.READY:
         raise HTTPException(
@@ -1204,7 +1200,7 @@ async def get_dataset_pca(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(
@@ -1292,7 +1288,7 @@ async def get_dataset_umap(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(
@@ -1368,7 +1364,7 @@ async def get_dataset_library_size(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(
@@ -1423,7 +1419,7 @@ async def list_dataset_comparisons(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(
@@ -1457,7 +1453,7 @@ async def get_dataset_comparisons_stats(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     # Check if stats are available in metadata
     metadata = dataset.dataset_metadata or {}
@@ -1659,7 +1655,7 @@ async def diagnose_deg_filtering(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         logger.debug(f"Dataset not found for user {current_user.user_id}")
@@ -1950,7 +1946,7 @@ async def get_deg_genes(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     # Build query for DegGene
     stmt = deg_genes_stmt(
@@ -2069,7 +2065,7 @@ async def get_volcano_plot_data(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
     
     # Level 2: Try metadata/file cache (unless force_recalculate is True)
     if not force_recalculate:
@@ -2291,7 +2287,7 @@ async def get_dataset_heatmaps(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -2329,7 +2325,7 @@ async def get_dataset_dotplots(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -2381,7 +2377,7 @@ async def get_enrichment_pathways(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -2508,7 +2504,7 @@ async def ai_select_enrichment_terms(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -2653,7 +2649,7 @@ async def get_comparison_interpretation(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     existing = await db.scalar(
         select(AIInterpretation)
@@ -2717,7 +2713,7 @@ async def interpret_comparison(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -2984,11 +2980,11 @@ async def ask_ai_question(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     try:
         interpreter = LocalAIInterpreter()
@@ -3115,11 +3111,11 @@ async def get_conversation_history(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     # Get all conversations for this comparison
     conversations_query = (
@@ -3177,11 +3173,11 @@ async def calculate_custom_pca(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     # Load parquet file
     parquet_path = Path(settings.LOCAL_STORAGE_PATH) / dataset.parquet_file_path
@@ -3298,11 +3294,11 @@ async def calculate_custom_umap(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     # Load parquet file
     parquet_path = Path(settings.LOCAL_STORAGE_PATH) / dataset.parquet_file_path
@@ -3418,11 +3414,11 @@ async def get_custom_boxplot_data(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not gene_list or len(gene_list) == 0:
         raise HTTPException(status_code=400, detail="At least one gene must be provided")
@@ -4088,7 +4084,7 @@ async def apply_advanced_filter(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     try:
         groups = filter_data.get("groups", [])
@@ -4458,6 +4454,11 @@ async def run_gsea_analysis(
         gsea_dataset = _gsea_ds_result.scalar_one_or_none()
         if not gsea_dataset:
             raise HTTPException(status_code=404, detail="Dataset not found")
+        # Le commentaire ci-dessus annoncait un controle d'acces qui n'avait
+        # jamais ete ecrit : la route calculait un GSEA sur les donnees de
+        # n'importe quel projet. Le pendant asynchrone (gsea.py) fait bien cette
+        # verification, c'est celle-la qu'on reprend.
+        await assert_project_read_access(db, gsea_dataset.project_id, current_user.user_id)
 
         try:
             payload = await compute_gsea(
@@ -4513,7 +4514,8 @@ async def get_enrichment_plot_data(
     gene_set_name: str,
     comparison_name: str = Query(...),
     ranking_metric: str = Query("signed_pvalue"),
-    db: Annotated[AsyncSession, Depends(get_db)] = None
+    db: Annotated[AsyncSession, Depends(get_db)] = None,
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)] = None,
 ) -> dict:
     """
     Get data for GSEA enrichment plot for a specific gene set
@@ -4522,6 +4524,16 @@ async def get_enrichment_plot_data(
     """
     import pandas as pd
     from sqlalchemy import text
+
+    # La route ne recevait meme pas l'utilisateur courant : elle lisait
+    # `deg_genes` (log2FC et padj gene par gene) pour n'importe quel dataset_id.
+    # C'est la seule des routes non protegees que le front appelle vraiment.
+    _ep_auth_ds = (
+        await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    ).scalar_one_or_none()
+    if not _ep_auth_ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    await assert_project_read_access(db, _ep_auth_ds.project_id, current_user.user_id)
 
     try:
         # Fetch DEG data
@@ -5112,7 +5124,7 @@ async def get_sample_correlations(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -5167,12 +5179,16 @@ async def precompute_sample_clustering(
     from scipy.stats import pearsonr
     
     # 1. Check permissions
+    #
+    # Le commentaire etait la, le controle non : la route rendait le clustering
+    # et les correlations d'echantillons de n'importe quel dataset.
     query = select(Dataset).join(Project).filter(Dataset.id == dataset_id)
     result = await db.execute(query)
     dataset = result.scalar_one_or_none()
-    
+
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
     
     # 2. Check if already cached
     cache_key = f"sample_clustering_{dataset_id}_{method}_{metric}_{top_n_genes}"
@@ -5321,7 +5337,7 @@ async def run_go_enrichment_analysis(
     dataset = _ds_result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
     
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -5480,7 +5496,7 @@ async def get_go_hierarchy(
     _ds = (await db.execute(select(Dataset).where(Dataset.id == dataset_id))).scalar_one_or_none()
     if not _ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    await _check_project_read_access(_ds.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, _ds.project_id, current_user.user_id)
 
     # Load enriched GO terms from EnrichmentPathway
     stmt = select(EnrichmentPathway).where(

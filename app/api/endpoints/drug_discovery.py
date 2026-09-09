@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
+from app.api.deps.project_access import assert_project_read_access
 from app.api.deps.subscription import require_drug_discovery_access
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import Dataset, User
@@ -246,13 +247,12 @@ async def _load_owned_dataset(
     and a plan check alone would let any TEAM user build a signature from another project's
     comparison.
     """
-    from app.api.endpoints.datasets import _check_project_read_access
 
     result = await db.execute(select(Dataset).where(Dataset.id == dataset_id))
     dataset = result.scalar_one_or_none()
     if dataset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
     return dataset
 
 
