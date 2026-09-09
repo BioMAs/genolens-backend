@@ -17,7 +17,7 @@ Deux familles de routes échouaient, dans les deux sens opposés.
 2. Des routes TROP fermées : les visualisations PCA / UMAP / boxplot et les deux
    routes de conversation IA comparaient `owner_id` à la main et rendaient 403 à
    un membre partagé, alors que la trentaine de routes voisines l'acceptent via
-   `_check_project_read_access`. Un membre voyait la table des DEG mais pas
+   `assert_project_read_access`. Un membre voyait la table des DEG mais pas
    l'ACP du même dataset.
 
 Le mock de session répond d'après l'entité interrogée plutôt que dans un ordre
@@ -34,7 +34,7 @@ import pytest_asyncio
 from app.models.models import Dataset, Project, ProjectMember, User, UserRole, UserStatus
 
 # Motifs de refus émis par les barrières d'accès elles-mêmes, avant toute
-# lecture. `_check_project_read_access` rend « Project not found » (un 404
+# lecture. `assert_project_read_access` rend « Project not found » (un 404
 # délibéré : révéler l'existence du projet à un tiers serait déjà une fuite) ;
 # les contrôles écrits à la main rendent l'un des trois autres.
 AUTHORIZATION_REFUSALS = {
@@ -255,5 +255,5 @@ async def test_shared_member_is_not_denied_access(method, template, body):
 
     assert resp.status_code != 403, (
         f"{method} {template} a rendu 403 à un membre du projet, alors que les "
-        f"routes voisines l'acceptent via _check_project_read_access."
+        f"routes voisines l'acceptent via assert_project_read_access."
     )

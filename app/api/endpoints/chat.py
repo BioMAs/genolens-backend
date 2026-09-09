@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
 from app.api.deps.subscription import check_ai_quota, increment_ai_usage, require_ai_access
-from app.api.endpoints.datasets import _check_project_read_access
+from app.api.deps.project_access import assert_project_read_access
 from app.core.supabase_auth import SupabaseUser
 from app.db.session import AsyncSessionLocal
 from app.models.models import AgentMessage, AgentSession, Dataset, User
@@ -66,7 +66,7 @@ async def create_chat_session(
     user: Annotated[User, Depends(require_ai_access)],
 ) -> AgentSessionOut:
     """Create a chat session bound to a selected project / dataset / comparison."""
-    await _check_project_read_access(payload.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, payload.project_id, current_user.user_id)
 
     dataset = await db.get(Dataset, payload.dataset_id)
     if not dataset or dataset.project_id != payload.project_id:

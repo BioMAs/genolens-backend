@@ -6,7 +6,7 @@ Les trois routes d'ingestion — `POST /datasets/upload`,
 `Project.owner_id == current_user.user_id`. Un membre ADMIN, à qui le partage
 donne pourtant le droit d'éditer, reprocesser et supprimer les datasets du
 projet, recevait 404 « Project not found » sur un projet qu'il avait sous les
-yeux. Elles passent sur `_check_project_admin`, la barrière que le partage ADMIN
+yeux. Elles passent sur `is_project_admin`, la barrière que le partage ADMIN
 est justement censé ouvrir.
 
 Le quota reste celui de l'APPELANT, pas du propriétaire : le décompte lit
@@ -94,7 +94,7 @@ def make_client(*, caller: User, owner_id, member_level, captured: list):
                 else:
                     value = project
             elif entity is ProjectMember:
-                # `_check_project_admin` ne cherche QUE les membres ADMIN : un
+                # `is_project_admin` ne cherche QUE les membres ADMIN : un
                 # membre USER doit donc rester introuvable pour cette requête.
                 value = membership if member_level == UserRole.ADMIN else None
             elif entity is Dataset:

@@ -12,7 +12,8 @@ from app.api.deps import get_db, get_current_user
 from app.api.deps.license import require_active_license
 from app.api.deps.subscription import get_or_create_user
 from app.core.supabase_auth import SupabaseUser, lookup_user_by_email
-from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, UserRole, User
+from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, User
+from app.api.deps.project_access import is_project_admin
 from app.services import email_service, history_service
 from app.services.comparison_catalog import build_comparisons_from_datasets
 from app.schemas.project import (
@@ -36,19 +37,6 @@ from app.schemas.project import (
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 
-async def _check_project_admin(project: Project, current_user_id: UUID, db: AsyncSession) -> bool:
-    """
-    Returns True if current_user_id is the project owner OR a member with access_level == ADMIN.
-    """
-    if project.owner_id == current_user_id:
-        return True
-    member_query = select(ProjectMember).where(
-        ProjectMember.project_id == project.id,
-        ProjectMember.user_id == current_user_id,
-        ProjectMember.access_level == UserRole.ADMIN,
-    )
-    result = await db.execute(member_query)
-    return result.scalar_one_or_none() is not None
 
 
 @router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_active_license)])
@@ -204,7 +192,7 @@ async def update_project(
             detail="Project not found"
         )
 
-    if not await _check_project_admin(project, current_user.user_id, db):
+    if not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only project admins can update this project"
@@ -556,7 +544,7 @@ async def delete_project(
             detail="Project not found"
         )
 
-    if not await _check_project_admin(project, current_user.user_id, db):
+    if not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only project admins can delete this project"
@@ -597,7 +585,7 @@ async def invite_project_member(
             detail="Project not found"
         )
     
-    if not await _check_project_admin(project, current_user.user_id, db):
+    if not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only project admins can invite members"
@@ -752,7 +740,7 @@ async def update_project_member(
             detail="Project not found"
         )
     
-    if not await _check_project_admin(project, current_user.user_id, db):
+    if not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only project admins can update member roles"
@@ -805,7 +793,7 @@ async def remove_project_member(
             detail="Project not found"
         )
     
-    if not await _check_project_admin(project, current_user.user_id, db):
+    if not await is_project_admin(db, project, current_user.user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Only project admins can remove members"

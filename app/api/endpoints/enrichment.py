@@ -7,7 +7,7 @@ from sqlalchemy import and_, asc, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
-from app.api.endpoints.datasets import _check_project_read_access
+from app.api.deps.project_access import assert_project_read_access
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import Dataset, EnrichmentPathway
 
@@ -49,7 +49,7 @@ async def get_enrichment_comparisons(
     ).scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     query = (
         select(EnrichmentPathway.comparison_name)
@@ -89,7 +89,7 @@ async def get_enrichment_results(
     ).scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     # 2. Query Enrichment Pathways
     query = select(EnrichmentPathway).where(

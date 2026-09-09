@@ -17,9 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
-from app.api.deps.project_access import assert_project_access
+from app.api.deps.project_access import assert_project_access, is_project_admin
 from app.api.deps.subscription import check_analysis_quota, get_or_create_user
-from app.api.endpoints.datasets import _check_project_admin
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import (
     Dataset,
@@ -241,7 +240,7 @@ async def create_analysis(
     # ici laisserait « New Analysis » casse pour un membre qui peut deposer.
     # Le quota decompte plus bas reste celui de l'appelant.
     proj = await db.scalar(select(Project).where(Project.id == payload.project_id))
-    if not proj or not await _check_project_admin(proj, current_user.user_id, db):
+    if not proj or not await is_project_admin(db, proj, current_user.user_id):
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Dataset de comparaisons, porté au projet. C'est la seule validation que
