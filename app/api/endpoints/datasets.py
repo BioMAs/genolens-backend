@@ -1011,11 +1011,30 @@ async def rerun_enrichment(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
 ) -> dict:
     """Re-run GO + ORA enrichment for a DEG dataset with updated thresholds."""
-    from app.worker.tasks import _auto_run_enrichment
-
     dataset = await db.scalar(select(Dataset).where(Dataset.id == dataset_id))
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
+
+    # La route n'avait AUCUN controle : n'importe quel compte authentifie
+    # pouvait ecraser l'enrichissement du dataset d'un autre client en
+    # connaissant son id. C'est une reecriture, donc meme barriere que
+    # /reprocess : proprietaire ou membre ADMIN.
+    project = await db.scalar(select(Project).where(Project.id == dataset.project_id))
+    if not project or not await _check_project_admin(project, current_user.user_id, db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required for this project",
+        )
+
+    # L'import vient APRES la barriere, et deliberement : `app/worker/tasks/`
+    # (package) masque `app/worker/tasks.py` et ne re-exporte pas
+    # `_auto_run_enrichment`, donc cette ligne leve ImportError -> 500. Place
+    # en tete comme avant, elle court-circuitait le controle d'acces : la route
+    # repondait 500 a tout le monde sans jamais verifier a qui appartient le
+    # dataset. Le 500 subsiste pour un appelant legitime — c'est un bug
+    # anterieur, distinct, a traiter en decidant si la route doit revivre ou
+    # disparaitre.
+    from app.worker.tasks import _auto_run_enrichment
 
     meta = dataset.dataset_metadata or {}
     min_log2fc = float(meta.get("min_log2fc", 1.0))
@@ -2996,11 +3015,11 @@ async def ask_ai_question(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     try:
         interpreter = LocalAIInterpreter()
@@ -3127,11 +3146,11 @@ async def get_conversation_history(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     # Get all conversations for this comparison
     conversations_query = (
@@ -3189,11 +3208,11 @@ async def calculate_custom_pca(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     # Load parquet file
     parquet_path = Path(settings.LOCAL_STORAGE_PATH) / dataset.parquet_file_path
@@ -3310,11 +3329,11 @@ async def calculate_custom_umap(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     # Load parquet file
     parquet_path = Path(settings.LOCAL_STORAGE_PATH) / dataset.parquet_file_path
@@ -3430,11 +3449,11 @@ async def get_custom_boxplot_data(
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    project = dataset.project
-    is_owner = project.owner_id == current_user.user_id
-
-    if not is_owner:
-        raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
+    # Owner OU membre du projet, comme la trentaine de routes voisines. Le
+    # controle etait ecrit a la main ici et n'acceptait que le proprietaire : un
+    # membre partage lisait la table des DEG et l'enrichissement du dataset,
+    # mais recevait 403 sur l'ACP du meme dataset.
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
 
     if not gene_list or len(gene_list) == 0:
         raise HTTPException(status_code=400, detail="At least one gene must be provided")
@@ -4470,6 +4489,11 @@ async def run_gsea_analysis(
         gsea_dataset = _gsea_ds_result.scalar_one_or_none()
         if not gsea_dataset:
             raise HTTPException(status_code=404, detail="Dataset not found")
+        # Le commentaire ci-dessus annoncait un controle d'acces qui n'avait
+        # jamais ete ecrit : la route calculait un GSEA sur les donnees de
+        # n'importe quel projet. Le pendant asynchrone (gsea.py) fait bien cette
+        # verification, c'est celle-la qu'on reprend.
+        await _check_project_read_access(gsea_dataset.project_id, current_user.user_id, db)
 
         try:
             payload = await compute_gsea(
@@ -4525,7 +4549,8 @@ async def get_enrichment_plot_data(
     gene_set_name: str,
     comparison_name: str = Query(...),
     ranking_metric: str = Query("signed_pvalue"),
-    db: Annotated[AsyncSession, Depends(get_db)] = None
+    db: Annotated[AsyncSession, Depends(get_db)] = None,
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)] = None,
 ) -> dict:
     """
     Get data for GSEA enrichment plot for a specific gene set
@@ -4534,6 +4559,16 @@ async def get_enrichment_plot_data(
     """
     import pandas as pd
     from sqlalchemy import text
+
+    # La route ne recevait meme pas l'utilisateur courant : elle lisait
+    # `deg_genes` (log2FC et padj gene par gene) pour n'importe quel dataset_id.
+    # C'est la seule des routes non protegees que le front appelle vraiment.
+    _ep_auth_ds = (
+        await db.execute(select(Dataset).where(Dataset.id == dataset_id))
+    ).scalar_one_or_none()
+    if not _ep_auth_ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    await _check_project_read_access(_ep_auth_ds.project_id, current_user.user_id, db)
 
     try:
         # Fetch DEG data
@@ -5179,12 +5214,16 @@ async def precompute_sample_clustering(
     from scipy.stats import pearsonr
     
     # 1. Check permissions
+    #
+    # Le commentaire etait la, le controle non : la route rendait le clustering
+    # et les correlations d'echantillons de n'importe quel dataset.
     query = select(Dataset).join(Project).filter(Dataset.id == dataset_id)
     result = await db.execute(query)
     dataset = result.scalar_one_or_none()
-    
+
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    await _check_project_read_access(dataset.project_id, current_user.user_id, db)
     
     # 2. Check if already cached
     cache_key = f"sample_clustering_{dataset_id}_{method}_{metric}_{top_n_genes}"
