@@ -36,6 +36,7 @@ from app.api.deps.subscription import (
     increment_ai_usage,
     check_analysis_quota,
     increment_analysis_usage,
+    warn_if_quota_threshold_crossed,
 )
 # from app.db.session import get_db  <-- Removed
 from app.core.supabase_auth import SupabaseUser
@@ -213,12 +214,23 @@ async def upload_dataset(
     )
     
     db.add(dataset)
+    await db.flush()
+
+    # Le décompte du quota partage la transaction de l'insert : c'est ce qui
+    # permet à son rollback d'annuler réellement le dataset quand une requête
+    # concurrente a épuisé le quota entre le contrôle d'entrée et ici. Décompter
+    # après le commit, comme avant, rendait un 429 pour un dataset bel et bien
+    # créé.
+    if dataset_type == DatasetType.DEG:
+        await increment_analysis_usage(db_user, db)
+
     await db.commit()
     await db.refresh(dataset)
 
-    # Increment comparison counter AFTER successful DB commit
+    # Après le commit seulement : l'avertissement annonce une consommation
+    # devenue durable.
     if dataset_type == DatasetType.DEG:
-        await increment_analysis_usage(db_user, db)
+        await warn_if_quota_threshold_crossed(db_user, db)
 
     # Trigger Celery task
     process_dataset_upload.delay(str(dataset.id), uploaded_path)

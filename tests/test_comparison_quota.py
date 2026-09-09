@@ -125,14 +125,21 @@ async def test_http_increment_raises_429_and_rolls_back_when_blocked():
     db.rollback.assert_awaited_once()
 
 
-async def test_http_increment_commits_when_allowed():
+async def test_http_increment_leaves_the_commit_to_its_caller():
+    """Le décompte s'écrit dans la transaction de l'appelant, sans la clore.
+
+    C'est ce qui rend le `rollback` de la variante bloquée utile : l'insert du
+    dataset est encore en vol au moment où le quota refuse. Un commit ici le
+    rendait durable, et le 429 arrivait sur un dataset déjà créé.
+    """
     user = make_user(used=5)
     db = db_returning(6)
 
     await increment_analysis_usage(user, db)
 
-    db.commit.assert_awaited_once()
-    db.refresh.assert_awaited_once_with(user)
+    db.execute.assert_awaited_once()
+    db.commit.assert_not_awaited()
+    db.rollback.assert_not_awaited()
 
 
 async def test_http_increment_is_noop_for_unlimited_plan():

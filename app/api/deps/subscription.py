@@ -333,18 +333,27 @@ async def try_increment_analysis_usage(user: User, db: AsyncSession) -> bool:
 
 async def increment_analysis_usage(user: User, db: AsyncSession) -> None:
     """
-    Incrémente le compteur après un import DEG réussi, côté HTTP.
-    Lève 429 si le quota est épuisé — y compris quand une requête concurrente
-    l'a épuisé entre-temps, auquel cas le commit du dataset est annulé.
-    Envoie un avertissement par email au franchissement des 80 %.
-    À appeler APRÈS le commit du dataset.
+    Incrémente le compteur pour un import DEG, côté HTTP.
+
+    À appeler AVANT le commit du dataset, dans la MÊME transaction que son
+    insert. C'est cette contrainte qui donne son sens au `rollback` ci-dessous :
+    appelée après le commit — ce qu'elle faisait dans sa première version — elle
+    annulait une transaction déjà vide, et l'appelant recevait un 429 pour un
+    dataset pourtant durable, qui comptait ensuite contre la limite par projet
+    sans avoir jamais été facturé.
+
+    Ne commit pas : le commit appartient à l'appelant, seul à savoir ce que sa
+    transaction porte d'autre. Lève 429 quand une requête concurrente a épuisé
+    le quota entre le contrôle d'entrée (`check_analysis_quota`) et ici — le
+    rollback emporte alors l'insert en cours avec le compteur.
     """
     if _has_unlimited_analyses(user):
         return  # Illimité — rien à faire
 
     quota = user.analyses_quota
     if not await try_increment_analysis_usage(user, db):
-        # Quota épuisé par une requête concurrente — on annule le dataset
+        # Quota épuisé par une requête concurrente — on annule le dataset,
+        # dont l'insert est encore dans cette transaction.
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -353,10 +362,22 @@ async def increment_analysis_usage(user: User, db: AsyncSession) -> None:
                 "Quota resets on the 1st of next month."
             ),
         )
-    await db.commit()
-    await db.refresh(user)
 
-    # Avertissement à 80 % — au mieux, ne bloque jamais l'import
+
+async def warn_if_quota_threshold_crossed(user: User, db: AsyncSession) -> None:
+    """
+    Avertissement par email au franchissement des 80 % du quota.
+
+    Séparé de l'incrément parce qu'il doit lire un compteur DURABLE : prévenir
+    depuis la transaction reviendrait à annoncer une consommation qu'un commit
+    raté n'aurait jamais rendue vraie. À appeler APRÈS le commit.
+
+    Ne bloque jamais l'import : toute erreur d'envoi est journalisée et avalée.
+    """
+    if _has_unlimited_analyses(user):
+        return
+
+    await db.refresh(user)
     quota = user.analyses_quota
     used = user.analyses_used_this_month
     if quota and used == int(quota * 0.8):
