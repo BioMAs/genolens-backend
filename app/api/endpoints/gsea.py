@@ -16,13 +16,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import joinedload
 
 from app.api.deps import get_current_user, get_db
+from app.api.deps.project_access import assert_project_read_access
 from app.api.deps.license import require_active_license
 from app.api.deps.subscription import require_scientific_access
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import Dataset, Project, ProjectMember
+from app.models.models import Dataset
 from app.models.gsea_job import GSEAJob, GSEAJobStatus
 
 logger = logging.getLogger(__name__)
@@ -40,19 +40,6 @@ class GSEAJobResponse(BaseModel):
     comparison_name: Optional[str] = None
     result: Optional[dict] = None
     error_message: Optional[str] = None
-
-
-async def _assert_project_access(db: AsyncSession, project: Project, user: SupabaseUser) -> None:
-    if project.owner_id == user.user_id:
-        return
-    member = await db.execute(
-        select(ProjectMember).where(
-            ProjectMember.project_id == project.id,
-            ProjectMember.user_id == user.user_id,
-        )
-    )
-    if member.scalar_one_or_none() is None:
-        raise HTTPException(status_code=403, detail="Access denied")
 
 
 @router.post(
@@ -74,12 +61,12 @@ async def trigger_gsea(
     fdr_threshold: float = Body(0.25),
 ) -> GSEATriggerResponse:
     result = await db.execute(
-        select(Dataset).options(joinedload(Dataset.project)).where(Dataset.id == dataset_id)
+        select(Dataset).where(Dataset.id == dataset_id)
     )
     dataset = result.scalar_one_or_none()
     if not dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    await _assert_project_access(db, dataset.project, current_user)
+    await assert_project_read_access(db, dataset.project_id, current_user.user_id)
 
     job = GSEAJob(
         dataset_id=dataset.id,
@@ -132,10 +119,9 @@ async def get_gsea_job(
     if not job:
         raise HTTPException(status_code=404, detail="GSEA job not found")
 
-    project = await db.get(Project, job.project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    await _assert_project_access(db, project, current_user)
+    # `assert_project_read_access` relit le projet et rend le meme 404 s'il
+    # n'existe pas : le pre-chargement qui vivait ici faisait double emploi.
+    await assert_project_read_access(db, job.project_id, current_user.user_id)
 
     return GSEAJobResponse(
         job_id=job.id,
