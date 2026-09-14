@@ -15,7 +15,7 @@ from app.api.deps.supabase_deps import get_current_user
 from app.core.config import settings
 from app.core.supabase_auth import SupabaseUser
 from app.db.session import get_db
-from app.models.models import SubscriptionPlan, User, UserRole
+from app.models.models import SubscriptionPlan, User, UserRole, UserStatus
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,8 @@ async def get_or_create_user(
         await db.commit()
         await db.refresh(user)
     else:
+        dirty = False
+
         if user.role != current_user.role:
             # Never downgrade a protected admin role via Supabase claims
             if user.role in _PROTECTED_ROLES:
@@ -65,9 +67,29 @@ async def get_or_create_user(
                     current_user.role,
                 )
                 user.role = current_user.role
-                db.add(user)
-                await db.commit()
-                await db.refresh(user)
+                dirty = True
+
+        # Invitation accepted. Reaching here means Supabase minted a valid token
+        # for this account, which only happens once the invitee has followed the
+        # magic link and set a password — so PENDING has served its purpose.
+        #
+        # Nothing else in the codebase ever clears PENDING: before this, an
+        # invited user stayed PENDING forever, the admin panel kept offering
+        # "Renvoyer l'invitation" for someone already using the product, and
+        # `resend_invitation` was the only code that read the flag. That was
+        # merely untidy while status was unenforced; once `require_active_account`
+        # treats a non-ACTIVE account as inactive, leaving it here would lock out
+        # every invited user on their first request. This transition is what makes
+        # enforcing status safe.
+        if user.status == UserStatus.PENDING:
+            logger.info("Activating invited user %s on first authenticated request", user.id)
+            user.status = UserStatus.ACTIVE
+            dirty = True
+
+        if dirty:
+            db.add(user)
+            await db.commit()
+            await db.refresh(user)
 
     return user
 
@@ -229,8 +251,45 @@ async def require_drug_discovery_access(user: Annotated[User, Depends(get_or_cre
 # ── TEAM plan guard ────────────────────────────────────────────────────────────
 
 
+async def require_advanced_export(user: Annotated[User, Depends(get_or_create_user)]) -> User:
+    """Require TEAM or ON_PREMISE plan for PDF report generation.
+
+    Backs the grid's `advanced_export` entitlement, which reads false for STARTER
+    (`app/config/pricing.json`). `User.can_export_advanced` has expressed that rule
+    since the plans were introduced and was never once called, so STARTER accounts
+    have been generating PDF reports the grid says they do not have.
+
+    Scope is PDF only. CSV/TSV (`GET /{dataset_id}/deg-stats/export`) is included
+    in every plan and stays open, and no Excel export exists in the product —
+    openpyxl appears only on the import side.
+
+    Applied to the two report *triggers*, not to `/report/status` or
+    `/report/download`: a STARTER can no longer start a report, so has none to
+    fetch, while gating the download would retroactively hide reports already
+    produced and paid for.
+    """
+    if not user.can_export_advanced:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"PDF report export requires a TEAM or ON_PREMISE plan. "
+                f"Current plan: {user.subscription_plan.value}"
+            ),
+        )
+    return user
+
+
 async def require_team_plan(user: Annotated[User, Depends(get_or_create_user)]) -> User:
-    """Require TEAM or ON_PREMISE plan (multi-comparison, export PDF, API access)."""
+    """Require TEAM or ON_PREMISE plan (multi-comparison features).
+
+    Backs the grid's `multi_comparison` entitlement. Written when the plans were
+    introduced and left with zero call sites until now, which is why Venn analysis
+    and cross-comparison intersection enrichment were reachable on STARTER.
+
+    Not applied to `logfc-scatter`: `contrast_scatter` is add-on-owned
+    (`ADDON_OWNED_ENTITLEMENTS`, app/core/pricing.py) and already sits behind
+    `require_scientific_access`. Adding a plan gate there would contradict the grid.
+    """
     if not user.can_use_multi_comparison:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

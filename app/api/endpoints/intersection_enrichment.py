@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db
 from app.api.deps.project_access import assert_project_read_access
 from app.api.deps.license import require_active_license
+from app.api.deps.subscription import require_team_plan
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import Dataset, SelfServiceAnalysis
 from app.models.intersection_enrichment_job import (
@@ -67,7 +68,7 @@ async def _resolve_species(db: AsyncSession, dataset: Dataset) -> str:
     "/datasets/{path_dataset_id}/intersection-enrichment",
     response_model=EnrichmentTriggerResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_active_license)],
+    dependencies=[Depends(require_active_license), Depends(require_team_plan)],
 )
 async def trigger_intersection_enrichment(
     path_dataset_id: UUID,

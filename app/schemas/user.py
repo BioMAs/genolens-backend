@@ -1,7 +1,7 @@
 from uuid import UUID
 from typing import Optional
 from pydantic import BaseModel, EmailStr
-from app.models.models import UserRole, SubscriptionPlan
+from app.models.models import UserRole, SubscriptionPlan, UserStatus
 
 class UserBase(BaseModel):
     email: Optional[EmailStr] = None
@@ -42,6 +42,17 @@ class UserSelf(User):
     can_use_ai: bool = False
     can_use_multi_comparison: bool = False
     can_export_advanced: bool = False
+    # Account lifecycle. Enforced by `require_active_account`; surfaced here so
+    # the client can explain a refusal instead of just failing. `status` drives
+    # the hard block (suspended / cancelled), the expiry drives read-only mode.
+    status: UserStatus = UserStatus.ACTIVE
+    subscription_ends_at: Optional[str] = None
+    # Computed server-side on purpose: the end date is an ISO string written by
+    # two callers with different formats, and the comparison rule (naive means
+    # UTC, unparsable means no expiry) lives in app/api/deps/account_state.py.
+    # Re-deriving it in TypeScript would be a second implementation free to drift
+    # from the one that actually refuses the request.
+    subscription_expired: bool = False
     # Add-on modules (unlocked per-user by an admin)
     has_cosmetics_module: bool = False
     has_report_customization: bool = False

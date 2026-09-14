@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db
 from app.api.deps.project_access import assert_project_access
-from app.api.deps.subscription import get_or_create_user
+from app.api.deps.subscription import get_or_create_user, require_advanced_export
 from app.core.security import CurrentUser
 from app.models.models import Dataset, SelfServiceAnalysis, User
 from app.models.report_job import ReportJob, ReportJobStatus
@@ -52,6 +52,7 @@ async def _get_analysis_or_404(
     "/{analysis_id}/report",
     response_model=ReportTriggerResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_advanced_export)],
 )
 async def trigger_report(
     analysis_id: UUID,
@@ -173,6 +174,7 @@ async def _get_dataset_or_404(dataset_id: UUID, db: AsyncSession, user_id: UUID)
     "/{dataset_id}/report",
     response_model=ReportTriggerResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_advanced_export)],
 )
 async def trigger_comparison_report(
     dataset_id: UUID,
