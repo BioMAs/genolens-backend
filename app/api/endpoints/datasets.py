@@ -32,6 +32,7 @@ from app.api.deps.subscription import (
     require_admin,
     require_ai_access,
     require_scientific_access,
+    require_team_plan,
     check_ai_quota,
     increment_ai_usage,
     check_analysis_quota,
@@ -3870,7 +3871,10 @@ async def check_ai_status(
     }
 
 
-@router.post("/{dataset_id}/venn-analysis", dependencies=[Depends(require_active_license)])
+@router.post(
+    "/{dataset_id}/venn-analysis",
+    dependencies=[Depends(require_active_license), Depends(require_team_plan)],
+)
 async def venn_analysis(
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],

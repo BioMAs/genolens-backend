@@ -6,6 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status, Depends
 from app.api.deps import get_current_user
+from app.api.deps.account_state import require_active_account
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -216,19 +217,143 @@ async def database_test(current_user=Depends(get_current_user)):
 
 
 # Include API Routers
+#
+# `require_active_account` is attached here, at the router level, rather than to
+# each endpoint. Thirteen endpoint modules resolve their caller through
+# `get_current_user` and never touch `get_or_create_user`, so a guard placed in
+# the latter would miss them; attaching it per-endpoint would leave the next
+# route added free to forget it. `tests/test_account_state_coverage.py` asserts
+# that every route below carries it, exemptions included.
+#
+# Deliberately NOT guarded, and why:
+#   billing          a cancelled account must be able to reach checkout to renew
+#   users            /users/me has to answer so the client can render the banner
+#                    that explains why everything else is refusing
+#   pricing          public by design, read before sign-in
+#   license, health  infrastructure status, needed precisely when access is broken
+#   admin, cosmetics.admin_router, admin_deployment, admin_ai_costs
+#                    admin-only already; privileged roles bypass the guard anyway
+
 app.include_router(
     projects.router,
     prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
 )
 
 app.include_router(
     comparisons.router,
     prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
 )
 
 app.include_router(
     datasets.router,
     prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    ontology.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    enrichment.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    cosmetics.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    bookmarks.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    genes.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    comments.router,
+    prefix=settings.API_V1_PREFIX,
+    tags=["comments"],
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    history.router,
+    prefix=settings.API_V1_PREFIX,
+    tags=["history"],
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    integrations.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    drug_discovery.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    reports.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    reports.comparison_router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    report_settings.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    intersection_enrichment.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    gsea.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    gene_sets.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    analyses.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    chat.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
 )
 
 app.include_router(
@@ -239,22 +364,7 @@ app.include_router(
 app.include_router(
     users.router,
     prefix=settings.API_V1_PREFIX + "/users",
-    tags=["users"]
-)
-
-app.include_router(
-    ontology.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    enrichment.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    cosmetics.router,
-    prefix=settings.API_V1_PREFIX,
+    tags=["users"],
 )
 
 app.include_router(
@@ -263,46 +373,12 @@ app.include_router(
 )
 
 app.include_router(
-    bookmarks.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    genes.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    comments.router,
-    prefix=settings.API_V1_PREFIX,
-    tags=["comments"]
-)
-
-app.include_router(
-    history.router,
-    prefix=settings.API_V1_PREFIX,
-    tags=["history"]
-)
-
-app.include_router(
-    integrations.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
     license.router,
     prefix=settings.API_V1_PREFIX,
 )
 
-# Public on purpose: the pricing grid must be readable before sign-in, by the
-# pricing page and the marketing site alike.
 app.include_router(
     pricing.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    drug_discovery.router,
     prefix=settings.API_V1_PREFIX,
 )
 
@@ -318,46 +394,6 @@ app.include_router(
 
 app.include_router(
     billing.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    reports.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    reports.comparison_router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    report_settings.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    intersection_enrichment.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    gsea.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    gene_sets.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    analyses.router,
-    prefix=settings.API_V1_PREFIX,
-)
-
-app.include_router(
-    chat.router,
     prefix=settings.API_V1_PREFIX,
 )
 

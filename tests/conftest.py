@@ -224,3 +224,67 @@ async def async_client():
     from app.main import app
     async with AsyncClient(app=app, base_url="http://testserver") as client:
         yield client
+
+
+# ─────────────────────────────────────────────
+# Default account state for integration tests
+# ─────────────────────────────────────────────
+
+def make_fake_db_user(
+    user_id: UUID = TEST_USER_ID,
+    email: str = "test@example.com",
+    plan=None,
+    role=None,
+    status=None,
+):
+    """A local `User` row that passes every account and plan guard.
+
+    Defaults to TEAM rather than STARTER on purpose: this is the *baseline* user
+    for tests that are not about plans at all (report generation, Venn analysis,
+    project stats). Handing them a STARTER would make unrelated suites fail on an
+    entitlement they never meant to exercise. Plan refusals are asserted
+    explicitly, with an explicit STARTER, in
+    `tests/test_account_state_and_plan_gates.py`.
+    """
+    from app.models.models import SubscriptionPlan, User, UserRole, UserStatus
+
+    u = User()
+    u.id = user_id
+    u.email = email
+    u.role = role or UserRole.USER
+    u.subscription_plan = plan or SubscriptionPlan.TEAM
+    u.status = status or UserStatus.ACTIVE
+    u.subscription_ends_at = None
+    u.ai_interpretations_used = 0
+    u.ai_tokens_purchased = 0
+    u.ai_tokens_used = 0
+    u.analyses_used_this_month = 0
+    u.cosmetics_module_enabled = False
+    u.report_customization_module_enabled = False
+    u.scientific_module_enabled = False
+    u.drug_discovery_module_enabled = False
+    return u
+
+
+@pytest.fixture(autouse=True)
+def _default_active_account():
+    """Resolve `get_or_create_user` to an active TEAM user for every test.
+
+    `require_active_account` is attached to every user-facing router in
+    `app/main.py`, so **all** of them now pull in `get_or_create_user` — including
+    the many routes whose handlers resolve their caller through
+    `get_current_user` alone and had therefore never touched it. Without a default
+    here, those suites would resolve the real dependency, hit Supabase token
+    verification and fail with 403 "Not authenticated" — a failure about test
+    plumbing, not about the behaviour under test.
+
+    Autouse and function-scoped so it survives the `dependency_overrides.clear()`
+    that many fixtures run at teardown. A test wanting a different account simply
+    overrides the same key afterwards; the last write wins.
+    """
+    from app.main import app
+    from app.api.deps.subscription import get_or_create_user
+
+    app.dependency_overrides[get_or_create_user] = lambda: make_fake_db_user()
+    yield
+    app.dependency_overrides.pop(get_or_create_user, None)

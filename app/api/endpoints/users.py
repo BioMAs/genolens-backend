@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db
+from app.api.deps.account_state import subscription_has_expired
 from app.api.deps.subscription import get_or_create_user
 from app.models.models import Project, User
 from app.schemas import user as user_schemas
@@ -33,6 +34,9 @@ async def read_user_me(
     current_user.project_count = await db.scalar(
         select(func.count()).select_from(Project).where(Project.owner_id == current_user.id)
     )
+    # Same predicate `require_active_account` applies when it refuses a write, so
+    # the banner and the refusal can never disagree.
+    current_user.subscription_expired = subscription_has_expired(current_user)
     return current_user
 
 # NOTE: PATCH /me/subscription was removed deliberately. It let any authenticated

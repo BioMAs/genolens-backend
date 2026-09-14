@@ -67,6 +67,7 @@ def make_user() -> User:
 def make_client(*, caller: User, dataset, project):
     """L'appelant n'est ni propriétaire ni membre : toute requête `ProjectMember`
     revient vide."""
+    from app.api.deps.db import get_db as get_db_deps
     from app.api.deps.license import require_active_license
     from app.api.deps.subscription import get_or_create_user
     from app.api.deps.supabase_deps import get_current_user, get_db
@@ -131,6 +132,16 @@ def make_client(*, caller: User, dataset, project):
         is_active=True,
     )
     app.dependency_overrides[get_db] = _fake_db
+    # Meme piege que pour `get_current_user` ci-dessus, applique a la session :
+    # `deps.supabase_deps.get_db` et `deps.db.get_db` sont deux objets
+    # DIFFERENTS, et `history.py` (comme `comments.py`, `reports.py`,
+    # `report_settings.py`) depend du second. Ne surcharger que le premier
+    # laissait la route `history` interroger le VRAI Postgres : elle repondait
+    # 404 par chance, parce qu'un projet tire au hasard n'y existe pas. Sur une
+    # suite complete, la connexion reelle finit par etre reutilisee depuis une
+    # autre boucle d'evenements (« attached to a different loop ») et la route
+    # repond 500 — un rouge qui n'a rien a voir avec le controle d'acces teste ici.
+    app.dependency_overrides[get_db_deps] = _fake_db
     app.dependency_overrides[require_active_license] = lambda: None
 
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver")

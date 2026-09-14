@@ -49,14 +49,32 @@ class UserProfile(BaseModel):
     report_customization_module_enabled: bool = False
     scientific_module_enabled: bool = False
     drug_discovery_module_enabled: bool = False
+    # ISO 8601, or null for an account with no end date. Enforced by
+    # `require_active_account`: past this instant the account goes read-only.
+    # It was settable at invitation time and invisible ever after, so an admin
+    # could neither see nor correct a limit they had set.
+    subscription_starts_at: Optional[str] = None
+    subscription_ends_at: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     last_sign_in_at: Optional[str] = None
     confirmed_at: Optional[str] = None
 
 class SubscriptionUpdate(BaseModel):
-    """Schema for updating subscription."""
+    """Schema for updating subscription.
+
+    `subscription_ends_at` distinguishes three cases deliberately, which is why
+    the endpoint reads `model_fields_set` rather than just the value:
+
+      field absent   → leave the current end date alone (a plan change on its own)
+      explicit null  → clear the end date, the account becomes open-ended
+      a datetime     → set/replace the end date
+
+    Collapsing the first two would make a mistakenly set expiry impossible to
+    lift: every plan change would silently re-clear it, or nothing ever could.
+    """
     plan: SubscriptionPlan
+    subscription_ends_at: Optional[datetime] = None
 
 class CosmeticsModuleUpdate(BaseModel):
     """Schema for toggling the Cosmetics add-on module for a user."""
@@ -233,6 +251,8 @@ async def list_users(
                 report_customization_enabled = False
                 scientific_enabled = False
                 drug_discovery_enabled = False
+                subscription_starts_at = None
+                subscription_ends_at = None
                 role_value = profile.get("role", "USER")
 
                 if local_user:
@@ -253,6 +273,8 @@ async def list_users(
                     report_customization_enabled = local_user.report_customization_module_enabled
                     scientific_enabled = local_user.scientific_module_enabled
                     drug_discovery_enabled = local_user.drug_discovery_module_enabled
+                    subscription_starts_at = local_user.subscription_starts_at
+                    subscription_ends_at = local_user.subscription_ends_at
 
                 result.append(UserProfile(
                     id=UUID(user_id),
@@ -270,6 +292,8 @@ async def list_users(
                     report_customization_module_enabled=report_customization_enabled,
                     scientific_module_enabled=scientific_enabled,
                     drug_discovery_module_enabled=drug_discovery_enabled,
+                    subscription_starts_at=subscription_starts_at,
+                    subscription_ends_at=subscription_ends_at,
                     created_at=profile.get("created_at"),
                     updated_at=profile.get("updated_at"),
                     last_sign_in_at=auth_info.get("last_sign_in_at"),
@@ -438,10 +462,20 @@ async def get_user_details(
                     report_customization_enabled = False
                     scientific_enabled = False
                     drug_discovery_enabled = False
+                    # Unlike list_users, this path never read the real status and
+                    # always reported "active" — so the detail modal showed every
+                    # suspended account as healthy. Now that status actually gates
+                    # access, that gap would misinform the admin acting on it.
+                    user_status = "active"
+                    subscription_starts_at = None
+                    subscription_ends_at = None
                     role_value = profile.get("role", "USER")
 
                     if local_user:
                         sub_plan = local_user.subscription_plan.value
+                        user_status = local_user.status.value.lower()
+                        subscription_starts_at = local_user.subscription_starts_at
+                        subscription_ends_at = local_user.subscription_ends_at
                         ai_used = local_user.ai_interpretations_used
                         ai_remaining = local_user.ai_interpretations_remaining
                         ai_purchased = local_user.ai_tokens_purchased
@@ -460,6 +494,7 @@ async def get_user_details(
                         full_name=profile.get("full_name"),
                         avatar_url=profile.get("avatar_url"),
                         role=role_value,
+                        status=user_status,
                         subscription_plan=sub_plan,
                         ai_interpretations_used=ai_used,
                         ai_interpretations_remaining=ai_remaining,
@@ -469,6 +504,8 @@ async def get_user_details(
                         report_customization_module_enabled=report_customization_enabled,
                         scientific_module_enabled=scientific_enabled,
                         drug_discovery_module_enabled=drug_discovery_enabled,
+                        subscription_starts_at=subscription_starts_at,
+                        subscription_ends_at=subscription_ends_at,
                         created_at=profile.get("created_at"),
                         updated_at=profile.get("updated_at"),
                         last_sign_in_at=last_sign_in,
@@ -531,7 +568,19 @@ async def update_user_subscription(
             db.add(user)
     else:
         user.subscription_plan = sub_update.plan
-    
+
+    # Only touch the end date when the caller actually sent the field. An absent
+    # field means "change the plan, leave the access period alone"; an explicit
+    # null means "remove the limit". See SubscriptionUpdate.
+    if "subscription_ends_at" in sub_update.model_fields_set:
+        # The column is a String(50) holding ISO 8601 (see models.py) — same
+        # convention as the invite path and the Stripe webhook.
+        user.subscription_ends_at = (
+            sub_update.subscription_ends_at.isoformat()
+            if sub_update.subscription_ends_at
+            else None
+        )
+
     await db.commit()
     await db.refresh(user)
     
