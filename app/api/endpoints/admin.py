@@ -776,11 +776,32 @@ async def get_ai_usage_logs(
 async def update_user_role(
     user_id: UUID,
     role_update: UserRoleUpdate,
-    current_user: SupabaseUser = Depends(require_admin)
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    Update a user's role.
+    Update a user's role, in Supabase `profiles` AND in the local `users` row.
     Admin only.
+
+    Two defects fixed here, both of which made this endpoint lie about what it did:
+
+    1. It returned the raw PostgREST `profiles` row against
+       `response_model=UserProfile`. That row carries no `subscription_plan`,
+       which `UserProfile` requires, so response validation failed and the caller
+       got a 500 — *after* the write had already landed in Supabase. The role did
+       change; the admin panel just reported failure, which invites a retry or the
+       conclusion that the feature is broken. It now returns a real profile, built
+       the same way `update_user_subscription` does.
+
+    2. It wrote the role to Supabase only. The local `users.role` syncs lazily in
+       `get_or_create_user`, which deliberately refuses to downgrade ADMIN and
+       SCILICIUM_ADMIN from Supabase claims — a sound protection against a stale
+       or forged claim, but it also meant a *deliberate* demotion made here could
+       never reach the local row. The demoted user lost the admin panel (whose
+       guard reads Supabase) while keeping every local-role privilege: unlimited
+       analysis quota, AI access, and a free pass through `require_active_account`.
+       Writing both sides here keeps that protection intact — it guards against
+       claims, not against an explicit admin action.
     """
     # Validate role
     from app.models.models import UserRole
@@ -809,20 +830,32 @@ async def update_user_role(
                 json={"role": role_update.role.lower()}
             )
 
-            if response.status_code == 200:
-                data = response.json()
-                if data and len(data) > 0:
-                    return data[0]
-                else:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="User not found"
-                    )
-            else:
+            if response.status_code != 200:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"Failed to update user role: {response.text}"
                 )
+
+            data = response.json()
+            if not data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
+
+        # Mirror onto the local row, which is what every plan and quota guard
+        # reads. Skipped silently when the user has no local row yet: it is
+        # created on their first authenticated call, and `get_or_create_user`
+        # picks the role up from the Supabase claim at that point.
+        result = await db.execute(select(User).where(User.id == user_id))
+        local_user = result.scalar_one_or_none()
+        if local_user:
+            local_user.role = UserRole(role_update.role.upper())
+            await db.commit()
+
+        # Build the response the same way update_user_subscription does, rather
+        # than returning the PostgREST row — see the note in the docstring.
+        return await get_user_details(user_id, current_user, db)
 
     except HTTPException:
         raise
