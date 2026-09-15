@@ -575,11 +575,18 @@ async def update_user_subscription(
     if "subscription_ends_at" in sub_update.model_fields_set:
         # The column is a String(50) holding ISO 8601 (see models.py) — same
         # convention as the invite path and the Stripe webhook.
-        user.subscription_ends_at = (
+        new_ends_at = (
             sub_update.subscription_ends_at.isoformat()
             if sub_update.subscription_ends_at
             else None
         )
+        if new_ends_at != user.subscription_ends_at:
+            # Re-arm the expiry warnings. `expiry_warning_sent_for` records the
+            # smallest threshold already emailed; leaving it set would mean a user
+            # warned once before a renewal is never warned again for the new
+            # period. See app/worker/tasks/account_tasks.py.
+            user.expiry_warning_sent_for = None
+        user.subscription_ends_at = new_ends_at
 
     await db.commit()
     await db.refresh(user)

@@ -516,6 +516,76 @@ async def send_quota_warning_email(
 
 
 # ---------------------------------------------------------------------------
+# Subscription expiry warning
+# ---------------------------------------------------------------------------
+
+
+def _expiry_warning_html(days_remaining: int, ends_on: str, contact_url: str) -> str:
+    when = "aujourd'hui" if days_remaining == 0 else f"dans {days_remaining} jour{'s' if days_remaining > 1 else ''}"
+    content = f"""
+      <p>Bonjour,</p>
+      <p>
+        Votre période d'accès à GenoLens se termine <strong>{when}</strong>
+        (le {ends_on}).
+      </p>
+      <div class="highlight-box">
+        <p>
+          À cette date, votre compte passera en <strong>lecture seule</strong> :
+          vous continuerez à consulter vos projets et résultats existants, mais la
+          création de projets, le dépôt de jeux de données et le lancement
+          d'analyses seront désactivés.
+        </p>
+      </div>
+      <p>
+        Vos données ne sont ni supprimées ni modifiées. Pour prolonger votre accès,
+        écrivez-nous et nous nous en occupons.
+      </p>
+      <a href="{contact_url}" class="btn">Prolonger mon accès →</a>
+      <div class="meta">
+        <p>Ou répondez simplement à ce message.</p>
+      </div>
+    """
+    return _base_layout(f"GenoLens — votre accès se termine {when}", content)
+
+
+def _expiry_warning_text(days_remaining: int, ends_on: str, contact_url: str) -> str:
+    when = "aujourd'hui" if days_remaining == 0 else f"dans {days_remaining} jour{'s' if days_remaining > 1 else ''}"
+    return (
+        f"Bonjour,\n\n"
+        f"Votre période d'accès à GenoLens se termine {when} (le {ends_on}).\n\n"
+        f"À cette date, votre compte passera en lecture seule : vous continuerez à "
+        f"consulter vos projets et résultats existants, mais la création de projets, "
+        f"le dépôt de jeux de données et le lancement d'analyses seront désactivés.\n\n"
+        f"Vos données ne sont ni supprimées ni modifiées.\n\n"
+        f"Pour prolonger votre accès : {contact_url}\n\n"
+        f"— L'équipe GenoLens"
+    )
+
+
+async def send_expiration_warning_email(
+    to: str,
+    days_remaining: int,
+    ends_on: str,
+) -> bool:
+    """Warn a user that their access period is about to end.
+
+    Deliberately describes the consequence as read-only rather than as a
+    lock-out, because that is exactly what `require_active_account` enforces:
+    reads keep working, writes stop. Promising less than the product does would
+    frighten people into thinking their data is at risk; promising more would be
+    a lie they discover the next morning.
+    """
+    contact_url = f"{settings.APP_URL}/pricing"
+    when = "aujourd'hui" if days_remaining == 0 else f"dans {days_remaining} jour{'s' if days_remaining > 1 else ''}"
+    return await send_email(
+        to=to,
+        subject=f"GenoLens — votre accès se termine {when}",
+        html_body=_expiry_warning_html(days_remaining, ends_on, contact_url),
+        text_body=_expiry_warning_text(days_remaining, ends_on, contact_url),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Mention parsing helper
 # ---------------------------------------------------------------------------
 
