@@ -928,6 +928,27 @@ async def _count_pipeline_analysis(user, db, produced_comparisons: int) -> None:
         )
 
 
+async def _analysis_cancelled(db, analysis_id: UUID, *, lock: bool = False) -> bool:
+    """Vrai si l'analyse a été annulée depuis `POST /analyses/{id}/cancel`.
+
+    Lu directement en base, pas sur l'objet ORM de la session du worker, qui
+    garde le statut qu'il a lu au démarrage. `lock=True` prend un verrou de
+    ligne jusqu'au commit de l'appelant : l'annulation fait un UPDATE
+    conditionnel sur le statut, elle attend donc ce commit et voit DONE — pas
+    de fenêtre où l'analyse finirait DONE, décomptée, et affichée CANCELLED.
+
+    La révocation Celery (`terminate=True`) ne suffit pas seule : elle vit en
+    mémoire des workers, se perd au redémarrage, et arrive trop tard si le
+    pipeline R vient de rendre la main.
+    """
+    from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus
+
+    stmt = select(SelfServiceAnalysis.status).where(SelfServiceAnalysis.id == analysis_id)
+    if lock:
+        stmt = stmt.with_for_update()
+    return (await db.scalar(stmt)) == SelfServiceAnalysisStatus.CANCELLED
+
+
 @celery_app.task(bind=True, base=DatabaseTask, name="app.worker.tasks.run_self_service_analysis", queue="r_analysis")
 def run_self_service_analysis(self, analysis_id: str) -> dict:
     """
@@ -963,6 +984,12 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     entry = {"step": step, "message": message, "timestamp": _now_iso()}
                     analysis.progress_log = (analysis.progress_log or []) + [entry]
                     logger.info("[ANALYSIS] %s: %s", step, message)
+
+                # Annulée pendant qu'elle attendait dans la file, et la
+                # révocation s'est perdue : ne pas la relancer.
+                if analysis.status == SelfServiceAnalysisStatus.CANCELLED:
+                    logger.info("[ANALYSIS] %s was cancelled before start, skipping", analysis_id)
+                    return {"status": "cancelled", "analysis_id": analysis_id}
 
                 # Mark as running
                 analysis.status = SelfServiceAnalysisStatus.RUNNING
@@ -1245,6 +1272,15 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     logger.warning("[ANALYSIS] %s", warn)
                     _log("no_results_warning", warn)
 
+                # Annulée pendant le calcul : ni DONE, ni unité de quota. Le
+                # verrou tient jusqu'au commit ci-dessous (voir
+                # _analysis_cancelled).
+                if await _analysis_cancelled(db, UUID(analysis_id), lock=True):
+                    await db.rollback()
+                    logger.info("[ANALYSIS] %s cancelled during run, not counted", analysis_id)
+                    shutil.rmtree(outdir, ignore_errors=True)
+                    return {"status": "cancelled", "analysis_id": analysis_id}
+
                 analysis.result_dataset_ids = result_dataset_ids
                 analysis.intermediate_dataset_ids = intermediate_dataset_ids
                 analysis.status = SelfServiceAnalysisStatus.DONE
@@ -1275,9 +1311,14 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 logger.error("[ANALYSIS] Failed for %s: %s", analysis_id, error_msg)
                 logger.error("[ANALYSIS] Traceback:\n%s", error_details)
                 shutil.rmtree(outdir, ignore_errors=True)
+                await db.rollback()
                 await db.execute(
                     update(SelfServiceAnalysis)
-                    .where(SelfServiceAnalysis.id == UUID(analysis_id))
+                    .where(
+                        SelfServiceAnalysis.id == UUID(analysis_id),
+                        # Une analyse annulée reste CANCELLED.
+                        SelfServiceAnalysis.status != SelfServiceAnalysisStatus.CANCELLED,
+                    )
                     .values(
                         status=SelfServiceAnalysisStatus.FAILED,
                         error_message=error_msg,
