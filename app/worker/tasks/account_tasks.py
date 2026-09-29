@@ -125,7 +125,8 @@ async def _async_check_account_expirations() -> dict:
                 await email_service.send_expiration_warning_email(
                     to=user.email,
                     days_remaining=max(0, days_remaining),
-                    ends_on=ends_at.strftime("%d/%m/%Y"),
+                    # "31 December 2026": unambiguous in English, unlike 31/12/2026.
+                    ends_on=f"{ends_at.day} {ends_at.strftime('%B %Y')}",
                 )
             except Exception as exc:
                 # Never let one bad address stop the run, and never record a

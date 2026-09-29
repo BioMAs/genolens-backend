@@ -219,6 +219,30 @@ async def test_the_mail_describes_read_only_not_a_lockout(monkeypatch):
     """
     from app.services.email_service import _expiry_warning_text
 
-    body = _expiry_warning_text(3, "31/12/2026", "https://example.com/pricing")
-    assert "lecture seule" in body
-    assert "ne sont ni supprimées ni modifiées" in body
+    body = _expiry_warning_text(3, "31 December 2026", "https://example.com/pricing")
+    assert "read-only" in body
+    assert "neither deleted nor modified" in body
+
+
+def test_the_mail_is_in_english():
+    from app.services.email_service import (
+        _expiry_warning_html,
+        _expiry_warning_subject,
+        _expiry_warning_text,
+    )
+
+    assert _expiry_warning_subject(0) == "GenoLens — your access ends today"
+    assert _expiry_warning_subject(1) == "GenoLens — your access ends in 1 day"
+    assert _expiry_warning_subject(7) == "GenoLens — your access ends in 7 days"
+    text = _expiry_warning_text(3, "31 December 2026", "https://example.com/pricing")
+    assert "ends in 3 days (on 31 December 2026)" in text
+    assert "support@scilicium.com" in text
+    # The shared layout (header, footer) is translated separately, with the other
+    # transactional emails; this checks the expiry content itself.
+    html = _expiry_warning_html(3, "31 December 2026", "https://example.com/pricing")
+    assert "<strong>in 3 days</strong>" in html
+    assert "(on 31 December 2026)" in html
+    assert "support@scilicium.com" in html
+    for french in ("Bonjour", "lecture seule", "votre", "jours", "Prolonger"):
+        assert french not in text
+        assert french not in html

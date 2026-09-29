@@ -520,45 +520,60 @@ async def send_quota_warning_email(
 # ---------------------------------------------------------------------------
 
 
+# Same address the account-state and license errors give (app/api/deps/).
+SUPPORT_EMAIL = "support@scilicium.com"
+
+
+def _expiry_when(days_remaining: int) -> str:
+    """ "today" / "in 1 day" / "in 3 days"."""
+    if days_remaining == 0:
+        return "today"
+    return f"in {days_remaining} day{'s' if days_remaining > 1 else ''}"
+
+
+def _expiry_warning_subject(days_remaining: int) -> str:
+    return f"GenoLens — your access ends {_expiry_when(days_remaining)}"
+
+
 def _expiry_warning_html(days_remaining: int, ends_on: str, contact_url: str) -> str:
-    when = "aujourd'hui" if days_remaining == 0 else f"dans {days_remaining} jour{'s' if days_remaining > 1 else ''}"
+    when = _expiry_when(days_remaining)
     content = f"""
-      <p>Bonjour,</p>
+      <p>Hello,</p>
       <p>
-        Votre période d'accès à GenoLens se termine <strong>{when}</strong>
-        (le {ends_on}).
+        Your GenoLens access period ends <strong>{when}</strong>
+        (on {ends_on}).
       </p>
       <div class="highlight-box">
         <p>
-          À cette date, votre compte passera en <strong>lecture seule</strong> :
-          vous continuerez à consulter vos projets et résultats existants, mais la
-          création de projets, le dépôt de jeux de données et le lancement
-          d'analyses seront désactivés.
+          From that date your account becomes <strong>read-only</strong>:
+          you can still browse your existing projects and results, but creating
+          projects, uploading datasets and launching analyses will be disabled.
         </p>
       </div>
       <p>
-        Vos données ne sont ni supprimées ni modifiées. Pour prolonger votre accès,
-        écrivez-nous et nous nous en occupons.
+        Your data is neither deleted nor modified. To extend your access,
+        get in touch and we will take care of it.
       </p>
-      <a href="{contact_url}" class="btn">Prolonger mon accès →</a>
+      <a href="{contact_url}" class="btn">Extend my access →</a>
       <div class="meta">
-        <p>Ou répondez simplement à ce message.</p>
+        <p>Questions? Contact <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>.</p>
       </div>
     """
-    return _base_layout(f"GenoLens — votre accès se termine {when}", content)
+    return _base_layout(_expiry_warning_subject(days_remaining), content)
 
 
 def _expiry_warning_text(days_remaining: int, ends_on: str, contact_url: str) -> str:
-    when = "aujourd'hui" if days_remaining == 0 else f"dans {days_remaining} jour{'s' if days_remaining > 1 else ''}"
+    when = _expiry_when(days_remaining)
     return (
-        f"Bonjour,\n\n"
-        f"Votre période d'accès à GenoLens se termine {when} (le {ends_on}).\n\n"
-        f"À cette date, votre compte passera en lecture seule : vous continuerez à "
-        f"consulter vos projets et résultats existants, mais la création de projets, "
-        f"le dépôt de jeux de données et le lancement d'analyses seront désactivés.\n\n"
-        f"Vos données ne sont ni supprimées ni modifiées.\n\n"
-        f"Pour prolonger votre accès : {contact_url}\n\n"
-        f"— L'équipe GenoLens"
+        f"Hello,\n\n"
+        f"Your GenoLens access period ends {when} (on {ends_on}).\n\n"
+        f"From that date your account becomes read-only: you can still browse your "
+        f"existing projects and results, but creating projects, uploading datasets "
+        f"and launching analyses will be disabled.\n\n"
+        f"Your data is neither deleted nor modified.\n\n"
+        f"To extend your access: {contact_url}\n"
+        f"Questions? Contact {SUPPORT_EMAIL}.\n\n"
+        f"— The GenoLens team"
     )
 
 
@@ -576,10 +591,9 @@ async def send_expiration_warning_email(
     a lie they discover the next morning.
     """
     contact_url = f"{settings.APP_URL}/pricing"
-    when = "aujourd'hui" if days_remaining == 0 else f"dans {days_remaining} jour{'s' if days_remaining > 1 else ''}"
     return await send_email(
         to=to,
-        subject=f"GenoLens — votre accès se termine {when}",
+        subject=_expiry_warning_subject(days_remaining),
         html_body=_expiry_warning_html(days_remaining, ends_on, contact_url),
         text_body=_expiry_warning_text(days_remaining, ends_on, contact_url),
     )
