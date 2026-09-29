@@ -856,6 +856,41 @@ def health_check() -> dict:
     return {"status": "healthy", "message": "Celery worker is running"}
 
 
+def _build_pipeline_command(
+    r_script, matrix_path: str, samples_path: str, comparisons_path: str, outdir: str, params: dict
+) -> list[str]:
+    """Build the Rscript argv for run_multimethod_pipeline.R from the analysis params."""
+    cmd = [
+        "Rscript", str(r_script),
+        "--counts", matrix_path,
+        "--samples", samples_path,
+        "--comparisons", comparisons_path,
+        "--outdir", outdir,
+        "--design", str(params.get("design", "auto")),
+        "--fdr", str(params.get("fdr", 0.05)),
+        "--min-log2fc", str(params.get("min_log2fc", 1.0)),
+        "--min-reads", str(params.get("min_reads", 10)),
+        "--min-genes", str(params.get("min_genes", 200)),
+        "--min-count", str(params.get("min_count", 5)),
+        "--min-reps", str(params.get("min_reps", 2)),
+        "--threads", str(params.get("threads", 4)),
+        "--species", str(params.get("species", "human")),
+    ]
+    cmd.extend(["--method", str(params.get("de_method", "all"))])
+    # Condition column picked in the wizard. Omitted when unset so analyses
+    # created before this option existed keep the R alias detection. The
+    # `--opt=value` form stops a column name starting with "-" from being read
+    # as a flag.
+    condition_column = params.get("condition_column")
+    if condition_column:
+        cmd.append(f"--condition-col={condition_column}")
+    enrichment_dbs = params.get("enrichment_databases")
+    if enrichment_dbs:
+        dbs_str = ",".join(enrichment_dbs) if isinstance(enrichment_dbs, list) else enrichment_dbs
+        cmd.extend(["--enrichment-databases", dbs_str])
+    return cmd
+
+
 async def _count_pipeline_analysis(user, db, produced_comparisons: int) -> None:
     """
     Décompte UNE unité de quota pour l'analyse que le pipeline vient de finir.
@@ -1007,27 +1042,9 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 db.add(analysis)
                 await db.commit()
 
-                cmd = [
-                    "Rscript", str(r_script),
-                    "--counts", matrix_path,
-                    "--samples", samples_path,
-                    "--comparisons", comparisons_path,
-                    "--outdir", outdir,
-                    "--design", str(params.get("design", "auto")),
-                    "--fdr", str(params.get("fdr", 0.05)),
-                    "--min-log2fc", str(params.get("min_log2fc", 1.0)),
-                    "--min-reads", str(params.get("min_reads", 10)),
-                    "--min-genes", str(params.get("min_genes", 200)),
-                    "--min-count", str(params.get("min_count", 5)),
-                    "--min-reps", str(params.get("min_reps", 2)),
-                    "--threads", str(params.get("threads", 4)),
-                    "--species", str(params.get("species", "human")),
-                ]
-                cmd.extend(["--method", str(params.get("de_method", "all"))])
-                enrichment_dbs = params.get("enrichment_databases")
-                if enrichment_dbs:
-                    dbs_str = ",".join(enrichment_dbs) if isinstance(enrichment_dbs, list) else enrichment_dbs
-                    cmd.extend(["--enrichment-databases", dbs_str])
+                cmd = _build_pipeline_command(
+                    r_script, matrix_path, samples_path, comparisons_path, outdir, params
+                )
 
                 proc = subprocess.run(
                     cmd,

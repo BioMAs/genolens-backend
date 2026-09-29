@@ -11,7 +11,7 @@ from typing import Annotated, List, Literal, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +56,22 @@ class AnalysisParams(BaseModel):
     enrichment_databases: Optional[List[str]] = None
     species: Optional[str] = "human"
     de_method: Optional[Literal["deseq2", "limma", "edger", "all"]] = "all"
+    # Sample-sheet column holding the conditions, as chosen in the wizard's
+    # contrast builder. None keeps the R pipeline's alias detection
+    # (condition / group / groupe / treatment / genotype).
+    condition_column: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("condition_column")
+    @classmethod
+    def _clean_condition_column(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if any(ch in value for ch in "\t\r\n"):
+            raise ValueError("condition_column must not contain tabs or line breaks")
+        return value
 
 
 class SelfServiceAnalysisCreate(BaseModel):
