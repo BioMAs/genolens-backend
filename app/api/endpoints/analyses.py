@@ -54,6 +54,9 @@ class AnalysisParams(BaseModel):
     min_reps: int = 2
     threads: int = 4
     enrichment_databases: Optional[List[str]] = None
+    # Adjusted p-value under which an enriched term is kept (R `--padj-cutoff`). Distinct from
+    # `fdr`, which selects the DEGs that are enriched.
+    enrichment_fdr: float = Field(0.05, gt=0, le=1)
     species: Optional[str] = "human"
     de_method: Optional[Literal["deseq2", "limma", "edger", "all"]] = "all"
 

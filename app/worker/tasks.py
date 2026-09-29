@@ -247,6 +247,37 @@ class DatabaseTask(Task):
     pass
 
 
+def build_functional_enrichment_cmd(
+    script: Path,
+    deg_csv: Path,
+    anno_db_dir: str,
+    comparison: str,
+    output: Path,
+    params: dict,
+) -> list[str]:
+    """
+    The Rscript call for one comparison's annoDB enrichment.
+
+    Two different cut-offs reach the script, and they are easy to conflate:
+
+    - ``--fdr`` / ``--min-log2fc`` choose which DEGs are enriched — the analysis's DEG thresholds;
+    - ``--padj-cutoff`` chooses which enriched terms are kept — the wizard's "Enrichment FDR
+      threshold" (``enrichment_fdr``). It was never passed, so the script's own 0.05 applied
+      whatever the user set. Absent (analyses created before the field), 0.05 is what they ran at.
+    """
+    return [
+        "Rscript", str(script),
+        "--deg", str(deg_csv),
+        "--anno-db-dir", anno_db_dir,
+        "--species", str(params.get("species", "human")),
+        "--comparison", comparison,
+        "--output", str(output),
+        "--fdr", str(params.get("fdr", 0.05)),
+        "--min-log2fc", str(params.get("min_log2fc", 1.0)),
+        "--padj-cutoff", str(params.get("enrichment_fdr", 0.05)),
+    ]
+
+
 def run_async(coro):
     """Helper to run async functions in Celery tasks."""
     return asyncio.run(coro)
@@ -1168,16 +1199,9 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                             anno_db_dir = os.environ.get("ANNO_DB_PATH", "/app/anno_db")
                             enrich_local = comp_dir / "genolens_enrichment.csv"
                             if enrich_script.exists():
-                                enrich_cmd = [
-                                    "Rscript", str(enrich_script),
-                                    "--deg", str(deg_csv),
-                                    "--anno-db-dir", anno_db_dir,
-                                    "--species", str(params.get("species", "human")),
-                                    "--comparison", comp_id,
-                                    "--output", str(enrich_local),
-                                    "--fdr", str(params.get("fdr", 0.05)),
-                                    "--min-log2fc", str(params.get("min_log2fc", 1.0)),
-                                ]
+                                enrich_cmd = build_functional_enrichment_cmd(
+                                    enrich_script, deg_csv, anno_db_dir, comp_id, enrich_local, params,
+                                )
                                 enrich_proc = subprocess.run(
                                     enrich_cmd, capture_output=True, text=True, timeout=1800
                                 )
