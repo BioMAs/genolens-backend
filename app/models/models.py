@@ -708,6 +708,20 @@ class User(Base, TimestampMixin):
         comment="Timestamp of last monthly quota reset"
     )
 
+    # Smallest expiry-warning threshold (7, 3, 1 day) already emailed to this
+    # user. NULL = none sent yet.
+    #
+    # This is what makes the daily expiration check idempotent: without it, a
+    # second beat worker, a manual trigger or a retry each re-send the same
+    # "1 day left" email, which reads as a malfunction. Reset to NULL whenever
+    # subscription_ends_at changes, so a renewed account is re-armed — otherwise
+    # a user warned once would never be warned again for any later period.
+    expiry_warning_sent_for: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Smallest expiry-warning threshold already emailed (7, 3, 1). "
+                "NULL = none sent. Reset when subscription_ends_at changes."
+    )
+
     # Optional add-on modules unlocked individually by an admin (independent of plan)
     cosmetics_module_enabled: Mapped[bool] = mapped_column(
         nullable=False,

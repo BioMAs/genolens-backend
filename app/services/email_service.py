@@ -543,6 +543,90 @@ async def send_quota_warning_email(
 
 
 # ---------------------------------------------------------------------------
+# Subscription expiry warning
+# ---------------------------------------------------------------------------
+
+
+# Same address the account-state and license errors give (app/api/deps/).
+SUPPORT_EMAIL = "support@scilicium.com"
+
+
+def _expiry_when(days_remaining: int) -> str:
+    """ "today" / "in 1 day" / "in 3 days"."""
+    if days_remaining == 0:
+        return "today"
+    return f"in {days_remaining} day{'s' if days_remaining > 1 else ''}"
+
+
+def _expiry_warning_subject(days_remaining: int) -> str:
+    return f"GenoLens — your access ends {_expiry_when(days_remaining)}"
+
+
+def _expiry_warning_html(days_remaining: int, ends_on: str, contact_url: str) -> str:
+    when = _expiry_when(days_remaining)
+    content = f"""
+      <p>Hello,</p>
+      <p>
+        Your GenoLens access period ends <strong>{when}</strong>
+        (on {ends_on}).
+      </p>
+      <div class="highlight-box">
+        <p>
+          From that date your account becomes <strong>read-only</strong>:
+          you can still browse your existing projects and results, but creating
+          projects, uploading datasets and launching analyses will be disabled.
+        </p>
+      </div>
+      <p>
+        Your data is neither deleted nor modified. To extend your access,
+        get in touch and we will take care of it.
+      </p>
+      <a href="{contact_url}" class="btn">Extend my access →</a>
+      <div class="meta">
+        <p>Questions? Contact <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>.</p>
+      </div>
+    """
+    return _base_layout(_expiry_warning_subject(days_remaining), content)
+
+
+def _expiry_warning_text(days_remaining: int, ends_on: str, contact_url: str) -> str:
+    when = _expiry_when(days_remaining)
+    return (
+        f"Hello,\n\n"
+        f"Your GenoLens access period ends {when} (on {ends_on}).\n\n"
+        f"From that date your account becomes read-only: you can still browse your "
+        f"existing projects and results, but creating projects, uploading datasets "
+        f"and launching analyses will be disabled.\n\n"
+        f"Your data is neither deleted nor modified.\n\n"
+        f"To extend your access: {contact_url}\n"
+        f"Questions? Contact {SUPPORT_EMAIL}.\n\n"
+        f"— The GenoLens team"
+    )
+
+
+async def send_expiration_warning_email(
+    to: str,
+    days_remaining: int,
+    ends_on: str,
+) -> bool:
+    """Warn a user that their access period is about to end.
+
+    Deliberately describes the consequence as read-only rather than as a
+    lock-out, because that is exactly what `require_active_account` enforces:
+    reads keep working, writes stop. Promising less than the product does would
+    frighten people into thinking their data is at risk; promising more would be
+    a lie they discover the next morning.
+    """
+    contact_url = f"{settings.APP_URL}/pricing"
+    return await send_email(
+        to=to,
+        subject=_expiry_warning_subject(days_remaining),
+        html_body=_expiry_warning_html(days_remaining, ends_on, contact_url),
+        text_body=_expiry_warning_text(days_remaining, ends_on, contact_url),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Mention parsing helper
 # ---------------------------------------------------------------------------
 

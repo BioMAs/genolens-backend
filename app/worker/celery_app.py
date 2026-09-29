@@ -44,6 +44,7 @@ from celery.schedules import crontab  # noqa: E402
 celery_app.conf.include = [
     "app.worker.tasks",
     "app.worker.tasks.quota_tasks",
+    "app.worker.tasks.account_tasks",
     "app.worker.tasks.deployment_task",
     "app.worker.tasks.report_task",
     "app.worker.tasks.intersection_enrichment_task",
@@ -55,5 +56,15 @@ celery_app.conf.beat_schedule = {
         "task": "app.worker.tasks.quota_tasks.reset_monthly_analysis_quotas",
         "schedule": crontab(minute=5, hour=0, day_of_month=1),
         # Runs at 00:05 UTC on the 1st of each month
+    },
+    "check-account-expirations": {
+        "task": "app.worker.tasks.account_tasks.check_account_expirations",
+        "schedule": crontab(minute=30, hour=6),
+        # Daily at 06:30 UTC — early enough to land in the morning across EU
+        # timezones, late enough not to collide with the 02:00 database backup.
+        #
+        # The task is idempotent (User.expiry_warning_sent_for), so a double run
+        # after a restart costs nothing, and a missed day is caught up on the
+        # next pass instead of losing that warning.
     },
 }
