@@ -654,3 +654,84 @@ class TestDetectEnrichmentComparisons:
         comps = svc._detect_enrichment_comparisons(df)
         assert isinstance(comps, list)
         assert len(comps) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Count matrix QC — read by the wizard's Data Validation step
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCountMatrixQC:
+
+    def _matrix(self) -> pd.DataFrame:
+        return pd.DataFrame({
+            "gene_id": ["G1", "G2", "G3", "G4"],
+            "gene_name": ["A", "B", "C", "D"],
+            "S1": [10, 0, 5, 0],
+            "S2": [100, 200, 300, 400],
+            "S3": [0, 0, 0, 7],
+        })
+
+    def test_counts_genes_and_samples_ignoring_text_columns(self):
+        from app.services.data_processor import compute_count_matrix_qc
+        qc = compute_count_matrix_qc(self._matrix())
+
+        assert qc["n_genes"] == 4
+        assert qc["n_samples"] == 3
+        assert qc["sample_names"] == ["S1", "S2", "S3"]
+
+    def test_library_size_is_the_column_sum(self):
+        from app.services.data_processor import compute_count_matrix_qc
+        qc = compute_count_matrix_qc(self._matrix())
+
+        assert qc["lib_sizes"] == {"S1": 15, "S2": 1000, "S3": 7}
+        assert qc["min_lib_size"] == 7
+
+    def test_detected_genes_are_strictly_positive_counts(self):
+        from app.services.data_processor import compute_count_matrix_qc
+        qc = compute_count_matrix_qc(self._matrix())
+
+        assert qc["detected_genes"] == {"S1": 2, "S2": 4, "S3": 1}
+        assert qc["min_detected_genes"] == 1
+
+    def test_missing_values_count_as_zero(self):
+        from app.services.data_processor import compute_count_matrix_qc
+        df = pd.DataFrame({"gene_id": ["G1", "G2"], "S1": [3.0, np.nan], "S2": [1.0, 2.0]})
+        qc = compute_count_matrix_qc(df)
+
+        assert qc["lib_sizes"] == {"S1": 3, "S2": 3}
+        assert qc["detected_genes"] == {"S1": 1, "S2": 2}
+
+    def test_featurecounts_annotation_columns_are_not_samples(self):
+        from app.services.data_processor import compute_count_matrix_qc
+        df = pd.DataFrame({
+            "Geneid": ["G1", "G2"], "Start": [1, 50], "End": [40, 90], "Length": [40, 41],
+            "S1": [1, 2], "S2": [3, 4],
+        })
+        qc = compute_count_matrix_qc(df)
+
+        assert qc["sample_names"] == ["S1", "S2"]
+
+    def test_no_sample_column_leaves_minima_empty(self):
+        from app.services.data_processor import compute_count_matrix_qc
+        qc = compute_count_matrix_qc(pd.DataFrame({"gene_id": ["G1"]}))
+
+        assert qc["n_samples"] == 0
+        assert qc["min_lib_size"] is None
+        assert qc["min_detected_genes"] is None
+
+    def test_values_are_json_serialisable_python_ints(self):
+        import json
+        from app.services.data_processor import compute_count_matrix_qc
+        qc = compute_count_matrix_qc(self._matrix())
+
+        json.dumps(qc)  # dataset_metadata is a JSON column
+        assert all(type(v) is int for v in qc["lib_sizes"].values())
+
+    @pytest.mark.asyncio
+    async def test_service_reads_the_stored_parquet(self):
+        svc = _make_service()
+        parquet = await svc.convert_to_parquet(_csv_bytes(self._matrix()), ".csv")
+        qc = await svc.calculate_count_matrix_qc(parquet)
+
+        assert qc["n_samples"] == 3
+        assert qc["min_lib_size"] == 7

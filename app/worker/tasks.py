@@ -310,7 +310,14 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                 dataset = result.scalar_one()
 
                 pca_results = {}
+                count_qc = {}
                 if dataset.type == "MATRIX":
+                    # Read by the wizard's Data Validation step (low reads / genes / samples).
+                    try:
+                        count_qc = await data_processor.calculate_count_matrix_qc(parquet_data)
+                    except Exception as e:
+                        logger.warning(f"Count matrix QC failed: {e}")
+
                     self.update_state(state="PROGRESS", meta={"step": "calculating_pca"})
                     try:
                         # Calculate PCA with 2 and 3 components
@@ -602,7 +609,9 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
 
                 # Merge: start with existing dataset metadata (preserves analysis_id, source,
                 # comparison_name, etc. set at creation time), then layer computed metadata on top.
-                final_metadata = {**(dataset.dataset_metadata or {}), **metadata, **pca_results, **plot_results}
+                final_metadata = {
+                    **(dataset.dataset_metadata or {}), **metadata, **count_qc, **pca_results, **plot_results
+                }
 
                 # Add DEG statistics to metadata
                 # For datasets with comparisons, store statistics per comparison
