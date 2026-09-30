@@ -33,6 +33,8 @@ _analysis_cancelled = _legacy_mod._analysis_cancelled  # noqa: F401
 # package masque `tasks.py`, et un symbole non repris ici n'existe plus pour
 # personne. `tests/test_rerun_enrichment_route.py` epingle le re-export.
 _auto_run_enrichment = _legacy_mod._auto_run_enrichment  # noqa: F401
+build_functional_enrichment_cmd = _legacy_mod.build_functional_enrichment_cmd  # noqa: F401
+enrichment_requested = _legacy_mod.enrichment_requested  # noqa: F401
 
 # ── Periodic tasks ────────────────────────────────────────────────────────────
 # These imports are what actually REGISTER the tasks with Celery. Listing a

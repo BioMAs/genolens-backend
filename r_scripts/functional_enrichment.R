@@ -31,7 +31,9 @@ option_list <- list(
   make_option("--min-log2fc",  type = "double",    default = 1.0,  help = "DEG |log2FC| threshold for significance"),
   make_option("--p-cutoff",    type = "double",    default = 0.05, help = "Enrichment p-value cutoff"),
   make_option("--padj-cutoff", type = "double",    default = 0.05, help = "Adjusted p-value (BH) cutoff for output"),
-  make_option("--r-cutoff",    type = "integer",   default = 3L,   help = "Minimum query genes per term")
+  make_option("--r-cutoff",    type = "integer",   default = 3L,   help = "Minimum query genes per term"),
+  make_option("--databases",   type = "character", default = NULL,
+              help = "Comma-separated anno.db categories to run (default: all available)")
 )
 opt <- parse_args(OptionParser(option_list = option_list))
 stopifnot(!is.null(opt$`anno-db-dir`), !is.null(opt$output), !is.null(opt$comparison))
@@ -204,8 +206,20 @@ all_ids <- unique(unlist(lapply(anno.db.obj$annotations, function(x) {
   if (inherits(x, "Matrix") || is.matrix(x)) rownames(x) else NULL
 })))
 
-categories <- names(anno.db.obj$annotations)
-categories <- categories[!grepl("^NCBI_|^chromosome_location$|^xrefs$|^interactions$|^regulations$", categories)]
+# The wizard's database picker lists these same anno.db category names (anno_db_categories.json),
+# so a selection is matched as is. Names the species' anno.db lacks are reported, not fatal.
+select_categories <- function(available, databases = NULL) {
+  available <- available[!grepl("^NCBI_|^chromosome_location$|^xrefs$|^interactions$|^regulations$", available)]
+  if (is.null(databases) || !nzchar(databases)) return(available)
+  wanted <- unique(trimws(strsplit(databases, ",", fixed = TRUE)[[1]]))
+  wanted <- wanted[nzchar(wanted)]
+  unknown <- setdiff(wanted, available)
+  if (length(unknown) > 0) message("Ignoring databases absent from this anno.db: ", paste(unknown, collapse = ", "))
+  intersect(available, wanted)
+}
+
+categories <- select_categories(names(anno.db.obj$annotations), opt$databases)
+message("Categories: ", length(categories))
 
 # -----------------------------------------------------------------------------
 # Run enrichment for every category × {all, up, down}
