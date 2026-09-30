@@ -112,7 +112,7 @@ class Settings(BaseSettings):
         description="Maximum file upload size in bytes"
     )
     ALLOWED_FILE_EXTENSIONS: list[str] = Field(
-        default=[".csv", ".tsv", ".xlsx", ".txt"],
+        default=[".csv", ".tsv", ".xlsx", ".xls", ".txt"],
         description="Allowed file extensions for upload"
     )
 

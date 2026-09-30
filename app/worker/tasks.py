@@ -17,7 +17,11 @@ from app.services.storage import storage_service
 from app.services.data_processor import data_processor, DEG_LOGFC_THRESHOLD, DEG_PADJ_THRESHOLD
 from app.services.go_service import GOService
 from app.services.external_integrations import geo_service
+from app.services.pipeline_inputs import INPUT_LABELS, prepare_pipeline_inputs
 from app.core.config import settings
+
+# Where the r-worker image ships the DEA pipeline scripts
+R_SCRIPTS_DIR = Path("/app/r_scripts")
 
 # GeneSetDatabase categories that run_ora_enrichment supports
 # (only databases actually loaded in the gene_sets table are worth trying)
@@ -1091,8 +1095,8 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 await db.commit()
                 await db.refresh(analysis)
 
-                # Resolve raw TSV file paths on local filesystem
-                # (R script reads TSV directly; parquet_file_path is the processed binary)
+                # Resolve the raw uploaded files on the local filesystem (any accepted
+                # format; normalised to TSV below). parquet_file_path is the processed binary.
                 async def _get_local_raw_path(dataset_id):
                     if not dataset_id:
                         return None
@@ -1114,10 +1118,24 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 # Prepare output directory
                 os.makedirs(outdir, exist_ok=True)
 
+                # The R script reads all three inputs with read_tsv, but uploads may be
+                # CSV, Excel or comma-separated .txt: hand R real TSV copies instead.
+                raw_inputs = {
+                    "counts": matrix_path,
+                    "samples": samples_path,
+                    "comparisons": comparisons_path,
+                }
+                r_inputs = prepare_pipeline_inputs(raw_inputs, Path(outdir) / "inputs")
+                converted = [
+                    INPUT_LABELS[key] for key in raw_inputs if r_inputs[key] != raw_inputs[key]
+                ]
+                if converted:
+                    _log("preparing_inputs", f"Converted to TSV: {', '.join(converted)}")
+
                 params = analysis.params or {}
-                r_script = Path("/app/r_scripts/run_multimethod_pipeline.R")
+                r_script = R_SCRIPTS_DIR / "run_multimethod_pipeline.R"
                 if not r_script.exists():
-                    r_script = Path("/app/r_scripts/run_deseq_pipeline.R")
+                    r_script = R_SCRIPTS_DIR / "run_deseq_pipeline.R"
                 if not r_script.exists():
                     raise FileNotFoundError("R pipeline script not found on this server.")
 
@@ -1127,7 +1145,12 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 await db.commit()
 
                 cmd = _build_pipeline_command(
-                    r_script, matrix_path, samples_path, comparisons_path, outdir, params
+                    r_script,
+                    r_inputs["counts"],
+                    r_inputs["samples"],
+                    r_inputs["comparisons"],
+                    outdir,
+                    params,
                 )
 
                 proc = subprocess.run(
