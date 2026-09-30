@@ -451,6 +451,10 @@ class DegGene(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_deg_genes_dataset_comparison", "dataset_id", "comparison_name"),
         Index("ix_deg_genes_dataset_comparison_regulation", "dataset_id", "comparison_name", "regulation"),
+        # Recherche de gènes par préfixe insensible à la casse (`/genes/search`).
+        # `text_pattern_ops` rend LIKE 'X%' indexable quelle que soit la collation.
+        Index("ix_deg_genes_gene_name_upper_pattern", sa_text("upper(gene_name) text_pattern_ops")),
+        Index("ix_deg_genes_gene_id_upper_pattern", sa_text("upper(gene_id) text_pattern_ops")),
     )
 
     def __repr__(self) -> str:
