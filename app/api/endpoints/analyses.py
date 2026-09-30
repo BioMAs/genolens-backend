@@ -11,7 +11,7 @@ from typing import Annotated, List, Literal, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,6 +59,22 @@ class AnalysisParams(BaseModel):
     enrichment_fdr: float = Field(0.05, gt=0, le=1)
     species: Optional[str] = "human"
     de_method: Optional[Literal["deseq2", "limma", "edger", "all"]] = "all"
+    # Sample-sheet column holding the conditions, as chosen in the wizard's
+    # contrast builder. None keeps the R pipeline's alias detection
+    # (condition / group / groupe / treatment / genotype).
+    condition_column: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("condition_column")
+    @classmethod
+    def _clean_condition_column(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        if any(ch in value for ch in "\t\r\n"):
+            raise ValueError("condition_column must not contain tabs or line breaks")
+        return value
 
 
 class SelfServiceAnalysisCreate(BaseModel):
@@ -371,3 +387,73 @@ async def delete_analysis(
 
     await db.execute(delete(SelfServiceAnalysis).where(SelfServiceAnalysis.id == analysis_id))
     await db.commit()
+
+
+_CANCELLABLE = (SelfServiceAnalysisStatus.PENDING, SelfServiceAnalysisStatus.RUNNING)
+
+
+@router.post("/{analysis_id}/cancel", response_model=SelfServiceAnalysisResponse)
+async def cancel_analysis(
+    analysis_id: UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+) -> SelfServiceAnalysisResponse:
+    """Annule une analyse en attente ou en cours, sans supprimer l'enregistrement.
+
+    Droit d'annuler : celui qui a lancé l'analyse, ou un ADMIN du projet
+    (propriétaire compris). Un simple membre lit l'analyse mais ne l'arrête pas.
+
+    Le passage à CANCELLED est un UPDATE conditionnel sur le statut : si le
+    worker a fini entre la lecture et l'écriture, zéro ligne touchée et on rend
+    409 au lieu de repeindre en CANCELLED une analyse DONE déjà décomptée. Le
+    worker relit le statut sous verrou avant de marquer DONE et de décompter le
+    quota (voir `run_self_service_analysis`), donc une analyse annulée ne
+    consomme jamais d'unité, même si la révocation Celery arrive trop tard.
+    """
+    analysis = await db.scalar(
+        select(SelfServiceAnalysis).where(SelfServiceAnalysis.id == analysis_id)
+    )
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    project = await assert_project_access(db, analysis.project_id, current_user.user_id)
+    if analysis.user_id != current_user.user_id and not await is_project_admin(
+        db, project, current_user.user_id
+    ):
+        raise HTTPException(
+            status_code=403, detail="Only the launcher or a project admin can cancel"
+        )
+
+    result = await db.execute(
+        update(SelfServiceAnalysis)
+        .where(
+            SelfServiceAnalysis.id == analysis_id,
+            SelfServiceAnalysis.status.in_(_CANCELLABLE),
+        )
+        .values(
+            status=SelfServiceAnalysisStatus.CANCELLED,
+            current_step="cancelled",
+            error_message="Cancelled by user",
+        )
+        .returning(SelfServiceAnalysis.id)
+    )
+    if result.scalar() is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Analysis has already finished and can no longer be cancelled",
+        )
+    await db.commit()
+
+    # Après le commit : si la révocation échoue (broker injoignable), le statut
+    # est déjà CANCELLED et le worker s'arrêtera de lui-même à son prochain
+    # contrôle, sans décompter de quota.
+    if analysis.celery_task_id:
+        try:
+            from app.worker.celery_app import celery_app
+
+            celery_app.control.revoke(analysis.celery_task_id, terminate=True)
+        except Exception as exc:
+            logger.warning("[ANALYSES] Could not revoke task %s: %s", analysis.celery_task_id, exc)
+
+    await db.refresh(analysis)
+    logger.info("[ANALYSES] Analysis %s cancelled by %s", analysis_id, current_user.user_id)
+    return SelfServiceAnalysisResponse.from_orm(analysis)

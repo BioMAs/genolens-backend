@@ -359,7 +359,14 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                 dataset = result.scalar_one()
 
                 pca_results = {}
+                count_qc = {}
                 if dataset.type == "MATRIX":
+                    # Read by the wizard's Data Validation step (low reads / genes / samples).
+                    try:
+                        count_qc = await data_processor.calculate_count_matrix_qc(parquet_data)
+                    except Exception as e:
+                        logger.warning(f"Count matrix QC failed: {e}")
+
                     self.update_state(state="PROGRESS", meta={"step": "calculating_pca"})
                     try:
                         # Calculate PCA with 2 and 3 components
@@ -651,7 +658,9 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
 
                 # Merge: start with existing dataset metadata (preserves analysis_id, source,
                 # comparison_name, etc. set at creation time), then layer computed metadata on top.
-                final_metadata = {**(dataset.dataset_metadata or {}), **metadata, **pca_results, **plot_results}
+                final_metadata = {
+                    **(dataset.dataset_metadata or {}), **metadata, **count_qc, **pca_results, **plot_results
+                }
 
                 # Add DEG statistics to metadata
                 # For datasets with comparisons, store statistics per comparison
@@ -905,6 +914,40 @@ def health_check() -> dict:
     return {"status": "healthy", "message": "Celery worker is running"}
 
 
+def _build_pipeline_command(
+    r_script, matrix_path: str, samples_path: str, comparisons_path: str, outdir: str, params: dict
+) -> list[str]:
+    """Build the Rscript argv for run_multimethod_pipeline.R from the analysis params."""
+    cmd = [
+        "Rscript", str(r_script),
+        "--counts", matrix_path,
+        "--samples", samples_path,
+        "--comparisons", comparisons_path,
+        "--outdir", outdir,
+        "--design", str(params.get("design", "auto")),
+        "--fdr", str(params.get("fdr", 0.05)),
+        "--min-log2fc", str(params.get("min_log2fc", 1.0)),
+        "--min-reads", str(params.get("min_reads", 10)),
+        "--min-genes", str(params.get("min_genes", 200)),
+        "--min-count", str(params.get("min_count", 5)),
+        "--min-reps", str(params.get("min_reps", 2)),
+        "--threads", str(params.get("threads", 4)),
+        "--species", str(params.get("species", "human")),
+    ]
+    cmd.extend(["--method", str(params.get("de_method", "all"))])
+    # Condition column picked in the wizard. Omitted when unset so analyses
+    # created before this option existed keep the R alias detection. The
+    # `--opt=value` form stops a column name starting with "-" from being read
+    # as a flag.
+    condition_column = params.get("condition_column")
+    if condition_column:
+        cmd.append(f"--condition-col={condition_column}")
+    # No `--enrichment-databases`: this script does no enrichment and its optparse rejects the
+    # flag, so any partial database pick failed the whole run. The pick goes to
+    # functional_enrichment.R instead (build_functional_enrichment_cmd).
+    return cmd
+
+
 async def _count_pipeline_analysis(user, db, produced_comparisons: int) -> None:
     """
     Décompte UNE unité de quota pour l'analyse que le pipeline vient de finir.
@@ -977,6 +1020,27 @@ async def _count_pipeline_analysis(user, db, produced_comparisons: int) -> None:
         )
 
 
+async def _analysis_cancelled(db, analysis_id: UUID, *, lock: bool = False) -> bool:
+    """Vrai si l'analyse a été annulée depuis `POST /analyses/{id}/cancel`.
+
+    Lu directement en base, pas sur l'objet ORM de la session du worker, qui
+    garde le statut qu'il a lu au démarrage. `lock=True` prend un verrou de
+    ligne jusqu'au commit de l'appelant : l'annulation fait un UPDATE
+    conditionnel sur le statut, elle attend donc ce commit et voit DONE — pas
+    de fenêtre où l'analyse finirait DONE, décomptée, et affichée CANCELLED.
+
+    La révocation Celery (`terminate=True`) ne suffit pas seule : elle vit en
+    mémoire des workers, se perd au redémarrage, et arrive trop tard si le
+    pipeline R vient de rendre la main.
+    """
+    from app.models.models import SelfServiceAnalysis, SelfServiceAnalysisStatus
+
+    stmt = select(SelfServiceAnalysis.status).where(SelfServiceAnalysis.id == analysis_id)
+    if lock:
+        stmt = stmt.with_for_update()
+    return (await db.scalar(stmt)) == SelfServiceAnalysisStatus.CANCELLED
+
+
 @celery_app.task(bind=True, base=DatabaseTask, name="app.worker.tasks.run_self_service_analysis", queue="r_analysis")
 def run_self_service_analysis(self, analysis_id: str) -> dict:
     """
@@ -1012,6 +1076,12 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     entry = {"step": step, "message": message, "timestamp": _now_iso()}
                     analysis.progress_log = (analysis.progress_log or []) + [entry]
                     logger.info("[ANALYSIS] %s: %s", step, message)
+
+                # Annulée pendant qu'elle attendait dans la file, et la
+                # révocation s'est perdue : ne pas la relancer.
+                if analysis.status == SelfServiceAnalysisStatus.CANCELLED:
+                    logger.info("[ANALYSIS] %s was cancelled before start, skipping", analysis_id)
+                    return {"status": "cancelled", "analysis_id": analysis_id}
 
                 # Mark as running
                 analysis.status = SelfServiceAnalysisStatus.RUNNING
@@ -1056,26 +1126,9 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 db.add(analysis)
                 await db.commit()
 
-                cmd = [
-                    "Rscript", str(r_script),
-                    "--counts", matrix_path,
-                    "--samples", samples_path,
-                    "--comparisons", comparisons_path,
-                    "--outdir", outdir,
-                    "--design", str(params.get("design", "auto")),
-                    "--fdr", str(params.get("fdr", 0.05)),
-                    "--min-log2fc", str(params.get("min_log2fc", 1.0)),
-                    "--min-reads", str(params.get("min_reads", 10)),
-                    "--min-genes", str(params.get("min_genes", 200)),
-                    "--min-count", str(params.get("min_count", 5)),
-                    "--min-reps", str(params.get("min_reps", 2)),
-                    "--threads", str(params.get("threads", 4)),
-                    "--species", str(params.get("species", "human")),
-                ]
-                cmd.extend(["--method", str(params.get("de_method", "all"))])
-                # No `--enrichment-databases` here: this script does no enrichment and its optparse
-                # rejects the flag, so any partial database pick failed the whole run. The pick goes
-                # to functional_enrichment.R instead (build_functional_enrichment_cmd).
+                cmd = _build_pipeline_command(
+                    r_script, matrix_path, samples_path, comparisons_path, outdir, params
+                )
 
                 proc = subprocess.run(
                     cmd,
@@ -1291,6 +1344,15 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     logger.warning("[ANALYSIS] %s", warn)
                     _log("no_results_warning", warn)
 
+                # Annulée pendant le calcul : ni DONE, ni unité de quota. Le
+                # verrou tient jusqu'au commit ci-dessous (voir
+                # _analysis_cancelled).
+                if await _analysis_cancelled(db, UUID(analysis_id), lock=True):
+                    await db.rollback()
+                    logger.info("[ANALYSIS] %s cancelled during run, not counted", analysis_id)
+                    shutil.rmtree(outdir, ignore_errors=True)
+                    return {"status": "cancelled", "analysis_id": analysis_id}
+
                 analysis.result_dataset_ids = result_dataset_ids
                 analysis.intermediate_dataset_ids = intermediate_dataset_ids
                 analysis.status = SelfServiceAnalysisStatus.DONE
@@ -1321,9 +1383,14 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                 logger.error("[ANALYSIS] Failed for %s: %s", analysis_id, error_msg)
                 logger.error("[ANALYSIS] Traceback:\n%s", error_details)
                 shutil.rmtree(outdir, ignore_errors=True)
+                await db.rollback()
                 await db.execute(
                     update(SelfServiceAnalysis)
-                    .where(SelfServiceAnalysis.id == UUID(analysis_id))
+                    .where(
+                        SelfServiceAnalysis.id == UUID(analysis_id),
+                        # Une analyse annulée reste CANCELLED.
+                        SelfServiceAnalysis.status != SelfServiceAnalysisStatus.CANCELLED,
+                    )
                     .values(
                         status=SelfServiceAnalysisStatus.FAILED,
                         error_message=error_msg,

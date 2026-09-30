@@ -15,7 +15,11 @@ import pytest
 from pydantic import ValidationError
 
 from app.api.endpoints.analyses import AnalysisParams
-from app.worker.tasks import build_functional_enrichment_cmd, enrichment_requested
+from app.worker.tasks import (
+    _build_pipeline_command,
+    build_functional_enrichment_cmd,
+    enrichment_requested,
+)
 
 
 def _cmd(params: dict) -> list[str]:
@@ -98,7 +102,6 @@ def test_an_explicit_empty_pick_skips_the_enrichment():
 
 # ── every flag the worker passes is one the R script defines ──────────────────────
 ROOT = Path(__file__).resolve().parent.parent
-TASKS = (ROOT / "app" / "worker" / "tasks.py").read_text()
 
 
 def _r_options(script: str) -> set[str]:
@@ -106,22 +109,33 @@ def _r_options(script: str) -> set[str]:
     return set(re.findall(r'make_option\(\s*"(--[a-z0-9-]+)"', source))
 
 
-def _flags_between(start: str, end: str) -> set[str]:
-    begin = TASKS.index(start)
-    finish = TASKS.index(end, begin)
-    block = TASKS[begin:finish]
-    return set(re.findall(r'"(--[a-z0-9-]+)"', block))
+def _flags(argv: list[str]) -> set[str]:
+    # `--condition-col=<name>` is passed in the `=` form.
+    return {a.split("=", 1)[0] for a in argv if a.startswith("--")}
 
 
 def test_pipeline_flags_are_all_defined():
-    passed = _flags_between('Path("/app/r_scripts/run_multimethod_pipeline.R")', "subprocess.run(")
-    assert passed, "the pipeline command was not found"
-    assert passed <= _r_options("run_multimethod_pipeline.R")
+    # Every optional param set, so a conditional flag cannot hide from the check.
+    argv = _build_pipeline_command(
+        Path("/app/r_scripts/run_multimethod_pipeline.R"),
+        "/tmp/m.tsv",
+        "/tmp/s.tsv",
+        "/tmp/c.tsv",
+        "/tmp/out",
+        {
+            "de_method": "deseq2",
+            "condition_column": "treatment",
+            "enrichment_databases": ["GSEA_hallmark"],
+            "enrichment_fdr": 0.01,
+        },
+    )
+    passed = _flags(argv)
     assert "--enrichment-databases" not in passed
+    assert passed <= _r_options("run_multimethod_pipeline.R")
 
 
 def test_enrichment_flags_are_all_defined():
-    passed = set(a for a in _cmd({"enrichment_databases": ["x"]}) if a.startswith("--"))
+    passed = _flags(_cmd({"enrichment_databases": ["x"]}))
     assert passed <= _r_options("functional_enrichment.R")
 
 

@@ -56,7 +56,9 @@ option_list <- list(
   make_option("--threads",     type = "integer",   default = 4L,      help = "Number of threads"),
   make_option("--species",     type = "character", default = "human", help = "Species"),
   make_option("--method",      type = "character", default = "all",
-              help = "DEA method: 'all' (DESeq2+edgeR+limma+Stouffer), 'deseq2', 'edger', 'limma'")
+              help = "DEA method: 'all' (DESeq2+edgeR+limma+Stouffer), 'deseq2', 'edger', 'limma'"),
+  make_option("--condition-col", type = "character", default = NULL,
+              help = "Sample-sheet column holding the conditions (case-insensitive). Default: auto-detect")
 )
 
 opt <- parse_args(OptionParser(option_list = option_list))
@@ -82,17 +84,42 @@ samples_df  <- read_tsv(opt$samples,   col_types = cols(), show_col_types = FALS
 contrasts   <- read_tsv(opt$comparisons, col_types = cols(), show_col_types = FALSE)
 
 # Normalise column names
-colnames(samples_df) <- tolower(colnames(samples_df))
+colnames(samples_df) <- tolower(trimws(colnames(samples_df)))
 
-# Identify sample_id and condition columns
-sid_col  <- intersect(c("sample_id", "sample", "sampleid", "id"), colnames(samples_df))[1]
-cond_col <- intersect(c("condition", "group", "treatment", "genotype"), colnames(samples_df))[1]
-batch_col <- intersect(c("batch", "run", "lane"), colnames(samples_df))
-batch_col <- if (length(batch_col) > 0) batch_col[1] else NULL
-
-if (is.na(sid_col) || is.na(cond_col)) {
-  stop("samples.tsv must have 'sample_id' and 'condition' columns (case-insensitive)")
+# Identify sample_id and condition columns. Alias lists are kept in sync with
+# the wizard's ContrastBuilder (CONDITION_ALIASES / SAMPLE_ID_ALIASES).
+sid_col  <- intersect(c("sample_id", "sample", "sampleid", "id", "name"), colnames(samples_df))[1]
+if (is.na(sid_col)) {
+  stop("samples.tsv needs a sample ID column named sample_id, sample, sampleid, id or name ",
+       "(case-insensitive). Columns found: ", paste(colnames(samples_df), collapse = ", "))
 }
+
+requested_cond <- opt$`condition-col`
+if (!is.null(requested_cond) && nzchar(trimws(requested_cond))) {
+  # Column chosen in the setup wizard: honour it, never fall back silently.
+  cond_col <- tolower(trimws(requested_cond))
+  if (!cond_col %in% colnames(samples_df)) {
+    stop("Condition column '", requested_cond, "' was not found in samples.tsv. ",
+         "Columns found: ", paste(colnames(samples_df), collapse = ", "))
+  }
+  if (cond_col == sid_col) {
+    stop("Condition column '", requested_cond, "' is also the sample ID column; ",
+         "choose the column that holds the conditions")
+  }
+} else {
+  cond_col <- intersect(c("condition", "group", "groupe", "treatment", "genotype"),
+                        colnames(samples_df))[1]
+  if (is.na(cond_col)) {
+    stop("samples.tsv needs a condition column named condition, group, groupe, treatment or ",
+         "genotype (case-insensitive), or pass --condition-col. Columns found: ",
+         paste(colnames(samples_df), collapse = ", "))
+  }
+}
+message("Sample ID column: ", sid_col, "  |  condition column: ", cond_col)
+
+batch_col <- intersect(c("batch", "run", "lane"), colnames(samples_df))
+batch_col <- setdiff(batch_col, cond_col)
+batch_col <- if (length(batch_col) > 0) batch_col[1] else NULL
 
 # Identify gene_id column in counts
 gene_col <- intersect(c("gene_id", "geneid", "gene", "id"), colnames(counts_raw))[1]
@@ -183,6 +210,8 @@ manifest <- list(
     min_count_threshold  = opt$`min-count`,
     min_reps_threshold   = opt$`min-reps`,
     design_formula       = as.character(opt$design),
+    sample_id_column     = sid_col,
+    condition_column     = cond_col,
     has_batch_correction = grepl("batch", tolower(as.character(opt$design)))
   )
 )

@@ -10,10 +10,25 @@ projects.
 from uuid import UUID
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import ColumnElement, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import Project, ProjectMember, UserRole
+
+
+def accessible_projects_clause(user_id: UUID) -> ColumnElement[bool]:
+    """Filtre SQL « propriétaire ou membre » sur `Project`, pour les requêtes transverses.
+
+    Les fonctions `assert_*` ci-dessous tranchent pour UN projet déjà désigné. Une
+    recherche qui balaie tous les projets d'un utilisateur a besoin de la même règle
+    sous forme de clause, sans quoi elle se réécrit à la main — et c'est ainsi que la
+    recherche de gènes n'a longtemps couvert que les projets possédés, en oubliant les
+    projets partagés.
+
+    La requête doit joindre `Project` pour que la clause s'applique.
+    """
+    member_projects = select(ProjectMember.project_id).where(ProjectMember.user_id == user_id)
+    return or_(Project.owner_id == user_id, Project.id.in_(member_projects))
 
 
 async def assert_project_access(db: AsyncSession, project_id: UUID, user_id: UUID) -> Project:

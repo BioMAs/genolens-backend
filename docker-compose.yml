@@ -95,6 +95,38 @@ services:
     command: celery -A app.worker.celery_app worker --loglevel=info -Q celery,default,data_processing
     restart: unless-stopped
 
+  # Celery Beat — the scheduler. Mirrors docker-compose.prod.yml so the
+  # periodic tasks can actually be exercised locally. Exactly one replica:
+  # two schedulers would each enqueue the same job.
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/genolens
+      - REDIS_URL=redis://redis:6379/0
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
+      - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
+      - ENVIRONMENT=development
+      - LOCAL_STORAGE_PATH=/app/data
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-google/gemma-4-E4B-it}
+    volumes:
+      - ./app:/app/app
+      - genolens_storage:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: celery -A app.worker.celery_app beat --loglevel=info
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   genolens_storage:

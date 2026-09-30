@@ -5,6 +5,9 @@ Supports:
 - Project invitation emails
 - Comment mention notifications (@username/@email)
 - Comment reply notifications
+- Monthly analysis quota warning (80 %)
+
+All user-facing copy is in English, like the app UI.
 
 Uses async SMTP (aiosmtplib) with configurable SMTP settings.
 Gracefully degrades if email is not configured (logs warning, does not raise).
@@ -29,7 +32,7 @@ logger = logging.getLogger(__name__)
 def _base_layout(title: str, content: str) -> str:
     """Wrap content in a consistent HTML layout."""
     return f"""<!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -94,19 +97,28 @@ def _base_layout(title: str, content: str) -> str:
   <div class="container">
     <div class="header">
       <h1>🧬 GenoLens</h1>
-      <p>Plateforme d'analyse génomique</p>
+      <p>Transcriptomics analysis platform</p>
     </div>
     <div class="body">
       {content}
     </div>
     <div class="footer">
-      Vous recevez cet e-mail car vous utilisez
+      You are receiving this email because you use
       <a href="{settings.APP_URL}">GenoLens</a>.
-      Ne répondez pas directement à cet e-mail.
+      Please do not reply to this email.
     </div>
   </div>
 </body>
 </html>"""
+
+
+def _role_label(access_level: str) -> str:
+    """Project access level as the app shows it (ProjectMembersModal)."""
+    return {
+        "ADMIN": "Admin",
+        "USER": "User",
+        "VIEWER": "Viewer",
+    }.get(access_level.upper(), access_level)
 
 
 def _project_invitation_html(
@@ -116,33 +128,28 @@ def _project_invitation_html(
     access_level: str,
     project_url: str,
 ) -> str:
-    role_label = {
-        "ADMIN": "Administrateur",
-        "USER": "Collaborateur",
-        "VIEWER": "Lecteur",
-    }.get(access_level.upper(), access_level)
+    role_label = _role_label(access_level)
 
     content = f"""
-      <p>Bonjour,</p>
+      <p>Hello,</p>
       <p>
-        <strong>{inviter_email}</strong> vous invite à collaborer sur le projet
-        <strong>« {project_name} »</strong> avec le rôle
-        <strong>{role_label}</strong>.
+        <strong>{inviter_email}</strong> has invited you to collaborate on the project
+        <strong>“{project_name}”</strong> with the <strong>{role_label}</strong> role.
       </p>
       <p>
-        GenoLens vous permet d'explorer et d'analyser des données d'expression génique :
-        volcano plots, heatmaps, GSEA, GO enrichment et bien plus.
+        GenoLens lets you explore and analyze gene expression data:
+        volcano plots, heatmaps, GSEA, GO enrichment and more.
       </p>
-      <a href="{project_url}" class="btn">Accéder au projet →</a>
+      <a href="{project_url}" class="btn">Open the project →</a>
       <div class="meta">
         <p>
-          Si vous n'avez pas encore de compte GenoLens, créez-en un avec l'adresse
-          <strong>{invitee_email}</strong> pour accéder automatiquement au projet partagé.
+          If you don't have a GenoLens account yet, sign up with
+          <strong>{invitee_email}</strong> to get access to the shared project automatically.
         </p>
-        <p>Lien direct : <a href="{project_url}">{project_url}</a></p>
+        <p>Direct link: <a href="{project_url}">{project_url}</a></p>
       </div>
     """
-    return _base_layout(f"Invitation au projet « {project_name} »", content)
+    return _base_layout(f"Invitation to the project “{project_name}”", content)
 
 
 def _project_invitation_text(
@@ -153,12 +160,12 @@ def _project_invitation_text(
     project_url: str,
 ) -> str:
     return (
-        f"Bonjour,\n\n"
-        f"{inviter_email} vous invite à collaborer sur le projet « {project_name} » "
-        f"avec le rôle {access_level}.\n\n"
-        f"Accédez au projet ici : {project_url}\n\n"
-        f"Si vous n'avez pas de compte, créez-en un avec l'adresse {invitee_email}.\n\n"
-        f"— L'équipe GenoLens"
+        f"Hello,\n\n"
+        f"{inviter_email} has invited you to collaborate on the project “{project_name}” "
+        f"with the {_role_label(access_level)} role.\n\n"
+        f"Open the project: {project_url}\n\n"
+        f"If you don't have an account yet, sign up with {invitee_email}.\n\n"
+        f"— The GenoLens team"
     )
 
 
@@ -171,20 +178,20 @@ def _mention_notification_html(
 ) -> str:
     excerpt_escaped = comment_excerpt.replace("<", "&lt;").replace(">", "&gt;")
     content = f"""
-      <p>Bonjour,</p>
+      <p>Hello,</p>
       <p>
-        <strong>{author_email}</strong> vous a mentionné dans un commentaire
-        du projet <strong>« {project_name} »</strong> :
+        <strong>{author_email}</strong> mentioned you in a comment
+        on the project <strong>“{project_name}”</strong>:
       </p>
       <div class="highlight-box">
         <p>{excerpt_escaped}</p>
       </div>
-      <a href="{comment_url}" class="btn">Voir le commentaire →</a>
+      <a href="{comment_url}" class="btn">View the comment →</a>
       <div class="meta">
-        <p>Lien direct : <a href="{comment_url}">{comment_url}</a></p>
+        <p>Direct link: <a href="{comment_url}">{comment_url}</a></p>
       </div>
     """
-    return _base_layout(f"Vous avez été mentionné dans « {project_name} »", content)
+    return _base_layout(f"You were mentioned in “{project_name}”", content)
 
 
 def _mention_notification_text(
@@ -195,12 +202,12 @@ def _mention_notification_text(
     comment_url: str,
 ) -> str:
     return (
-        f"Bonjour,\n\n"
-        f"{author_email} vous a mentionné dans un commentaire "
-        f"du projet « {project_name} » :\n\n"
+        f"Hello,\n\n"
+        f"{author_email} mentioned you in a comment "
+        f"on the project “{project_name}”:\n\n"
         f"  {comment_excerpt}\n\n"
-        f"Voir le commentaire : {comment_url}\n\n"
-        f"— L'équipe GenoLens"
+        f"View the comment: {comment_url}\n\n"
+        f"— The GenoLens team"
     )
 
 
@@ -215,25 +222,25 @@ def _reply_notification_html(
     orig_escaped = original_excerpt.replace("<", "&lt;").replace(">", "&gt;")
     reply_escaped = reply_excerpt.replace("<", "&lt;").replace(">", "&gt;")
     content = f"""
-      <p>Bonjour,</p>
+      <p>Hello,</p>
       <p>
-        <strong>{replier_email}</strong> a répondu à votre commentaire
-        dans le projet <strong>« {project_name} »</strong>.
+        <strong>{replier_email}</strong> replied to your comment
+        on the project <strong>“{project_name}”</strong>.
       </p>
-      <p style="color:#6b7280; font-size:13px; margin-bottom:4px;">Votre commentaire :</p>
+      <p style="color:#6b7280; font-size:13px; margin-bottom:4px;">Your comment:</p>
       <div class="highlight-box" style="border-color:#d1d5db; background:#f9fafb;">
         <p style="color:#6b7280;">{orig_escaped}</p>
       </div>
-      <p style="color:#6b7280; font-size:13px; margin-bottom:4px;">Réponse de {replier_email} :</p>
+      <p style="color:#6b7280; font-size:13px; margin-bottom:4px;">Reply from {replier_email}:</p>
       <div class="highlight-box">
         <p>{reply_escaped}</p>
       </div>
-      <a href="{comment_url}" class="btn">Voir la réponse →</a>
+      <a href="{comment_url}" class="btn">View the reply →</a>
       <div class="meta">
-        <p>Lien direct : <a href="{comment_url}">{comment_url}</a></p>
+        <p>Direct link: <a href="{comment_url}">{comment_url}</a></p>
       </div>
     """
-    return _base_layout(f"Réponse à votre commentaire — « {project_name} »", content)
+    return _base_layout(f"New reply to your comment — “{project_name}”", content)
 
 
 def _reply_notification_text(
@@ -245,13 +252,13 @@ def _reply_notification_text(
     comment_url: str,
 ) -> str:
     return (
-        f"Bonjour,\n\n"
-        f"{replier_email} a répondu à votre commentaire "
-        f"dans le projet « {project_name} ».\n\n"
-        f"Votre commentaire : {original_excerpt}\n\n"
-        f"Réponse : {reply_excerpt}\n\n"
-        f"Voir la réponse : {comment_url}\n\n"
-        f"— L'équipe GenoLens"
+        f"Hello,\n\n"
+        f"{replier_email} replied to your comment "
+        f"on the project “{project_name}”.\n\n"
+        f"Your comment: {original_excerpt}\n\n"
+        f"Reply: {reply_excerpt}\n\n"
+        f"View the reply: {comment_url}\n\n"
+        f"— The GenoLens team"
     )
 
 
@@ -358,7 +365,7 @@ async def send_project_invitation(
     project_url = f"{settings.APP_URL}/projects/{project_id}"
     return await send_email(
         to=invitee_email,
-        subject=f"Invitation au projet « {project_name} » — GenoLens",
+        subject=f"Invitation to the project “{project_name}” — GenoLens",
         html_body=_project_invitation_html(
             invitee_email=invitee_email,
             inviter_email=inviter_email,
@@ -388,7 +395,7 @@ async def send_mention_notification(
     comment_url = f"{settings.APP_URL}/projects/{project_id}?comment={comment_id}"
     return await send_email(
         to=mentioned_email,
-        subject=f"Vous avez été mentionné dans « {project_name} » — GenoLens",
+        subject=f"You were mentioned in “{project_name}” — GenoLens",
         html_body=_mention_notification_html(
             mentioned_email=mentioned_email,
             author_email=author_email,
@@ -419,7 +426,7 @@ async def send_reply_notification(
     comment_url = f"{settings.APP_URL}/projects/{project_id}?comment={comment_id}"
     return await send_email(
         to=parent_author_email,
-        subject=f"Réponse à votre commentaire — « {project_name} » — GenoLens",
+        subject=f"New reply to your comment — “{project_name}” — GenoLens",
         html_body=_reply_notification_html(
             parent_author_email=parent_author_email,
             replier_email=replier_email,
@@ -439,6 +446,25 @@ async def send_reply_notification(
     )
 
 
+def _plan_label(plan: str) -> str:
+    """Display name of a plan id, e.g. TEAM -> "Pro", from the pricing grid."""
+    try:
+        from app.core.pricing import get_pricing
+
+        return get_pricing().get_plan(plan).name_en
+    except Exception:  # unknown id or grid unavailable: never block the email
+        return str(getattr(plan, "value", plan)).replace("_", " ").title()
+
+
+def _analyses(n: int) -> str:
+    """ "1 analysis" / "3 analyses" — the billing unit is the analysis, not the contrast."""
+    return f"{n} analysis" if n == 1 else f"{n} analyses"
+
+
+def _quota_warning_subject(remaining: int) -> str:
+    return f"GenoLens — {_analyses(remaining)} left this month"
+
+
 def _quota_warning_html(
     to: str,
     used: int,
@@ -448,24 +474,24 @@ def _quota_warning_html(
 ) -> str:
     remaining = quota - used
     content = f"""
-      <p>Bonjour,</p>
+      <p>Hello,</p>
       <p>
-        Vous avez utilisé <strong>{used} comparaisons</strong> sur <strong>{quota}</strong>
-        ce mois-ci (forfait <strong>{plan}</strong>).
+        You have used <strong>{used} of your {quota} analyses</strong>
+        this month (<strong>{_plan_label(plan)}</strong> plan).
       </p>
       <div class="highlight-box">
-        <p>Il vous reste <strong>{remaining} comparaison{'s' if remaining > 1 else ''}</strong> pour ce mois.</p>
+        <p>You have <strong>{_analyses(remaining)}</strong> left this month.</p>
       </div>
       <p>
-        Pour continuer vos analyses sans interruption, vous pouvez passer à un forfait supérieur
-        depuis votre espace tarifaire.
+        To keep running analyses without interruption, you can upgrade your plan
+        from the pricing page.
       </p>
-      <a href="{pricing_url}" class="btn">Voir les forfaits →</a>
+      <a href="{pricing_url}" class="btn">View plans →</a>
       <div class="meta">
-        <p>Lien direct : <a href="{pricing_url}">{pricing_url}</a></p>
+        <p>Direct link: <a href="{pricing_url}">{pricing_url}</a></p>
       </div>
     """
-    return _base_layout(f"GenoLens — {remaining} comparaisons restantes ce mois", content)
+    return _base_layout(_quota_warning_subject(remaining), content)
 
 
 def _quota_warning_text(
@@ -477,12 +503,13 @@ def _quota_warning_text(
 ) -> str:
     remaining = quota - used
     return (
-        f"Bonjour,\n\n"
-        f"Vous avez utilisé {used} comparaisons sur {quota} ce mois-ci (forfait {plan}).\n\n"
-        f"Il vous reste {remaining} comparaison{'s' if remaining > 1 else ''} pour ce mois.\n\n"
-        f"Pour continuer vos analyses sans interruption, consultez nos forfaits :\n"
+        f"Hello,\n\n"
+        f"You have used {used} of your {quota} analyses this month "
+        f"({_plan_label(plan)} plan).\n\n"
+        f"You have {_analyses(remaining)} left this month.\n\n"
+        f"To keep running analyses without interruption, see our plans:\n"
         f"{pricing_url}\n\n"
-        f"— L'équipe GenoLens"
+        f"— The GenoLens team"
     )
 
 
@@ -497,7 +524,7 @@ async def send_quota_warning_email(
     pricing_url = f"{settings.APP_URL}/pricing"
     return await send_email(
         to=to,
-        subject=f"GenoLens — {remaining} comparaisons restantes ce mois",
+        subject=_quota_warning_subject(remaining),
         html_body=_quota_warning_html(
             to=to,
             used=used,
@@ -512,6 +539,90 @@ async def send_quota_warning_email(
             plan=plan,
             pricing_url=pricing_url,
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subscription expiry warning
+# ---------------------------------------------------------------------------
+
+
+# Same address the account-state and license errors give (app/api/deps/).
+SUPPORT_EMAIL = "support@scilicium.com"
+
+
+def _expiry_when(days_remaining: int) -> str:
+    """ "today" / "in 1 day" / "in 3 days"."""
+    if days_remaining == 0:
+        return "today"
+    return f"in {days_remaining} day{'s' if days_remaining > 1 else ''}"
+
+
+def _expiry_warning_subject(days_remaining: int) -> str:
+    return f"GenoLens — your access ends {_expiry_when(days_remaining)}"
+
+
+def _expiry_warning_html(days_remaining: int, ends_on: str, contact_url: str) -> str:
+    when = _expiry_when(days_remaining)
+    content = f"""
+      <p>Hello,</p>
+      <p>
+        Your GenoLens access period ends <strong>{when}</strong>
+        (on {ends_on}).
+      </p>
+      <div class="highlight-box">
+        <p>
+          From that date your account becomes <strong>read-only</strong>:
+          you can still browse your existing projects and results, but creating
+          projects, uploading datasets and launching analyses will be disabled.
+        </p>
+      </div>
+      <p>
+        Your data is neither deleted nor modified. To extend your access,
+        get in touch and we will take care of it.
+      </p>
+      <a href="{contact_url}" class="btn">Extend my access →</a>
+      <div class="meta">
+        <p>Questions? Contact <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>.</p>
+      </div>
+    """
+    return _base_layout(_expiry_warning_subject(days_remaining), content)
+
+
+def _expiry_warning_text(days_remaining: int, ends_on: str, contact_url: str) -> str:
+    when = _expiry_when(days_remaining)
+    return (
+        f"Hello,\n\n"
+        f"Your GenoLens access period ends {when} (on {ends_on}).\n\n"
+        f"From that date your account becomes read-only: you can still browse your "
+        f"existing projects and results, but creating projects, uploading datasets "
+        f"and launching analyses will be disabled.\n\n"
+        f"Your data is neither deleted nor modified.\n\n"
+        f"To extend your access: {contact_url}\n"
+        f"Questions? Contact {SUPPORT_EMAIL}.\n\n"
+        f"— The GenoLens team"
+    )
+
+
+async def send_expiration_warning_email(
+    to: str,
+    days_remaining: int,
+    ends_on: str,
+) -> bool:
+    """Warn a user that their access period is about to end.
+
+    Deliberately describes the consequence as read-only rather than as a
+    lock-out, because that is exactly what `require_active_account` enforces:
+    reads keep working, writes stop. Promising less than the product does would
+    frighten people into thinking their data is at risk; promising more would be
+    a lie they discover the next morning.
+    """
+    contact_url = f"{settings.APP_URL}/pricing"
+    return await send_email(
+        to=to,
+        subject=_expiry_warning_subject(days_remaining),
+        html_body=_expiry_warning_html(days_remaining, ends_on, contact_url),
+        text_body=_expiry_warning_text(days_remaining, ends_on, contact_url),
     )
 
 

@@ -26,6 +26,14 @@ from app.core.encryption import decrypt
 
 logger = logging.getLogger(__name__)
 
+
+# Every long-running backend service in docker-compose.prod.yml, restarted after a
+# build. postgres and redis are left alone: their images do not change on deploy.
+# `beat` (the Celery scheduler) was missing, so the daily expiry warnings and the
+# monthly quota reset never ran. tests/test_deploy_services.py keeps this list in
+# step with the compose file.
+RESTARTED_BACKEND_SERVICES = ["api", "worker", "r-worker", "beat"]
+
 # Services that require a Docker build step
 SERVICES_WITH_BUILD = {"backend", "license"}
 
@@ -211,7 +219,7 @@ def run_deployment(self, job_id: str) -> dict:
                             ssh.close()
                             return {"status": "error"}
 
-                        for container in ["api", "worker", "r-worker"]:
+                        for container in RESTARTED_BACKEND_SERVICES:
                             ok = await exec_step(
                                 f"restart {container}",
                                 f"cd {backend_dir} && docker compose -f docker-compose.prod.yml up -d --no-deps {container}"
