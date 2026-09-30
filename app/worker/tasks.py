@@ -264,8 +264,11 @@ def build_functional_enrichment_cmd(
     - ``--padj-cutoff`` chooses which enriched terms are kept — the wizard's "Enrichment FDR
       threshold" (``enrichment_fdr``). It was never passed, so the script's own 0.05 applied
       whatever the user set. Absent (analyses created before the field), 0.05 is what they ran at.
+
+    ``--databases`` restricts the anno.db categories to the wizard's pick (``enrichment_databases``,
+    the same category names). ``None`` means all, so the flag is omitted.
     """
-    return [
+    cmd = [
         "Rscript", str(script),
         "--deg", str(deg_csv),
         "--anno-db-dir", anno_db_dir,
@@ -276,6 +279,21 @@ def build_functional_enrichment_cmd(
         "--min-log2fc", str(params.get("min_log2fc", 1.0)),
         "--padj-cutoff", str(params.get("enrichment_fdr", 0.05)),
     ]
+    names = [d.strip() for d in params.get("enrichment_databases") or [] if d and d.strip()]
+    if names:
+        cmd.extend(["--databases", ",".join(names)])
+    return cmd
+
+
+def enrichment_requested(params: dict) -> bool:
+    """
+    False only for an explicit empty pick — the wizard's "Clear", shown as "0 databases selected".
+
+    That list used to be falsy, so it sent no flag and every database ran: the opposite of the
+    choice on screen. ``None`` (the default, "all") and any non-empty pick run the enrichment.
+    """
+    databases = params.get("enrichment_databases")
+    return databases is None or bool(databases)
 
 
 def run_async(coro):
@@ -1055,10 +1073,9 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                     "--species", str(params.get("species", "human")),
                 ]
                 cmd.extend(["--method", str(params.get("de_method", "all"))])
-                enrichment_dbs = params.get("enrichment_databases")
-                if enrichment_dbs:
-                    dbs_str = ",".join(enrichment_dbs) if isinstance(enrichment_dbs, list) else enrichment_dbs
-                    cmd.extend(["--enrichment-databases", dbs_str])
+                # No `--enrichment-databases` here: this script does no enrichment and its optparse
+                # rejects the flag, so any partial database pick failed the whole run. The pick goes
+                # to functional_enrichment.R instead (build_functional_enrichment_cmd).
 
                 proc = subprocess.run(
                     cmd,
@@ -1198,7 +1215,12 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                             enrich_script = Path("/app/r_scripts/functional_enrichment.R")
                             anno_db_dir = os.environ.get("ANNO_DB_PATH", "/app/anno_db")
                             enrich_local = comp_dir / "genolens_enrichment.csv"
-                            if enrich_script.exists():
+                            if not enrichment_requested(params):
+                                logger.info(
+                                    "[ANALYSIS] No enrichment database selected — skipping %s",
+                                    comp_id,
+                                )
+                            elif enrich_script.exists():
                                 enrich_cmd = build_functional_enrichment_cmd(
                                     enrich_script, deg_csv, anno_db_dir, comp_id, enrich_local, params,
                                 )

@@ -32,6 +32,7 @@ _count_pipeline_analysis = _legacy_mod._count_pipeline_analysis  # noqa: F401
 # personne. `tests/test_rerun_enrichment_route.py` epingle le re-export.
 _auto_run_enrichment = _legacy_mod._auto_run_enrichment  # noqa: F401
 build_functional_enrichment_cmd = _legacy_mod.build_functional_enrichment_cmd  # noqa: F401
+enrichment_requested = _legacy_mod.enrichment_requested  # noqa: F401
 
 # ── New periodic quota task ───────────────────────────────────────────────────
 from app.worker.tasks.quota_tasks import reset_monthly_analysis_quotas  # noqa: F401
