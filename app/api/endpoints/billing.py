@@ -284,9 +284,14 @@ async def stripe_webhook(
         # app/services/account_service.py.
         period_end = _subscription_period_end(subscription)
         if period_end:
-            user.subscription_ends_at = datetime.fromtimestamp(
-                period_end, tz=timezone.utc
-            ).isoformat()
+            new_ends_at = datetime.fromtimestamp(period_end, tz=timezone.utc).isoformat()
+            if new_ends_at != user.subscription_ends_at:
+                # Re-arm the expiry warnings on every renewal. Without this, a
+                # user warned once before their subscription rolled over would
+                # never be warned again — the counter only ever shrinks.
+                # See app/worker/tasks/account_tasks.py.
+                user.expiry_warning_sent_for = None
+            user.subscription_ends_at = new_ends_at
         else:
             logger.warning(
                 "No current_period_end on subscription for customer %s "

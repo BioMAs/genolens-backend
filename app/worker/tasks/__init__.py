@@ -26,14 +26,24 @@ import_geo_dataset = _legacy_mod.import_geo_dataset  # noqa: F401
 health_check = _legacy_mod.health_check  # noqa: F401
 run_self_service_analysis = _legacy_mod.run_self_service_analysis  # noqa: F401
 _count_pipeline_analysis = _legacy_mod._count_pipeline_analysis  # noqa: F401
+_build_pipeline_command = _legacy_mod._build_pipeline_command  # noqa: F401
+_analysis_cancelled = _legacy_mod._analysis_cancelled  # noqa: F401
 # Appele par POST /datasets/{id}/rerun-enrichment. Son absence de cette liste
 # faisait lever ImportError a la route, donc 500 pour tout appelant : le
 # package masque `tasks.py`, et un symbole non repris ici n'existe plus pour
 # personne. `tests/test_rerun_enrichment_route.py` epingle le re-export.
 _auto_run_enrichment = _legacy_mod._auto_run_enrichment  # noqa: F401
+build_functional_enrichment_cmd = _legacy_mod.build_functional_enrichment_cmd  # noqa: F401
+enrichment_requested = _legacy_mod.enrichment_requested  # noqa: F401
 
-# ── New periodic quota task ───────────────────────────────────────────────────
+# ── Periodic tasks ────────────────────────────────────────────────────────────
+# These imports are what actually REGISTER the tasks with Celery. Listing a
+# module in `celery_app.conf.include` schedules it but does not import it here,
+# so a task missing from this file is one beat enqueues and the worker answers
+# with "Received unregistered task". `tests/test_periodic_tasks_registered.py`
+# walks the beat schedule and fails when that happens.
 from app.worker.tasks.quota_tasks import reset_monthly_analysis_quotas  # noqa: F401
+from app.worker.tasks.account_tasks import check_account_expirations  # noqa: F401
 
 __all__ = [
     "process_dataset_upload",
@@ -41,4 +51,5 @@ __all__ = [
     "health_check",
     "run_self_service_analysis",
     "reset_monthly_analysis_quotas",
+    "check_account_expirations",
 ]

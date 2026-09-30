@@ -268,6 +268,7 @@ def _fake_session_factory(scalar_results):
     db.scalar = AsyncMock(side_effect=scalar_results)
     db.commit = AsyncMock()
     db.refresh = AsyncMock()
+    db.rollback = AsyncMock()
     db.execute = AsyncMock()
 
     class _Ctx:

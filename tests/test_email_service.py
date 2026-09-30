@@ -9,9 +9,12 @@ Tests:
 - send_mention_notification helper
 - send_reply_notification helper
 """
+import re as _re
+
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
+from app.services import email_service as _es
 from app.services.email_service import (
     extract_mentions,
     send_email,
@@ -190,7 +193,7 @@ async def test_send_mention_notification_calls_send_email():
     mock_send.assert_called_once()
     call_kwargs = mock_send.call_args
     assert call_kwargs[1]["to"] == "alice@example.com"
-    assert "mentionné" in call_kwargs[1]["subject"]
+    assert call_kwargs[1]["subject"] == "You were mentioned in “My Project” — GenoLens"
 
 
 @pytest.mark.asyncio
@@ -216,4 +219,65 @@ async def test_send_reply_notification_calls_send_email():
     mock_send.assert_called_once()
     call_kwargs = mock_send.call_args
     assert call_kwargs[1]["to"] == "alice@example.com"
-    assert "Réponse" in call_kwargs[1]["subject"]
+    assert call_kwargs[1]["subject"] == "New reply to your comment — “My Project” — GenoLens"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# English copy (the app UI is English; these emails used to be French)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+# Accented letters, guillemets and the words the French templates used.
+_FRENCH = _re.compile(
+    r"[àâçéèêëîïôûùœ«»]|\b(Bonjour|Vous|votre|projet|forfait|comparaisons?|Lien direct)\b",
+    _re.I,
+)
+
+
+def _rendered_emails():
+    inv = dict(invitee_email="new@example.com", inviter_email="owner@example.com",
+               project_name="P", access_level="ADMIN", project_url="http://x/p")
+    men = dict(mentioned_email="a@example.com", author_email="b@example.com",
+               project_name="P", comment_excerpt="hi", comment_url="http://x/c")
+    rep = dict(parent_author_email="a@example.com", replier_email="b@example.com",
+               project_name="P", original_excerpt="o", reply_excerpt="r", comment_url="http://x/c")
+    quo = dict(to="a@example.com", used=24, quota=30, plan="TEAM", pricing_url="http://x/pricing")
+    return {
+        "invitation_html": _es._project_invitation_html(**inv),
+        "invitation_text": _es._project_invitation_text(**inv),
+        "mention_html": _es._mention_notification_html(**men),
+        "mention_text": _es._mention_notification_text(**men),
+        "reply_html": _es._reply_notification_html(**rep),
+        "reply_text": _es._reply_notification_text(**rep),
+        "quota_html": _es._quota_warning_html(**quo),
+        "quota_text": _es._quota_warning_text(**quo),
+    }
+
+
+@pytest.mark.parametrize("name", list(_rendered_emails()))
+def test_email_bodies_are_english(name):
+    body = _rendered_emails()[name]
+    match = _FRENCH.search(body)
+    assert match is None, f"{name} still contains French: {match.group(0)!r}"
+
+
+def test_invitation_uses_the_app_role_label():
+    assert "Admin role" in _es._project_invitation_text(
+        invitee_email="n@e.com", inviter_email="o@e.com",
+        project_name="P", access_level="ADMIN", project_url="http://x",
+    )
+
+
+def test_quota_warning_names_the_plan_and_counts_analyses():
+    text = _es._quota_warning_text(
+        to="a@e.com", used=24, quota=30, plan="TEAM", pricing_url="http://x"
+    )
+    assert "24 of your 30 analyses" in text
+    assert "(Pro plan)" in text
+    assert "6 analyses left" in text
+    assert _es._quota_warning_subject(1) == "GenoLens — 1 analysis left this month"
+
+
+def test_plan_label_falls_back_for_an_unknown_plan():
+    assert _es._plan_label("ON_PREMISE") == "Enterprise"
+    assert _es._plan_label("SOMETHING_ELSE") == "Something Else"

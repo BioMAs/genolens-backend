@@ -139,13 +139,16 @@ jobs:
 
       - name: Build, migrate, restart
         # Build first, run migrations, then restart services with the new image.
+        # `beat` is the Celery scheduler (daily expiry warnings, monthly quota reset).
+        # It was declared in docker-compose.prod.yml but missing from these two lists,
+        # so it was never started: keep it in both, or scheduled jobs silently stop.
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
             "$DEPLOY_USER@$DEPLOY_HOST" \
             "set -e; cd $DEPLOY_PATH && \
-             docker compose -f $COMPOSE_FILE build api worker r-worker && \
+             docker compose -f $COMPOSE_FILE build api worker r-worker beat && \
              docker compose -f $COMPOSE_FILE run --rm api alembic upgrade head && \
-             docker compose -f $COMPOSE_FILE up -d --no-deps api worker r-worker && \
+             docker compose -f $COMPOSE_FILE up -d --no-deps api worker r-worker beat && \
              docker compose -f $COMPOSE_FILE ps"
 
       - name: Health check

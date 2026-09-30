@@ -49,6 +49,36 @@ def padj_display_floor(padj: "pd.Series") -> float:
     return float(positive.min()) if not positive.empty else ABSOLUTE_PADJ_FLOOR
 
 
+#: featureCounts annotation columns: numeric, but not samples.
+_COUNT_MATRIX_ANNOTATION_COLUMNS = frozenset({"chr", "start", "end", "strand", "length"})
+
+
+def compute_count_matrix_qc(df: pd.DataFrame) -> dict[str, Any]:
+    """
+    Sample columns are the numeric ones, minus featureCounts annotations; the gene
+    identifier and symbol columns are text and drop out on their own. Keys:
+    n_genes, n_samples, sample_names, lib_sizes, detected_genes, min_lib_size,
+    min_detected_genes (the two minima are None when there is no sample column).
+    """
+    sample_cols = [
+        c for c in df.select_dtypes(include=[np.number]).columns
+        if str(c).strip().lower() not in _COUNT_MATRIX_ANNOTATION_COLUMNS
+    ]
+    counts = df[sample_cols].fillna(0)
+    lib_sizes = {str(c): int(round(v)) for c, v in counts.sum().items()}
+    detected = {str(c): int(v) for c, v in (counts > 0).sum().items()}
+
+    return {
+        "n_genes": int(len(df)),
+        "n_samples": len(sample_cols),
+        "sample_names": [str(c) for c in sample_cols],
+        "lib_sizes": lib_sizes,
+        "detected_genes": detected,
+        "min_lib_size": min(lib_sizes.values()) if lib_sizes else None,
+        "min_detected_genes": min(detected.values()) if detected else None,
+    }
+
+
 class DataProcessorService:
     """Service for data processing operations (CSV/Excel -> Parquet)."""
 
@@ -848,6 +878,17 @@ class DataProcessorService:
             "n_neighbors": n_neighbors,
             "min_dist": min_dist
         }
+
+    async def calculate_count_matrix_qc(self, parquet_data: bytes) -> dict[str, Any]:
+        """
+        Shape and per-sample QC of a raw count matrix (genes x samples), stored in
+        dataset_metadata and read by the wizard's Data Validation step.
+
+        Library size = sum of counts; detected genes = counts > 0 — the same two
+        quantities the R pipeline filters samples on (--min-reads / --min-genes).
+        """
+        df = pd.read_parquet(io.BytesIO(parquet_data))
+        return compute_count_matrix_qc(df)
 
     async def calculate_library_size(self, parquet_data: bytes) -> list[dict[str, Any]]:
         """

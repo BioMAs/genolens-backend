@@ -394,6 +394,14 @@ _CLIENT_PROTECTED_METADATA_KEYS = frozenset(
         "dotplot_error",
         "validation_warnings",
         "qc_report",
+        # QC de la matrice de comptage — compute_count_matrix_qc
+        "n_genes",
+        "n_samples",
+        "sample_names",
+        "lib_sizes",
+        "detected_genes",
+        "min_lib_size",
+        "min_detected_genes",
         # Provenance posée à la création du dataset
         "analysis_id",
         "comparison_name",

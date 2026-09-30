@@ -140,6 +140,58 @@ services:
       - default
 
   # R worker — DEG pipeline (DESeq2/edgeR/limma) + annoDB functional enrichment
+  # Celery Beat — the scheduler. Without this service the `beat_schedule` in
+  # app/worker/celery_app.py is inert, which it had been since it was written:
+  # the monthly quota reset never fired in production. It now drives both that
+  # and the daily subscription-expiry warnings.
+  #
+  # Exactly one replica. Beat is a scheduler, not a worker: two of them would
+  # each enqueue the same job. The expiry task is idempotent so a duplicate is
+  # harmless, but the quota reset is not.
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-genolens}
+      - REDIS_URL=redis://redis:6379/0
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
+      - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
+      - ENVIRONMENT=production
+      - LOCAL_STORAGE_PATH=/app/data
+      - LLM_BASE_URL=${LLM_BASE_URL}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-google/gemma-4-E4B-it}
+      - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY}
+      - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY}
+      - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
+      # Email (Resend via SMTP)
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_TLS=${SMTP_TLS:-false}
+      - SMTP_STARTTLS=${SMTP_STARTTLS:-true}
+      - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS}
+      - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-GenoLens}
+      - SALES_EMAIL=${SALES_EMAIL:-contact@scilicium.com}
+    volumes:
+      - genolens_storage:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: celery -A app.worker.celery_app beat --loglevel=info
+    restart: always
+    networks:
+      - default
+
+  # R worker — DEG pipeline (DESeq2/edgeR/limma) + annoDB functional enrichment
   r-worker:
     build:
       context: .

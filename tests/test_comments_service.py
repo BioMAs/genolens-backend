@@ -312,6 +312,24 @@ class TestUpdateComment:
             )
 
     @pytest.mark.asyncio
+    async def test_raises_permission_error_for_non_owner_metadata_edit(self, mock_db):
+        """Metadata (mentions, tags) belongs to the author, like content."""
+        from app.services.comments_service import CommentsService
+
+        c = make_comment(user_id=uuid4())
+        mock_db.execute.return_value = _scalar_one_or_none(c)
+
+        service = CommentsService()
+        with pytest.raises(PermissionError):
+            await service.update_comment(
+                mock_db,
+                comment_id=TEST_COMMENT_ID,
+                user_id=TEST_USER_ID,
+                extra_metadata={"tags": ["hijacked"]},
+            )
+        mock_db.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_non_owner_can_resolve_comment(self, mock_db):
         """Any user should be able to resolve a comment (no content change)."""
         from app.services.comments_service import CommentsService

@@ -451,6 +451,10 @@ class DegGene(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_deg_genes_dataset_comparison", "dataset_id", "comparison_name"),
         Index("ix_deg_genes_dataset_comparison_regulation", "dataset_id", "comparison_name", "regulation"),
+        # Recherche de gènes par préfixe insensible à la casse (`/genes/search`).
+        # `text_pattern_ops` rend LIKE 'X%' indexable quelle que soit la collation.
+        Index("ix_deg_genes_gene_name_upper_pattern", sa_text("upper(gene_name) text_pattern_ops")),
+        Index("ix_deg_genes_gene_id_upper_pattern", sa_text("upper(gene_id) text_pattern_ops")),
     )
 
     def __repr__(self) -> str:
@@ -706,6 +710,20 @@ class User(Base, TimestampMixin):
     quota_reset_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
         comment="Timestamp of last monthly quota reset"
+    )
+
+    # Smallest expiry-warning threshold (7, 3, 1 day) already emailed to this
+    # user. NULL = none sent yet.
+    #
+    # This is what makes the daily expiration check idempotent: without it, a
+    # second beat worker, a manual trigger or a retry each re-send the same
+    # "1 day left" email, which reads as a malfunction. Reset to NULL whenever
+    # subscription_ends_at changes, so a renewed account is re-armed — otherwise
+    # a user warned once would never be warned again for any later period.
+    expiry_warning_sent_for: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Smallest expiry-warning threshold already emailed (7, 3, 1). "
+                "NULL = none sent. Reset when subscription_ends_at changes."
     )
 
     # Optional add-on modules unlocked individually by an admin (independent of plan)

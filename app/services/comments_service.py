@@ -216,8 +216,9 @@ class CommentsService:
         if not comment:
             return None
         
-        # Only owner can update (except for is_resolved which can be set by project members)
-        if comment.user_id != user_id and content is not None:
+        # Only owner can update content or metadata; is_resolved can be set by
+        # any project member (the endpoint checks project access first).
+        if comment.user_id != user_id and (content is not None or extra_metadata is not None):
             raise PermissionError("Only comment owner can edit content")
         
         if content is not None:
