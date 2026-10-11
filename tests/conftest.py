@@ -263,6 +263,11 @@ def make_fake_db_user(
     u.report_customization_module_enabled = False
     u.scientific_module_enabled = False
     u.drug_discovery_module_enabled = False
+    u.is_demo = False
+    u.ai_requests_limit = None
+    u.ai_requests_used = 0
+    u.analyses_quota_override = None
+    u.analyses_bonus = 0
     return u
 
 

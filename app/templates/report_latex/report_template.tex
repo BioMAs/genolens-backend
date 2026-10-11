@@ -25,6 +25,24 @@
 \renewcommand{\@invertedlogo}{\JINJAVAR{jj_logo_path}}
 \makeatother
 \JINJABLOCK{endif}
+% Demo account: a large diagonal "DEMO" on every page. Foreground (FG) rather
+% than background, otherwise the coloured cover (\pagecolor) and full-width
+% figures hide it; the low opacity keeps the content readable. Scaled with
+% \scalebox rather than \fontsize so it does not depend on the font offering
+% large optical sizes. The base size is pinned (\fontsize{10}{12}): at shipout
+% the current size is whatever the page was set in, and the back cover's huge
+% motto would otherwise blow the watermark past the page edges.
+% eso-pic and tikz are loaded by sciliciumreport.cls.
+\JINJABLOCK{if jj_demo_watermark}
+\AddToShipoutPictureFG{%
+  \AtPageCenter{%
+    \makebox(0,0){%
+      \tikz\node[rotate=45, opacity=0.12, text=black, inner sep=0pt]%
+        {\scalebox{15}{\fontsize{10}{12}\selectfont\bfseries\sffamily DEMO}};%
+    }%
+  }%
+}
+\JINJABLOCK{endif}
 
 \institute{\JINJAVAR{jj_institute_name}}
 \address{\JINJAVAR{jj_institute_address}}

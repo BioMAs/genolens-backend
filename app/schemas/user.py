@@ -1,6 +1,6 @@
 from uuid import UUID
 from typing import Optional
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from app.models.models import UserRole, SubscriptionPlan, UserStatus
 
 class UserBase(BaseModel):
@@ -58,3 +58,21 @@ class UserSelf(User):
     has_report_customization: bool = False
     has_scientific_module: bool = False
     has_drug_discovery_module: bool = False
+    # Compte de démonstration : filigrane DEMO sur ce qu'il génère, et pas de
+    # remise à zéro mensuelle de ses compteurs. Son plafond de datasets passe par
+    # `analyses_quota` ci-dessus, déjà résolu avec l'override du compte.
+    is_demo: bool = False
+    # Plafond de requêtes IA (chaque appel réel au LLM, le cache est gratuit),
+    # sur toute la durée du compte. None = pas de plafond.
+    ai_requests_limit: Optional[int] = None
+    ai_requests_used: int = 0
+    ai_requests_remaining: Optional[int] = None
+
+    @field_validator("is_demo", "ai_requests_used", mode="before")
+    @classmethod
+    def _unset_column_defaults(cls, value, info):
+        # Un `User` jamais flushé (tests, utilisateur créé dans la requête) n'a
+        # pas encore reçu les défauts de colonne : None vaut False / 0 ici.
+        if value is None:
+            return False if info.field_name == "is_demo" else 0
+        return value

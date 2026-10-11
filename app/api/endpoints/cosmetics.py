@@ -27,6 +27,7 @@ from app.api.deps.subscription import (
     require_admin,
     require_ai_access,
     require_cosmetics_access,
+    reserve_ai_request,
 )
 from app.models.models import (
     ClaimDirection,
@@ -135,11 +136,16 @@ async def interpret_cosmetics(
     scores = await score_claims(db, dataset_id, comparison_name)
     claims_count = sum(1 for c in scores.get("claims", []) if c.get("n_supporting", 0) > 0)
 
+    # Le cache a été servi gratuitement ci-dessus : une requête IA est réservée
+    # pour l'appel au LLM (429 si le plafond du compte est atteint), et rendue
+    # s'il échoue.
+    reservation = await reserve_ai_request(user, db)
     interpreter = LocalAIInterpreter()
     try:
         text = await interpreter.interpret_cosmetics(scores, comparison_name)
     except Exception as e:  # noqa: BLE001
         logger.error("Cosmetics AI interpretation failed: %s", e)
+        await reservation.refund()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"AI service unavailable: {e}",

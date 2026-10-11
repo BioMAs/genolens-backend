@@ -21,7 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
-from app.api.deps.subscription import check_ai_quota, increment_ai_usage, require_ai_access
+from app.api.deps.subscription import (
+    check_ai_quota,
+    increment_ai_usage,
+    require_ai_access,
+    reserve_ai_request,
+)
 from app.api.deps.project_access import assert_project_read_access
 from app.core.supabase_auth import SupabaseUser
 from app.db.session import AsyncSessionLocal
@@ -133,6 +138,12 @@ async def send_chat_message(
     """
     session = await _load_owned_session(session_id, current_user, db)
 
+    # Une requête IA par message, quel que soit le nombre d'appels au LLM que
+    # l'agent enchaîne. Réservée ici, avant la StreamingResponse : une fois le
+    # flux ouvert le statut HTTP est figé, et un 429 ne pourrait plus partir.
+    # Avant l'enregistrement du message aussi, la réservation commit la session.
+    reservation = await reserve_ai_request(user, db)
+
     # Load prior turns (content only) for conversational memory.
     prior = (await db.execute(
         select(AgentMessage)
@@ -215,6 +226,10 @@ async def send_chat_message(
                         )
                 except Exception as persist_exc:  # noqa: BLE001
                     logger.warning("Failed to persist assistant turn: %s", persist_exc)
+                # Rien n'est parvenu à l'utilisateur (échec du LLM, déconnexion
+                # immédiate) : la requête IA réservée lui est rendue.
+                if not narrative_parts and not figures:
+                    await reservation.refund()
 
     return StreamingResponse(
         event_stream(),

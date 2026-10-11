@@ -1,21 +1,16 @@
 """
 Periodic tasks for quota management.
 
-ATTENTION : cette tache est declaree dans le `beat_schedule` de
-`app/worker/celery_app.py` (1er du mois, 00:05 UTC) mais **aucun service
-`celery beat` n'existe dans `docker-compose.prod.yml`** — seuls `api`, `worker`
-et `r-worker` tournent. Elle n'est donc jamais declenchee en production.
+`reset_monthly_analysis_quotas` est declaree dans le `beat_schedule` de
+`app/worker/celery_app.py` (1er du mois, 00:05 UTC) et tourne en production
+depuis l'ajout du service `beat` a `docker-compose.prod.yml`.
 
-La remise a zero effective vient du chemin paresseux :
-`_reset_quota_if_new_month` (app/api/deps/subscription.py) remet le compteur a
-zero au premier appel touchant au quota que fait l'utilisateur dans le mois.
-C'est suffisant fonctionnellement — un compteur n'a d'importance qu'au moment
-ou on le lit — mais ca veut dire qu'aucun etat en base n'est remis a zero pour
-un utilisateur inactif, et que les statistiques lues directement en base
-peuvent montrer un compteur du mois precedent.
+Le chemin paresseux reste en place en filet : `_reset_quota_if_new_month`
+(app/api/deps/subscription.py) remet le compteur a zero au premier appel
+touchant au quota que fait l'utilisateur dans le mois.
 
-Ajouter un service `beat` rendrait cette tache reelle. En attendant, ne pas
-compter sur elle.
+Les deux chemins epargnent les comptes demo (`users.is_demo`) : leur quota
+couvre toute la duree de la demo, un nouveau mois ne doit pas le renouveler.
 """
 import asyncio
 import logging
@@ -39,7 +34,7 @@ def _run_async(coro):
 @celery_app.task(name="app.worker.tasks.quota_tasks.reset_monthly_analysis_quotas")
 def reset_monthly_analysis_quotas() -> dict:
     """
-    Reset analyses_used_this_month to 0 for all users.
+    Reset analyses_used_this_month to 0 for all users except demo accounts.
     Updates quota_reset_at to now.
     Runs via async session (asyncpg) — no psycopg2 required.
     """
@@ -56,7 +51,9 @@ async def _async_reset() -> dict:
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             update(User)
-            .values(analyses_used_this_month=0, quota_reset_at=now)
+            .where(User.is_demo.is_(False))
+            # Le bonus accordé par un admin vaut pour le mois écoulé.
+            .values(analyses_used_this_month=0, analyses_bonus=0, quota_reset_at=now)
         )
         await db.commit()
         row_count = result.rowcount
