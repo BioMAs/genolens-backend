@@ -35,6 +35,7 @@ from app.api.deps.subscription import (
     require_team_plan,
     check_ai_quota,
     increment_ai_usage,
+    reserve_ai_request,
     check_analysis_quota,
     increment_analysis_usage,
     warn_if_quota_threshold_crossed,
@@ -2555,11 +2556,29 @@ Task: Select exactly {max_terms} pathways that best match the user's request. Pr
 Return ONLY a JSON array of pathway IDs (the exact IDs from the list), nothing else. Example format:
 ["GO:0006096", "GO:0019319", "hsa00010"]"""
 
-    # Call AI
+    # Call AI — une requête IA réservée, rendue si le LLM échoue et que la
+    # sélection retombe sur le repli sans IA.
+    reservation = await reserve_ai_request(user, db)
     interpreter = LocalAIInterpreter()
     
     try:
         ai_response = await interpreter._call_llm_raw(ai_prompt, max_tokens=500)
+
+        # Seul appel au LLM qui n'était pas journalisé : il manquait au suivi
+        # des coûts. Isolé, pour qu'un échec du journal ne bascule pas une
+        # sélection réussie sur le repli (et ne rende pas la requête).
+        try:
+            await increment_ai_usage(
+                user=user,
+                db=db,
+                action_type="enrichment_ai_select",
+                dataset_id=dataset_id,
+                comparison_name=comparison_name,
+                model_used=interpreter.model,
+                tokens_used=interpreter.last_usage["total_tokens"],
+            )
+        except Exception as log_err:
+            logger.warning(f"AI usage logging failed for ai-select: {log_err}")
         
         # Parse AI response
         import json
@@ -2610,6 +2629,7 @@ Return ONLY a JSON array of pathway IDs (the exact IDs from the list), nothing e
         
     except Exception as e:
         logger.error(f"AI term selection failed: {e}")
+        await reservation.refund()
         # Fallback: return top N diverse pathways
         categories_seen = set()
         selected_pathways = []
@@ -2750,6 +2770,12 @@ async def interpret_comparison(
             }
         }
     
+    # Le cache a été servi gratuitement ci-dessus : à partir d'ici un appel au
+    # LLM va avoir lieu, on réserve donc une requête IA (429 si le plafond du
+    # compte est atteint). Avant la suppression, pour qu'un refus ne fasse pas
+    # perdre l'interprétation existante.
+    reservation = await reserve_ai_request(user, db)
+
     # If forcing regeneration, delete existing one
     if existing_interpretation and force_regenerate:
         logger.info(f"Deleting existing interpretation for {comparison_name} to regenerate")
@@ -2942,8 +2968,10 @@ async def interpret_comparison(
         }
         
     except HTTPException:
+        await reservation.refund()
         raise
     except Exception as e:
+        await reservation.refund()
         logger.error(f"Failed to generate AI interpretation: {str(e)}")
         raise HTTPException(
             status_code=500,
@@ -2994,6 +3022,11 @@ async def ask_ai_question(
     # membre partage lisait la table des DEG et l'enrichissement du dataset,
     # mais recevait 403 sur l'ACP du meme dataset.
     await assert_project_read_access(db, dataset.project_id, current_user.user_id)
+
+    # Hors du `try` : le `except Exception` ci-dessous transforme toute erreur,
+    # HTTPException comprise, en 500 — un 429 de plafond IA levé dedans
+    # arriverait au client comme une panne serveur.
+    reservation = await reserve_ai_request(user, db)
 
     try:
         interpreter = LocalAIInterpreter()
@@ -3082,6 +3115,7 @@ IMPORTANT: Write in plain text only. Do NOT use Markdown formatting (no # for he
         }
         
     except Exception as e:
+        await reservation.refund()
         logger.error(f"Error answering AI question: {str(e)}")
         raise HTTPException(
             status_code=500,

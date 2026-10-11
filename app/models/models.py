@@ -752,6 +752,42 @@ class User(Base, TimestampMixin):
         comment="Whether the Drug Discovery module (target ranking, indications, reports) is unlocked for this user",
     )
 
+    # Compte de démonstration (prospects). Orthogonal au plan : une démo reste
+    # TEAM pour garder l'IA et les modules ouverts. Le drapeau porte deux effets
+    # que le plan ne peut pas exprimer : le filigrane DEMO sur ce que le compte
+    # génère, et l'absence de remise à zéro mensuelle de ses compteurs.
+    #
+    # Le nom ne finit volontairement PAS par `_module_enabled` :
+    # test_pricing_config exige que chaque colonne de ce suffixe soit un add-on.
+    is_demo: Mapped[bool] = mapped_column(
+        nullable=False,
+        default=False,
+        server_default=sa_text("false"),
+        comment="Demo (prospect) account: DEMO watermark on generated reports, "
+                "no monthly reset of its counters",
+    )
+
+    # Plafond de requêtes IA par compte, sur toute sa durée (pas de remise à
+    # zéro). « Requête » et non « question » : chaque appel réel au LLM compte
+    # (interprétation, /ask, message de chat, cosmétique, sélection IA de
+    # voies), alors que l'action_type "question" d'AIUsageLog ne désigne que
+    # /ask. NULL = pas de plafond, l'accès reste gouverné par le plan seul.
+    ai_requests_limit: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Max AI requests over the account's lifetime. NULL = no cap.",
+    )
+    ai_requests_used: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0"),
+        comment="AI requests consumed (real LLM calls; cached results are free).",
+    )
+
+    # Quota d'analyses propre au compte, prioritaire sur la grille du plan.
+    # Remplace l'ancienne astuce des démos (compteur pré-rempli à 150 - N).
+    analyses_quota_override: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Per-account analyses quota overriding the plan's. NULL = plan default.",
+    )
+
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email}, role={self.role}, plan={self.subscription_plan})>"
 
@@ -793,6 +829,8 @@ class User(Base, TimestampMixin):
         """
         if self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
+        if self.analyses_quota_override is not None:
+            return self.analyses_quota_override
         return {
             SubscriptionPlan.STARTER: 30,
             SubscriptionPlan.TEAM: 150,
@@ -835,6 +873,15 @@ class User(Base, TimestampMixin):
         if self.subscription_plan in (SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE) or self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
         return -1  # STARTER: no access
+
+    @property
+    def ai_requests_remaining(self) -> Optional[int]:
+        """Requêtes IA restantes. None = pas de plafond (ou rôle privilégié)."""
+        if self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
+            return None
+        if self.ai_requests_limit is None:
+            return None
+        return max(0, self.ai_requests_limit - (self.ai_requests_used or 0))
 
     @property
     def has_cosmetics_module(self) -> bool:

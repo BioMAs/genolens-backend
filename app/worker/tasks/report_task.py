@@ -74,7 +74,13 @@ async def _async_generate(task, job_id: str, analysis_id: str) -> dict:
             from app.services.report_latex_service import report_latex_service
             from app.services.storage import storage_service
 
-            pdf_bytes = await report_latex_service.render_pdf(db, UUID(analysis_id))
+            pdf_bytes = await report_latex_service.render_pdf(
+                db,
+                UUID(analysis_id),
+                demo_watermark=await report_latex_service.is_demo_requester(
+                    db, job.requested_by
+                ),
+            )
 
             pdf_path = f"reports/{analysis_id}/{job_id}.pdf"
             await storage_service.upload_file(pdf_path, pdf_bytes, "application/pdf")
@@ -128,6 +134,9 @@ async def _async_generate_comparison(task, job_id: str) -> dict:
                 first_page_type=job.first_page_type,
                 last_page_type=job.last_page_type,
                 cover_info=job.cover_info,
+                demo_watermark=await report_latex_service.is_demo_requester(
+                    db, job.requested_by
+                ),
             )
 
             pdf_path = f"reports/comparisons/{job.dataset_id}/{job_id}.pdf"

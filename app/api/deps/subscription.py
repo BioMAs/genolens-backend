@@ -4,17 +4,18 @@ Subscription and quota dependencies for API endpoints.
 
 import logging
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Optional
 from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.api.deps.supabase_deps import get_current_user
 from app.core.config import settings
 from app.core.supabase_auth import SupabaseUser
-from app.db.session import get_db
+from app.db.session import AsyncSessionLocal, get_db
 from app.models.models import SubscriptionPlan, User, UserRole, UserStatus
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,113 @@ async def increment_ai_usage(
     await db.commit()
 
 
+# ── AI request cap (per-account, demo accounts) ─────────────────────────────────
+
+
+def _has_unlimited_ai_requests(user: User) -> bool:
+    """True when no AI request cap applies: privileged roles, or no cap set."""
+    return user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or user.ai_requests_limit is None
+
+
+class AIRequestReservation:
+    """Une requête IA réservée, à rendre si l'appel au LLM échoue.
+
+    Ne retient que l'id de l'utilisateur, capturé au moment de la réservation :
+    dans un chemin d'erreur, l'objet `User` de la requête peut avoir été expiré
+    par un rollback, et le relire en async lève une erreur qui masquerait celle
+    d'origine. `refund()` est idempotent et sans effet quand rien n'a été réservé
+    (compte sans plafond, rôle privilégié).
+    """
+
+    def __init__(self, user_id: Optional[UUID] = None) -> None:
+        self._user_id = user_id
+
+    @property
+    def reserved(self) -> bool:
+        return self._user_id is not None
+
+    async def refund(self) -> None:
+        if self._user_id is None:
+            return
+        user_id, self._user_id = self._user_id, None
+        await refund_ai_request(user_id)
+
+
+async def reserve_ai_request(user: User, db: AsyncSession) -> AIRequestReservation:
+    """Consomme une requête IA avant l'appel au LLM, ou répond 429.
+
+    À appeler dans le handler, juste avant l'appel au LLM et APRÈS le contrôle
+    de cache : ce n'est pas une dépendance FastAPI, sinon une interprétation
+    servie depuis le cache serait décomptée. À appeler aussi avant toute
+    écriture de la requête, car la réservation commit la session.
+
+    La réservation est atomique (`UPDATE … WHERE used < limit`), sur le modèle
+    de `try_increment_analysis_usage` : deux requêtes simultanées ne peuvent pas
+    dépasser le plafond en lisant toutes deux le même reste. Elle est commitée
+    tout de suite, pour survivre à un échec plus loin dans la requête ;
+    l'appelant rend l'unité avec `reservation.refund()` si le LLM échoue.
+
+    Le refus porte un `detail` structuré, comme `account_inactive`, pour que le
+    frontend puisse le reconnaître à `detail.error`.
+    """
+    if _has_unlimited_ai_requests(user):
+        return AIRequestReservation()
+
+    user_id = user.id
+    limit = user.ai_requests_limit
+    result = await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .where(User.ai_requests_used < User.ai_requests_limit)
+        .values(ai_requests_used=User.ai_requests_used + 1)
+        .returning(User.ai_requests_used)
+    )
+    used = result.scalar()
+    if used is None:
+        # Pas de rollback : l'UPDATE n'a touché aucune ligne, et un rollback
+        # expirerait `user`, dont la relecture paresseuse échoue en async.
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "ai_quota_exhausted",
+                "limit": limit,
+                "used": limit,
+                "message": (
+                    f"This account has used all of its {limit} AI requests. "
+                    "Please contact support@scilicium.com to continue."
+                ),
+            },
+        )
+    await db.commit()
+    # Valeur en mémoire mise à jour SANS marquer l'objet modifié : un simple
+    # `user.ai_requests_used = used` serait réécrit au prochain commit du
+    # handler et écraserait un incrément concurrent.
+    set_committed_value(user, "ai_requests_used", used)
+    return AIRequestReservation(user_id)
+
+
+async def refund_ai_request(user_id: UUID) -> None:
+    """Rend une requête IA réservée quand l'appel au LLM a échoué.
+
+    Passe par une session à part : on l'appelle depuis des chemins d'erreur où
+    la session de la requête peut être dans une transaction avortée. Ne descend
+    jamais sous zéro, même si un admin a remis le compteur à zéro entre la
+    réservation et l'échec. Ne lève rien : un remboursement raté ne doit pas
+    masquer l'erreur d'origine.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(User)
+                .where(User.id == user_id)
+                .where(User.ai_requests_used > 0)
+                .values(ai_requests_used=User.ai_requests_used - 1)
+            )
+            await session.commit()
+    except Exception:
+        logger.exception("Failed to refund an AI request for user %s", user_id)
+
+
 # ── Cosmetics module (per-user add-on) ───────────────────────────────────────────
 
 
@@ -311,11 +419,31 @@ def _has_unlimited_analyses(user: User) -> bool:
     return user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or user.analyses_quota is None
 
 
+def analysis_quota_renewal_hint(user: User) -> str:
+    """Phrase de fin des refus de quota d'analyses.
+
+    Un compte démo n'est jamais remis à zéro (voir `_reset_quota_if_new_month`) :
+    lui promettre le 1er du mois serait faux, et l'inviter à changer de plan
+    hors de propos.
+    """
+    if user.is_demo:
+        return (
+            "This demo account has no monthly renewal. "
+            "Please contact support@scilicium.com to continue."
+        )
+    return "Quota resets on the 1st of next month. Upgrade your plan for more analyses."
+
+
 def _reset_quota_if_new_month(user: User) -> bool:
     """
     Reset analyses_used_this_month if we're in a new calendar month.
     Returns True if a reset was performed.
+
+    Never for a demo account: its quota covers the whole demo, so a new month
+    must not hand it a fresh allowance.
     """
+    if user.is_demo:
+        return False
     now = datetime.now(timezone.utc)
     if user.quota_reset_at is None:
         user.analyses_used_this_month = 0
@@ -351,9 +479,8 @@ async def check_analysis_quota(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
-                f"Monthly comparison quota exhausted ({quota}/{quota}). "
-                f"Quota resets on the 1st of next month. "
-                f"Upgrade to a higher plan for more comparisons."
+                f"Analysis quota exhausted ({quota}/{quota}). "
+                f"{analysis_quota_renewal_hint(user)}"
             ),
         )
 
@@ -417,8 +544,8 @@ async def increment_analysis_usage(user: User, db: AsyncSession) -> None:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=(
-                f"Monthly comparison quota exhausted ({quota}/{quota}). "
-                "Quota resets on the 1st of next month."
+                f"Analysis quota exhausted ({quota}/{quota}). "
+                f"{analysis_quota_renewal_hint(user)}"
             ),
         )
 

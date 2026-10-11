@@ -76,10 +76,16 @@ class AccountService:
         plan: SubscriptionPlan,
         invited_by_admin_id: UUID,
         subscription_ends_at: Optional[datetime] = None,
+        is_demo: bool = False,
+        ai_requests_limit: Optional[int] = None,
+        analyses_quota_override: Optional[int] = None,
     ) -> User:
         """
         Invite someone: create their Supabase auth account, send the invitation
         magic link, and record a PENDING local profile keyed on the auth id.
+
+        `is_demo` and the two per-account caps let a demo (prospect) account be
+        created in one step, rather than invited and then patched.
         """
         result = await self._db.execute(select(User).where(User.email == email))
         if result.scalar_one_or_none():
@@ -101,6 +107,10 @@ class AccountService:
             status=UserStatus.PENDING,
             # subscription_ends_at is a String(50) column; store ISO 8601.
             subscription_ends_at=subscription_ends_at.isoformat() if subscription_ends_at else None,
+            is_demo=is_demo,
+            ai_requests_limit=ai_requests_limit,
+            ai_requests_used=0,
+            analyses_quota_override=analyses_quota_override,
         )
         self._db.add(user)
         await self._db.commit()

@@ -608,6 +608,10 @@ class ReportLatexService:
         if ai is None and generate_ai:
             # Time-boxed, best-effort: LLM generation can be slow (cold start) and the
             # r-worker is single-concurrency, so never let it block the report/worker.
+            # ⚠️ Ce chemin ne passe pas par `reserve_ai_request` : il contournerait le
+            # plafond de requêtes IA des comptes démo. Aucun appelant ne l'active
+            # aujourd'hui (generate_ai=False partout) ; le brancher sur le plafond
+            # avant de l'activer.
             try:
                 from app.services.ai_interpreter import generate_and_store  # T6
                 ai = await asyncio.wait_for(
@@ -798,6 +802,9 @@ class ReportLatexService:
             "jj_projects_results": projects_results,
             "jj_appendix": "",
             "ref_appendix_soft_versions": "A",
+            # Filigrane DEMO sur chaque page, pour un rapport demandé par un
+            # compte de démonstration (users.is_demo).
+            "jj_demo_watermark": bool(data.get("demo_watermark")),
         }
         template = self.env.get_template(MAIN_TEMPLATE)
         return template.render(**template_vars)
@@ -841,11 +848,25 @@ class ReportLatexService:
                 return out.read_bytes()
         return pdf_path.read_bytes()
 
-    async def render_pdf(self, db: AsyncSession, analysis_id: UUID, generate_ai: bool = False) -> bytes:
+    async def render_pdf(self, db: AsyncSession, analysis_id: UUID, generate_ai: bool = False,
+                         demo_watermark: bool = False) -> bytes:
         with tempfile.TemporaryDirectory(prefix="report_") as work_dir:
             data = await self.collect_analysis_data(db, analysis_id, work_dir, generate_ai)
+            data["demo_watermark"] = demo_watermark
             tex_str = self.assemble_tex(data)
             return await asyncio.to_thread(self.compile_pdf, tex_str, work_dir)
+
+    async def is_demo_requester(self, db: AsyncSession, user_id) -> bool:
+        """True quand le rapport est demandé par un compte de démonstration.
+
+        Lu à la génération, sur le demandeur du job : le filigrane est figé dans
+        le PDF stocké, que le téléchargement sert ensuite tel quel.
+        """
+        if not user_id:
+            return False
+        from app.models.models import User
+        user = await db.get(User, user_id)
+        return bool(user and user.is_demo)
 
     async def _load_branding(self, db: AsyncSession, user_id, work_dir: str) -> Optional[dict]:
         """Load persistent report branding for a user, gated by the customization module.
@@ -893,11 +914,13 @@ class ReportLatexService:
                                     first_page_type: Optional[str] = None,
                                     last_page_type: Optional[str] = None,
                                     cover_info: Optional[dict] = None,
-                                    generate_ai: bool = False) -> bytes:
+                                    generate_ai: bool = False,
+                                    demo_watermark: bool = False) -> bytes:
         with tempfile.TemporaryDirectory(prefix="report_") as work_dir:
             data = await self.collect_comparison_data(
                 db, dataset_id, comparison_name, work_dir, generate_ai
             )
+            data["demo_watermark"] = demo_watermark
             branding = await self._load_branding(db, requested_by, work_dir)
             data["branding"] = branding
             defaults = branding or {}

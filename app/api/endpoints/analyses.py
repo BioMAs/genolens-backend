@@ -18,7 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
 from app.api.deps.project_access import assert_project_access, is_project_admin
-from app.api.deps.subscription import check_analysis_quota, get_or_create_user
+from app.api.deps.subscription import (
+    analysis_quota_renewal_hint,
+    check_analysis_quota,
+    get_or_create_user,
+)
 from app.core.supabase_auth import SupabaseUser
 from app.models.models import (
     Dataset,
@@ -295,13 +299,12 @@ async def create_analysis(
         # 5 unités, alors que la grille tarifaire facture le dépôt, pas le
         # contraste.
         if remaining <= 0:
+            hint = analysis_quota_renewal_hint(db_user)
             detail = (
-                f"No analysis left this month ({counter_remaining} on the counter"
-                f", {in_flight} already queued). Quota resets on the 1st of next "
-                "month. Upgrade your plan for more analyses."
+                f"No analysis left ({counter_remaining} on the counter"
+                f", {in_flight} already queued). {hint}"
                 if in_flight
-                else "No analysis left this month. Quota resets on the 1st of "
-                "next month. Upgrade your plan for more analyses."
+                else f"No analysis left. {hint}"
             )
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail)
 

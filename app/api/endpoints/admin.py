@@ -3,7 +3,7 @@ Admin endpoints for user and system management.
 Requires ADMIN role.
 """
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
@@ -19,7 +19,7 @@ from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
 from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent, UserStatus
 from app.services.account_service import AccountService
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
@@ -55,10 +55,31 @@ class UserProfile(BaseModel):
     # could neither see nor correct a limit they had set.
     subscription_starts_at: Optional[str] = None
     subscription_ends_at: Optional[str] = None
+    # Compte démo et plafonds par compte (voir PATCH /users/{id}/demo).
+    is_demo: bool = False
+    ai_requests_limit: Optional[int] = None      # None = pas de plafond IA
+    ai_requests_used: int = 0
+    analyses_quota_override: Optional[int] = None  # None = quota du plan
+    analyses_used_this_month: int = 0
+    analyses_quota: Optional[int] = None         # quota effectif, None = illimité
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     last_sign_in_at: Optional[str] = None
     confirmed_at: Optional[str] = None
+
+
+def _demo_fields(local_user: Optional[User]) -> dict:
+    """Champs démo / plafonds d'un UserProfile, défauts compris sans ligne locale."""
+    if local_user is None:
+        return {}
+    return {
+        "is_demo": bool(local_user.is_demo),
+        "ai_requests_limit": local_user.ai_requests_limit,
+        "ai_requests_used": local_user.ai_requests_used or 0,
+        "analyses_quota_override": local_user.analyses_quota_override,
+        "analyses_used_this_month": local_user.analyses_used_this_month or 0,
+        "analyses_quota": local_user.analyses_quota,
+    }
 
 class SubscriptionUpdate(BaseModel):
     """Schema for updating subscription.
@@ -91,6 +112,23 @@ class ScientificModuleUpdate(BaseModel):
 class DrugDiscoveryModuleUpdate(BaseModel):
     """Schema for toggling the Drug Discovery add-on module for a user."""
     enabled: bool
+
+class DemoAccountUpdate(BaseModel):
+    """Compte démo et plafonds par compte.
+
+    Même sémantique que `SubscriptionUpdate`, lue via `model_fields_set` :
+
+      champ absent   → inchangé
+      null explicite → effacé (plus de plafond IA / retour au quota du plan)
+      une valeur     → posée
+
+    `reset_usage` remet à zéro les deux compteurs (requêtes IA et analyses) :
+    c'est ce qui permet de démarrer une démo propre, ou d'en prolonger une.
+    """
+    is_demo: Optional[bool] = None
+    ai_requests_limit: Optional[int] = Field(None, ge=0)
+    analyses_quota_override: Optional[int] = Field(None, ge=0)
+    reset_usage: bool = False
 
 class TokenAdd(BaseModel):
     """Schema for adding AI tokens."""
@@ -135,6 +173,10 @@ class InviteUserRequest(BaseModel):
     full_name: Optional[str] = None
     plan: SubscriptionPlan = SubscriptionPlan.STARTER
     subscription_ends_at: Optional[datetime] = None
+    # Compte démo créé en une seule étape (voir DemoAccountUpdate).
+    is_demo: bool = False
+    ai_requests_limit: Optional[int] = Field(None, ge=0)
+    analyses_quota_override: Optional[int] = Field(None, ge=0)
 
 
 class UserStatusUpdate(BaseModel):
@@ -294,6 +336,7 @@ async def list_users(
                     drug_discovery_module_enabled=drug_discovery_enabled,
                     subscription_starts_at=subscription_starts_at,
                     subscription_ends_at=subscription_ends_at,
+                    **_demo_fields(local_user),
                     created_at=profile.get("created_at"),
                     updated_at=profile.get("updated_at"),
                     last_sign_in_at=auth_info.get("last_sign_in_at"),
@@ -324,6 +367,13 @@ async def invite_user(
     Declared before the parameterised `/users/{user_id}` routes so the literal
     "invite" segment cannot be captured as a user id.
     """
+    if body.is_demo and body.subscription_ends_at is None:
+        # Une démo sans échéance ne se termine jamais : refusé avant d'envoyer
+        # l'invitation, qu'on ne pourrait plus retirer.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A demo account needs an access end date (subscription_ends_at).",
+        )
     service = AccountService(db)
     try:
         user = await service.invite_user(
@@ -332,6 +382,9 @@ async def invite_user(
             plan=body.plan,
             invited_by_admin_id=current_user.user_id,
             subscription_ends_at=body.subscription_ends_at,
+            is_demo=body.is_demo,
+            ai_requests_limit=body.ai_requests_limit,
+            analyses_quota_override=body.analyses_quota_override,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
@@ -506,6 +559,7 @@ async def get_user_details(
                         drug_discovery_module_enabled=drug_discovery_enabled,
                         subscription_starts_at=subscription_starts_at,
                         subscription_ends_at=subscription_ends_at,
+                        **_demo_fields(local_user),
                         created_at=profile.get("created_at"),
                         updated_at=profile.get("updated_at"),
                         last_sign_in_at=last_sign_in,
@@ -702,6 +756,55 @@ async def update_user_drug_discovery_module(
     user.drug_discovery_module_enabled = update.enabled
     await db.commit()
 
+    return await get_user_details(user_id, current_user, db)
+
+
+@router.patch("/users/{user_id}/demo", response_model=UserProfile)
+async def update_user_demo_account(
+    user_id: UUID,
+    update: DemoAccountUpdate,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Déclare ou retire un compte démo, et règle ses plafonds par compte.
+    Admin only.
+
+    Seuls les champs présents dans le corps sont appliqués (voir
+    `DemoAccountUpdate`). L'échéance reste portée par `subscription_ends_at`
+    (PATCH /users/{id}/subscription) : un compte démo passe en lecture seule à
+    cette date, comme tout compte expiré.
+    """
+    user = await db.scalar(select(User).where(User.id == user_id))
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not initialized in local database. Please update subscription first.",
+        )
+
+    fields = update.model_fields_set
+    if "is_demo" in fields and update.is_demo is not None:
+        user.is_demo = update.is_demo
+    if "ai_requests_limit" in fields:
+        user.ai_requests_limit = update.ai_requests_limit
+    if "analyses_quota_override" in fields:
+        user.analyses_quota_override = update.analyses_quota_override
+    if update.reset_usage:
+        user.ai_requests_used = 0
+        user.analyses_used_this_month = 0
+        user.quota_reset_at = datetime.now(timezone.utc)
+
+    if user.is_demo and not user.subscription_ends_at:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A demo account needs an access end date: set subscription_ends_at first.",
+        )
+
+    await db.commit()
+    logger.info(
+        "Demo settings for user %s updated by admin %s: %s",
+        user_id, current_user.user_id, update.model_dump(include=fields),
+    )
     return await get_user_details(user_id, current_user, db)
 
 
