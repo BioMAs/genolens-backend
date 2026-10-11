@@ -14,6 +14,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from app.api.deps import get_db, require_admin
+from app.api.deps.subscription import _reset_quota_if_new_month
 from app.api.deps.license import require_active_license
 from app.core.supabase_auth import SupabaseUser
 from app.core.config import settings
@@ -61,6 +62,7 @@ class UserProfile(BaseModel):
     ai_requests_used: int = 0
     analyses_quota_override: Optional[int] = None  # None = quota du plan
     analyses_used_this_month: int = 0
+    analyses_bonus: int = 0                      # bonus de la période, inclus dans le quota
     analyses_quota: Optional[int] = None         # quota effectif, None = illimité
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -78,6 +80,7 @@ def _demo_fields(local_user: Optional[User]) -> dict:
         "ai_requests_used": local_user.ai_requests_used or 0,
         "analyses_quota_override": local_user.analyses_quota_override,
         "analyses_used_this_month": local_user.analyses_used_this_month or 0,
+        "analyses_bonus": local_user.analyses_bonus or 0,
         "analyses_quota": local_user.analyses_quota,
     }
 
@@ -129,6 +132,10 @@ class DemoAccountUpdate(BaseModel):
     ai_requests_limit: Optional[int] = Field(None, ge=0)
     analyses_quota_override: Optional[int] = Field(None, ge=0)
     reset_usage: bool = False
+
+class GrantAmount(BaseModel):
+    """Quantité accordée par un admin (requêtes IA ou analyses)."""
+    amount: int = Field(..., ge=1, le=100_000)
 
 class TokenAdd(BaseModel):
     """Schema for adding AI tokens."""
@@ -804,6 +811,87 @@ async def update_user_demo_account(
     logger.info(
         "Demo settings for user %s updated by admin %s: %s",
         user_id, current_user.user_id, update.model_dump(include=fields),
+    )
+    return await get_user_details(user_id, current_user, db)
+
+
+async def _local_user_or_404(db: AsyncSession, user_id: UUID) -> User:
+    user = await db.scalar(select(User).where(User.id == user_id))
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not initialized in local database. Please update subscription first.",
+        )
+    return user
+
+
+@router.post("/users/{user_id}/grant-ai-requests", response_model=UserProfile)
+async def grant_ai_requests(
+    user_id: UUID,
+    grant: GrantAmount,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Accorde N requêtes IA à un compte. Admin only.
+
+    Crédits à l'unité : le compte dispose ensuite d'exactement N requêtes de
+    plus qu'il n'en avait de disponibles — d'où le `max(plafond, utilisées)`,
+    qui ne fait pas compter un plafond déjà dépassé. Un compte STARTER, sans IA
+    par son plan, y accède dans cette limite (`User.can_use_ai`).
+
+    Refusé (409) pour un compte à l'IA illimitée : lui poser un plafond le
+    restreindrait au lieu de lui accorder quoi que ce soit.
+    """
+    user = await _local_user_or_404(db, user_id)
+    if user.ai_requests_limit is None and user.can_use_ai:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This account already has unlimited AI requests.",
+        )
+
+    previous = user.ai_requests_limit
+    user.ai_requests_limit = max(previous or 0, user.ai_requests_used or 0) + grant.amount
+    await db.commit()
+    logger.info(
+        "Admin %s granted %d AI requests to user %s (limit %s -> %s)",
+        current_user.user_id, grant.amount, user_id, previous, user.ai_requests_limit,
+    )
+    return await get_user_details(user_id, current_user, db)
+
+
+@router.post("/users/{user_id}/grant-analyses", response_model=UserProfile)
+async def grant_analyses(
+    user_id: UUID,
+    grant: GrantAmount,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Accorde N analyses (datasets) en bonus pour la période en cours. Admin only.
+
+    Le bonus s'ajoute au quota et part avec la remise à zéro du 1er du mois ;
+    pour un compte démo, jamais remis à zéro, il vaut pour toute la démo.
+
+    Le compteur est d'abord basculé sur le mois en cours s'il ne l'a pas encore
+    été : sans ça, un bonus accordé avant le premier appel du mois serait effacé
+    par la remise à zéro paresseuse de ce même appel.
+
+    Refusé (409) pour un compte au quota illimité.
+    """
+    user = await _local_user_or_404(db, user_id)
+    if user.role in (UserRoleEnum.ADMIN, UserRoleEnum.SCILICIUM_ADMIN) or user.analyses_quota is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This account already has an unlimited analyses quota.",
+        )
+
+    _reset_quota_if_new_month(user)
+    user.analyses_bonus = (user.analyses_bonus or 0) + grant.amount
+    await db.commit()
+    logger.info(
+        "Admin %s granted %d analyses to user %s (bonus now %d, quota %s)",
+        current_user.user_id, grant.amount, user_id, user.analyses_bonus, user.analyses_quota,
     )
     return await get_user_details(user_id, current_user, db)
 

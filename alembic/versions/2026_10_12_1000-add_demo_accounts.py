@@ -12,6 +12,9 @@ Nothing capped AI usage, and nothing marked what the account generated.
 - users.ai_requests_used         : AI requests consumed (real LLM calls only).
 - users.analyses_quota_override  : per-account analyses quota, overriding the
                                    plan's (NULL = plan default).
+- users.analyses_bonus           : extra analyses granted by an admin for the
+                                   current period, reset with the monthly counter
+                                   (never for demo accounts).
 
 Purely additive with server defaults, so the old code keeps working while the
 deploy job applies migrations before restarting the containers. Idempotent so it
@@ -64,6 +67,16 @@ def _columns() -> list:
             sa.Integer(),
             nullable=True,
             comment="Per-account analyses quota overriding the plan's. NULL = plan default.",
+        ),
+        sa.Column(
+            "analyses_bonus",
+            sa.Integer(),
+            nullable=False,
+            server_default=sa.text("0"),
+            comment=(
+                "Extra analyses granted by an admin for the current period. "
+                "Reset with the monthly counter (never for demo accounts)."
+            ),
         ),
     ]
 

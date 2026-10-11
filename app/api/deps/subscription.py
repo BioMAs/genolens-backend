@@ -129,11 +129,10 @@ async def check_ai_quota(
     - ON_PREMISE / ADMIN / SCILICIUM_ADMIN: unlimited.
     - TEAM: 1 AI interpretation per comparison (enforced upstream via DB unique
       index on AIInterpretation(dataset_id, comparison_name) — always passes here).
-    - STARTER: blocked by require_ai_access before reaching here.
+    - STARTER: passes only when granted AI requests (`can_use_ai`); the per-call
+      cap itself is enforced by `reserve_ai_request`.
     """
-    if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
-        return user
-    if user.subscription_plan in (SubscriptionPlan.ON_PREMISE, SubscriptionPlan.TEAM):
+    if user.can_use_ai:
         return user
     raise HTTPException(
         status_code=status.HTTP_403_FORBIDDEN, detail="AI features not available on STARTER plan"
@@ -445,12 +444,14 @@ def _reset_quota_if_new_month(user: User) -> bool:
     if user.is_demo:
         return False
     now = datetime.now(timezone.utc)
-    if user.quota_reset_at is None:
+    if (
+        user.quota_reset_at is None
+        or now.year != user.quota_reset_at.year
+        or now.month != user.quota_reset_at.month
+    ):
         user.analyses_used_this_month = 0
-        user.quota_reset_at = now
-        return True
-    if now.year != user.quota_reset_at.year or now.month != user.quota_reset_at.month:
-        user.analyses_used_this_month = 0
+        # Le bonus accordé par un admin vaut pour la période : il part avec elle.
+        user.analyses_bonus = 0
         user.quota_reset_at = now
         return True
     return False

@@ -52,7 +52,8 @@ async def _async_reset() -> dict:
         result = await db.execute(
             update(User)
             .where(User.is_demo.is_(False))
-            .values(analyses_used_this_month=0, quota_reset_at=now)
+            # Le bonus accordé par un admin vaut pour le mois écoulé.
+            .values(analyses_used_this_month=0, analyses_bonus=0, quota_reset_at=now)
         )
         await db.commit()
         row_count = result.rowcount

@@ -267,6 +267,7 @@ def make_fake_db_user(
     u.ai_requests_limit = None
     u.ai_requests_used = 0
     u.analyses_quota_override = None
+    u.analyses_bonus = 0
     return u
 
 

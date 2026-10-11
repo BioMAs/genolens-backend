@@ -787,15 +787,31 @@ class User(Base, TimestampMixin):
         Integer, nullable=True,
         comment="Per-account analyses quota overriding the plan's. NULL = plan default.",
     )
+    # Analyses supplémentaires accordées par un admin pour la période en cours,
+    # ajoutées au quota. Remises à zéro avec le compteur mensuel : un bonus
+    # dépanne un client pour le mois, il ne relève pas son plan. Un compte démo
+    # n'étant jamais remis à zéro, son bonus vaut pour toute la démo.
+    analyses_bonus: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0"),
+        comment="Extra analyses granted by an admin for the current period. "
+                "Reset with the monthly counter (never for demo accounts).",
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email={self.email}, role={self.role}, plan={self.subscription_plan})>"
 
     @property
     def can_use_ai(self) -> bool:
-        """TEAM and ON_PREMISE only. ADMIN/SCILICIUM_ADMIN always yes."""
-        return self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN) or self.subscription_plan in (
-            SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE
+        """TEAM and ON_PREMISE, or any account granted AI requests. Admins always.
+
+        Les requêtes IA accordées par un admin sont des crédits à l'unité : elles
+        ouvrent l'IA à un compte STARTER, dans la limite accordée (le plafond est
+        appliqué par `reserve_ai_request`).
+        """
+        return (
+            self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN)
+            or self.subscription_plan in (SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE)
+            or (self.ai_requests_limit or 0) > 0
         )
 
     @property
@@ -826,16 +842,23 @@ class User(Base, TimestampMixin):
         L'unite est l'analyse : un depot de dataset DEG accepte, ou une analyse
         self-service terminee. Le nombre de contrastes du fichier n'entre pas
         dans le compte (voir `billable_unit` dans app/config/pricing.json).
+
+        Base : `analyses_quota_override` s'il est pose, sinon la grille du plan.
+        S'y ajoute `analyses_bonus`, accorde par un admin pour la periode.
         """
         if self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
             return None
         if self.analyses_quota_override is not None:
-            return self.analyses_quota_override
-        return {
-            SubscriptionPlan.STARTER: 30,
-            SubscriptionPlan.TEAM: 150,
-            SubscriptionPlan.ON_PREMISE: None,
-        }.get(self.subscription_plan, 30)
+            base = self.analyses_quota_override
+        else:
+            base = {
+                SubscriptionPlan.STARTER: 30,
+                SubscriptionPlan.TEAM: 150,
+                SubscriptionPlan.ON_PREMISE: None,
+            }.get(self.subscription_plan, 30)
+        if base is None:
+            return None
+        return base + (self.analyses_bonus or 0)
 
     @property
     def analyses_remaining(self) -> Optional[int]:
@@ -869,10 +892,10 @@ class User(Base, TimestampMixin):
 
     @property
     def ai_interpretations_remaining(self) -> Optional[int]:
-        """TEAM/ON_PREMISE: None (AI access governed at endpoint). STARTER: -1 (no access)."""
-        if self.subscription_plan in (SubscriptionPlan.TEAM, SubscriptionPlan.ON_PREMISE) or self.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
+        """None when AI is open (plan, admin role or granted AI requests). -1: no access."""
+        if self.can_use_ai:
             return None
-        return -1  # STARTER: no access
+        return -1  # STARTER without AI requests: no access
 
     @property
     def ai_requests_remaining(self) -> Optional[int]:

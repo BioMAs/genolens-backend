@@ -41,6 +41,7 @@ def make_user(
     ai_used: int = 0,
     quota_override: int | None = None,
     analyses_used: int = 0,
+    analyses_bonus: int = 0,
     ends_at: str | None = None,
 ) -> User:
     u = User()
@@ -63,6 +64,7 @@ def make_user(
     u.ai_requests_limit = ai_limit
     u.ai_requests_used = ai_used
     u.analyses_quota_override = quota_override
+    u.analyses_bonus = analyses_bonus
     return u
 
 
@@ -509,3 +511,152 @@ async def test_is_demo_requester():
     db.get = AsyncMock(return_value=None)
     assert await svc.is_demo_requester(db, uuid4()) is False
     assert await svc.is_demo_requester(db, None) is False
+
+
+# ── Bonus d'analyses et crédits IA accordés par un admin ────────────────────
+
+
+def test_analyses_bonus_is_added_to_the_quota():
+    assert make_user(analyses_bonus=5).analyses_quota == 155          # TEAM 150 + 5
+    assert make_user(quota_override=3, analyses_bonus=2).analyses_quota == 5
+    assert make_user(plan=SubscriptionPlan.ON_PREMISE, analyses_bonus=5).analyses_quota is None
+
+
+def test_ai_requests_open_ai_to_a_starter():
+    assert make_user(plan=SubscriptionPlan.STARTER).can_use_ai is False
+    credited = make_user(plan=SubscriptionPlan.STARTER, ai_limit=10)
+    assert credited.can_use_ai is True
+    assert credited.ai_interpretations_remaining is None
+    assert make_user(plan=SubscriptionPlan.STARTER, ai_limit=0).can_use_ai is False
+
+
+async def test_check_ai_quota_lets_a_credited_starter_through():
+    credited = make_user(plan=SubscriptionPlan.STARTER, ai_limit=10)
+    assert await sub.check_ai_quota(credited, AsyncMock()) is credited
+    with pytest.raises(HTTPException) as exc:
+        await sub.check_ai_quota(make_user(plan=SubscriptionPlan.STARTER), AsyncMock())
+    assert exc.value.status_code == 403
+
+
+def test_lazy_monthly_reset_clears_the_bonus_except_for_a_demo():
+    last_month = datetime.now(timezone.utc) - timedelta(days=40)
+    regular = make_user(analyses_used=3, analyses_bonus=4)
+    regular.quota_reset_at = last_month
+    assert sub._reset_quota_if_new_month(regular) is True
+    assert regular.analyses_bonus == 0
+
+    demo = make_user(is_demo=True, analyses_bonus=4)
+    demo.quota_reset_at = last_month
+    sub._reset_quota_if_new_month(demo)
+    assert demo.analyses_bonus == 4
+
+
+async def test_monthly_reset_task_clears_the_bonus():
+    from app.worker.tasks import quota_tasks
+
+    factory = FakeSessionFactory()
+    factory.session.execute = AsyncMock(return_value=MagicMock(rowcount=1))
+    with patch("app.db.session.AsyncSessionLocal", factory):
+        await quota_tasks._async_reset()
+    assert "analyses_bonus" in str(factory.session.execute.await_args.args[0])
+
+
+async def test_credited_starter_reaches_the_ai_cap_not_the_plan_gate():
+    """Un STARTER à crédits épuisés reçoit le 429 du plafond, pas le 403 du plan."""
+    user = make_user(plan=SubscriptionPlan.STARTER, ai_limit=1, ai_used=1, ends_at=FUTURE)
+    db = dataset_db(update_returns=None)
+    with patch("app.api.endpoints.datasets.assert_project_read_access", AsyncMock()):
+        async with make_client(user, db) as client:
+            resp = await client.post(
+                f"/api/v1/datasets/{uuid4()}/comparisons/A_vs_B/ask",
+                json={"question": "Which pathways?"},
+            )
+    assert resp.status_code == 429, resp.text
+    assert resp.json()["detail"]["error"] == "ai_quota_exhausted"
+
+
+async def _grant(target, path: str, amount):
+    client, db = make_admin_client(target)
+    with patch("app.api.endpoints.admin.get_user_details",
+               AsyncMock(return_value=_profile_stub(target or make_user()))):
+        async with client:
+            resp = await client.post(
+                f"/api/v1/admin/users/{uuid4()}/{path}", json={"amount": amount}
+            )
+    return resp, db
+
+
+@pytest.mark.parametrize("limit, used, expected", [
+    (None, 0, 10),   # STARTER sans IA : 10 requêtes, donc l'IA
+    (20, 5, 30),     # démo plafonnée : +10 sur le plafond
+    (5, 7, 17),      # plafond déjà dépassé : 10 de plus que l'utilisé
+])
+async def test_grant_ai_requests_adds_exactly_the_amount(limit, used, expected):
+    plan = SubscriptionPlan.STARTER if limit is None else SubscriptionPlan.TEAM
+    target = make_user(plan=plan, ai_limit=limit, ai_used=used)
+    resp, db = await _grant(target, "grant-ai-requests", 10)
+    assert resp.status_code == 200, resp.text
+    assert target.ai_requests_limit == expected
+    assert target.can_use_ai is True
+    db.commit.assert_awaited_once()
+
+
+@pytest.mark.parametrize("plan, role", [
+    (SubscriptionPlan.TEAM, UserRole.USER),
+    (SubscriptionPlan.ON_PREMISE, UserRole.USER),
+    (SubscriptionPlan.STARTER, UserRole.ADMIN),
+])
+async def test_grant_ai_requests_refuses_unlimited_accounts(plan, role):
+    target = make_user(plan=plan, role=role)
+    resp, db = await _grant(target, "grant-ai-requests", 10)
+    assert resp.status_code == 409
+    assert target.ai_requests_limit is None
+    db.commit.assert_not_awaited()
+
+
+async def test_grant_rejects_a_non_positive_amount():
+    resp, _ = await _grant(make_user(plan=SubscriptionPlan.STARTER), "grant-ai-requests", 0)
+    assert resp.status_code == 422
+
+
+async def test_grant_without_local_user_is_404():
+    resp, _ = await _grant(None, "grant-analyses", 1)
+    assert resp.status_code == 404
+
+
+async def test_grant_analyses_adds_a_bonus_for_the_period():
+    target = make_user(analyses_used=150, analyses_bonus=0)
+    target.quota_reset_at = datetime.now(timezone.utc)
+    resp, _ = await _grant(target, "grant-analyses", 3)
+    assert resp.status_code == 200, resp.text
+    assert target.analyses_bonus == 3
+    assert target.analyses_quota == 153
+    assert target.analyses_remaining == 3
+
+
+async def test_grant_analyses_rolls_a_stale_month_over_first():
+    """Sinon la remise à zéro paresseuse du premier appel du mois effacerait le bonus."""
+    target = make_user(analyses_used=30, analyses_bonus=2, plan=SubscriptionPlan.STARTER)
+    target.quota_reset_at = datetime.now(timezone.utc) - timedelta(days=40)
+    resp, _ = await _grant(target, "grant-analyses", 5)
+    assert resp.status_code == 200, resp.text
+    assert target.analyses_used_this_month == 0
+    assert target.analyses_bonus == 5
+    assert sub._reset_quota_if_new_month(target) is False   # le bonus survit au prochain appel
+
+
+async def test_grant_analyses_accumulates_on_a_demo():
+    target = make_user(is_demo=True, quota_override=3, analyses_used=3, analyses_bonus=1)
+    target.quota_reset_at = datetime.now(timezone.utc) - timedelta(days=40)
+    resp, _ = await _grant(target, "grant-analyses", 2)
+    assert resp.status_code == 200, resp.text
+    assert target.analyses_used_this_month == 3   # une démo n'est jamais remise à zéro
+    assert target.analyses_bonus == 3
+    assert target.analyses_remaining == 3
+
+
+async def test_grant_analyses_refuses_an_unlimited_quota():
+    target = make_user(plan=SubscriptionPlan.ON_PREMISE)
+    resp, db = await _grant(target, "grant-analyses", 2)
+    assert resp.status_code == 409
+    db.commit.assert_not_awaited()
