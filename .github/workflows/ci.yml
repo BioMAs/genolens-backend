@@ -87,6 +87,71 @@ jobs:
         if: failure()
         run: docker compose logs api
 
+  r-tests:
+    name: R pipeline tests
+    # r_scripts/tests/test_*.R run in an image built from the same Dockerfile stage and package
+    # list as the prod r-worker. install_packages.R pins no versions, so this image gets the
+    # CRAN/Bioconductor releases of the day its cache was built cold, not necessarily those
+    # of prod: the next step prints them for comparison.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build r-worker image
+        # The r-deps layers (R, pip, CRAN/Bioconductor, LaTeX) live in the GitHub Actions cache.
+        # They are rebuilt, compiling every R package from source, only when the cache is cold
+        # or requirements.txt / r_scripts/install_packages.R change.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: r-worker
+          tags: genolens-r-worker:ci
+          load: true
+          cache-from: type=gha,scope=r-worker
+          cache-to: type=gha,scope=r-worker,mode=max,ignore-error=true
+
+      - name: R and package versions
+        run: |
+          docker run --rm --entrypoint Rscript genolens-r-worker:ci -e '
+            cat(R.version.string, "- Bioconductor", as.character(BiocManager::version()), "\n\n")
+            for (p in c("DESeq2", "edgeR", "limma", "apeglm", "tidyverse", "optparse", "jsonlite"))
+              cat("    ", p, as.character(packageVersion(p)), "\n")
+          ' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run R tests
+        run: |
+          shopt -s nullglob
+          tests=(r_scripts/tests/test_*.R)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "::error::no r_scripts/tests/test_*.R found"
+            exit 1
+          fi
+          printf '\n| R test | PASS | FAIL | exit |\n|---|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for test in "${tests[@]}"; do
+            log=$(mktemp)
+            echo "::group::$test"
+            docker run --rm --entrypoint Rscript genolens-r-worker:ci "/app/$test" > "$log" 2>&1 && rc=0 || rc=$?
+            cat "$log"
+            echo "::endgroup::"
+            pass=$(grep -c '^PASS ' "$log" || true)
+            fail=$(grep -c '^FAIL ' "$log" || true)
+            echo "$test: $pass passed, $fail failed, exit $rc"
+            echo "| \`$(basename "$test")\` | $pass | $fail | $rc |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$rc" -ne 0 ] || [ "$fail" -ne 0 ]; then
+              failed=1
+              echo "::error file=$test::$fail failed check(s), exit $rc"
+              grep '^FAIL ' "$log" || true
+            fi
+          done
+          exit $failed
+
   deploy:
     name: Deploy to production
     needs: test
