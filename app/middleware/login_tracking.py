@@ -3,7 +3,9 @@ Middleware for tracking user login events.
 Records a deduplicated login event per user per 30-minute window.
 Non-blocking: uses BackgroundTask so the request is never delayed.
 """
+import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -19,6 +21,26 @@ logger = logging.getLogger(__name__)
 
 # Deduplication window: one event per user per N minutes
 _DEDUP_WINDOW_MINUTES = 30
+
+# Per-process memo of when an event was last recorded for a user. The DB check in
+# `_record_login_event` stays the source of truth (across workers and restarts);
+# this only spares a session per authenticated request. Without it, one page
+# firing 50 API calls opened 50 extra sessions against a 15-connection pool.
+_last_recorded: dict[str, float] = {}
+
+# Strong references to in-flight tasks: the event loop only keeps weak ones, so a
+# bare ensure_future() can be garbage-collected before it runs.
+_pending: set[asyncio.Task] = set()
+
+
+def _should_record(user_id: str, now: float | None = None) -> bool:
+    """True at most once per user per dedup window, within this process."""
+    now = time.monotonic() if now is None else now
+    last = _last_recorded.get(user_id)
+    if last is not None and now - last < _DEDUP_WINDOW_MINUTES * 60:
+        return False
+    _last_recorded[user_id] = now
+    return True
 
 
 def _extract_user_id(authorization: str) -> str | None:
@@ -83,9 +105,10 @@ class LoginTrackingMiddleware(BaseHTTPMiddleware):
 
         response: Response = await call_next(request)
 
-        if user_id:
+        if user_id and _should_record(user_id):
             # Fire-and-forget after the response is sent
-            import asyncio
-            asyncio.ensure_future(_record_login_event(user_id))
+            task = asyncio.ensure_future(_record_login_event(user_id))
+            _pending.add(task)
+            task.add_done_callback(_pending.discard)
 
         return response

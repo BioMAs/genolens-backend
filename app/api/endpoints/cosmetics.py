@@ -170,6 +170,9 @@ async def interpret_cosmetics(
     except IntegrityError:
         # Concurrent request created it first — return that one.
         await db.rollback()
+        # The rollback expired `user`, which lives in this same request session;
+        # reload it before increment_ai_usage reads user.id further down.
+        await db.refresh(user)
         existing = (
             await db.execute(
                 select(CosmeticInterpretation).where(
