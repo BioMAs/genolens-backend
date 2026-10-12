@@ -29,6 +29,7 @@ pyarrow==15.0.0
 cachetools==5.3.2
 openpyxl==3.1.2
 xlrd==2.0.1
+PyYAML>=6.0  # claim_subgroups.yaml (CosmOmics nova); already pulled in by uvicorn[standard]
 umap-learn==0.5.5
 
 # HTTP Client

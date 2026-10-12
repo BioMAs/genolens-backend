@@ -1,0 +1,1089 @@
+{
+  "contrast": "Mock active vs control (illustrative data)",
+  "claims": [
+    {
+      "name": "Regeneration",
+      "importance": 68.3,
+      "s_pro": 59.3,
+      "s_anti": 9.0,
+      "coherence": 0.8682,
+      "n_for": 7,
+      "n_against": 1,
+      "best_subgroup": "Keratinocyte renewal",
+      "best_nl": 10.422,
+      "color": {
+        "fill": "#FEC601",
+        "text": "#CA9A00"
+      },
+      "subgroups": [
+        {
+          "name": "Keratinocyte renewal",
+          "nl": 10.422,
+          "s_pro": 12.3,
+          "s_anti": 0,
+          "delta": 12.3,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0010837",
+              "label": "Regulation of keratinocyte proliferation",
+              "nl": 5.0,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0007173",
+              "label": "EGFR signalling pathway",
+              "nl": 4.0,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "R-HSA-69206",
+              "label": "G1/S transition",
+              "nl": 3.3,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Wound healing",
+          "nl": 9.4107,
+          "s_pro": 10.2,
+          "s_anti": 1.7,
+          "delta": 8.5,
+          "balance": 0.7143,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0042060",
+              "label": "Wound healing",
+              "nl": 5.9,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0030335",
+              "label": "Pos. regulation of cell migration",
+              "nl": 4.3,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0010718",
+              "label": "Pos. regulation of EMT",
+              "nl": 1.7,
+              "effect": -1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Stem-cell niche (Wnt)",
+          "nl": 2.5391,
+          "s_pro": 2.2,
+          "s_anti": 1.1,
+          "delta": 1.1,
+          "balance": 0.3333,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0060070",
+              "label": "Canonical Wnt signalling",
+              "nl": 2.2,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0090090",
+              "label": "Neg. regulation of canonical Wnt",
+              "nl": 1.1,
+              "effect": -1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Autophagy & proteostasis",
+          "nl": 5.8026,
+          "s_pro": 7.0,
+          "s_anti": 0,
+          "delta": 7.0,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0006914",
+              "label": "Autophagy",
+              "nl": 5.0,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "R-HSA-9907900",
+              "label": "Proteasome assembly",
+              "nl": 2.0,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Organelle biogenesis",
+          "nl": 5.3554,
+          "s_pro": 0,
+          "s_anti": 6.2,
+          "delta": -6.2,
+          "balance": -1.0,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "GO:0042254",
+              "label": "Ribosome biogenesis",
+              "nl": 3.6,
+              "effect": -1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0032543",
+              "label": "Mitochondrial translation",
+              "nl": 2.6,
+              "effect": -1,
+              "obs": "down"
+            }
+          ]
+        },
+        {
+          "name": "Re-epithelialisation",
+          "nl": 10.38,
+          "s_pro": 12.2,
+          "s_anti": 0,
+          "delta": 12.2,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0061436",
+              "label": "Establishment of skin barrier",
+              "nl": 4.6,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0030216",
+              "label": "Keratinocyte differentiation",
+              "nl": 4.1,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0035313",
+              "label": "Wound healing, spreading of epidermal cells",
+              "nl": 3.5,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Angiogenesis",
+          "nl": 7.5491,
+          "s_pro": 9.3,
+          "s_anti": 0,
+          "delta": 9.3,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0001525",
+              "label": "Angiogenesis",
+              "nl": 3.9,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "R-HSA-194138",
+              "label": "Signalling by VEGF",
+              "nl": 3.0,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0002040",
+              "label": "Sprouting angiogenesis",
+              "nl": 2.4,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Growth-factor signalling",
+          "nl": 5.2814,
+          "s_pro": 6.1,
+          "s_anti": 0,
+          "delta": 6.1,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "R-HSA-190236",
+              "label": "Signalling by FGF",
+              "nl": 3.4,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0007179",
+              "label": "TGF-β receptor signalling",
+              "nl": 2.7,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Firming",
+      "importance": 45.5,
+      "s_pro": 41.5,
+      "s_anti": 4.0,
+      "coherence": 0.9121,
+      "n_for": 5,
+      "n_against": 0,
+      "best_subgroup": "Collagen biosynthesis",
+      "best_nl": 15.2649,
+      "color": {
+        "fill": "#158394",
+        "text": "#158394"
+      },
+      "subgroups": [
+        {
+          "name": "Collagen biosynthesis",
+          "nl": 15.2649,
+          "s_pro": 18.3,
+          "s_anti": 0,
+          "delta": 18.3,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "R-HSA-1650814",
+              "label": "Collagen biosynthesis & modifying enzymes",
+              "nl": 6.0,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0030199",
+              "label": "Collagen fibril organization",
+              "nl": 4.9,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0032964",
+              "label": "Collagen biosynthetic process",
+              "nl": 4.1,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0019511",
+              "label": "Peptidyl-proline hydroxylation",
+              "nl": 3.3,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Elastic fibres",
+          "nl": 7.1358,
+          "s_pro": 9.0,
+          "s_anti": 0,
+          "delta": 9.0,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "R-HSA-1566948",
+              "label": "Elastic fibre formation",
+              "nl": 4.1,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0048251",
+              "label": "Elastic fiber assembly",
+              "nl": 3.0,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0001527",
+              "label": "Microfibril",
+              "nl": 1.9,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "ECM degradation (MMPs)",
+          "nl": 7.0686,
+          "s_pro": 6.6,
+          "s_anti": 2.2,
+          "delta": 4.4,
+          "balance": 0.5,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "R-HSA-1474228",
+              "label": "Degradation of the extracellular matrix",
+              "nl": 3.7,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0030574",
+              "label": "Collagen catabolic process",
+              "nl": 2.9,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "R-HSA-1592389",
+              "label": "Activation of matrix metalloproteinases",
+              "nl": 2.2,
+              "effect": -1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Fibroblast contraction",
+          "nl": 4.0642,
+          "s_pro": 5.0,
+          "s_anti": 0,
+          "delta": 5.0,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0031032",
+              "label": "Actomyosin structure organization",
+              "nl": 3.4,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0006940",
+              "label": "Regulation of smooth muscle contraction",
+              "nl": 1.6,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Integrin–ECM adhesion",
+          "nl": 3.6379,
+          "s_pro": 2.6,
+          "s_anti": 1.8,
+          "delta": 0.8,
+          "balance": 0.1818,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "R-HSA-216083",
+              "label": "Integrin cell surface interactions",
+              "nl": 2.6,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0007160",
+              "label": "Cell–matrix adhesion",
+              "nl": 1.8,
+              "effect": -1,
+              "obs": "down"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Barrier",
+      "importance": 39.1,
+      "s_pro": 37.7,
+      "s_anti": 1.4,
+      "coherence": 0.9642,
+      "n_for": 4,
+      "n_against": 0,
+      "best_subgroup": "Cornified envelope",
+      "best_nl": 12.119,
+      "color": {
+        "fill": "#47BDD7",
+        "text": "#2A6478"
+      },
+      "subgroups": [
+        {
+          "name": "Ceramide synthesis",
+          "nl": 11.4986,
+          "s_pro": 13.5,
+          "s_anti": 0,
+          "delta": 13.5,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0046513",
+              "label": "Ceramide biosynthetic process",
+              "nl": 5.7,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "R-HSA-428157",
+              "label": "Sphingolipid metabolism",
+              "nl": 4.5,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0030497",
+              "label": "Fatty acid elongation",
+              "nl": 3.3,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Cornified envelope",
+          "nl": 12.119,
+          "s_pro": 14.1,
+          "s_anti": 0,
+          "delta": 14.1,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "R-HSA-6809371",
+              "label": "Formation of the cornified envelope",
+              "nl": 5.4,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "R-HSA-6805567",
+              "label": "Keratinization",
+              "nl": 5.2,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0018149",
+              "label": "Peptide cross-linking",
+              "nl": 3.5,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Tight junctions",
+          "nl": 5.2782,
+          "s_pro": 5.6,
+          "s_anti": 1.4,
+          "delta": 4.2,
+          "balance": 0.6,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0120192",
+              "label": "Tight junction assembly",
+              "nl": 3.2,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0070830",
+              "label": "Bicellular tight junction assembly",
+              "nl": 2.4,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0045216",
+              "label": "Cell–cell junction organization",
+              "nl": 1.4,
+              "effect": -1,
+              "obs": "down"
+            }
+          ]
+        },
+        {
+          "name": "Lamellar body lipids",
+          "nl": 3.6979,
+          "s_pro": 4.5,
+          "s_anti": 0,
+          "delta": 4.5,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0042627",
+              "label": "Lipid transport (ABCA12)",
+              "nl": 2.8,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0097208",
+              "label": "Lamellar body",
+              "nl": 1.7,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Anti-ageing",
+      "importance": 33.0,
+      "s_pro": 26.0,
+      "s_anti": 7.0,
+      "coherence": 0.7879,
+      "n_for": 4,
+      "n_against": 1,
+      "best_subgroup": "Autophagy",
+      "best_nl": 9.9111,
+      "color": {
+        "fill": "#5D5892",
+        "text": "#5D5892"
+      },
+      "subgroups": [
+        {
+          "name": "Cellular senescence",
+          "nl": 7.2678,
+          "s_pro": 7.7,
+          "s_anti": 1.6,
+          "delta": 6.1,
+          "balance": 0.6559,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "R-HSA-2559583",
+              "label": "Cellular senescence",
+              "nl": 4.3,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "R-HSA-2559582",
+              "label": "Senescence-associated secretory phenotype",
+              "nl": 3.4,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0090398",
+              "label": "Cellular senescence (GO)",
+              "nl": 1.6,
+              "effect": -1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Autophagy",
+          "nl": 9.9111,
+          "s_pro": 11.8,
+          "s_anti": 0,
+          "delta": 11.8,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0006914",
+              "label": "Autophagy",
+              "nl": 5.0,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0016236",
+              "label": "Macroautophagy",
+              "nl": 3.7,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0010506",
+              "label": "Regulation of autophagy",
+              "nl": 3.1,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "DNA repair",
+          "nl": 4.2137,
+          "s_pro": 5.0,
+          "s_anti": 0,
+          "delta": 5.0,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0006281",
+              "label": "DNA repair",
+              "nl": 2.9,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "R-HSA-5696398",
+              "label": "Nucleotide excision repair",
+              "nl": 2.1,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Glycation (AGE–RAGE)",
+          "nl": 2.0802,
+          "s_pro": 1.5,
+          "s_anti": 1.2,
+          "delta": 0.3,
+          "balance": 0.1111,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "hsa04933",
+              "label": "AGE–RAGE signalling",
+              "nl": 1.5,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:1903189",
+              "label": "Glyoxal metabolic process",
+              "nl": 1.2,
+              "effect": -1,
+              "obs": "down"
+            }
+          ]
+        },
+        {
+          "name": "Telomere maintenance",
+          "nl": 3.4652,
+          "s_pro": 0,
+          "s_anti": 4.2,
+          "delta": -4.2,
+          "balance": -1.0,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "GO:0000723",
+              "label": "Telomere maintenance",
+              "nl": 2.4,
+              "effect": -1,
+              "obs": "down"
+            },
+            {
+              "id": "R-HSA-157579",
+              "label": "Telomere maintenance (Reactome)",
+              "nl": 1.8,
+              "effect": -1,
+              "obs": "down"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Soothing",
+      "importance": 22.8,
+      "s_pro": 21.7,
+      "s_anti": 1.1,
+      "coherence": 0.9518,
+      "n_for": 4,
+      "n_against": 0,
+      "best_subgroup": "NF-κB signalling",
+      "best_nl": 7.8977,
+      "color": {
+        "fill": "#C9ADA7",
+        "text": "#9C7B74"
+      },
+      "subgroups": [
+        {
+          "name": "NF-κB signalling",
+          "nl": 7.8977,
+          "s_pro": 9.6,
+          "s_anti": 0,
+          "delta": 9.6,
+          "balance": 1.0,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "R-HSA-9020702",
+              "label": "Interleukin-1 signalling",
+              "nl": 3.7,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0043123",
+              "label": "Pos. regulation of NF-κB signalling",
+              "nl": 3.1,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "hsa04668",
+              "label": "TNF signalling pathway",
+              "nl": 2.8,
+              "effect": 1,
+              "obs": "down"
+            }
+          ]
+        },
+        {
+          "name": "Pro-inflammatory cytokines",
+          "nl": 4.1933,
+          "s_pro": 4.7,
+          "s_anti": 1.1,
+          "delta": 3.6,
+          "balance": 0.6207,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "GO:0032635",
+              "label": "Interleukin-6 production",
+              "nl": 2.5,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0032637",
+              "label": "Interleukin-8 production",
+              "nl": 2.2,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0019221",
+              "label": "Cytokine-mediated signalling",
+              "nl": 1.1,
+              "effect": -1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Neurosensory (TRP)",
+          "nl": 1.8512,
+          "s_pro": 2.5,
+          "s_anti": 0,
+          "delta": 2.5,
+          "balance": 1.0,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "R-HSA-3295583",
+              "label": "TRP channels",
+              "nl": 1.6,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0007218",
+              "label": "Neuropeptide signalling",
+              "nl": 0.9,
+              "effect": 1,
+              "obs": "down"
+            }
+          ]
+        },
+        {
+          "name": "Inflammation resolution",
+          "nl": 4.1078,
+          "s_pro": 4.9,
+          "s_anti": 0,
+          "delta": 4.9,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0050728",
+              "label": "Neg. regulation of inflammatory response",
+              "nl": 2.9,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "R-HSA-6783783",
+              "label": "Interleukin-10 signalling",
+              "nl": 2.0,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Antioxidant",
+      "importance": 33.1,
+      "s_pro": 20.9,
+      "s_anti": 12.2,
+      "coherence": 0.6314,
+      "n_for": 3,
+      "n_against": 1,
+      "best_subgroup": "NRF2 response",
+      "best_nl": 11.4564,
+      "color": {
+        "fill": "#364B44",
+        "text": "#364B44"
+      },
+      "subgroups": [
+        {
+          "name": "NRF2 response",
+          "nl": 11.4564,
+          "s_pro": 13.4,
+          "s_anti": 0,
+          "delta": 13.4,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "R-HSA-9818027",
+              "label": "NFE2L2 regulating anti-oxidant genes",
+              "nl": 5.5,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0098869",
+              "label": "Cellular oxidant detoxification",
+              "nl": 4.4,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "GO:0006979",
+              "label": "Response to oxidative stress",
+              "nl": 3.5,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Glutathione metabolism",
+          "nl": 4.8603,
+          "s_pro": 5.7,
+          "s_anti": 0,
+          "delta": 5.7,
+          "balance": 1.0,
+          "obs": "up",
+          "terms": [
+            {
+              "id": "GO:0006749",
+              "label": "Glutathione metabolic process",
+              "nl": 3.4,
+              "effect": 1,
+              "obs": "up"
+            },
+            {
+              "id": "R-HSA-156590",
+              "label": "Glutathione conjugation",
+              "nl": 2.3,
+              "effect": 1,
+              "obs": "up"
+            }
+          ]
+        },
+        {
+          "name": "Mitochondrial respiration",
+          "nl": 9.1123,
+          "s_pro": 0,
+          "s_anti": 11.0,
+          "delta": -11.0,
+          "balance": -1.0,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "R-HSA-611105",
+              "label": "Respiratory electron transport",
+              "nl": 4.6,
+              "effect": -1,
+              "obs": "down"
+            },
+            {
+              "id": "hsa00190",
+              "label": "Oxidative phosphorylation",
+              "nl": 3.8,
+              "effect": -1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0032543",
+              "label": "Mitochondrial translation",
+              "nl": 2.6,
+              "effect": -1,
+              "obs": "down"
+            }
+          ]
+        },
+        {
+          "name": "ROS production (NOX)",
+          "nl": 2.332,
+          "s_pro": 1.8,
+          "s_anti": 1.2,
+          "delta": 0.6,
+          "balance": 0.2,
+          "obs": "down",
+          "terms": [
+            {
+              "id": "GO:0042554",
+              "label": "Superoxide anion generation",
+              "nl": 1.8,
+              "effect": 1,
+              "obs": "down"
+            },
+            {
+              "id": "GO:0016175",
+              "label": "NAD(P)H oxidase activity",
+              "nl": 1.2,
+              "effect": -1,
+              "obs": "up"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "unlinked": [
+    {
+      "name": "RNA splicing",
+      "nl": 6.417,
+      "s_pro": 0,
+      "s_anti": 0,
+      "delta": 0,
+      "balance": 0,
+      "obs": "down",
+      "terms": [
+        {
+          "id": "GO:0008380",
+          "label": "RNA splicing",
+          "nl": 4.2,
+          "effect": 0,
+          "obs": "down"
+        },
+        {
+          "id": "R-HSA-72163",
+          "label": "mRNA splicing – major pathway",
+          "nl": 3.1,
+          "effect": 0,
+          "obs": "down"
+        }
+      ]
+    },
+    {
+      "name": "Cholesterol biosynthesis",
+      "nl": 5.6683,
+      "s_pro": 0,
+      "s_anti": 0,
+      "delta": 0,
+      "balance": 0,
+      "obs": "up",
+      "terms": [
+        {
+          "id": "GO:0006695",
+          "label": "Cholesterol biosynthetic process",
+          "nl": 3.6,
+          "effect": 0,
+          "obs": "up"
+        },
+        {
+          "id": "R-HSA-191273",
+          "label": "Cholesterol biosynthesis",
+          "nl": 2.9,
+          "effect": 0,
+          "obs": "up"
+        }
+      ]
+    },
+    {
+      "name": "Mitotic cell cycle",
+      "nl": 4.1261,
+      "s_pro": 0,
+      "s_anti": 0,
+      "delta": 0,
+      "balance": 0,
+      "obs": "up",
+      "terms": [
+        {
+          "id": "R-HSA-69278",
+          "label": "Cell cycle, mitotic",
+          "nl": 2.8,
+          "effect": 0,
+          "obs": "up"
+        },
+        {
+          "id": "GO:0007059",
+          "label": "Chromosome segregation",
+          "nl": 2.1,
+          "effect": 0,
+          "obs": "up"
+        }
+      ]
+    },
+    {
+      "name": "Unfolded protein response",
+      "nl": 2.0,
+      "s_pro": 0,
+      "s_anti": 0,
+      "delta": 0,
+      "balance": 0,
+      "obs": "up",
+      "terms": [
+        {
+          "id": "GO:0030968",
+          "label": "Endoplasmic reticulum UPR",
+          "nl": 2.0,
+          "effect": 0,
+          "obs": "up"
+        }
+      ]
+    },
+    {
+      "name": "Axon guidance",
+      "nl": 1.5,
+      "s_pro": 0,
+      "s_anti": 0,
+      "delta": 0,
+      "balance": 0,
+      "obs": "down",
+      "terms": [
+        {
+          "id": "R-HSA-422475",
+          "label": "Axon guidance",
+          "nl": 1.5,
+          "effect": 0,
+          "obs": "down"
+        }
+      ]
+    }
+  ]
+}

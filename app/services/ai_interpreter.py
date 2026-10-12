@@ -130,28 +130,22 @@ class LocalAIInterpreter:
             logger.error(f"AI interpretation error: {str(e)}")
             raise
 
-    async def interpret_cosmetics(
+    async def interpret_cosmomics(
         self,
-        cosmetics_data: Dict[str, Any],
+        nova: Dict[str, Any],
         comparison_name: Optional[str] = None,
     ) -> str:
         """
-        Generate a cosmetic-focused interpretation aid from scored claim data.
-
-        Output is always in ENGLISH and structured as:
-          1. Per-claim narrative (mechanism in skin-care terms)
-          2. Executive marketing summary
-          3. Regulatory guardrail (cosmetic, not medical claims)
-
-        Args:
-            cosmetics_data: output of cosmetics_service.score_claims()
-            comparison_name: optional comparison label
-
-        Returns:
-            AI-generated, English markdown interpretation text.
+        Cosmetic-focused interpretation of a CosmOmics Pathway Nova
+        (output of cosmomics_nova.build_nova), in three English markdown sections —
+        claim-by-claim narrative, executive summary, regulatory note — grounded on the
+        pathways for / against each claim.
         """
-        prompt = self._build_cosmetics_prompt(cosmetics_data, comparison_name)
+        prompt = self._build_cosmomics_prompt(nova, comparison_name)
+        return await self._complete_cosmetic_prompt(prompt)
 
+    async def _complete_cosmetic_prompt(self, prompt: str) -> str:
+        """Run one cosmetic-persona prompt and return the non-empty answer."""
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -176,63 +170,58 @@ class LocalAIInterpreter:
             logger.error(f"Cosmetics AI interpretation error: {str(e)}")
             raise
 
-    def _build_cosmetics_prompt(
-        self, data: Dict[str, Any], comparison_name: Optional[str] = None
+    def _build_cosmomics_prompt(
+        self, nova: Dict[str, Any], comparison_name: Optional[str] = None
     ) -> str:
-        """Build the English cosmetic-persona prompt from scored claim data."""
-        claims = [c for c in data.get("claims", []) if c.get("n_supporting", 0) > 0]
-        claims = claims[:8]
-        zones = data.get("skin_zones", [])
-        caveats = data.get("caveats", [])
+        """Build the English cosmetic-persona prompt from a CosmOmics Pathway Nova."""
 
-        if claims:
-            claims_text = "\n".join(
-                f"- {c['label']}: activation score {c['score']}/100, "
-                f"direction {c['direction']}, confidence {c['confidence']}, "
-                f"{c['n_supporting']} supporting pathways"
-                + (f" (e.g. {', '.join(p['pathway_name'] for p in c['evidence_pathways'][:3])})"
-                   if c.get('evidence_pathways') else "")
-                + (f"; key genes: {', '.join(c['top_genes'][:6])}" if c.get("top_genes") else "")
-                for c in claims
+        def p_text(nl: float) -> str:
+            return f"p = {10 ** -nl:.1e}" if nl >= 3 else f"p = {10 ** -nl:.3f}"
+
+        def sub_text(s: Dict[str, Any]) -> str:
+            arrow = "up" if s.get("obs") == "up" else "down"
+            return f"{s['name']} ({arrow}, {p_text(s['nl'])})"
+
+        claim_lines = []
+        for c in nova.get("claims", [])[:9]:
+            subs = c.get("subgroups", [])
+            pro = [s for s in subs if s.get("delta", 0) > 0][:3]
+            con = [s for s in subs if s.get("delta", 0) <= 0][:3]
+            line = (
+                f"- {c['name']}: coherence {round(100 * c.get('coherence', 0))}% "
+                f"({c.get('n_for', 0)} pathways for, {c.get('n_against', 0)} against)"
             )
-        else:
-            claims_text = "- No cosmetic claim was significantly supported in this comparison."
-
-        zones_text = "\n".join(
-            f"- {z['label']}: activity {z['activity']}/100 ({z['dominant_direction']})"
-            for z in zones
-            if z.get("activity", 0) > 0
-        ) or "- No clear skin-compartment engagement."
-
-        caveats_text = "\n".join(
-            f"- {c.get('pathway_name', c.get('term_id'))} [{c.get('flag')}]: {c.get('note') or ''}"
-            for c in caveats[:6]
-        ) or "- None flagged."
-
+            if pro:
+                line += "; supporting: " + ", ".join(sub_text(s) for s in pro)
+            if con:
+                line += "; contradicting: " + ", ".join(sub_text(s) for s in con)
+            claim_lines.append(line)
+        claims_text = "\n".join(claim_lines) or (
+            "- No cosmetic claim has a significant pathway in this comparison."
+        )
+        unlinked_text = ", ".join(sub_text(s) for s in nova.get("unlinked", [])[:6]) or "none"
         comp = f" for the comparison '{comparison_name}'" if comparison_name else ""
 
         return f"""You are a senior cosmetic-science expert helping a R&D team turn \
 transcriptomic results into clear, marketing-ready skin-benefit insights{comp}.
 
-The data below was computed by mapping the modulated biological pathways of this \
-comparison onto a curated catalogue of skin "claims". Each claim has an activation \
-score (0-100), a direction (favorable/unfavorable), and a confidence level.
+The data below comes from the CosmOmics Pathway Nova: the enriched pathways of this \
+comparison are mapped onto a curated catalogue of cosmetic claims. For each claim, a \
+pathway counts FOR the claim when its observed direction (up / down) matches the one the \
+claim expects, and AGAINST it otherwise. Coherence = share of the evidence that supports \
+the claim. p-values are adjusted (Benjamini-Hochberg) and combined per pathway.
 
-COSMETIC CLAIM SCORES:
+CLAIMS (strongest supporting evidence first):
 {claims_text}
 
-SKIN COMPARTMENT ENGAGEMENT:
-{zones_text}
-
-CAVEATS / FLAGS (pathways to handle with care):
-{caveats_text}
+SIGNIFICANT PATHWAYS NOT LINKED TO ANY CLAIM: {unlinked_text}
 
 Write your answer in ENGLISH, in markdown, with EXACTLY these three sections:
 
 ## Claim-by-claim narrative
-For each well-supported claim (highest scores first), explain in 2-3 sentences the \
-biological mechanism in accessible skin-care language (what it means for the skin), \
-and how strongly the data supports it. Skip claims with no support.
+For each claim (strongest first), explain in 2-3 sentences the biological mechanism in \
+accessible skin-care language, how coherent the evidence is, and name the pathways that \
+contradict it, if any. Skip claims without supporting pathways.
 
 ## Executive summary
 One short, punchy marketing-oriented paragraph (4-6 sentences) describing the overall \
@@ -240,8 +229,8 @@ effect of the tested product/ingredient on the skin.
 
 ## Regulatory note
 A brief disclaimer. These are COSMETIC effects only, not medical or therapeutic claims. \
-Mention any caveats above. Use cautious, compliant wording (e.g. "helps support", \
-"appears to", "may contribute to") and avoid disease/treatment language.
+Mention the contradicting evidence above. Use cautious, compliant wording (e.g. "helps \
+support", "appears to", "may contribute to") and avoid disease/treatment language.
 
 Be specific, rely only on the data provided, and never invent gene names or pathways."""
 
