@@ -15,7 +15,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.config import settings
 from app.core.supabase_auth import close_supabase_http_client
 from app.db.session import close_db
-from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmetics, cosmomics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
+from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmomics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -233,7 +233,7 @@ async def database_test(current_user=Depends(get_current_user)):
 #                    that explains why everything else is refusing
 #   pricing          public by design, read before sign-in
 #   license, health  infrastructure status, needed precisely when access is broken
-#   admin, cosmetics.admin_router, admin_deployment, admin_ai_costs
+#   admin, admin_deployment, admin_ai_costs
 #                    admin-only already; privileged roles bypass the guard anyway
 
 app.include_router(
@@ -262,12 +262,6 @@ app.include_router(
 
 app.include_router(
     enrichment.router,
-    prefix=settings.API_V1_PREFIX,
-    dependencies=[Depends(require_active_account)],
-)
-
-app.include_router(
-    cosmetics.router,
     prefix=settings.API_V1_PREFIX,
     dependencies=[Depends(require_active_account)],
 )
@@ -373,11 +367,6 @@ app.include_router(
     users.router,
     prefix=settings.API_V1_PREFIX + "/users",
     tags=["users"],
-)
-
-app.include_router(
-    cosmetics.admin_router,
-    prefix=settings.API_V1_PREFIX,
 )
 
 app.include_router(

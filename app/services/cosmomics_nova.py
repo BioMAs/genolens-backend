@@ -1,7 +1,7 @@
 """
 CosmOmics Pathway Nova — which pathways support or contradict each cosmetic claim.
 
-Replaces the Skin claims scoring (`cosmetics_service.score_claims`). For one comparison it reads
+Successor of the Skin claims scoring (claim scores, Skin Stack). For one comparison it reads
 the over-representation results already stored in `enrichment_pathways`, joins them to the
 versioned claim referential `app/data/claims/claim_subgroups.yaml` (one row per claim × term,
 grouped into pathway sub-groups) and returns the payload drawn by the frontend nova.
@@ -195,8 +195,8 @@ def default_claim_subgroups() -> ClaimSubgroupMap:
 def subgroup_rows_from_referential(pathway_rows: Iterable[dict]) -> list[dict[str, str]]:
     """Pre-fill claim_subgroups.yaml from the Skin claims workbooks (one row per claim × term).
 
-    `pathway_rows` are the parsed "Pathways" sheets (claim_import_service._parse_workbook),
-    in workbook order: a later row for the same Term_ID wins, as in the database import.
+    `pathway_rows` are the parsed "Pathways" sheets (claim_workbooks.parse_workbook),
+    in workbook order: a later row for the same Term_ID wins.
     Terms whose curated direction is BOTH / UNKNOWN / AVOID carry no expected direction and
     are left out — when significant they show as "not linked".
     """

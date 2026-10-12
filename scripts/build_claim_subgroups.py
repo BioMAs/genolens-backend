@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import yaml  # noqa: E402
 
-from app.services.claim_import_service import DEFAULT_CLAIMS_DIR, _parse_workbook  # noqa: E402
+from app.services.claim_workbooks import DEFAULT_CLAIMS_DIR, parse_workbook  # noqa: E402
 from app.services.cosmomics_nova import (  # noqa: E402
     CLAIM_SUBGROUPS_PATH,
     subgroup_rows_from_referential,
@@ -53,8 +53,7 @@ def main(claims_dir: Path, out: Path) -> None:
 
     pathway_rows: list[dict] = []
     for path in workbooks:
-        rows, _ = _parse_workbook(path)
-        pathway_rows.extend(rows)
+        pathway_rows.extend(parse_workbook(path))
 
     rows = subgroup_rows_from_referential(pathway_rows)
     lines = [HEADER, "version: 1", "terms:"]

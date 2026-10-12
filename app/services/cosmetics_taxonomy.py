@@ -1,17 +1,14 @@
 """
-Cosmetics module — shared taxonomy & helpers.
+Cosmetic claims — referential helpers shared by the CosmOmics nova.
 
-Single source of truth for:
-  - the canonical (display-facing) cosmetic claim taxonomy (English),
-  - the skin-zone taxonomy used by the annotated skin schematic,
-  - mapping of referential `Category` -> skin zone and fallback claim,
   - the pathway-id normalization used to join the claim referential against
     EnrichmentPathway rows,
-  - derivation of canonical claim slugs from the free-text `Original_claims`.
+  - derivation of canonical claim slugs from the free-text `Original_claims` of the
+    SciLicium workbooks (with the referential `Category` as fallback).
 
-Imported by both the import service (to populate canonical_claims / seed the
-taxonomy) and the scoring service (to aggregate scores per claim and per zone).
+The slugs map to the claim names shown on the nova in `cosmomics_nova.CLAIM_NAMES`.
 """
+
 from __future__ import annotations
 
 import re
@@ -23,130 +20,6 @@ _GO_RE = re.compile(r"GO:(\d{5,7})", re.IGNORECASE)
 _REACTOME_RE = re.compile(r"R-HSA-(\d+)", re.IGNORECASE)
 _HSA_RE = re.compile(r"(?<![A-Za-z0-9])HSA-(\d+)", re.IGNORECASE)
 _CL_RE = re.compile(r"(?<![A-Za-z0-9])CL:(\d+)", re.IGNORECASE)
-
-# ---------------------------------------------------------------------------
-# Canonical claim taxonomy (English). Seeded into the cosmetic_claims table.
-# ---------------------------------------------------------------------------
-# Each entry: slug, label, skin_zone, color (hex), icon, description, order
-CANONICAL_CLAIMS: list[dict] = [
-    {
-        "slug": "anti-ageing",
-        "label": "Anti-ageing",
-        "skin_zone": "cellular",
-        "color": "#8b5cf6",
-        "icon": "sparkles",
-        "description": "Supports cellular resilience, proteostasis and DNA integrity associated with younger-looking skin.",
-        "display_order": 1,
-    },
-    {
-        "slug": "anti-wrinkles",
-        "label": "Anti-wrinkles",
-        "skin_zone": "dermis",
-        "color": "#7c3aed",
-        "icon": "waves",
-        "description": "Targets the dermal matrix mechanics linked to fine lines and wrinkles.",
-        "display_order": 2,
-    },
-    {
-        "slug": "firming",
-        "label": "Firming & Elasticity",
-        "skin_zone": "dermis",
-        "color": "#db2777",
-        "icon": "activity",
-        "description": "Reinforces extracellular matrix, adhesion and cytoskeleton for firmer, more elastic skin.",
-        "display_order": 3,
-    },
-    {
-        "slug": "regenerating",
-        "label": "Regenerating & Renewal",
-        "skin_zone": "epidermis",
-        "color": "#16a34a",
-        "icon": "refresh-cw",
-        "description": "Stimulates turnover, protein synthesis and cellular trafficking for skin renewal.",
-        "display_order": 4,
-    },
-    {
-        "slug": "moisturising",
-        "label": "Moisturising & Barrier",
-        "skin_zone": "stratum_corneum",
-        "color": "#0ea5e9",
-        "icon": "droplet",
-        "description": "Supports barrier lipid synthesis and organization for better hydration and TEWL control.",
-        "display_order": 5,
-    },
-    {
-        "slug": "soothing",
-        "label": "Soothing & Anti-redness",
-        "skin_zone": "inflammation",
-        "color": "#10b981",
-        "icon": "shield",
-        "description": "Modulates inflammatory and eicosanoid signaling to calm redness and irritation.",
-        "display_order": 6,
-    },
-    {
-        "slug": "antioxidant",
-        "label": "Antioxidant & Detox",
-        "skin_zone": "antioxidant",
-        "color": "#f59e0b",
-        "icon": "zap-off",
-        "description": "Reinforces redox defenses and detoxification against oxidative stress.",
-        "display_order": 7,
-    },
-    {
-        "slug": "energising",
-        "label": "Energising",
-        "skin_zone": "energy",
-        "color": "#ef4444",
-        "icon": "battery-charging",
-        "description": "Boosts mitochondrial and metabolic activity for energized skin cells.",
-        "display_order": 8,
-    },
-    {
-        "slug": "healing",
-        "label": "Healing & Repair",
-        "skin_zone": "epidermis",
-        "color": "#14b8a6",
-        "icon": "heart-pulse",
-        "description": "Promotes wound-healing and tissue repair processes.",
-        "display_order": 9,
-    },
-]
-
-CANONICAL_SLUGS = {c["slug"] for c in CANONICAL_CLAIMS}
-
-# ---------------------------------------------------------------------------
-# Skin zones used by the annotated schematic.
-# ---------------------------------------------------------------------------
-SKIN_ZONES: list[dict] = [
-    {"slug": "stratum_corneum", "label": "Skin barrier (stratum corneum)"},
-    {"slug": "epidermis", "label": "Epidermis (renewal & repair)"},
-    {"slug": "dermis", "label": "Dermis (collagen & elasticity)"},
-    {"slug": "inflammation", "label": "Inflammation & redness"},
-    {"slug": "antioxidant", "label": "Antioxidant defense"},
-    {"slug": "energy", "label": "Cellular energy"},
-    {"slug": "cellular", "label": "Cellular resilience & ageing"},
-]
-SKIN_ZONE_SLUGS = {z["slug"] for z in SKIN_ZONES}
-
-# Referential Category -> skin zone (for the schematic aggregation)
-CATEGORY_TO_ZONE: dict[str, str] = {
-    "BARRIER_LIPID": "stratum_corneum",
-    "ECM_CYTO": "dermis",
-    "BARRIER_ECM": "dermis",
-    "IMMUNE_INFLAM": "inflammation",
-    "EICOSANOID": "inflammation",
-    "REDOX_ANTIOX": "antioxidant",
-    "ENERGY_METAB": "energy",
-    "PROTEOSTASIS": "cellular",
-    "GENOME_STABILITY": "cellular",
-    "AGING": "cellular",
-    "CELL_DEATH": "cellular",
-    "TRAFFICKING": "epidermis",
-    "GENE_EXPRESSION": "epidermis",
-    "CELL_CYCLE": "epidermis",
-    "GROWTH_SIGNAL": "epidermis",
-    "MTOR_SIGNAL": "epidermis",
-}
 
 # Referential Category -> fallback canonical claim, used when Original_claims is
 # empty/"Unknown" so a curated row still contributes.
@@ -240,9 +113,7 @@ def normalize_pathway_id(pid: Optional[str]) -> str:
     return u
 
 
-def derive_canonical_claims(
-    original_claims: Optional[str], category: Optional[str]
-) -> list[str]:
+def derive_canonical_claims(original_claims: Optional[str], category: Optional[str]) -> list[str]:
     """Reduce the free-text Original_claims (and Category as fallback) to a
     de-duplicated list of canonical claim slugs."""
     found: list[str] = []
@@ -259,13 +130,3 @@ def derive_canonical_claims(
             found.append(fallback)
 
     return found
-
-
-def category_to_zone(category: Optional[str]) -> Optional[str]:
-    if not category:
-        return None
-    return CATEGORY_TO_ZONE.get(category.strip().upper())
-
-
-# Evidence-level numeric weights used by the scoring service.
-EVIDENCE_WEIGHTS: dict[str, float] = {"HIGH": 1.0, "MODERATE": 0.6, "LOW": 0.3}
