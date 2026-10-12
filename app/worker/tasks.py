@@ -689,11 +689,15 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                 deg_up_count = None
                 deg_down_count = None
                 deg_significant_count = None
+                total_genes = None
                 if deg_stats:
                     first_comp = next(iter(deg_stats.values()), {})
                     deg_up_count = first_comp.get('deg_up')
                     deg_down_count = first_comp.get('deg_down')
                     deg_significant_count = first_comp.get('deg_total')
+                    # Genes tested = rows of the table. /stats reads this column
+                    # next to the counts; left NULL it answered a 500.
+                    total_genes = metadata.get('rows')
 
                 stmt = update(Dataset).where(Dataset.id == dataset_id).values(
                     status=DatasetStatus.READY,
@@ -703,6 +707,8 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                     deg_up_count=deg_up_count,
                     deg_down_count=deg_down_count,
                     deg_significant_count=deg_significant_count,
+                    # Only when known: a NULL here would wipe a value already set.
+                    **({"total_genes": total_genes} if total_genes is not None else {}),
                 )
                 await db.execute(stmt)
                 await db.commit()

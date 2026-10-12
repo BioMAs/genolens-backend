@@ -539,15 +539,16 @@ async def increment_analysis_usage(user: User, db: AsyncSession) -> None:
 
     quota = user.analyses_quota
     if not await try_increment_analysis_usage(user, db):
+        # Message construit AVANT le rollback : `user` vit dans la session de la
+        # requête, que le rollback expire ; le relire ensuite déclencherait un
+        # chargement implicite (MissingGreenlet) et un 500 au lieu du 429.
+        hint = analysis_quota_renewal_hint(user)
         # Quota épuisé par une requête concurrente — on annule le dataset,
         # dont l'insert est encore dans cette transaction.
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=(
-                f"Analysis quota exhausted ({quota}/{quota}). "
-                f"{analysis_quota_renewal_hint(user)}"
-            ),
+            detail=f"Analysis quota exhausted ({quota}/{quota}). {hint}",
         )
 
 

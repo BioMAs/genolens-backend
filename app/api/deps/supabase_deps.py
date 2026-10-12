@@ -1,33 +1,19 @@
 """
 API dependencies for authentication and database sessions.
 """
-from typing import Annotated, AsyncGenerator
+from typing import Annotated
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.supabase_auth import verify_supabase_token, SupabaseUser
-from app.db.session import AsyncSessionLocal
+
+# Re-exported, never redefined: a second get_db would give each request two
+# sessions and deadlock the pool (see app.db.session.get_db).
+from app.db.session import get_db  # noqa: F401
 
 
 # HTTP Bearer security scheme for JWT tokens
 security = HTTPBearer()
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Dependency for database sessions.
-    Provides an async SQLAlchemy session that is properly closed after use.
-    """
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
 
 
 async def get_current_user(

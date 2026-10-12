@@ -788,31 +788,44 @@ async def get_dataset_stats(
         )
 
     # Level 1: Check database columns (fastest - no JSON parsing)
+    # The ingestion worker fills the DEG counts but, before 2026-10-12, never
+    # total_genes — and `total_genes: int` turned that None into a 500. Fall back
+    # on the row count it stored in the metadata (what calculate_deg_stats uses
+    # for total_genes) and persist it, so the column read is enough next time.
     if dataset.deg_up_count is not None and dataset.deg_down_count is not None:
-        logger.info(f"Stats from DB columns for dataset {dataset_id}")
-        return {
-            "total_genes": dataset.total_genes,
-            "up_genes": dataset.deg_up_count,
-            "down_genes": dataset.deg_down_count,
-            "significant_genes": dataset.deg_significant_count,
-            "cached": True
-        }
+        total_genes = dataset.total_genes
+        if total_genes is None:
+            rows = (dataset.dataset_metadata or {}).get("rows")
+            if isinstance(rows, int):
+                total_genes = rows
+                dataset.total_genes = rows
+                await db.commit()
+        if total_genes is not None:
+            logger.info(f"Stats from DB columns for dataset {dataset_id}")
+            return {
+                "total_genes": total_genes,
+                "up_genes": dataset.deg_up_count,
+                "down_genes": dataset.deg_down_count,
+                "significant_genes": dataset.deg_significant_count,
+                "cached": True
+            }
 
     # Level 2: Check metadata cache
     cached = False
     if dataset.dataset_metadata and "statistics" in dataset.dataset_metadata:
         stats = dataset.dataset_metadata["statistics"]
         cached = True
-        
+
         # If comparison_name specified, try to get comparison-specific stats
         if comparison_name and isinstance(stats, dict) and comparison_name in stats:
             stats = stats[comparison_name]
-        
-        logger.info(f"Stats from metadata for dataset {dataset_id}")
-        return {
-            **stats,
-            "cached": cached
-        }
+
+        if isinstance(stats, dict) and stats.get("total_genes") is not None:
+            logger.info(f"Stats from metadata for dataset {dataset_id}")
+            return {
+                **stats,
+                "cached": cached
+            }
 
     # Level 3: Not in cache, calculate from Parquet file
     if not dataset.parquet_file_path:

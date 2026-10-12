@@ -25,10 +25,22 @@ AsyncSessionLocal = async_sessionmaker(
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     Dependency for getting async database session.
+
+    The ONLY session provider: every import path (app.api.deps, app.api.deps.db,
+    app.api.deps.supabase_deps) re-exports this object. FastAPI caches a
+    dependency per callable, so a second copy would give a route two sessions —
+    two pool connections held at once — and deadlock the pool under concurrent
+    load (see tests/test_single_db_session_per_request.py).
+
+    Commits when the request succeeds, rolls back when it raises.
     """
     async with AsyncSessionLocal() as session:
         try:
             yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
         finally:
             await session.close()
 
