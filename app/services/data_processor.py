@@ -368,13 +368,17 @@ class DataProcessorService:
         parquet_buffer = io.BytesIO(parquet_data)
         return pd.read_parquet(parquet_buffer)
 
-    async def get_file_metadata(self, file_data: bytes, file_extension: str) -> dict[str, Any]:
+    async def get_file_metadata(
+        self, file_data: bytes, file_extension: str, primary_method: Optional[str] = None
+    ) -> dict[str, Any]:
         """
         Extract metadata from a file.
 
         Args:
             file_data: Raw file bytes
             file_extension: File extension
+            primary_method: Method that decided the DEGs upstream, when known (see
+                ``_detect_comparisons``)
 
         Returns:
             dict: Metadata (rows, columns, size, etc.)
@@ -390,7 +394,7 @@ class DataProcessorService:
         }
 
         # Attempt to detect comparisons if it looks like a DEG file
-        comparisons = self._detect_comparisons(df.columns.tolist())
+        comparisons = self._detect_comparisons(df.columns.tolist(), primary_method=primary_method)
         if comparisons:
             metadata["comparisons"] = comparisons
             # Also populate columns_info for consistency with frontend/API expectation
@@ -568,11 +572,19 @@ class DataProcessorService:
         except Exception as e:
             raise ValueError(f"Failed to calculate DEG stats: {str(e)}")
 
-    def _detect_comparisons(self, columns: list[str]) -> dict[str, dict[str, str]]:
+    def _detect_comparisons(
+        self, columns: list[str], primary_method: Optional[str] = None
+    ) -> dict[str, dict[str, str]]:
         """
         Detect comparisons from column names.
         Looks for patterns like 'log2FoldChange:ComparisonName', 'padj.Stouffer:ComparisonName', etc.
         Handles contrast: prefix in comparison names.
+
+        ``primary_method`` names the method whose padj decided the DEGs upstream: a GenoLens
+        pipeline run records it (DESeq2 with ``--method all``). Its columns become the active
+        ``padj`` / ``pvalue`` ahead of ``_PADJ_PRIORITY``. Without it — imported tables, older
+        runs — the Stouffer-first priority applies, which matches the ``contrast:`` labels those
+        upstream pipelines wrote.
         """
         comparisons = {}
         
@@ -662,14 +674,17 @@ class DataProcessorService:
                     break # Found a match for this column, move to next column
 
         # Choose the active padj/pvalue column per comparison using priority order
+        priority = _PADJ_PRIORITY
+        if primary_method:
+            priority = [primary_method] + [m for m in _PADJ_PRIORITY if m != primary_method]
         for comp_name in comparisons:
             padj_dict = all_padj_cols.get(comp_name, {})
             pval_dict = all_pvalue_cols.get(comp_name, {})
-            for method in _PADJ_PRIORITY:
+            for method in priority:
                 if method in padj_dict:
                     comparisons[comp_name]['padj'] = padj_dict[method]
                     break
-            for method in _PADJ_PRIORITY:
+            for method in priority:
                 if method in pval_dict:
                     comparisons[comp_name]['pvalue'] = pval_dict[method]
                     break
@@ -1389,7 +1404,8 @@ class DataProcessorService:
 
             result['stats_per_method'] = stats_per_method
             # Active method = the one whose column is the priority-chosen active padj
-            # column (cols['padj'], Stouffer-first), not just the first dict key.
+            # column (cols['padj']: the pipeline's deciding method, else Stouffer-first), not
+            # just the first dict key.
             if test_method:
                 result['active_method'] = test_method
             else:

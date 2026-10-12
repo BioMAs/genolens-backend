@@ -82,7 +82,8 @@
 <h3>Bioinformatic processing</h3>
 <p>Reads were aligned against the reference genome using STAR. Gene-level read counts were generated with featureCounts and normalised using DESeq2 variance-stabilising transformation (VST) for exploratory analyses.</p>
 <h3>Differential expression analysis</h3>
-<p>Differential expression was assessed using DESeq2. Genes with adjusted p-value (Benjamini-Hochberg) &lt; 0.05 and |log₂(Fold Change)| &gt; 1 were considered significantly differentially expressed (DEGs).</p>
+<p>Genes with very low expression were removed beforehand: a gene was kept when it reached the minimum count in at least as many samples as the smallest compared condition contains (edgeR <em>filterByExpr</em> rule), unless a fixed number of samples was set for the analysis.</p>
+<p>Differential expression was assessed using DESeq2. Genes with a DESeq2 adjusted p-value (Benjamini-Hochberg) below the FDR threshold of the analysis and a DESeq2 |log₂(Fold Change)| at or above its fold-change threshold were considered significantly differentially expressed (DEGs). When edgeR and limma-voom were also run, they are reported for concordance only and do not change the DEG list; their Stouffer combination is informative and is not used to call DEGs, since the three methods analyse the same counts.</p>
 <h3>Pathway enrichment analysis</h3>
 <p>Over-representation analysis (ORA) was performed against Gene Ontology (GO-BP, MF, CC), KEGG, and Reactome databases using clusterProfiler. Results were filtered at padj &lt; 0.05.</p>
 

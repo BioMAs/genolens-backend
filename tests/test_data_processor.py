@@ -247,6 +247,57 @@ class TestDetectComparisonsAdvanced:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DP-04b  _detect_comparisons — the method that decided upstream (primary_method)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MULTIMETHOD_COLS = [
+    "gene_id", "logFC:A_vs_B",
+    "padj.DESeq2:A_vs_B", "pvalue.DESeq2:A_vs_B",
+    "padj.edgeR:A_vs_B", "pvalue.edgeR:A_vs_B",
+    "padj.limma:A_vs_B", "pvalue.limma:A_vs_B",
+    "padj.Stouffer:A_vs_B", "pvalue.Stouffer:A_vs_B",
+    "n_significant_methods", "contrast:A_vs_B",
+]
+
+
+class TestDetectComparisonsPrimaryMethod:
+    """
+    A GenoLens pipeline run records which method decided its DEGs (DESeq2 with
+    --method all); that column becomes the active padj. Imported tables carry no
+    such record and keep the Stouffer-first priority, which matches the
+    `contrast:` labels their upstream pipeline wrote.
+    """
+
+    def test_dp04b_imported_table_keeps_stouffer_first(self):
+        comps = _make_service()._detect_comparisons(_MULTIMETHOD_COLS)
+        assert comps["A_vs_B"]["padj"] == "padj.Stouffer:A_vs_B"
+        assert comps["A_vs_B"]["pvalue"] == "pvalue.Stouffer:A_vs_B"
+
+    def test_dp04b_primary_method_becomes_active_padj(self):
+        comps = _make_service()._detect_comparisons(_MULTIMETHOD_COLS, primary_method="DESeq2")
+        assert comps["A_vs_B"]["padj"] == "padj.DESeq2:A_vs_B"
+        assert comps["A_vs_B"]["pvalue"] == "pvalue.DESeq2:A_vs_B"
+        # The other methods stay available for the per-method breakdown.
+        assert set(comps["A_vs_B"]["all_padj_cols"]) == {"DESeq2", "edgeR", "limma", "Stouffer"}
+
+    def test_dp04b_primary_limma_is_honoured(self):
+        """limma is absent from the default priority, so a limma-only run needs the record."""
+        cols = ["gene_id", "logFC:A_vs_B", "padj.limma:A_vs_B", "pvalue.limma:A_vs_B"]
+        comps = _make_service()._detect_comparisons(cols, primary_method="limma")
+        assert comps["A_vs_B"]["padj"] == "padj.limma:A_vs_B"
+
+    def test_dp04b_primary_method_without_its_column_falls_back(self):
+        cols = ["gene_id", "logFC:A_vs_B", "padj.Stouffer:A_vs_B", "padj.edgeR:A_vs_B"]
+        comps = _make_service()._detect_comparisons(cols, primary_method="DESeq2")
+        assert comps["A_vs_B"]["padj"] == "padj.Stouffer:A_vs_B"
+
+    async def test_dp04b_get_file_metadata_forwards_primary_method(self):
+        csv = (",".join(_MULTIMETHOD_COLS) + "\n" + "G1," + ",".join(["0.5"] * 10) + ",UP\n").encode()
+        meta = await _make_service().get_file_metadata(csv, ".csv", primary_method="DESeq2")
+        assert meta["comparisons"]["A_vs_B"]["padj"] == "padj.DESeq2:A_vs_B"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DP-05  calculate_deg_stats — up / down / total counts
 # ─────────────────────────────────────────────────────────────────────────────
 

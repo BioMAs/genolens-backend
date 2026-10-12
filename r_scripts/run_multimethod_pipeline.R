@@ -1,7 +1,9 @@
 #!/usr/bin/env Rscript
 # =============================================================================
 # GenoLens Multi-Method DEA Pipeline
-# Wraps DESeq2 / edgeR / limma-voom with optional Stouffer combination.
+# Wraps DESeq2 / edgeR / limma-voom. One method decides which genes are DEGs
+# (DESeq2 with --method all); the others, and their Stouffer combination, are
+# written alongside as concordance columns.
 # Outputs genolens_deg.csv per comparison in the format expected by the
 # GenoLens Python backend (padj.Method:comparison, logFC:comparison columns).
 # =============================================================================
@@ -86,17 +88,46 @@ option_list <- list(
   make_option("--min-reads",   type = "integer",   default = 10L,     help = "Min total reads per sample"),
   make_option("--min-genes",   type = "integer",   default = 200L,    help = "Min expressed genes per sample"),
   make_option("--min-count",   type = "integer",   default = 5L,      help = "Min count per gene (CPM filter)"),
-  make_option("--min-reps",    type = "integer",   default = 2L,      help = "Min replicates per condition"),
+  make_option("--min-reps",    type = "character", default = "2",
+              help = "Min samples reaching --min-count for a gene to be kept: an integer, or 'auto' for the smallest compared group (edgeR::filterByExpr)"),
   make_option("--threads",     type = "integer",   default = 4L,      help = "Number of threads"),
   make_option("--species",     type = "character", default = "human", help = "Species"),
   make_option("--method",      type = "character", default = "all",
-              help = "DEA method: 'all' (DESeq2+edgeR+limma+Stouffer), 'deseq2', 'edger', 'limma'"),
+              help = "DEA method: 'all' (DESeq2 decides, edgeR+limma+Stouffer for concordance), 'deseq2', 'edger', 'limma'"),
   make_option("--condition-col", type = "character", default = NULL,
               help = "Sample-sheet column holding the conditions (case-insensitive). Default: auto-detect")
 )
 
 opt <- parse_args(OptionParser(option_list = option_list))
 stopifnot(!is.null(opt$counts), !is.null(opt$samples), !is.null(opt$comparisons), !is.null(opt$outdir))
+
+if (!opt$method %in% c("all", "deseq2", "edger", "limma")) {
+  stop("--method must be one of all, deseq2, edger, limma (got '", opt$method, "')")
+}
+
+# --min-reps: a whole number >= 1, or "auto" (resolved once the compared groups are known)
+min_reps_arg  <- tolower(trimws(opt$`min-reps`))
+min_reps_auto <- identical(min_reps_arg, "auto")
+if (!min_reps_auto) {
+  min_reps <- suppressWarnings(as.numeric(min_reps_arg))
+  if (is.na(min_reps) || min_reps < 1 || min_reps != floor(min_reps)) {
+    stop("--min-reps must be a whole number >= 1 or 'auto' (got '", opt$`min-reps`, "')")
+  }
+  min_reps <- as.integer(min_reps)
+}
+
+# Method that decides UP/DOWN, n_up/n_down and the logFC column, in fallback
+# order. With "all", DESeq2 decides. edgeR, limma and their Stouffer combination
+# stay in the table to show concordance but never decide: Stouffer assumes
+# independent tests, and these three analyse the same counts, so their p-values
+# are strongly correlated and the combination is anti-conservative (three
+# p = 0.05 combine to p ~ 0.002).
+primary_order <- switch(opt$method,
+  all    = c("DESeq2", "edgeR", "limma"),
+  deseq2 = "DESeq2",
+  edger  = "edgeR",
+  limma  = "limma"
+)
 
 run_deseq2 <- opt$method %in% c("all", "deseq2")
 run_edger   <- opt$method %in% c("all", "edger")
@@ -206,18 +237,7 @@ counts_mat  <- counts_mat[, keep_samples, drop = FALSE]
 sample_ids  <- colnames(counts_mat)
 samples_df  <- samples_df[samples_df[[sid_col]] %in% sample_ids, , drop = FALSE]
 
-# Filter low-count genes (at least min_count in at least min_reps samples)
-keep_genes <- rowSums(counts_mat >= opt$`min-count`) >= opt$`min-reps`
-counts_mat  <- counts_mat[keep_genes, , drop = FALSE]
-gene_ids    <- rownames(counts_mat)
-gene_names  <- if (!is.null(gene_name_col)) {
-  counts_raw[[gene_name_col]][counts_raw[[gene_col]] %in% gene_ids]
-} else gene_ids
-
-qc_genes_after <- nrow(counts_mat)
-message("  Retained ", nrow(counts_mat), " genes and ", ncol(counts_mat), " samples")
-
-# Normalise contrast table
+# Normalise contrast table (before the gene filter: --min-reps auto needs the compared groups)
 colnames(contrasts) <- tolower(colnames(contrasts))
 comp_col  <- intersect(c("comparison", "comparison_id", "comparison_name", "name", "contrast"), colnames(contrasts))[1]
 cond1_col <- intersect(c("condition1", "test", "numerator",  "group1"), colnames(contrasts))[1]
@@ -235,6 +255,34 @@ if (!is.na(flag_col)) {
   if (nrow(contrasts) == 0) stop("No comparisons left to run after perform_analysis filter")
 }
 
+# --min-reps auto: as many samples as the smallest compared group holds, so a
+# gene expressed in a single condition survives. A fixed 2 also keeps genes seen
+# in two samples only. Groups above 10 samples relax the requirement the way
+# edgeR::filterByExpr does (large.n = 10, min.prop = 0.7). Conditions no
+# comparison uses are ignored; if none matches, every group counts.
+if (min_reps_auto) {
+  kept_conditions <- as.character(samples_df[[cond_col]][samples_df[[sid_col]] %in% colnames(counts_mat)])
+  group_sizes <- table(kept_conditions)
+  compared <- unique(c(as.character(contrasts[[cond1_col]]), as.character(contrasts[[cond2_col]])))
+  if (any(names(group_sizes) %in% compared)) group_sizes <- group_sizes[names(group_sizes) %in% compared]
+  smallest_group <- if (length(group_sizes) > 0) min(group_sizes) else 2L
+  min_reps_n <- if (smallest_group > 10) 10 + (smallest_group - 10) * 0.7 else smallest_group
+  min_reps <- max(1L, as.integer(ceiling(min_reps_n - 1e-8)))
+  message("  --min-reps auto: smallest compared group has ", smallest_group,
+          " samples -> genes need >= ", opt$`min-count`, " counts in >= ", min_reps, " samples")
+}
+
+# Filter low-count genes (at least min_count in at least min_reps samples)
+keep_genes <- rowSums(counts_mat >= opt$`min-count`) >= min_reps
+counts_mat  <- counts_mat[keep_genes, , drop = FALSE]
+gene_ids    <- rownames(counts_mat)
+gene_names  <- if (!is.null(gene_name_col)) {
+  counts_raw[[gene_name_col]][counts_raw[[gene_col]] %in% gene_ids]
+} else gene_ids
+
+qc_genes_after <- nrow(counts_mat)
+message("  Retained ", nrow(counts_mat), " genes and ", ncol(counts_mat), " samples")
+
 qc_removed_ids <- setdiff(qc_input_sample_ids, sample_ids)
 manifest <- list(
   has_vst = FALSE,
@@ -251,7 +299,8 @@ manifest <- list(
     min_reads_threshold  = opt$`min-reads`,
     min_genes_threshold  = opt$`min-genes`,
     min_count_threshold  = opt$`min-count`,
-    min_reps_threshold   = opt$`min-reps`,
+    min_reps_threshold   = min_reps,
+    min_reps_mode        = if (min_reps_auto) "auto" else "fixed",
     design_formula       = as.character(opt$design),
     sample_id_column     = sid_col,
     condition_column     = cond_col,
@@ -440,7 +489,7 @@ for (i in seq_len(nrow(contrasts))) {
     }, error = function(e) message("    limma failed: ", conditionMessage(e)))
   }
 
-  # ── Stouffer combination (only if method=all) ──────────────────────────────
+  # ── Stouffer combination (only if method=all; concordance only, never decides) ──
   stouffer_padj   <- rep(NA_real_, nrow(cnt_sub))
   stouffer_pvalue <- rep(NA_real_, nrow(cnt_sub))
   n_sig_methods   <- rep(0L, nrow(cnt_sub))
@@ -458,38 +507,29 @@ for (i in seq_len(nrow(contrasts))) {
         !is.na(limma_padj) & limma_padj < opt$fdr
       )
       n_sig_methods <- rowSums(sig_mat, na.rm = TRUE)
-      message("    Stouffer: ", sum(!is.na(stouffer_padj) & stouffer_padj < opt$fdr, na.rm = TRUE), " sig genes")
+      message("    Stouffer: ", sum(!is.na(stouffer_padj) & stouffer_padj < opt$fdr, na.rm = TRUE),
+              " sig genes (concordance only, not used for DEG calls)")
     } else if (length(avail_pvals) == 1) {
       stouffer_pvalue <- avail_pvals[[1]]
       stouffer_padj   <- p.adjust(stouffer_pvalue, method = "BH")
     }
   }
 
-  # Choose primary padj/pvalue/lfc for the contrast column
-  if (opt$method == "all") {
-    primary_padj   <- stouffer_padj
-    primary_pvalue <- stouffer_pvalue
-  } else if (opt$method == "deseq2") {
-    primary_padj   <- deseq_padj
-    primary_pvalue <- deseq_pvalue
-  } else if (opt$method == "edger") {
-    primary_padj   <- edger_padj
-    primary_pvalue <- edger_pvalue
-  } else if (opt$method == "limma") {
-    primary_padj   <- limma_padj
-    primary_pvalue <- limma_pvalue
+  # ── Primary method: its padj AND its log2FC decide (see primary_order) ──────
+  # The first method of primary_order that produced results; with --method all a
+  # DESeq2 failure on this comparison hands the decision to edgeR, then limma.
+  method_results <- list(
+    DESeq2 = list(padj = deseq_padj, lfc = deseq_lfc),
+    edgeR  = list(padj = edger_padj, lfc = edger_lfc),
+    limma  = list(padj = limma_padj, lfc = limma_lfc)
+  )
+  primary_method <- Find(function(m) !all(is.na(method_results[[m]]$padj)), primary_order)
+  if (is.null(primary_method)) primary_method <- primary_order[1]
+  if (primary_method != primary_order[1]) {
+    message("    ", primary_order[1], " gave no result: ", primary_method, " decides for this comparison")
   }
-
-  # Canonical log2FoldChange for filtering/reporting: limma (matches pipe_scilicium's
-  # step3_multimethod_comparison.R, which always uses limma-voom's logFC), falling
-  # back to edgeR then DESeq2 if limma didn't run.
-  if (!all(is.na(limma_lfc))) {
-    canonical_lfc <- limma_lfc
-  } else if (!all(is.na(edger_lfc))) {
-    canonical_lfc <- edger_lfc
-  } else {
-    canonical_lfc <- deseq_lfc
-  }
+  primary_padj  <- method_results[[primary_method]]$padj
+  canonical_lfc <- method_results[[primary_method]]$lfc
 
   # ── Contrast column (UP/DOWN regulation) ───────────────────────────────────
   regulation <- rep(NA_character_, nrow(cnt_sub))
@@ -502,9 +542,13 @@ for (i in seq_len(nrow(contrasts))) {
   out_df$baseMean <- basemean
 
   out_df[[lfc_col]]        <- canonical_lfc
-  out_df[[padj_deseq_col]] <- deseq_padj
-  out_df[[pval_deseq_col]] <- deseq_pvalue
 
+  # Only the methods that ran get columns: an all-NA padj.DESeq2 next to an
+  # edgeR-only run used to show up as a DESeq2 result with zero DEGs.
+  if (run_deseq2) {
+    out_df[[padj_deseq_col]] <- deseq_padj
+    out_df[[pval_deseq_col]] <- deseq_pvalue
+  }
   if (run_edger) {
     out_df[[padj_edger_col]] <- edger_padj
     out_df[[pval_edger_col]] <- edger_pvalue
@@ -528,13 +572,14 @@ for (i in seq_len(nrow(contrasts))) {
 
   n_up   <- sum(regulation == "UP",   na.rm = TRUE)
   n_down <- sum(regulation == "DOWN", na.rm = TRUE)
-  message("    Output: ", nrow(out_df), " genes | UP=", n_up, " DOWN=", n_down)
+  message("    Output: ", nrow(out_df), " genes | UP=", n_up, " DOWN=", n_down, " (", primary_method, ")")
   manifest$comparisons <- c(manifest$comparisons, comp_name)
   comp_stats <- list(
     skipped = FALSE, n_samples = length(sids_comp),
     n_up = n_up, n_down = n_down, n_genes_tested = nrow(out_df),
     design_used = design_used,
-    design_fallback = !is.null(design_problem)
+    design_fallback = !is.null(design_problem),
+    primary_method = primary_method
   )
   # NA only when the design matrix itself could not be built; write_json would
   # turn it into the string "NA"
