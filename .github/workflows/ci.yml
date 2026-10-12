@@ -89,8 +89,10 @@ jobs:
 
   r-tests:
     name: R pipeline tests
-    # r_scripts/tests/test_*.R run in the production r-worker image, so they see the same
-    # R, CRAN and Bioconductor versions as the DEG pipeline in prod.
+    # r_scripts/tests/test_*.R run in an image built from the same Dockerfile stage and package
+    # list as the prod r-worker. install_packages.R pins no versions, so this image gets the
+    # CRAN/Bioconductor releases of the day its cache was built cold, not necessarily those
+    # of prod: the next step prints them for comparison.
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
