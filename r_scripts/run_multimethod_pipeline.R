@@ -141,6 +141,15 @@ if (length(count_cols) < 2) {
 
 counts_mat <- as.matrix(counts_raw[, count_cols, drop = FALSE])
 rownames(counts_mat) <- gene_ids
+# salmon/tximport estimates are not integers. Round them, as the legacy
+# pipe_scilicium step3 does: a bare integer cast truncates (2.9 -> 2) and biases
+# shallow samples downwards.
+storage.mode(counts_mat) <- "double"
+rounded_mat <- round(counts_mat)
+if (any(rounded_mat != counts_mat, na.rm = TRUE)) {
+  message("  Counts are not integers (e.g. salmon/tximport estimates): rounding them")
+}
+counts_mat <- rounded_mat
 storage.mode(counts_mat) <- "integer"
 
 # QC capture — pre-filter totals (persisted to the manifest as qc_report)
