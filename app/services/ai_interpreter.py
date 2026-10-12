@@ -151,7 +151,23 @@ class LocalAIInterpreter:
             AI-generated, English markdown interpretation text.
         """
         prompt = self._build_cosmetics_prompt(cosmetics_data, comparison_name)
+        return await self._complete_cosmetic_prompt(prompt)
 
+    async def interpret_cosmomics(
+        self,
+        nova: Dict[str, Any],
+        comparison_name: Optional[str] = None,
+    ) -> str:
+        """
+        Cosmetic-focused interpretation of a CosmOmics Pathway Nova
+        (output of cosmomics_nova.build_nova): same three English sections as
+        interpret_cosmetics, grounded on the pathways for / against each claim.
+        """
+        prompt = self._build_cosmomics_prompt(nova, comparison_name)
+        return await self._complete_cosmetic_prompt(prompt)
+
+    async def _complete_cosmetic_prompt(self, prompt: str) -> str:
+        """Run one cosmetic-persona prompt and return the non-empty answer."""
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -175,6 +191,70 @@ class LocalAIInterpreter:
         except Exception as e:
             logger.error(f"Cosmetics AI interpretation error: {str(e)}")
             raise
+
+    def _build_cosmomics_prompt(
+        self, nova: Dict[str, Any], comparison_name: Optional[str] = None
+    ) -> str:
+        """Build the English cosmetic-persona prompt from a CosmOmics Pathway Nova."""
+
+        def p_text(nl: float) -> str:
+            return f"p = {10 ** -nl:.1e}" if nl >= 3 else f"p = {10 ** -nl:.3f}"
+
+        def sub_text(s: Dict[str, Any]) -> str:
+            arrow = "up" if s.get("obs") == "up" else "down"
+            return f"{s['name']} ({arrow}, {p_text(s['nl'])})"
+
+        claim_lines = []
+        for c in nova.get("claims", [])[:9]:
+            subs = c.get("subgroups", [])
+            pro = [s for s in subs if s.get("delta", 0) > 0][:3]
+            con = [s for s in subs if s.get("delta", 0) <= 0][:3]
+            line = (
+                f"- {c['name']}: coherence {round(100 * c.get('coherence', 0))}% "
+                f"({c.get('n_for', 0)} pathways for, {c.get('n_against', 0)} against)"
+            )
+            if pro:
+                line += "; supporting: " + ", ".join(sub_text(s) for s in pro)
+            if con:
+                line += "; contradicting: " + ", ".join(sub_text(s) for s in con)
+            claim_lines.append(line)
+        claims_text = "\n".join(claim_lines) or (
+            "- No cosmetic claim has a significant pathway in this comparison."
+        )
+        unlinked_text = ", ".join(sub_text(s) for s in nova.get("unlinked", [])[:6]) or "none"
+        comp = f" for the comparison '{comparison_name}'" if comparison_name else ""
+
+        return f"""You are a senior cosmetic-science expert helping a R&D team turn \
+transcriptomic results into clear, marketing-ready skin-benefit insights{comp}.
+
+The data below comes from the CosmOmics Pathway Nova: the enriched pathways of this \
+comparison are mapped onto a curated catalogue of cosmetic claims. For each claim, a \
+pathway counts FOR the claim when its observed direction (up / down) matches the one the \
+claim expects, and AGAINST it otherwise. Coherence = share of the evidence that supports \
+the claim. p-values are adjusted (Benjamini-Hochberg) and combined per pathway.
+
+CLAIMS (strongest supporting evidence first):
+{claims_text}
+
+SIGNIFICANT PATHWAYS NOT LINKED TO ANY CLAIM: {unlinked_text}
+
+Write your answer in ENGLISH, in markdown, with EXACTLY these three sections:
+
+## Claim-by-claim narrative
+For each claim (strongest first), explain in 2-3 sentences the biological mechanism in \
+accessible skin-care language, how coherent the evidence is, and name the pathways that \
+contradict it, if any. Skip claims without supporting pathways.
+
+## Executive summary
+One short, punchy marketing-oriented paragraph (4-6 sentences) describing the overall \
+effect of the tested product/ingredient on the skin.
+
+## Regulatory note
+A brief disclaimer. These are COSMETIC effects only, not medical or therapeutic claims. \
+Mention the contradicting evidence above. Use cautious, compliant wording (e.g. "helps \
+support", "appears to", "may contribute to") and avoid disease/treatment language.
+
+Be specific, rely only on the data provided, and never invent gene names or pathways."""
 
     def _build_cosmetics_prompt(
         self, data: Dict[str, Any], comparison_name: Optional[str] = None

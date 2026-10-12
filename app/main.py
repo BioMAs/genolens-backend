@@ -15,7 +15,7 @@ from slowapi.errors import RateLimitExceeded
 from app.core.config import settings
 from app.core.supabase_auth import close_supabase_http_client
 from app.db.session import close_db
-from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmetics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
+from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmetics, cosmomics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -268,6 +268,12 @@ app.include_router(
 
 app.include_router(
     cosmetics.router,
+    prefix=settings.API_V1_PREFIX,
+    dependencies=[Depends(require_active_account)],
+)
+
+app.include_router(
+    cosmomics.router,
     prefix=settings.API_V1_PREFIX,
     dependencies=[Depends(require_active_account)],
 )
