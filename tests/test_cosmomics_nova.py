@@ -422,6 +422,11 @@ def test_subgroup_name(label, expected):
 def test_label_helpers():
     assert clean_label("signaling (GO:0023052)") == "signaling"
     assert label_stem("Positive regulation of cell adhesion") == "Cell adhesion"
+    # Stripping the suffix must not leave a lone generic word.
+    assert label_stem("developmental process (GO:0032502)") == "Developmental process"
+    assert label_stem("metabolic process") == "Metabolic process"
+    assert label_stem("cellular process") == "Cellular process"
+    assert label_stem("Nucleobase biosynthetic process") == "Nucleobase"
     assert label_match_key("REACTOME_CELL_CYCLE_MITOTIC") == label_match_key("Cell Cycle, Mitotic")
 
 

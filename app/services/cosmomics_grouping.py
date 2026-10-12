@@ -162,6 +162,32 @@ _MSIGDB_PREFIX = re.compile(
 )
 _NON_ALNUM = re.compile(r"[^0-9a-z]+")
 
+# Stems too vague to name a pathway on their own.
+_GENERIC_STEMS = {
+    "process",
+    "developmental",
+    "metabolic",
+    "catabolic",
+    "biosynthetic",
+    "biological",
+    "cellular",
+    "multicellular",
+    "organismal",
+    "system",
+    "response",
+    "regulation",
+    "signaling",
+    "signalling",
+    "activity",
+    "pathway",
+    "transport",
+    "localization",
+    "organization",
+    "binding",
+    "complex",
+    "component",
+}
+
 _CATEGORY_NAMES: dict[str, str] = {
     "BARRIER_LIPID": "Barrier lipids",
     "BARRIER_ECM": "Barrier ECM",
@@ -204,11 +230,18 @@ def label_stem(label: Optional[str]) -> str:
     """The label without its regulation prefix and process suffix, capitalised.
 
     "Positive regulation of keratinocyte proliferation" -> "Keratinocyte proliferation",
-    "Ceramide biosynthetic process" -> "Ceramide".
+    "Nucleobase biosynthetic process" -> "Nucleobase". A lone generic word names nothing, so
+    "developmental process" stays "Developmental process" and "cellular process" stays whole.
     """
     text = clean_label(label)
-    stem = _STEM_SUFFIXES.sub("", _STEM_PREFIXES.sub("", text)).strip(" ,;:-")
-    stem = stem or text
+    unprefixed = _STEM_PREFIXES.sub("", text).strip(" ,;:-")
+    stem = _STEM_SUFFIXES.sub("", unprefixed).strip(" ,;:-")
+    for candidate in (stem, unprefixed, text):
+        if candidate and candidate.lower() not in _GENERIC_STEMS:
+            stem = candidate
+            break
+    else:
+        stem = text
     return stem[:1].upper() + stem[1:] if stem else ""
 
 

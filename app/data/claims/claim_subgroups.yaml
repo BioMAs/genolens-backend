@@ -638,8 +638,8 @@ terms:
   - {claim: Anti-ageing, subgroup: Autophagy, term_id: HSA-9663891, label: Selective autophagy, expected_direction: UP}
   - {claim: Anti-ageing, subgroup: CDK-mediated phosphorylation and removal of Cdc6, term_id: HSA-69017, label: CDK-mediated phosphorylation and removal of Cdc6, expected_direction: UP}
   - {claim: Anti-ageing, subgroup: Carbohydrate, term_id: 'GO:0016052', label: Carbohydrate catabolic process, expected_direction: UP}
-  - {claim: Anti-ageing, subgroup: Catabolic, term_id: 'GO:0009895', label: Negative regulation of catabolic process, expected_direction: UP}
-  - {claim: Anti-ageing, subgroup: Catabolic, term_id: 'GO:0031330', label: Negative regulation of cellular catabolic process, expected_direction: UP}
+  - {claim: Anti-ageing, subgroup: Catabolic process, term_id: 'GO:0009895', label: Negative regulation of catabolic process, expected_direction: UP}
+  - {claim: Anti-ageing, subgroup: Catabolic process, term_id: 'GO:0031330', label: Negative regulation of cellular catabolic process, expected_direction: UP}
   - {claim: Anti-ageing, subgroup: Cell cycle, term_id: HSA-69620, label: Cell Cycle Checkpoints, expected_direction: UP}
   - {claim: Anti-ageing, subgroup: Cell cycle, term_id: HSA-8854050, label: FBXL7 down-regulates AURKA during mitotic entry, expected_direction: UP}
   - {claim: Anti-ageing, subgroup: Cell death, term_id: 'GO:0043281', label: Regulation of cysteine-type endopeptidase activity in apoptosis, expected_direction: DOWN}

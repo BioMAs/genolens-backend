@@ -63,7 +63,9 @@ P_FLOOR = 1e-300
 _P_CEIL = 1.0 - 1e-15
 
 DEFAULT_ALPHA = 0.05
-UNLINKED_LIMIT = 40
+# The "not linked" sector is a fixed 36° slice: beyond a dozen sub-groups it turns into a smear.
+# The payload keeps the strongest ones and the total count.
+UNLINKED_LIMIT = 12
 
 CLAIM_SUBGROUPS_PATH = (
     Path(__file__).resolve().parent.parent / "data" / "claims" / "claim_subgroups.yaml"
