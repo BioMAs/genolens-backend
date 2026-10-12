@@ -337,9 +337,15 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                 # Get file extension
                 file_extension = Path(raw_file_path).suffix
 
-                # Extract metadata
+                # Extract metadata. A GenoLens pipeline DEG table names the method that decided
+                # its DEGs (see deg_dataset_metadata): its padj becomes the active one.
                 self.update_state(state="PROGRESS", meta={"step": "analyzing"})
-                metadata = await data_processor.get_file_metadata(raw_data, file_extension)
+                creation_meta = await db.scalar(
+                    select(Dataset.dataset_metadata).where(Dataset.id == dataset_id)
+                ) or {}
+                metadata = await data_processor.get_file_metadata(
+                    raw_data, file_extension, primary_method=creation_meta.get("primary_method")
+                )
 
                 # Convert to Parquet
                 self.update_state(state="PROGRESS", meta={"step": "converting"})
@@ -924,6 +930,28 @@ def health_check() -> dict:
     return {"status": "healthy", "message": "Celery worker is running"}
 
 
+def deg_dataset_metadata(analysis_id: str, comp_id: str, params: dict, manifest: dict) -> dict:
+    """
+    Creation-time metadata of the DEG dataset a pipeline comparison produces.
+
+    ``primary_method`` is the method whose padj decided this comparison's DEGs in
+    run_multimethod_pipeline.R (DESeq2 with ``--method all``). Ingestion makes its column the
+    active padj (``_detect_comparisons(primary_method=…)``), so the volcano, the counts and the
+    DEG table follow the same decision as the ``contrast:`` labels. Manifests from older runs
+    have no such record: those datasets keep the default priority, which matches their labels.
+    """
+    meta = {
+        "analysis_id": analysis_id,
+        "comparison_name": comp_id,
+        "min_log2fc": params.get("min_log2fc", 1.0),
+        "de_method": params.get("de_method", "all"),
+    }
+    stats = ((manifest or {}).get("comparison_stats") or {}).get(comp_id) or {}
+    if stats.get("primary_method"):
+        meta["primary_method"] = stats["primary_method"]
+    return meta
+
+
 def _build_pipeline_command(
     r_script, matrix_path: str, samples_path: str, comparisons_path: str, outdir: str, params: dict
 ) -> list[str]:
@@ -1274,12 +1302,9 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                             type=DatasetType.DEG,
                             status=DatasetStatus.PENDING,
                             raw_file_path=deg_storage,
-                            dataset_metadata={
-                                "analysis_id": str(analysis_id),
-                                "comparison_name": comp_id,
-                                "min_log2fc": params.get("min_log2fc", 1.0),
-                                "de_method": params.get("de_method", "all"),
-                            },
+                            dataset_metadata=deg_dataset_metadata(
+                                str(analysis_id), comp_id, params, manifest
+                            ),
                             column_mapping={},
                         )
                         db.add(deg_ds)

@@ -7,7 +7,7 @@ from existing datasets (matrix + samples + comparisons).
 import json
 import logging
 from pathlib import Path
-from typing import Annotated, List, Literal, Optional
+from typing import Annotated, List, Literal, Optional, Union
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -55,7 +55,10 @@ class AnalysisParams(BaseModel):
     min_reads: int = 10
     min_genes: int = 200
     min_count: int = 5
-    min_reps: int = 2
+    # Samples that must reach `min_count` for a gene to be kept. "auto" = the smallest compared
+    # group (edgeR::filterByExpr), the wizard's default. 2 stays the API default so analyses
+    # created without the field filter as they always did.
+    min_reps: Union[Literal["auto"], Annotated[int, Field(ge=1)]] = 2
     threads: int = 4
     enrichment_databases: Optional[List[str]] = None
     # Adjusted p-value under which an enriched term is kept (R `--padj-cutoff`). Distinct from

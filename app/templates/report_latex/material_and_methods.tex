@@ -1,18 +1,19 @@
 
 \subsection{Input Data}
-The analysis was performed on the provided gene-level count matrix. Low-quality samples and conditions with an insufficient number of biological replicates were filtered out prior to analysis, and genes with very low expression across samples were removed to improve statistical power.
+The analysis was performed on the provided gene-level count matrix. Samples below the minimum sequencing depth or number of detected genes set for the analysis were excluded. Genes with very low expression were then removed: a gene was kept when it reached the minimum count set for the analysis (10 by default) in at least as many samples as the smallest compared condition contains, the rule of edgeR's \textit{filterByExpr} (Chen et al., 2016); above ten samples per condition the requirement is relaxed to $10 + 0.7\,(n - 10)$ samples. A gene expressed in a single condition is therefore retained, whereas a gene detected in fewer samples than any condition holds is not. When a fixed number of samples was set for the analysis instead, that number applies.
 
 \subsection{Differential Gene Expression Analysis}
 
-To ensure robust detection of differentially expressed genes (DEGs), a multi-method consensus approach was applied, combining complementary statistical frameworks on the normalised count data:
+Differentially expressed genes (DEGs) were called with \textbf{DESeq2} (Love et al., 2014), which fits a negative binomial generalised linear model with shrinkage of the dispersion estimates and tests each gene with a Wald test. P-values were corrected for multiple testing using the Benjamini-Hochberg (BH) False Discovery Rate. A gene was classified as a DEG if (i) its DESeq2 adjusted p-value was below the FDR threshold set for the analysis (0.05 by default), and (ii) its absolute DESeq2 log$_2$ fold-change (maximum-likelihood estimate, unshrunken) was at or above the fold-change threshold set for the analysis (log$_2$(1.5) by default).
+
+To show how robust each call is, two complementary frameworks were applied to the same counts and reported alongside DESeq2, without changing the DEG list:
 
 \begin{enumerate}
+  \item \textbf{edgeR} (Robinson et al., 2010): fits a negative binomial model on TMM-normalised counts and performs quasi-likelihood F-tests to account for overdispersion.
   \item \textbf{limma-voom} (Ritchie et al., 2015): models log-transformed data with precision weights derived from the mean--variance trend and employs empirical Bayes shrinkage of variance estimates.
-  \item \textbf{edgeR} (Robinson et al., 2010): fits a negative binomial model and performs quasi-likelihood F-tests to account for overdispersion.
-  \item \textbf{DESeq2} (Love et al., 2014): uses a negative binomial generalised linear model with shrinkage of dispersion parameters and log$_2$ fold-change estimates via \textit{apeglm} (Zhu et al., 2019).
 \end{enumerate}
 
-The p-values from all applicable methods were combined using Stouffer's Z-score meta-analysis approach, with p-values constrained to [10$^{-10}$, 0.95] to avoid numerical instabilities. Combined p-values were corrected for multiple testing using the Benjamini-Hochberg (BH) False Discovery Rate. Genes were classified as DEGs if: (i) combined adjusted p-value $< 0.05$, and (ii) absolute log$_2$ fold-change $\geq$ log$_2$(1.2).
+For each gene, the number of methods in which it is significant is reported. A combined p-value (Stouffer's Z-score method) is also provided for information only: it assumes independent tests, whereas the three methods analyse the same counts and give strongly correlated p-values, so the combination overstates significance and is not used to call DEGs.
 
 \subsection{Functional Enrichment Analysis}
 

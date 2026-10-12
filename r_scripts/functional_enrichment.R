@@ -166,12 +166,19 @@ if (!is.null(opt$`gene-list`)) {
 
   # The per-comparison genolens_deg.csv has dynamic, comparison-suffixed columns.
   logfc_col <- grep("^log2FoldChange|^logFC", names(deg), value = TRUE)[1]
-  padj_priority <- c("^padj\\.Stouffer", "^padj\\.DESeq2", "^padj\\.edgeR", "^padj\\.limma", "^padj")
+  # Same deciding method as run_multimethod_pipeline.R: DESeq2, then edgeR, then
+  # limma when DESeq2 gave no result (its column is then all NA). The Stouffer
+  # combination is a concordance column there and only comes after them.
+  padj_priority <- c("^padj\\.DESeq2", "^padj\\.edgeR", "^padj\\.limma", "^padj\\.Stouffer", "^padj")
   padj_col <- NA_character_
   for (pat in padj_priority) {
     hit <- grep(pat, names(deg), value = TRUE)
-    if (length(hit) > 0) { padj_col <- hit[1]; break }
+    if (length(hit) > 0 && any(!is.na(suppressWarnings(as.numeric(deg[[hit[1]]]))))) {
+      padj_col <- hit[1]
+      break
+    }
   }
+  message("DEG padj column: ", padj_col)
   # When no dedicated symbol column is present, the gene_id already holds the
   # symbol (e.g. HGNC-symbol count matrices) — use it so enrichment still runs.
   if (!("gene_name" %in% names(deg)) && ("gene_id" %in% names(deg))) {
