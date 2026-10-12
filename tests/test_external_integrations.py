@@ -419,3 +419,100 @@ class TestSingletons:
 
     def test_cytoscape_exporter_singleton(self):
         assert isinstance(cytoscape_exporter, CytoscapeExporter)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRING: identifiers and failures the network panel must be able to tell apart
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _mock_string_client(mock_client_cls, *, response=None, side_effect=None):
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+    mock_client.post = AsyncMock(return_value=response, side_effect=side_effect)
+    mock_client_cls.return_value = mock_client
+    return mock_client
+
+
+def _status_error(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://string-db.org/api/json/network")
+    return httpx.HTTPStatusError(
+        f"{status}", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+class TestStringIdentifiersAndErrors:
+
+    def test_clean_identifiers_strips_ensembl_versions_and_duplicates(self):
+        from app.services.external_integrations import _clean_identifiers
+
+        assert _clean_identifiers(
+            [" ENSG00000141510.17", "ENSG00000141510", "tp53", "TP53", "", "HLA-DRB1", "C1orf112"]
+        ) == ["ENSG00000141510", "tp53", "HLA-DRB1", "C1orf112"]
+
+    @pytest.mark.asyncio
+    async def test_get_network_sends_unversioned_ids(self):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = SAMPLE_STRING_RESPONSE
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("app.services.external_integrations.httpx.AsyncClient") as mock_client_cls:
+            client = _mock_string_client(mock_client_cls, response=mock_resp)
+            await StringDBService().get_network(["ENSG00000141510.17", "ENSG00000135679.26"])
+
+        sent = client.post.call_args.kwargs["data"]["identifiers"]
+        assert sent == "ENSG00000141510\rENSG00000135679"
+
+    @pytest.mark.asyncio
+    async def test_get_network_reports_unknown_genes_as_not_found(self):
+        with patch("app.services.external_integrations.httpx.AsyncClient") as mock_client_cls:
+            _mock_string_client(mock_client_cls, side_effect=_status_error(404))
+            result = await StringDBService().get_network(["NOT_A_GENE"])
+
+        assert result["nodes"] == [] and result["edges"] == []
+        assert result["error"] == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_get_network_reports_server_errors_by_status(self):
+        with patch("app.services.external_integrations.httpx.AsyncClient") as mock_client_cls:
+            _mock_string_client(mock_client_cls, side_effect=_status_error(502))
+            result = await StringDBService().get_network(["TP53"])
+
+        assert result["error"] == "http_502"
+
+    # These used to escape as an unhandled exception, i.e. a 500 from our own API.
+    @pytest.mark.asyncio
+    async def test_get_network_catches_connection_errors(self):
+        with patch("app.services.external_integrations.httpx.AsyncClient") as mock_client_cls:
+            _mock_string_client(mock_client_cls, side_effect=httpx.ConnectError("refused"))
+            result = await StringDBService().get_network(["TP53"])
+
+        assert result["error"] == "unreachable"
+
+    @pytest.mark.asyncio
+    async def test_get_network_catches_unparsable_bodies(self):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.side_effect = ValueError("not json")
+
+        with patch("app.services.external_integrations.httpx.AsyncClient") as mock_client_cls:
+            _mock_string_client(mock_client_cls, response=mock_resp)
+            result = await StringDBService().get_network(["TP53"])
+
+        assert result["error"] == "invalid_response"
+
+    @pytest.mark.asyncio
+    async def test_enrichment_reads_the_genes_from_input_genes(self):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = [
+            {"category": "Process", "term": "GO:0006915", "description": "Apoptotic process",
+             "number_of_genes": 2, "number_of_genes_in_background": 200, "p_value": 0.001,
+             "fdr": 0.01, "inputGenes": ["TP53", "BAX"], "preferredNames": ["TP53", "BAX"]},
+        ]
+
+        with patch("app.services.external_integrations.httpx.AsyncClient") as mock_client_cls:
+            _mock_string_client(mock_client_cls, response=mock_resp)
+            result = await StringDBService().get_functional_enrichment(["TP53", "BAX"])
+
+        assert result["enrichments"][0]["matching_genes"] == "TP53,BAX"
