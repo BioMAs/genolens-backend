@@ -38,6 +38,40 @@ weighted_stouffer_pvalue <- function(pvalues, weights = NULL) {
 }
 
 # =============================================================================
+# Batch check for --design auto
+# =============================================================================
+
+# Fewest residual degrees of freedom `auto` accepts for ~ batch + condition.
+# 2 is what the classic paired design leaves (3 donors x 2 conditions: 6
+# samples, 4 coefficients), the smallest design where blocking on donor pays
+# off, so it must pass. With 1, each gene's dispersion rests on a single
+# residual: the edgeR QL F-test gets 1 denominator df and power collapses
+# (SLC-26-158 Sertoli_vs_iso: 2158 DEG with ~ condition, 447 with
+# ~ batch + condition, none at all in edgeR).
+MIN_RESIDUAL_DF <- 2L
+
+# NULL when ~ batch + condition is usable for this comparison, otherwise why
+# not: a stable `code` for the manifest and a `text` for the log.
+batch_design_problem <- function(batch_vec, cond_vec, min_df = MIN_RESIDUAL_DF) {
+  if (anyNA(batch_vec)) {
+    # model.matrix() would silently drop those samples
+    return(list(code = "batch_has_missing_values", text = "the batch column has missing values"))
+  }
+  design <- model.matrix(~ batch_vec + cond_vec)
+  rank <- qr(design)$rank
+  if (rank < ncol(design)) {
+    return(list(code = "batch_confounded_with_condition",
+                text = "batch is confounded with condition (design matrix not of full rank)"))
+  }
+  df <- nrow(design) - rank
+  if (df < min_df) {
+    return(list(code = "too_few_residual_df", residual_df = df,
+                text = sprintf("~ batch + condition would leave %d residual df (minimum %d)", df, min_df)))
+  }
+  NULL
+}
+
+# =============================================================================
 # CLI arguments
 # =============================================================================
 
@@ -286,7 +320,29 @@ for (i in seq_len(nrow(contrasts))) {
   cond_vec <- factor(smp_sub[[cond_col]], levels = c(cond2, cond1))  # ref=cond2, test=cond1
   has_batch <- !is.null(batch_col) && batch_col %in% colnames(smp_sub) && opt$design != "condition" &&
     length(unique(smp_sub[[batch_col]])) > 1
+  batch_vec <- if (has_batch) factor(smp_sub[[batch_col]]) else NULL
   n_per_cond <- table(cond_vec)
+
+  # `auto` keeps batch only if ~ batch + condition is still estimable on these
+  # samples; `batch_condition` keeps it regardless, `condition` never adds it.
+  design_problem <- if (has_batch && opt$design == "auto") batch_design_problem(batch_vec, cond_vec) else NULL
+  if (!is.null(design_problem)) {
+    message("    Design: ", design_problem$text, ", falling back to ~ condition")
+    has_batch <- FALSE
+    batch_vec <- NULL
+  }
+  # Shared by edgeR and limma (DESeq2 builds the same design from col_data);
+  # the condition effect is the last column. Called inside each method's
+  # tryCatch so an unusable batch column fails that method, not the whole run.
+  make_design <- function() {
+    if (has_batch) model.matrix(~ batch_vec + cond_vec) else model.matrix(~ cond_vec)
+  }
+  design_used <- if (has_batch) "~ batch + condition" else "~ condition"
+  residual_df <- tryCatch({
+    d <- make_design()
+    nrow(d) - qr(d)$rank
+  }, error = function(e) NA_integer_)
+  message("    Design: ", design_used, " (", residual_df, " residual df)")
 
   # ── Build result frame base ─────────────────────────────────────────────────
   base_df <- data.frame(gene_id = rownames(cnt_sub), stringsAsFactors = FALSE)
@@ -323,7 +379,6 @@ for (i in seq_len(nrow(contrasts))) {
     tryCatch({
       col_data <- data.frame(condition = cond_vec, row.names = sids_comp)
       if (has_batch) {
-        batch_vec <- factor(smp_sub[[batch_col]])
         col_data$batch <- batch_vec
         design_formula <- ~ batch + condition
       } else {
@@ -350,12 +405,7 @@ for (i in seq_len(nrow(contrasts))) {
     tryCatch({
       dge <- DGEList(counts = cnt_sub, group = cond_vec)
       dge <- calcNormFactors(dge, method = "TMM")
-      if (has_batch) {
-        batch_vec <- factor(smp_sub[[batch_col]])
-        design_e <- model.matrix(~ batch_vec + cond_vec)
-      } else {
-        design_e <- model.matrix(~ cond_vec)
-      }
+      design_e <- make_design()
       dge <- estimateDisp(dge, design_e, robust = TRUE)
       fit <- glmQLFit(dge, design_e)
       qlt <- glmQLFTest(fit, coef = ncol(design_e))
@@ -377,12 +427,7 @@ for (i in seq_len(nrow(contrasts))) {
     tryCatch({
       dge_l <- DGEList(counts = cnt_sub, group = cond_vec)
       dge_l <- calcNormFactors(dge_l, method = "TMM")
-      if (has_batch) {
-        batch_vec <- factor(smp_sub[[batch_col]])
-        design_l <- model.matrix(~ batch_vec + cond_vec)
-      } else {
-        design_l <- model.matrix(~ cond_vec)
-      }
+      design_l <- make_design()
       v   <- voom(dge_l, design_l, plot = FALSE)
       fit <- lmFit(v, design_l)
       fit <- eBayes(fit)
@@ -485,10 +530,20 @@ for (i in seq_len(nrow(contrasts))) {
   n_down <- sum(regulation == "DOWN", na.rm = TRUE)
   message("    Output: ", nrow(out_df), " genes | UP=", n_up, " DOWN=", n_down)
   manifest$comparisons <- c(manifest$comparisons, comp_name)
-  manifest$comparison_stats[[comp_name]] <- list(
+  comp_stats <- list(
     skipped = FALSE, n_samples = length(sids_comp),
-    n_up = n_up, n_down = n_down, n_genes_tested = nrow(out_df)
+    n_up = n_up, n_down = n_down, n_genes_tested = nrow(out_df),
+    design_used = design_used,
+    design_fallback = !is.null(design_problem)
   )
+  # NA only when the design matrix itself could not be built; write_json would
+  # turn it into the string "NA"
+  if (!is.na(residual_df)) comp_stats$residual_df <- residual_df
+  if (!is.null(design_problem)) {
+    comp_stats$design_fallback_reason <- design_problem$code
+    comp_stats$batch_residual_df      <- design_problem$residual_df  # NULL (dropped) unless too few df
+  }
+  manifest$comparison_stats[[comp_name]] <- comp_stats
 }
 
 # =============================================================================
