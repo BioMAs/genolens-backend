@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 from app.api.deps import get_db, require_admin
 from app.api.deps.subscription import _reset_quota_if_new_month
 from app.api.deps.license import require_active_license
-from app.core.supabase_auth import SupabaseUser
+from app.core.supabase_auth import SupabaseUser, invalidate_cached_role
 from app.core.config import settings
 from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent, UserStatus
 from app.services.account_service import AccountService
@@ -1041,6 +1041,10 @@ async def update_user_role(
                     detail="User not found"
                 )
 
+        # The role guards read a per-process cache of `profiles.role`: drop it so
+        # the change applies on the user's next request, not after the TTL.
+        invalidate_cached_role(user_id)
+
         # Mirror onto the local row, which is what every plan and quota guard
         # reads. Skipped silently when the user has no local row yet: it is
         # created on their first authenticated call, and `get_or_create_user`
@@ -1304,6 +1308,9 @@ async def update_user(
             )
 
             if response.status_code == 200:
+                if "role" in update_data:
+                    # See update_user_role: the role guards read a cached copy.
+                    invalidate_cached_role(user_id)
                 # Return full updated profile
                 return await get_user_details(user_id, current_user, db)
             else:
