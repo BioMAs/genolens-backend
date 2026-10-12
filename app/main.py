@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
+from app.core.supabase_auth import close_supabase_http_client
 from app.db.session import close_db
 from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmetics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
@@ -39,6 +40,7 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 Shutting down...")
     await close_db()
     logger.info("✅ Database connections closed")
+    await close_supabase_http_client()
 
 
 # Create FastAPI app

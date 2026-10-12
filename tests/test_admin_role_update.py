@@ -211,3 +211,35 @@ async def test_invalid_role_is_rejected_before_any_write(client_and_user):
     assert "Invalid role" in resp.json()["detail"]
     assert local_user.role is UserRole.ADMIN
     db.commit.assert_not_awaited()
+
+
+# ── Role cache ───────────────────────────────────────────────────────────────
+# `verify_supabase_token` caches `profiles.role` per process (see
+# app.core.supabase_auth). Every admin endpoint that writes the role must drop
+# that entry, or the change waits out the TTL — and a demoted admin keeps the
+# admin panel in the meantime.
+
+
+@pytest.fixture
+def cached_admin_role(monkeypatch):
+    from app.core import supabase_auth
+
+    cache = {TARGET_ID: (float("inf"), "admin")}
+    monkeypatch.setattr(supabase_auth, "_role_cache", cache)
+    return cache
+
+
+async def test_role_change_drops_the_cached_role(client_and_user, cached_admin_role):
+    client, _, _ = client_and_user
+    resp = await client.patch(f"/api/v1/admin/users/{TARGET_ID}/role", json={"role": "user"})
+
+    assert resp.status_code == 200, resp.text
+    assert TARGET_ID not in cached_admin_role
+
+
+async def test_profile_update_with_a_role_drops_the_cached_role(client_and_user, cached_admin_role):
+    client, _, _ = client_and_user
+    resp = await client.patch(f"/api/v1/admin/users/{TARGET_ID}", json={"role": "user"})
+
+    assert resp.status_code == 200, resp.text
+    assert TARGET_ID not in cached_admin_role
