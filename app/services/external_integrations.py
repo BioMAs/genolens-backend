@@ -19,6 +19,7 @@ import gzip
 import io
 import json
 import logging
+import re
 import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
@@ -59,6 +60,46 @@ GEO_ORGANISMS: dict[str, dict[str, str]] = {
 # 1. STRING DB helpers
 # ===========================================================================
 
+# An Ensembl accession carrying a version suffix: `ENSG00000141510.17`. STRING resolves the
+# unversioned id but answers 404 "nothing found" to the versioned one — which is how DEG files
+# name their genes, so a whole network came back empty.
+_VERSIONED_ENSEMBL = re.compile(r"^(ENS[A-Z]*[GTP]\d+)\.\d+$", re.IGNORECASE)
+
+
+def _clean_identifiers(identifiers: list[str]) -> list[str]:
+    """Trim, drop Ensembl version suffixes, blanks and duplicates — keeping input order."""
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for raw in identifiers:
+        value = str(raw or "").strip()
+        match = _VERSIONED_ENSEMBL.match(value)
+        if match:
+            value = match.group(1)
+        key = value.upper()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(value)
+    return cleaned
+
+
+def _string_error(exc: Exception) -> str:
+    """
+    A stable code for a failed STRING call, which the page turns into a sentence.
+
+    `not_found` is STRING's 404 for identifiers it does not know — the common case, and the one
+    the page must not present as "STRING is down".
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        return "not_found" if status_code == 404 else f"http_{status_code}"
+    if isinstance(exc, httpx.RequestError):
+        return "unreachable"
+    return "invalid_response"
+
+
 class StringDBService:
     """
     Thin async wrapper around the STRING v12 public API.
@@ -96,6 +137,7 @@ class StringDBService:
             required_score  : Minimum combined interaction score 0-1000 (default 400).
             limit           : Max interaction partners per seed (default 10).
         """
+        gene_symbols = _clean_identifiers(gene_symbols)
         if not gene_symbols:
             return {"nodes": [], "edges": [], "species": species, "count": 0}
 
@@ -119,12 +161,12 @@ class StringDBService:
                 )
                 resp.raise_for_status()
                 raw = resp.json()
-            except httpx.TimeoutException:
-                logger.warning("STRING DB request timed out")
-                return {"nodes": [], "edges": [], "species": species, "count": 0, "error": "timeout"}
-            except httpx.HTTPStatusError as exc:
-                logger.warning("STRING DB HTTP error: %s", exc)
-                return {"nodes": [], "edges": [], "species": species, "count": 0, "error": str(exc)}
+            except (httpx.HTTPError, ValueError) as exc:
+                # Connection failures and unparsable bodies used to escape as a 500, which the
+                # page could not tell apart from an outage of this API.
+                error = _string_error(exc)
+                logger.warning("STRING DB network error (%s): %s", error, exc)
+                return {"nodes": [], "edges": [], "species": species, "count": 0, "error": error}
 
         return self._parse_network(raw, species)
 
@@ -140,8 +182,12 @@ class StringDBService:
 
         Returns the same structure as `get_network`.
         """
+        cleaned = _clean_identifiers([gene_symbol])
+        if not cleaned:
+            return {"nodes": [], "edges": [], "species": species, "count": 0}
+
         params = {
-            "identifiers": gene_symbol,
+            "identifiers": cleaned[0],
             "species": species,
             "required_score": required_score,
             "limit": limit,
@@ -156,9 +202,10 @@ class StringDBService:
                 )
                 resp.raise_for_status()
                 raw = resp.json()
-            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                logger.warning("STRING DB error: %s", exc)
-                return {"nodes": [], "edges": [], "species": species, "count": 0}
+            except (httpx.HTTPError, ValueError) as exc:
+                error = _string_error(exc)
+                logger.warning("STRING DB partners error (%s): %s", error, exc)
+                return {"nodes": [], "edges": [], "species": species, "count": 0, "error": error}
 
         return self._parse_network(raw, species)
 
@@ -176,6 +223,7 @@ class StringDBService:
                                    number_of_genes_in_background, p_value, fdr,
                                    matching_genes}
         """
+        gene_symbols = _clean_identifiers(gene_symbols)
         if not gene_symbols:
             return {"enrichments": []}
 
@@ -194,12 +242,23 @@ class StringDBService:
                 )
                 resp.raise_for_status()
                 raw = resp.json()
-            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-                logger.warning("STRING enrichment error: %s", exc)
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning("STRING enrichment error (%s): %s", _string_error(exc), exc)
                 return {"enrichments": []}
 
         enrichments = []
         for item in raw:
+            # STRING 12 names the matched genes `inputGenes` (as submitted) and `preferredNames`
+            # (its own symbols); `matching_proteins_in_your_network` is gone, so reading only it
+            # left every row's gene list empty.
+            matching = (
+                item.get("inputGenes")
+                or item.get("preferredNames")
+                or item.get("matching_proteins_in_your_network")
+                or ""
+            )
+            if isinstance(matching, list):
+                matching = ",".join(str(gene) for gene in matching)
             enrichments.append({
                 "category": item.get("category", ""),
                 "term": item.get("term", ""),
@@ -208,7 +267,7 @@ class StringDBService:
                 "number_of_genes_in_background": item.get("number_of_genes_in_background", 0),
                 "p_value": item.get("p_value", 1.0),
                 "fdr": item.get("fdr", 1.0),
-                "matching_genes": item.get("matching_proteins_in_your_network", ""),
+                "matching_genes": matching,
             })
 
         # Sort by FDR
