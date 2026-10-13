@@ -786,3 +786,46 @@ class TestCountMatrixQC:
 
         assert qc["n_samples"] == 3
         assert qc["min_lib_size"] == 7
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# calculate_library_size — the "Library Size (Total Reads)" chart
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCalculateLibrarySize:
+
+    @staticmethod
+    def _parquet(df: pd.DataFrame) -> bytes:
+        buffer = io.BytesIO()
+        df.to_parquet(buffer, index=False)
+        return buffer.getvalue()
+
+    @pytest.mark.asyncio
+    async def test_only_sample_columns_become_bars(self):
+        # featureCounts annotations are numeric: summing them drew "Length" as a sample.
+        from app.services.data_processor import DataProcessorService
+        df = pd.DataFrame({
+            "gene_id": ["G1", "G2", "G3"], "gene_name": ["A", "B", "C"],
+            "Start": [1, 50, 90], "End": [40, 90, 120], "Length": [40, 41, 31],
+            "S1": [10, 0, 5], "S2": [100, 200, 300],
+        })
+        rows = await DataProcessorService().calculate_library_size(self._parquet(df))
+
+        assert [r["sample"] for r in rows] == ["S2", "S1"]
+        assert rows[0]["reads"] == 600.0
+        assert rows[1]["genes_detected"] == 2
+
+    @pytest.mark.asyncio
+    async def test_missing_counts_are_zero_reads(self):
+        from app.services.data_processor import DataProcessorService
+        df = pd.DataFrame({"gene_id": ["G1", "G2"], "S1": [3.0, np.nan], "S2": [1.0, 2.0]})
+        rows = await DataProcessorService().calculate_library_size(self._parquet(df))
+
+        assert {r["sample"]: r["reads"] for r in rows} == {"S1": 3.0, "S2": 3.0}
+
+    @pytest.mark.asyncio
+    async def test_no_sample_column_gives_no_bar(self):
+        from app.services.data_processor import DataProcessorService
+        df = pd.DataFrame({"gene_id": ["G1"], "Length": [40]})
+
+        assert await DataProcessorService().calculate_library_size(self._parquet(df)) == []

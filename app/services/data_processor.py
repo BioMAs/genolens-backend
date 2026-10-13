@@ -53,6 +53,20 @@ def padj_display_floor(padj: "pd.Series") -> float:
 _COUNT_MATRIX_ANNOTATION_COLUMNS = frozenset({"chr", "start", "end", "strand", "length"})
 
 
+def count_matrix_sample_columns(df: pd.DataFrame) -> list:
+    """
+    The sample columns of a count matrix: numeric, minus featureCounts annotations.
+
+    The gene identifier and symbol columns are text and drop out on their own. Shared by the
+    upload QC and the Library Size chart, which used to sum *every* numeric column and drew
+    `Length` or `Start` as a sample bar.
+    """
+    return [
+        c for c in df.select_dtypes(include=[np.number]).columns
+        if str(c).strip().lower() not in _COUNT_MATRIX_ANNOTATION_COLUMNS
+    ]
+
+
 def compute_count_matrix_qc(df: pd.DataFrame) -> dict[str, Any]:
     """
     Sample columns are the numeric ones, minus featureCounts annotations; the gene
@@ -60,10 +74,7 @@ def compute_count_matrix_qc(df: pd.DataFrame) -> dict[str, Any]:
     n_genes, n_samples, sample_names, lib_sizes, detected_genes, min_lib_size,
     min_detected_genes (the two minima are None when there is no sample column).
     """
-    sample_cols = [
-        c for c in df.select_dtypes(include=[np.number]).columns
-        if str(c).strip().lower() not in _COUNT_MATRIX_ANNOTATION_COLUMNS
-    ]
+    sample_cols = count_matrix_sample_columns(df)
     counts = df[sample_cols].fillna(0)
     lib_sizes = {str(c): int(round(v)) for c, v in counts.sum().items()}
     detected = {str(c): int(v) for c, v in (counts > 0).sum().items()}
@@ -916,18 +927,19 @@ class DataProcessorService:
         if "gene_id" in df.columns:
             df = df.set_index("gene_id")
         
-        # Select only numeric columns (samples)
-        numeric_df = df.select_dtypes(include=[np.number])
-        
+        # Samples only: featureCounts annotations (Length, Start, End…) are numeric too, and
+        # summing them drew a fake "Length" bar. Missing counts are zero reads, not NaN totals.
+        numeric_df = df[count_matrix_sample_columns(df)].fillna(0)
+
         # Sum columns
         library_sizes = numeric_df.sum().sort_values(ascending=False)
-        
+
         # Count genes with >= 3 reads per sample
         genes_detected = (numeric_df >= 3).sum()
-        
+
         return [
             {
-                "sample": sample, 
+                "sample": str(sample),
                 "reads": float(reads),
                 "genes_detected": int(genes_detected[sample])
             }
