@@ -36,6 +36,7 @@ from app.models.models import (
     SelfServiceAnalysis,
 )
 from app.services.data_processor import data_processor
+from app.services.species import declared_species
 from app.services.storage import storage_service
 
 logger = logging.getLogger(__name__)
@@ -319,20 +320,9 @@ def _count_by_condition(
 async def resolve_species(db: AsyncSession, dataset: Dataset) -> str:
     """Espèce du dataset, humain par défaut.
 
-    Même échelle de résolution que l'enrichissement d'intersection.
+    Même échelle de résolution que l'enrichissement d'intersection et le réseau STRING.
     """
-    metadata = dataset.dataset_metadata or {}
-    if metadata.get("species"):
-        return str(metadata["species"])
-    analysis_id = metadata.get("analysis_id")
-    if analysis_id:
-        try:
-            analysis = await db.get(SelfServiceAnalysis, UUID(str(analysis_id)))
-        except (ValueError, TypeError):
-            analysis = None
-        if analysis is not None and (analysis.params or {}).get("species"):
-            return str(analysis.params["species"])
-    return "human"
+    return await declared_species(db, dataset) or "human"
 
 
 async def build_signature_payload(
