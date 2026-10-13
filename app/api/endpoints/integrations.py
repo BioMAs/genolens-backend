@@ -13,18 +13,23 @@ Routes:
 import logging
 import json
 from typing import Optional, Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_db
+from app.api.deps.project_access import assert_project_read_access
 from app.core.supabase_auth import SupabaseUser
+from app.models.models import Dataset
 from app.services.external_integrations import (
     string_service,
     geo_service,
     cytoscape_exporter,
 )
+from app.services.species import declared_species, species_taxon
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/integrations", tags=["integrations"])
@@ -36,7 +41,16 @@ router = APIRouter(prefix="/integrations", tags=["integrations"])
 
 class StringNetworkRequest(BaseModel):
     gene_symbols: list[str] = Field(..., min_length=1, max_length=100)
-    species: int = Field(default=9606, description="NCBI taxonomy ID (9606=human)")
+    species: int = Field(
+        default=9606,
+        description="NCBI taxonomy ID (9606=human). With `dataset_id`, only the fallback "
+        "for a dataset that records no species.",
+    )
+    dataset_id: Optional[UUID] = Field(
+        default=None,
+        description="Dataset the genes come from: the species its analysis was launched with "
+        "wins over `species`.",
+    )
     required_score: int = Field(default=400, ge=0, le=1000)
     limit: int = Field(default=10, ge=1, le=50)
 
@@ -62,23 +76,48 @@ class CytoscapeExportRequest(BaseModel):
 # STRING DB endpoints
 # ---------------------------------------------------------------------------
 
+async def _dataset_taxon(db: AsyncSession, dataset_id: UUID, user_id: UUID) -> Optional[int]:
+    """STRING taxon of the species a dataset records, ``None`` when it records none we know.
+
+    404 for a dataset the caller cannot read, so the route does not confirm it exists.
+    """
+    dataset = await db.get(Dataset, dataset_id)
+    if dataset is None:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    await assert_project_read_access(db, dataset.project_id, user_id)
+    return species_taxon(await declared_species(db, dataset))
+
+
 @router.post("/string/network", summary="Protein-protein interaction network")
 async def string_network(
     body: StringNetworkRequest,
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> dict:
     """
     Fetch a PPI network for a list of gene symbols from STRING DB.
 
-    Returns nodes and edges with confidence scores.  
+    Returns nodes and edges with confidence scores.
     Useful for visualising the interaction landscape of a DEG list.
+
+    The organism is the one recorded for `dataset_id` when there is one — the species the
+    analysis was launched with — else the caller's `species`. `species` in the response is the
+    taxon STRING was asked about, and `species_source` says which of the two it came from
+    (`dataset` or `request`).
     """
+    species, species_source = body.species, "request"
+    if body.dataset_id is not None:
+        taxon = await _dataset_taxon(db, body.dataset_id, current_user.user_id)
+        if taxon is not None:
+            species, species_source = taxon, "dataset"
+
     result = await string_service.get_network(
         gene_symbols=body.gene_symbols,
-        species=body.species,
+        species=species,
         required_score=body.required_score,
         limit=body.limit,
     )
+    result["species_source"] = species_source
     if "error" in result:
         logger.warning("STRING network error for %s genes: %s", len(body.gene_symbols), result["error"])
     return result

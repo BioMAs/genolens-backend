@@ -21,11 +21,12 @@ from app.api.deps.project_access import assert_project_read_access
 from app.api.deps.license import require_active_license
 from app.api.deps.subscription import require_team_plan
 from app.core.supabase_auth import SupabaseUser
-from app.models.models import Dataset, SelfServiceAnalysis
+from app.models.models import Dataset
 from app.models.intersection_enrichment_job import (
     IntersectionEnrichmentJob,
     IntersectionEnrichmentStatus,
 )
+from app.services.species import declared_species
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["intersection-enrichment"])
@@ -50,18 +51,7 @@ class EnrichmentJobResponse(BaseModel):
 
 async def _resolve_species(db: AsyncSession, dataset: Dataset) -> str:
     """Best-effort species for the dataset's project (defaults to human)."""
-    meta = dataset.dataset_metadata or {}
-    if meta.get("species"):
-        return str(meta["species"])
-    analysis_id = meta.get("analysis_id")
-    if analysis_id:
-        try:
-            analysis = await db.get(SelfServiceAnalysis, UUID(str(analysis_id)))
-            if analysis and (analysis.params or {}).get("species"):
-                return str(analysis.params["species"])
-        except (ValueError, TypeError):
-            pass
-    return "human"
+    return await declared_species(db, dataset) or "human"
 
 
 @router.post(
