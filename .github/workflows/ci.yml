@@ -157,6 +157,13 @@ jobs:
     needs: test
     # Auto-deploy only on a push to main (not on PRs / develop). Also runnable manually.
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # Un seul déploiement à la fois : deux merges rapprochés lançaient deux déploiements en
+    # parallèle et le dernier à finir gagnait, même avec un commit plus ancien. Le suivant attend
+    # sans interrompre celui en cours ; GitHub ne garde que le plus récent en attente. Le groupe
+    # porte la ref pour que les runs de PR (où ce job est sauté) ne le partagent jamais.
+    concurrency:
+      group: deploy-production-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
 
     env:
