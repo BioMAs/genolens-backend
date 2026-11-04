@@ -69,6 +69,6 @@ Un jeton perdu ne peut pas être réaffiché : on le révoque et on en crée un 
 
 ## Bonnes pratiques
 
-- Un propriétaire dédié : un compte interne, avec le plan et les modules dont le pipeline a besoin (TEAM et module cosmétique pour le rapport éditorial), qui ne sert pas à travailler dans l'interface.
+- Un propriétaire dédié : un compte interne **actif**, avec le plan et les modules dont le pipeline a besoin (TEAM et module cosmétique pour le rapport éditorial), qui ne sert pas à travailler dans l'interface. Un jeton n'active jamais une invitation en attente : avec un propriétaire `pending`, le suivi et le téléchargement du rapport répondent 403 (`User account is inactive`).
 - Le jeton se range dans un gestionnaire de secrets ou dans une variable d'environnement. Jamais dans un fichier de configuration versionné, ni sur une ligne de commande.
 - Un jeton par usage. On révoque un jeton dès qu'il n'est plus utilisé, ou au moindre doute.

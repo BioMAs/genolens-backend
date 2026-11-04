@@ -26,7 +26,7 @@ ALL_SCOPES = (SCOPE_PROJECTS_CREATE, SCOPE_DATASETS_UPLOAD, SCOPE_REPORTS_EDITOR
 
 def is_service_token(token: Optional[str]) -> bool:
     """True for a bearer value that claims to be a service token (whatever its validity)."""
-    return bool(token) and token.startswith(TOKEN_PREFIX)
+    return token is not None and token.startswith(TOKEN_PREFIX)
 
 
 def is_well_formed(token: str) -> bool:
@@ -40,10 +40,3 @@ def new_service_token() -> str:
 def hash_service_token(token: str) -> str:
     """The only form in which a token is stored or compared."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def bearer_value(authorization: Optional[str]) -> Optional[str]:
-    """The token of an `Authorization: Bearer …` header, else None."""
-    if not authorization or not authorization.startswith("Bearer "):
-        return None
-    return authorization.removeprefix("Bearer ").strip()

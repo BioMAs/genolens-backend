@@ -85,7 +85,7 @@ async def resolve_service_token(
     token on a route its scopes do not open. Resolved once per request. No refusal, log or
     stored value ever carries the token.
     """
-    cached = getattr(request.state, _STATE_ATTR, None)
+    cached: Optional[ServicePrincipal] = getattr(request.state, _STATE_ATTR, None)
     if cached is not None:
         return cached
     if not is_well_formed(token):
