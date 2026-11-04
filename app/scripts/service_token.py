@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.service_tokens import ALL_SCOPES, hash_service_token, new_service_token
-from app.models.models import User
+from app.models.models import User, UserStatus
 from app.models.service_token import ServiceToken
 
 
@@ -35,6 +35,12 @@ async def _owner(db: AsyncSession, owner: str) -> User:
         user = await db.scalar(select(User).where(User.email == owner))
     if user is None:
         raise CommandError(f"no GenoLens user {owner!r}: the owner must have an account")
+    if user.status != UserStatus.ACTIVE:
+        # A token of an inactive account would be refused on every request (403).
+        raise CommandError(
+            f"the account {owner!r} is {user.status.value}, not active: an administrator must "
+            "activate it first (docs/SERVICE_TOKENS.md)"
+        )
     return user
 
 

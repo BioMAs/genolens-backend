@@ -25,7 +25,7 @@ import jwt
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from app.models.models import (
     Dataset,
@@ -435,25 +435,60 @@ async def test_service_token_inherits_the_owner_gates(client, sessions):
     resp = await upload(client, spent_token, project.json()["id"])
     assert resp.status_code == 429, resp.text
 
-    # Suspended owner: refused before anything else.
-    suspended = await seed_owner(sessions, status=UserStatus.SUSPENDED)
-    _, suspended_token = await make_token(sessions, suspended)
-    resp = await client.post(
-        f"{API}/projects/", headers=bearer(suspended_token), json={"name": "TST01"}
-    )
-    assert resp.status_code == 403, resp.text
-    assert resp.json()["detail"]["error"] == "account_inactive"
-
-    # The token never changes its owner's account: a pending invitation stays pending (a
-    # user's own first login would activate it), the role stays the stored one.
-    pending = await seed_owner(sessions, status=UserStatus.PENDING, role=UserRole.ANALYST)
-    _, pending_token = await make_token(sessions, pending)
-    resp = await client.post(f"{API}/projects/", headers=bearer(pending_token), json={"name": "P"})
-    assert resp.status_code == 201, resp.text
+    # An account that is not ACTIVE gets no token from the command...
+    for inactive in (UserStatus.PENDING, UserStatus.SUSPENDED):
+        account = await seed_owner(sessions, status=inactive)
+        code, printed = await run_command(
+            sessions, "create", "--owner", account.email, "--name", "pipeline"
+        )
+        assert code == 1 and "not active" in printed, printed
+        assert not TOKEN_RE.search(printed)
     async with sessions() as s:
-        stored = await s.get(User, pending.id)
-        assert stored.status == UserStatus.PENDING and stored.role == UserRole.ANALYST
-        assert (await s.get(User, suspended.id)).status == UserStatus.SUSPENDED
+        issued = await s.scalar(text("SELECT count(*) FROM service_tokens"))
+
+    # ...and a token whose owner is no longer ACTIVE is refused on every scoped route, before
+    # any project, upload, quota unit or report job. A pending invitation stays pending: the
+    # token never activates it, and never changes the stored role.
+    for inactive in (UserStatus.PENDING, UserStatus.SUSPENDED):
+        account = await seed_owner(sessions, role=UserRole.ANALYST)
+        _, account_token = await make_token(sessions, account)
+        dataset_id = await seed_dataset(sessions, account)
+        async with sessions() as s:
+            (await s.get(User, account.id)).status = inactive
+            await s.commit()
+            project_id = (await s.get(Dataset, dataset_id)).project_id
+        report = f"{API}/datasets/{dataset_id}/report"
+        auth = bearer(account_token)
+        calls = [
+            ("create a project", lambda: client.post(f"{API}/projects/", headers=auth,
+                                                     json={"name": "TST09"})),
+            ("upload", lambda: upload(client, account_token, str(project_id))),
+            ("poll the dataset", lambda: client.get(f"{API}/datasets/{dataset_id}", headers=auth)),
+            ("ask for the report", lambda: client.post(report, headers=auth, params=EDITORIAL,
+                                                       json={"use_ai": False})),
+            ("poll the report", lambda: client.get(f"{report}/status", headers=auth,
+                                                   params=EDITORIAL)),
+            ("download the report", lambda: client.get(f"{report}/download", headers=auth,
+                                                       params=EDITORIAL)),
+        ]
+        for what, call in calls:
+            resp = await call()
+            assert resp.status_code == 403, f"{inactive.value}, {what}: {resp.text}"
+            detail = resp.json()["detail"]
+            assert detail["error"] == "account_inactive", detail
+            assert detail["status"] == inactive.value
+            assert account_token not in resp.text
+        async with sessions() as s:
+            stored = await s.get(User, account.id)
+            assert stored.status == inactive and stored.role == UserRole.ANALYST
+            assert stored.analyses_used_this_month == 0
+            owned = await s.scalar(
+                select(func.count()).select_from(Project).where(Project.owner_id == account.id)
+            )
+            assert owned == 1  # the seeded project only
+        assert await jobs_of(sessions, dataset_id) == []
+    async with sessions() as s:
+        assert await s.scalar(text("SELECT count(*) FROM service_tokens")) == issued + 2
 
 
 # ── The editorial report: use_ai and branding ────────────────────────────────
@@ -546,9 +581,62 @@ async def test_editorial_without_ai_calls_no_llm(tmp_path):
     # No AI text and no AI label in the rendered report, even if a text were handed over.
     page = render_html(build_editorial_context(_inputs(use_ai=False)))
     assert re.search(r"\bAI\b", page) is None, re.findall(r".{60}\bAI\b.{60}", page)[:3]
-    assert "AI-generated" not in page and "Interpretation model" not in page
+    assert "AI-generated" not in page and "interpretation model" not in page.lower()
     assert "cornified-envelope genes" not in page and "<b>barrier</b>" not in page
     assert "Top genes across conditions" in page  # the heatmap page stays
+
+
+async def test_editorial_service_leaves_out_the_owner_branding(tmp_path):
+    from app.services.report_editorial_content import build_editorial_context
+    from app.services.report_editorial_service import render_html, report_editorial_service
+    from app.services.report_latex_service import report_latex_service
+    from tests.test_report_editorial import FIXTURE
+
+    nova = json.loads(FIXTURE.read_text())
+    saved = {
+        "institute_name": "Fictitious Skin Institute",
+        "institute_address": "1 Example Street",
+        "cover_info": {"prepared_by": "A. Tester"},
+        "logo_file": None,
+    }
+
+    async def fake_collect(*_args, **_kwargs):
+        comp = {"test": "AL-7", "control": "Vehicle", "degs": [], "n_up": 0, "n_down": 0,
+                "enr_up": [], "enr_down": []}
+        return {"comparisons": [comp], "expression": {}, "qc_rows": [], "params": {},
+                "project": SimpleNamespace(name="Fictitious study"), "analysis": None}
+
+    db = MagicMock()
+    db.scalar = AsyncMock(return_value=None)
+    empty = MagicMock()
+    empty.scalar_one_or_none.return_value = None
+    db.execute = AsyncMock(return_value=empty)
+    db.get = AsyncMock(return_value=SimpleNamespace(id=uuid4(), project_id=uuid4()))
+    load_branding = AsyncMock(return_value=saved)
+    with (
+        patch.object(report_latex_service, "collect_comparison_data", new=fake_collect),
+        patch.object(report_latex_service, "_load_branding", new=load_branding),
+        patch(
+            "app.services.report_editorial_service.compute_nova",
+            new=AsyncMock(return_value=(nova, [])),
+        ),
+    ):
+        plain = await report_editorial_service.collect(
+            db, uuid4(), "AL-7_vs_Vehicle", str(tmp_path), requested_by=uuid4(),
+            use_ai=False, use_branding=False,
+        )
+        load_branding.assert_not_called()
+        assert plain.branding is None and "prepared_by" not in plain.cover_info
+
+        # Control: by default the requester's saved branding is loaded and printed.
+        branded = await report_editorial_service.collect(
+            db, uuid4(), "AL-7_vs_Vehicle", str(tmp_path), requested_by=uuid4(), use_ai=False,
+        )
+        load_branding.assert_awaited_once()
+        assert branded.branding == saved
+
+    assert "Fictitious Skin Institute" not in render_html(build_editorial_context(plain))
+    assert "Fictitious Skin Institute" in render_html(build_editorial_context(branded))
 
 
 async def test_use_ai_is_read_without_the_customization_module(client, sessions):

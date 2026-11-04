@@ -7,7 +7,9 @@ right under its router decorator. On every other authenticated route a valid ser
 resolve it here, and every user-facing router pulls in the first through `require_active_account`.
 
 A valid token resolves to its owner's `User` row, and everything downstream — licence, plan,
-modules, quotas, project access, account status — sees that owner, unchanged.
+modules, quotas, project access, subscription expiry — sees that owner, unchanged. The owner must
+be ACTIVE: a token of a pending, suspended or cancelled account is refused on every route, before
+any project, upload or quota is touched (a token never activates a pending invitation).
 """
 
 from dataclasses import dataclass
@@ -20,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.service_tokens import hash_service_token, is_well_formed
-from app.models.models import User
+from app.models.models import User, UserStatus
 from app.models.service_token import ServiceToken
 
 _RULE_ATTR = "__service_token_rule__"
@@ -82,8 +84,9 @@ async def resolve_service_token(
     """The owner behind `token`, when the token is valid and open on this route.
 
     401 for a malformed, unknown or revoked token, or one whose owner is gone; 403 for a valid
-    token on a route its scopes do not open. Resolved once per request. No refusal, log or
-    stored value ever carries the token.
+    token on a route its scopes do not open, and 403 `account_inactive` (the shape
+    `require_active_account` uses) when the owner is not ACTIVE. Resolved once per request. No
+    refusal, log or stored value ever carries the token.
     """
     cached: Optional[ServicePrincipal] = getattr(request.state, _STATE_ATTR, None)
     if cached is not None:
@@ -107,6 +110,18 @@ async def resolve_service_token(
     owner = await db.get(User, row.owner_id)
     if owner is None:
         raise _unauthorized()
+    if owner.status != UserStatus.ACTIVE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "account_inactive",
+                "status": owner.status.value,
+                "message": (
+                    "The account that owns this service token is not active. "
+                    "An administrator must activate it (docs/SERVICE_TOKENS.md)."
+                ),
+            },
+        )
     # Committed with the request's own work: a request that fails leaves it as it was.
     row.last_used_at = datetime.now(timezone.utc)
     principal = ServicePrincipal(token_id=row.id, owner=owner)

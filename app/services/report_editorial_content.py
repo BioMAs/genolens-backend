@@ -1105,7 +1105,11 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
         (
             "Traceability.",
             f"Page {total} lists every version behind the score (analysis engine, "
-            f"thresholds, claim referential, interpretation model)."
+            + (
+                "thresholds, claim referential, interpretation model)."
+                if inp.use_ai
+                else "thresholds, claim referential)."
+            )
             + (" Illustrative data." if inp.illustrative else ""),
         )
     )
