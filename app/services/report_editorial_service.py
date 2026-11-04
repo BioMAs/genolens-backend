@@ -250,12 +250,31 @@ class ReportEditorialService:
         cover_info: Optional[dict] = None,
         generate_ai: bool = False,
         demo_watermark: bool = False,
+        use_ai: bool = True,
+        use_branding: bool = True,
     ) -> EditorialInputs:
+        """The report's inputs.
+
+        use_ai=False: no AI at all — no LLM call (whatever `generate_ai` says), no stored
+        interpretation read, and the content layer prints no AI label.
+        use_branding=False: the requester's saved branding and cover data are left out (a
+        report requested through a service token).
+        """
         data = await report_latex_service.collect_comparison_data(
-            db, dataset_id, comparison_name, work_dir, generate_ai=False, make_figures=False
+            db,
+            dataset_id,
+            comparison_name,
+            work_dir,
+            generate_ai=False,
+            make_figures=False,
+            include_ai=use_ai,
         )
         comp = data["comparisons"][0]
-        branding = await report_latex_service._load_branding(db, requested_by, work_dir)
+        branding = (
+            await report_latex_service._load_branding(db, requested_by, work_dir)
+            if use_branding
+            else None
+        )
         cover = merge_cover_info(branding, cover_info)
 
         dataset = await db.get(Dataset, dataset_id)
@@ -300,17 +319,19 @@ class ReportEditorialService:
         nova_light = render_nova_svg(nova, "light", id_prefix="nova-light", center_label=center)
         nova_dark = render_nova_svg(nova, "dark", id_prefix="nova-dark", center_label=center)
 
-        cmp_text, cmp_model = await self._comparison_ai(
-            db,
-            dataset_id,
-            comparison_name,
-            comp.get("ai_interpretation"),
-            generate_ai,
-            demo_watermark,
-        )
-        nova_text, nova_model = await self._nova_ai(
-            db, dataset_id, comparison_name, nova, generate_ai, demo_watermark
-        )
+        cmp_text = cmp_model = nova_text = nova_model = None
+        if use_ai:
+            cmp_text, cmp_model = await self._comparison_ai(
+                db,
+                dataset_id,
+                comparison_name,
+                comp.get("ai_interpretation"),
+                generate_ai,
+                demo_watermark,
+            )
+            nova_text, nova_model = await self._nova_ai(
+                db, dataset_id, comparison_name, nova, generate_ai, demo_watermark
+            )
 
         project = data.get("project")
         analysis = data.get("analysis")
@@ -349,6 +370,7 @@ class ReportEditorialService:
             app_version=settings.APP_VERSION,
             generated_at=datetime.now(timezone.utc),
             demo_watermark=demo_watermark,
+            use_ai=use_ai,
         )
 
     async def render_comparison_pdf(
@@ -360,6 +382,8 @@ class ReportEditorialService:
         cover_info: Optional[dict] = None,
         generate_ai: bool = False,
         demo_watermark: bool = False,
+        use_ai: bool = True,
+        use_branding: bool = True,
     ) -> bytes:
         with tempfile.TemporaryDirectory(prefix="report_editorial_") as work_dir:
             inputs = await self.collect(
@@ -371,6 +395,8 @@ class ReportEditorialService:
                 cover_info,
                 generate_ai,
                 demo_watermark,
+                use_ai=use_ai,
+                use_branding=use_branding,
             )
             html = render_html(build_editorial_context(inputs))
             pdf, overflow = await html_to_pdf(html, work_dir)

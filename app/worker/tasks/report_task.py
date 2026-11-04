@@ -161,6 +161,7 @@ async def _render_latex(db, job) -> bytes:
         last_page_type=job.last_page_type,
         cover_info=job.cover_info,
         demo_watermark=await report_latex_service.is_demo_requester(db, job.requested_by),
+        use_ai=job.use_ai,
     )
 
 
@@ -192,4 +193,8 @@ async def _render_editorial(db, job) -> bytes:
         requested_by=job.requested_by,
         cover_info=job.cover_info,
         demo_watermark=await report_latex_service.is_demo_requester(db, job.requested_by),
+        use_ai=job.use_ai,
+        # Requested through a service token: never the owner's saved branding (the PDF
+        # goes to the pipeline's client, not to the internal account's own reports).
+        use_branding=job.service_token_id is None,
     )

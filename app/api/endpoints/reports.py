@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,8 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps.auth import get_current_user
 from app.api.deps.db import get_db
 from app.api.deps.project_access import assert_project_access
+from app.api.deps.service_token import service_token_id, service_token_scope
 from app.api.deps.subscription import get_or_create_user, require_advanced_export
 from app.core.security import CurrentUser
+from app.core.service_tokens import SCOPE_REPORTS_EDITORIAL
 from app.models.models import Dataset, SelfServiceAnalysis, User
 from app.models.report_job import ReportJob, ReportJobStatus
 from app.schemas.report import (
@@ -177,13 +179,23 @@ async def _get_dataset_or_404(dataset_id: UUID, db: AsyncSession, user_id: UUID)
     return dataset
 
 
+def _visible_to(stmt, token_id: Optional[UUID]):
+    """A user sees every job of the comparison; a service token only the jobs requested
+    through a service token (rendered without the owner's saved branding)."""
+    if token_id is None:
+        return stmt
+    return stmt.where(ReportJob.service_token_id.is_not(None))
+
+
 @comparison_router.post(
     "/{dataset_id}/report",
     response_model=ReportTriggerResponse,
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_advanced_export)],
 )
+@service_token_scope(SCOPE_REPORTS_EDITORIAL, template="editorial")
 async def trigger_comparison_report(
+    request: Request,
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(get_or_create_user)],
@@ -198,7 +210,11 @@ async def trigger_comparison_report(
 
     Per-report customization content (conclusion / materials & methods) is only
     applied when the requesting user has the report customization module.
+    `use_ai` is read for everyone. A service token (editorial only) gets a report without
+    the owner's saved branding and cover data, and ignores any customization it sends.
     """
+    token_id = service_token_id(request)
+    use_ai = payload.use_ai if payload is not None else True
     dataset = await _get_dataset_or_404(dataset_id, db, user.id)
 
     # The OmicSkin editorial report is built on the CosmOmics nova: same add-on gate as the
@@ -211,20 +227,24 @@ async def trigger_comparison_report(
 
     # Return existing in-progress job rather than spawning a duplicate — but only
     # if it is *recent*. A job that has been PENDING/RUNNING for too long is stale
-    # (e.g. the worker died) and must not block regeneration forever.
+    # (e.g. the worker died) and must not block regeneration forever. Only a job made
+    # the same way is reused: same format, same `use_ai`, and requested through a service
+    # token (unbranded) or not.
     recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
-    stmt = (
-        select(ReportJob)
-        .where(
-            ReportJob.dataset_id == dataset_id,
-            ReportJob.comparison_name == comparison_name,
-            ReportJob.template == template,
-            ReportJob.status.in_([ReportJobStatus.PENDING, ReportJobStatus.RUNNING]),
-            ReportJob.created_at >= recent_cutoff,
-        )
-        .order_by(desc(ReportJob.created_at))
-        .limit(1)
+    stmt = select(ReportJob).where(
+        ReportJob.dataset_id == dataset_id,
+        ReportJob.comparison_name == comparison_name,
+        ReportJob.template == template,
+        ReportJob.use_ai == use_ai,
+        ReportJob.status.in_([ReportJobStatus.PENDING, ReportJobStatus.RUNNING]),
+        ReportJob.created_at >= recent_cutoff,
+        (
+            ReportJob.service_token_id.is_(None)
+            if token_id is None
+            else ReportJob.service_token_id.is_not(None)
+        ),
     )
+    stmt = stmt.order_by(desc(ReportJob.created_at)).limit(1)
     existing = (await db.execute(stmt)).scalars().first()
     if existing:
         return ReportTriggerResponse(
@@ -237,7 +257,7 @@ async def trigger_comparison_report(
     first_page_type = None
     last_page_type = None
     cover_info = None
-    if payload and user.has_report_customization:
+    if payload and user.has_report_customization and token_id is None:
         conclusion = payload.conclusion
         materials_methods = payload.materials_methods
         first_page_type = payload.first_page_type
@@ -255,6 +275,8 @@ async def trigger_comparison_report(
         last_page_type=last_page_type,
         cover_info=cover_info,
         template=template,
+        use_ai=use_ai,
+        service_token_id=token_id,
         requested_by=user.id,
         status=ReportJobStatus.PENDING,
     )
@@ -291,7 +313,9 @@ async def trigger_comparison_report(
 
 
 @comparison_router.get("/{dataset_id}/report/status", response_model=ReportJobResponse)
+@service_token_scope(SCOPE_REPORTS_EDITORIAL, template="editorial")
 async def comparison_report_status(
+    request: Request,
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
@@ -306,6 +330,7 @@ async def comparison_report_status(
     )
     if template:
         stmt = stmt.where(ReportJob.template == template)
+    stmt = _visible_to(stmt, service_token_id(request))
     stmt = stmt.order_by(desc(ReportJob.created_at)).limit(1)
     job = (await db.execute(stmt)).scalar_one_or_none()
     if not job:
@@ -324,7 +349,9 @@ async def comparison_report_status(
 
 
 @comparison_router.get("/{dataset_id}/report/download")
+@service_token_scope(SCOPE_REPORTS_EDITORIAL, template="editorial")
 async def download_comparison_report(
+    request: Request,
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
@@ -340,6 +367,7 @@ async def download_comparison_report(
     )
     if template:
         stmt = stmt.where(ReportJob.template == template)
+    stmt = _visible_to(stmt, service_token_id(request))
     stmt = stmt.order_by(desc(ReportJob.created_at)).limit(1)
     job = (await db.execute(stmt)).scalar_one_or_none()
     if not job or not job.pdf_path:

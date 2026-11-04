@@ -27,6 +27,8 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.api.deps import get_current_user, get_db
 from app.api.deps.license import require_active_license
+from app.api.deps.service_token import service_token_scope
+from app.core.service_tokens import SCOPE_DATASETS_UPLOAD
 from app.api.deps.subscription import (
     get_or_create_user,
     require_admin,
@@ -90,6 +92,7 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 
 @router.post("/upload", response_model=DatasetUploadResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_active_license)])
+@service_token_scope(SCOPE_DATASETS_UPLOAD)
 async def upload_dataset(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
@@ -327,6 +330,7 @@ async def import_from_geo(
 
 
 @router.get("/{dataset_id}", response_model=DatasetResponse)
+@service_token_scope(SCOPE_DATASETS_UPLOAD)  # the uploader polls its dataset's status
 async def get_dataset(
     dataset_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],

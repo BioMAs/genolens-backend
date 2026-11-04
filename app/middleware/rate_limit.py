@@ -9,6 +9,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from app.models.models import SubscriptionPlan
 from app.core.config import settings
+from app.core.service_tokens import is_service_token
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,9 @@ def get_user_identifier(request: Request) -> str:
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header.replace("Bearer ", "")
+            if is_service_token(token):
+                # Never parsed as a JWT, never used (even partly) as a limiter key: by address.
+                return f"ip:{get_remote_address(request)}"
             # Extract user ID from token using JWT decode (simple extraction without full validation)
             try:
                 import jwt

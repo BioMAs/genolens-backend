@@ -246,7 +246,9 @@
 <div class="page" data-kind="science">
   <div class="kicker">Scientific results · IV</div>
   <h2>{% if p.heatmap %}Top genes across conditions{% else %}Interpretation{% endif %}</h2>
-  {%- if p.heatmap %}
+  {%- if p.heatmap and not p.ai %}
+  <div style="max-width:120mm">{% set ns.fig = ns.fig + 1 %}<div class="figure">{{ p.heatmap }}</div><p class="cap">Fig. {{ ns.fig }} — Expression of the most significant up- and down-regulated genes (log<sub>2</sub> VST, centred on the control mean).</p></div>
+  {%- elif p.heatmap %}
   <div style="display:grid;grid-template-columns:1fr 1.1fr;gap:8mm">
     <div>{% set ns.fig = ns.fig + 1 %}<div class="figure">{{ p.heatmap }}</div><p class="cap">Fig. {{ ns.fig }} — Expression of the most significant up- and down-regulated genes (log<sub>2</sub> VST, centred on the control mean).</p></div>
     {{ ai_box(p) }}

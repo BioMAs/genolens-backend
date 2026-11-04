@@ -1,7 +1,7 @@
 from uuid import UUID
 from datetime import datetime
 from typing import Literal, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from app.models.report_job import ReportJobStatus
 
 # Comparison report formats: the branded LaTeX report, or the OmicSkin editorial PDF.
@@ -15,6 +15,7 @@ class ReportJobResponse(BaseModel):
     dataset_id: Optional[UUID] = None
     comparison_name: Optional[str] = None
     template: str = "latex"
+    use_ai: bool = True
     celery_task_id: Optional[str]
     status: ReportJobStatus
     pdf_path: Optional[str]
@@ -24,6 +25,12 @@ class ReportJobResponse(BaseModel):
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("use_ai", mode="before")
+    @classmethod
+    def _unset_use_ai_is_the_default(cls, value):
+        # A job not yet flushed has no column default applied: it is the default, True.
+        return True if value is None else value
 
 
 class ReportTriggerResponse(BaseModel):
@@ -62,12 +69,16 @@ LAST_PAGE_TYPES = ("color", "contact")
 
 class ComparisonReportTriggerRequest(BaseModel):
     """Optional per-report customization (requires the report customization
-    module to be applied; ignored otherwise)."""
+    module to be applied; ignored otherwise).
+
+    `use_ai` is read for every caller: False gives a report without any AI text (no LLM
+    call, no stored interpretation read, no AI label)."""
     conclusion: Optional[str] = None
     materials_methods: Optional[str] = None
     first_page_type: Optional[str] = None
     last_page_type: Optional[str] = None
     cover_info: Optional[CoverInfo] = None
+    use_ai: bool = True
 
 
 class ReportDownloadResponse(BaseModel):

@@ -1,7 +1,7 @@
 import enum
 from uuid import UUID, uuid4
 from typing import Optional
-from sqlalchemy import String, ForeignKey, Text, Enum as SQLEnum, Index, JSON
+from sqlalchemy import Boolean, String, ForeignKey, Text, Enum as SQLEnum, Index, JSON, true
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -47,6 +47,13 @@ class ReportJob(Base, TimestampMixin):
     template: Mapped[str] = mapped_column(
         String(16), nullable=False, default="latex", server_default="latex"
     )
+    # False: the report carries no AI text — no LLM call, no stored interpretation read.
+    use_ai: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
+    )
+    # The service token the job was requested through (None: a user). Such a job is rendered
+    # without the owner's saved branding and cover data. No foreign key, like `requested_by`.
+    service_token_id: Mapped[Optional[UUID]] = mapped_column(nullable=True)
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[ReportJobStatus] = mapped_column(
         SQLEnum(ReportJobStatus, name="report_job_status"),

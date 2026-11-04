@@ -2,9 +2,12 @@
 API dependencies for authentication and database sessions.
 """
 from typing import Annotated
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps.service_token import resolve_service_token
+from app.core.service_tokens import is_service_token
 from app.core.supabase_auth import verify_supabase_token, SupabaseUser
 
 # Re-exported, never redefined: a second get_db would give each request two
@@ -17,12 +20,18 @@ security = HTTPBearer()
 
 
 async def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)]
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ) -> SupabaseUser:
     """
     Dependency to get the current authenticated user from Supabase JWT.
     
     Validates the JWT token and extracts user information including role and subscription.
+
+    A service token (`glst_…`) is never parsed as a JWT: it stands for its owner, and only on
+    the routes its scopes open (`app.api.deps.service_token`; 401 if invalid or revoked, 403
+    elsewhere). `db` is the request's own session (`get_db` is cached per request).
     
     Args:
         credentials: HTTP Bearer credentials containing JWT token
@@ -34,6 +43,17 @@ async def get_current_user(
         HTTPException: 401 Unauthorized if token is invalid
     """
     token = credentials.credentials
+    if is_service_token(token):
+        principal = await resolve_service_token(request, token, db)
+        owner = principal.owner
+        return SupabaseUser(
+            user_id=owner.id,
+            email=owner.email,
+            role=owner.role,
+            subscription_tier=owner.subscription_plan,
+            service_token_id=principal.token_id,
+        )
+
     user = await verify_supabase_token(token)
     
     if not user:

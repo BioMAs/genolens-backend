@@ -410,6 +410,8 @@ class EditorialInputs:
     app_version: str = ""
     generated_at: datetime = field(default_factory=datetime.utcnow)
     demo_watermark: bool = False
+    # False: a report without AI — no AI text, box, notice or label is printed.
+    use_ai: bool = True
     illustrative: bool = False
     dose_series: Optional[list[tuple[str, dict]]] = None
 
@@ -568,7 +570,7 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
     )
     rows.append(("OmicSkin score", "100 × coherence × min(1, best sub-group −log10 p / 8)"))
     models = [m for m in (inp.comparison_ai_model, inp.nova_ai_model) if m]
-    if models:
+    if models and inp.use_ai:
         rows.append(("Interpretation model", ", ".join(dict.fromkeys(models))))
     rows.append(("Report generated", inp.generated_at.strftime("%d %B %Y, %H:%M UTC")))
     return rows
@@ -803,7 +805,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     )
 
     # 3. nova (+ optional AI reading page)
-    nova_text = (inp.nova_ai or "").strip()
+    nova_text = (inp.nova_ai or "").strip() if inp.use_ai else ""
     nova_inline = bool(nova_text) and len(nova_text) <= NOVA_READING_INLINE_CHARS
     pages.append(
         {
@@ -988,9 +990,12 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             }
         )
 
-    cmp_text = (inp.comparison_ai or "").strip()
+    cmp_text = (inp.comparison_ai or "").strip() if inp.use_ai else ""
     english = looks_english(cmp_text) if cmp_text else False
-    if figures.get("heatmap") or cmp_text:
+    if figures.get("heatmap") and not inp.use_ai:
+        # The heatmap alone: a report without AI has no interpretation box, not even empty.
+        pages.append({"kind": "science_heatmap", "heatmap": figures["heatmap"], "ai": False})
+    elif figures.get("heatmap") or cmp_text:
         wide = not figures.get("heatmap")
         capped, truncated = cap_text(
             cmp_text, COMPARISON_AI_WIDE_CHARS if wide else COMPARISON_AI_CHARS
@@ -1005,6 +1010,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             {
                 "kind": "science_heatmap",
                 "heatmap": figures.get("heatmap"),
+                "ai": True,
                 "ai_html": md_to_html(capped) if english else None,
                 "ai_notice": notice,
                 "ai_label": reviewer_label,
@@ -1037,6 +1043,8 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             "scope": (
                 "All AI-generated texts in this report are labelled as such and state whether "
                 "they were reviewed. " + SCOPE
+                if inp.use_ai
+                else SCOPE
             ),
             "versions": _versions(inp, inp.referential_version),
             "signoff": [
@@ -1085,8 +1093,12 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
         (
             "Where the evidence comes from.",
             f"Pages {first_science_page}–{last_science_page} give the scientific results: "
-            f"study design, differential expression, functional enrichment and the AI "
-            f"interpretation, labelled with its review status.",
+            + (
+                "study design, differential expression, functional enrichment and the AI "
+                "interpretation, labelled with its review status."
+                if inp.use_ai
+                else "study design, differential expression and functional enrichment."
+            ),
         )
     )
     guide.append(

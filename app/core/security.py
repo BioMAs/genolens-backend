@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.core.service_tokens import is_service_token
 from app.models.models import UserRole, SubscriptionPlan
 
 
@@ -83,6 +84,13 @@ def verify_token(token: str) -> TokenPayload:
     Raises:
         HTTPException: If token is invalid or expired
     """
+    if is_service_token(token):
+        # Never a JWT: a service token is resolved by app.api.deps.service_token.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     try:
         # Use raw secret string as verified by debug script
         # print(f"DEBUG: Verifying token: {token[:10]}...")

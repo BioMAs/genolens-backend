@@ -486,11 +486,13 @@ class ReportLatexService:
     async def collect_comparison_data(self, db: AsyncSession, dataset_id: UUID,
                                       comparison_name: str, work_dir: str,
                                       generate_ai: bool = False,
-                                      make_figures: bool = True) -> dict[str, Any]:
+                                      make_figures: bool = True,
+                                      include_ai: bool = True) -> dict[str, Any]:
         """Data of one comparison report.
 
         make_figures=False (editorial report) skips the LaTeX PDF figures and returns the raw
         expression data instead, under "expression" (see `_expression_data`).
+        include_ai=False reads no stored AI interpretation and generates none.
         """
         deg_ds = await db.get(Dataset, dataset_id)
         if not deg_ds:
@@ -521,7 +523,7 @@ class ReportLatexService:
 
         comp = await self._build_comparison(db, deg_ds, enr_datasets, comp_conditions,
                                             work_dir, generate_ai, comparison_name=comparison_name,
-                                            make_figures=make_figures)
+                                            make_figures=make_figures, include_ai=include_ai)
 
         return {
             "project": project,
@@ -560,7 +562,7 @@ class ReportLatexService:
 
     async def _build_comparison(self, db, deg_ds, enr_datasets, comp_conditions,
                                 work_dir, generate_ai, comparison_name: Optional[str] = None,
-                                make_figures: bool = True) -> dict:
+                                make_figures: bool = True, include_ai: bool = True) -> dict:
         meta = deg_ds.dataset_metadata if isinstance(deg_ds.dataset_metadata, dict) else {}
         comp_name = comparison_name or meta.get("comparison_name") or deg_ds.name
         safe_id = re.sub(r"[^a-zA-Z0-9]+", "-", comp_name).strip("-")
@@ -614,7 +616,9 @@ class ReportLatexService:
                 if await asyncio.to_thread(_plot_enrichment_dotplot, enr_down, os.path.join(work_dir, f)):
                     comp["dotplot_down_fig"] = f
 
-        # AI interpretation (existing, or generate)
+        # AI interpretation (existing, or generate); none at all without include_ai
+        if not include_ai:
+            return comp
         ai = await db.scalar(
             select(AIInterpretation).where(
                 AIInterpretation.dataset_id == deg_ds.id,
@@ -958,10 +962,12 @@ class ReportLatexService:
                                     last_page_type: Optional[str] = None,
                                     cover_info: Optional[dict] = None,
                                     generate_ai: bool = False,
-                                    demo_watermark: bool = False) -> bytes:
+                                    demo_watermark: bool = False,
+                                    use_ai: bool = True) -> bytes:
         with tempfile.TemporaryDirectory(prefix="report_") as work_dir:
             data = await self.collect_comparison_data(
-                db, dataset_id, comparison_name, work_dir, generate_ai
+                db, dataset_id, comparison_name, work_dir, generate_ai and use_ai,
+                include_ai=use_ai,
             )
             data["demo_watermark"] = demo_watermark
             branding = await self._load_branding(db, requested_by, work_dir)

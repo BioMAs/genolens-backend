@@ -10,7 +10,9 @@ from datetime import datetime, timedelta, timezone
 
 from app.api.deps import get_db, get_current_user
 from app.api.deps.license import require_active_license
+from app.api.deps.service_token import service_token_scope
 from app.api.deps.subscription import get_or_create_user
+from app.core.service_tokens import SCOPE_PROJECTS_CREATE
 from app.core.supabase_auth import SupabaseUser, lookup_user_by_email
 from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, User
 from app.api.deps.project_access import is_project_admin
@@ -40,6 +42,7 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 
 
 @router.post("/", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_active_license)])
+@service_token_scope(SCOPE_PROJECTS_CREATE)
 async def create_project(
     project_in: ProjectCreate,
     db: Annotated[AsyncSession, Depends(get_db)],
