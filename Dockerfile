@@ -49,6 +49,12 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 # ================================
 FROM base as worker
 
+# Headless Chromium for the OmicSkin editorial PDF report (Playwright). The editorial
+# report task runs on this worker's "default" queue; --with-deps installs the browser's
+# system libraries, and a fixed browsers path keeps it independent of the running user.
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install --with-deps chromium
+
 # Run Celery worker
 CMD ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=info", "-Q", "default,data_processing"]
 

@@ -31,7 +31,21 @@ async def get_or_create_user(
     current_user: Annotated[SupabaseUser, Depends(get_current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
-    """Get or create User profile from Supabase auth. Defaults to STARTER plan."""
+    """Get or create User profile from Supabase auth. Defaults to STARTER plan.
+
+    For a service token, the token's owner as stored: a token never creates an account, nor
+    syncs its role or activates it, so every gate below sees the owner unchanged.
+    """
+    if current_user.service_token_id is not None:
+        owner = await db.get(User, current_user.user_id)  # loaded by the token's resolution
+        if owner is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or revoked service token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return owner
+
     query = select(User).where(User.id == current_user.user_id)
     result = await db.execute(query)
     user = result.scalar_one_or_none()

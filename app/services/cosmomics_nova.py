@@ -63,6 +63,10 @@ P_FLOOR = 1e-300
 _P_CEIL = 1.0 - 1e-15
 
 DEFAULT_ALPHA = 0.05
+# `cosmetic_interpretations` holds one row per comparison, shared with the legacy Skin claims
+# narrative. The nova's rows carry this prefix in `model`, so a legacy text is never served as
+# a nova interpretation.
+NOVA_MODEL_TAG = "cosmomics-nova:"
 # The "not linked" sector is a fixed 36° slice: beyond a dozen sub-groups it turns into a smear.
 # The payload keeps the strongest ones and the total count.
 UNLINKED_LIMIT = 12
@@ -103,6 +107,10 @@ class TermHit:
     p: float
     obs: Direction
     category: Optional[str] = None
+    gene_count: Optional[int] = None
+    # Genes of the enriched list that hit the term (EnrichmentPathway.genes); feeds the report's
+    # "key genes" chips, never the nova statistics.
+    genes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -123,6 +131,8 @@ class ClaimSubgroupMap:
     rows: list[SubgroupTerm]
     by_id: dict[str, list[SubgroupTerm]] = field(default_factory=dict)
     by_label: dict[str, list[SubgroupTerm]] = field(default_factory=dict)
+    # `version` of claim_subgroups.yaml — the only part of the referential a deliverable may print.
+    version: Optional[str] = None
 
     def __post_init__(self) -> None:
         seen: set[tuple[Optional[str], str]] = set()
@@ -184,7 +194,8 @@ def load_claim_subgroups(path: Path | str = CLAIM_SUBGROUPS_PATH) -> ClaimSubgro
                 expected=direction if claim is not None else None,  # type: ignore[arg-type]
             )
         )
-    return ClaimSubgroupMap(rows)
+    version = doc.get("version")
+    return ClaimSubgroupMap(rows, version=str(version) if version is not None else None)
 
 
 @lru_cache(maxsize=1)
@@ -462,6 +473,8 @@ async def fetch_term_hits(
             EnrichmentPathway.padj,
             EnrichmentPathway.regulation,
             EnrichmentPathway.comparison_name,
+            EnrichmentPathway.gene_count,
+            EnrichmentPathway.genes,
         ).where(
             EnrichmentPathway.dataset_id == source_id,
             EnrichmentPathway.comparison_name.in_(names),
@@ -480,6 +493,47 @@ async def fetch_term_hits(
                 p=float(p) if p is not None else 1.0,
                 obs=obs,
                 category=row.category,
+                gene_count=row.gene_count,
+                genes=tuple(str(g) for g in (row.genes or []) if g),
             )
         )
     return hits
+
+
+def nova_from_hits(
+    hits: Iterable[TermHit], comparison_name: str, alpha: float = DEFAULT_ALPHA
+) -> dict[str, Any]:
+    """The nova of one comparison from its enriched terms, joined to the default referential.
+
+    Shared by the `cosmomics-nova` endpoints and the OmicSkin editorial report.
+    """
+    return build_nova(
+        hits,
+        default_claim_subgroups(),
+        alpha=alpha,
+        contrast=comparison_name,
+        condition=condition_label(comparison_name),
+    )
+
+
+async def compute_nova(
+    db: AsyncSession, dataset: Dataset, comparison_name: str, alpha: float = DEFAULT_ALPHA
+) -> tuple[dict[str, Any], list[TermHit]]:
+    """The nova of one comparison as served by the API, plus the enriched terms behind it."""
+    hits = await fetch_term_hits(db, dataset, comparison_name)
+    return nova_from_hits(hits, comparison_name, alpha), hits
+
+
+def term_gene_map(hits: Iterable[TermHit], mapping: ClaimSubgroupMap) -> dict[str, set[str]]:
+    """Genes per referential term (normalised id), joined exactly as `build_nova` joins terms.
+
+    Keys match `normalize_pathway_id(term["id"])` for the terms of the nova payload, so a
+    report can list the genes behind a claim without re-reading the referential.
+    """
+    genes: dict[str, set[str]] = defaultdict(set)
+    for hit in hits:
+        if not hit.genes:
+            continue
+        for row in mapping.lookup(hit):
+            genes[normalize_pathway_id(row.term_id)].update(hit.genes)
+    return dict(genes)

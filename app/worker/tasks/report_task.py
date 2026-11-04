@@ -1,8 +1,9 @@
 """
-Celery task: generate the branded SciLicium LaTeX PDF report for one analysis.
+Celery tasks: generate the comparison / analysis PDF reports.
 
-Runs on the `r_analysis` queue (the r-worker), where the LaTeX toolchain
-(pdflatex/texlive + ghostscript) is installed.
+LaTeX reports run on the `r_analysis` queue (the r-worker), where the LaTeX toolchain
+(pdflatex/texlive + ghostscript) is installed. The OmicSkin editorial report runs on the
+`default` queue (the worker), where headless Chromium is installed.
 """
 import asyncio
 import logging
@@ -98,18 +99,12 @@ async def _async_generate(task, job_id: str, analysis_id: str) -> dict:
             return {"status": "failed", "error": str(exc)}
 
 
-@celery_app.task(
-    bind=True,
-    name="app.worker.tasks.report_task.generate_comparison_report",
-    queue="r_analysis",
-    max_retries=1,
-    default_retry_delay=30,
-)
-def generate_comparison_report(self, job_id: str) -> dict:
-    return _run_async(_async_generate_comparison(self, job_id))
+async def _run_comparison_job(job_id: str, render) -> dict:
+    """Lifecycle shared by both comparison report formats.
 
-
-async def _async_generate_comparison(task, job_id: str) -> dict:
+    PENDING → RUNNING → `await render(db, job)` (PDF bytes) → stored under
+    reports/comparisons/{dataset}/{job}.pdf → DONE; any error marks the job FAILED.
+    """
     from app.models.report_job import ReportJob, ReportJobStatus
 
     async with _fresh_session() as db:
@@ -121,23 +116,9 @@ async def _async_generate_comparison(task, job_id: str) -> dict:
         await db.commit()
 
         try:
-            from app.services.report_latex_service import report_latex_service
             from app.services.storage import storage_service
 
-            pdf_bytes = await report_latex_service.render_comparison_pdf(
-                db,
-                job.dataset_id,
-                job.comparison_name,
-                requested_by=job.requested_by,
-                conclusion=job.conclusion,
-                materials_methods=job.materials_methods,
-                first_page_type=job.first_page_type,
-                last_page_type=job.last_page_type,
-                cover_info=job.cover_info,
-                demo_watermark=await report_latex_service.is_demo_requester(
-                    db, job.requested_by
-                ),
-            )
+            pdf_bytes = await render(db, job)
 
             pdf_path = f"reports/comparisons/{job.dataset_id}/{job_id}.pdf"
             await storage_service.upload_file(pdf_path, pdf_bytes, "application/pdf")
@@ -153,3 +134,67 @@ async def _async_generate_comparison(task, job_id: str) -> dict:
             job.error_message = str(exc)[:2000]
             await db.commit()
             return {"status": "failed", "error": str(exc)}
+
+
+@celery_app.task(
+    bind=True,
+    name="app.worker.tasks.report_task.generate_comparison_report",
+    queue="r_analysis",
+    max_retries=1,
+    default_retry_delay=30,
+)
+def generate_comparison_report(self, job_id: str) -> dict:
+    return _run_async(_async_generate_comparison(self, job_id))
+
+
+async def _render_latex(db, job) -> bytes:
+    from app.services.report_latex_service import report_latex_service
+
+    return await report_latex_service.render_comparison_pdf(
+        db,
+        job.dataset_id,
+        job.comparison_name,
+        requested_by=job.requested_by,
+        conclusion=job.conclusion,
+        materials_methods=job.materials_methods,
+        first_page_type=job.first_page_type,
+        last_page_type=job.last_page_type,
+        cover_info=job.cover_info,
+        demo_watermark=await report_latex_service.is_demo_requester(db, job.requested_by),
+        use_ai=job.use_ai,
+    )
+
+
+async def _async_generate_comparison(task, job_id: str) -> dict:
+    return await _run_comparison_job(job_id, _render_latex)
+
+
+# OmicSkin editorial report: HTML rendered by headless Chromium, installed in the `worker`
+# image — hence the "default" queue (no LaTeX, no R needed).
+@celery_app.task(
+    bind=True,
+    name="app.worker.tasks.report_task.generate_comparison_report_editorial",
+    queue="default",
+    max_retries=1,
+    default_retry_delay=30,
+)
+def generate_comparison_report_editorial(self, job_id: str) -> dict:
+    return _run_async(_run_comparison_job(job_id, _render_editorial))
+
+
+async def _render_editorial(db, job) -> bytes:
+    from app.services.report_editorial_service import report_editorial_service
+    from app.services.report_latex_service import report_latex_service
+
+    return await report_editorial_service.render_comparison_pdf(
+        db,
+        job.dataset_id,
+        job.comparison_name,
+        requested_by=job.requested_by,
+        cover_info=job.cover_info,
+        demo_watermark=await report_latex_service.is_demo_requester(db, job.requested_by),
+        use_ai=job.use_ai,
+        # Requested through a service token: never the owner's saved branding (the PDF
+        # goes to the pipeline's client, not to the internal account's own reports).
+        use_branding=job.service_token_id is None,
+    )

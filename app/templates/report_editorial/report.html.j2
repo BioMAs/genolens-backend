@@ -1,0 +1,283 @@
+{#- OmicSkin editorial report (variant D). Structure: docs/omicskin-report-editorial/build_D.py.
+    Context: app.services.report_editorial_content.build_editorial_context. -#}
+{%- set C = colors -%}
+{%- set ns = namespace(fig=0) -%}
+
+{%- macro foot(p) -%}
+<div class="foot"><span>{{ footer }}</span><span>{{ '%02d' % p.n }} / {{ total }}</span></div>
+{%- if demo_watermark %}<div class="watermark"><span>DEMO</span></div>{% endif -%}
+{%- endmacro -%}
+
+{%- macro terms_table(c, font=8.3) -%}
+<table class="tight" style="font-size:{{ font }}pt">
+  <tr><th>Sub-group</th><th>Term</th><th>ID</th><th class="num">−log10 p</th><th style="text-align:center">Obs.</th><th>Evidence</th></tr>
+  {%- for t in c.terms %}
+  <tr>
+    <td style="color:{{ C.grey }}">{{ t.subgroup }}</td>
+    <td>{{ t.label }}</td>
+    <td style="color:{{ C.grey }};font-size:{{ font - 0.8 }}pt">{{ t.id }}</td>
+    <td class="num">{{ '%.1f' % t.nl }}</td>
+    <td style="text-align:center;color:{{ C.green if t.up else C.blue }};font-weight:700">{{ '↑' if t.up else '↓' }}</td>
+    <td><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{{ C.green if t.pro else C.coral }};margin-right:2mm"></span>{{ 'for' if t.pro else 'against' }}</td>
+  </tr>
+  {%- endfor %}
+</table>
+{%- if c.terms_truncated %}<p class="cap" style="margin-top:1mm">Showing the first {{ c.terms|length }} of {{ c.n_terms }} terms (sub-groups in decreasing significance); the complete table is available in GenoLens.</p>{% endif -%}
+{%- endmacro -%}
+
+{%- macro claim_page(p) -%}
+{%- set c = p.claim -%}
+<div class="page" data-claim="{{ c.name }}" data-kind="claim" style="padding-left:24mm">
+  <div class="side" style="background:{{ c.color }}"><span>{{ c.name|upper }}</span></div>
+  <div style="display:flex;gap:8mm;align-items:center">
+    <div style="text-align:center">{{ c.ring }}<div style="font-size:8pt;letter-spacing:.14em;text-transform:uppercase;font-weight:600;color:{{ c.text_color }};margin-top:-2mm">{{ c.band_label }}</div></div>
+    <div style="flex:1">
+      <div class="kicker" style="color:{{ c.text_color }}">{{ c.kicker }}</div>
+      <p class="lede" style="margin:3mm 0 0 0;font-size:14.5pt">{{ c.statement }}</p>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8mm;margin-top:6mm">
+    <div class="card"><h3>Pathway sub-groups · {{ c.n_for }} for · {{ c.n_against }} against · coherence {{ c.coherence }} %</h3>
+      {{ c.bars }}
+      <p class="cap">Bar: significance of the sub-group (−log<sub>10</sub> p, Stouffer). Colour: balance of the evidence, green = for the claim, coral = against. Greyed names: sub-groups whose evidence goes against the claim.{% if c.n_subgroups > 9 %} The 9 most significant of {{ c.n_subgroups }} sub-groups are shown.{% endif %}</p></div>
+    <div class="card"><h3>Key genes · log<sub>2</sub> FC</h3>
+      {%- if c.genes %}<div style="margin-top:2mm">{{ c.genes }}</div>
+      {%- else %}<p class="empty">No differentially expressed gene is annotated to the supporting terms.</p>{% endif %}
+      {%- if c.dose %}
+      <h3 style="margin-top:6mm">Dose progression · OmicSkin score</h3>
+      {{ c.dose }}
+      <p class="cap">{{ c.dose_caption }}</p>
+      {%- endif %}</div>
+  </div>
+  <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:6mm;margin-top:5mm">
+    <div class="card"><h3>Strongest sub-group</h3><div style="font-size:9pt"><b>{{ c.best }}</b><br>p = {{ c.best_p }}</div></div>
+    <div class="card"><h3>Evidence</h3><div style="font-size:9pt">{{ c.n_subgroups }} sub-groups · {{ c.n_terms }} terms<br>coherence {{ c.coherence }} %</div></div>
+    <div class="card"><h3>Scientific review</h3><p class="sig{% if c.review.startswith('Not') %} pending{% endif %}" style="margin:0;font-size:8pt">{{ c.review }}</p></div>
+  </div>
+  <div class="card" style="margin-top:5mm"><h3>Ontology terms behind the score · {{ c.n_terms }} terms in {{ c.n_subgroups }} sub-groups</h3>{{ terms_table(c) }}</div>
+  {{ foot(p) }}
+</div>
+{%- endmacro -%}
+
+{%- macro half(c) -%}
+<div data-claim="{{ c.name }}" data-kind="reservation" style="border-top:4px solid {{ c.color }};padding-top:4mm">
+  <div style="display:flex;gap:6mm;align-items:center">
+    <div style="text-align:center">{{ c.ring }}<div style="font-size:7.5pt;letter-spacing:.12em;text-transform:uppercase;font-weight:600;color:{{ c.text_color }};margin-top:-1.5mm">{{ c.band_label }}</div></div>
+    <div><div class="kicker" style="color:{{ c.text_color }}">{{ c.kicker }}</div><p class="lede" style="margin:2mm 0 0 0;font-size:12pt">{{ c.statement }}</p></div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6mm;margin-top:5mm">
+    <div>{{ c.bars }}</div>
+    <div>
+      {%- if c.genes %}{{ c.genes }}{% else %}<p class="empty" style="margin:0">No differentially expressed gene is annotated to the supporting terms.</p>{% endif %}
+      {%- if c.dose %}<div style="margin-top:3mm">{{ c.dose }}</div>{% endif %}
+      <p class="cap">Strongest sub-group: <b>{{ c.best }}</b> (p = {{ c.best_p }}) · coherence {{ c.coherence }} %</p>
+    </div>
+  </div>
+</div>
+{%- endmacro -%}
+
+{%- macro ai_box(p) -%}
+<div class="ai">
+  <h3>{{ p.ai_label if p.ai_html else 'AI interpretation' }}</h3>
+  {%- if p.ai_html %}{{ p.ai_html }}{% if p.truncated %}<p class="cap">Shortened to fit the page; the full text is available in GenoLens.</p>{% endif %}
+  {%- else %}<p class="notice">{{ p.ai_notice }}</p>{% endif %}
+</div>
+{%- endmacro -%}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ title }}</title>
+<style>{% include "report.css.j2" %}</style>
+</head>
+<body>
+{%- for p in pages %}
+
+{%- if p.kind == 'cover' %}
+<div class="page" data-kind="cover" style="background:{{ C.navy }};color:white;padding:0">
+  <div style="position:absolute;right:-66mm;top:78mm;width:205mm;opacity:.95">{{ p.nova }}</div>
+  <div style="position:absolute;left:16mm;top:16mm;display:flex;align-items:center;gap:4mm">
+    {%- if logo %}<img src="{{ logo }}" alt="" style="height:7mm;filter:brightness(0) invert(1)">{% endif %}
+    <span style="font-size:8.5pt;letter-spacing:.2em;text-transform:uppercase;color:#B8C4D0">OmicSkin PLUS · Transcriptomic proof of efficacy</span></div>
+  <div style="position:absolute;left:16mm;top:48mm;width:100mm">
+    <div class="kicker" style="color:#42E2BA">Claim substantiation dossier</div>
+    <h1 style="font-size:{{ p.title_size }}pt;margin-top:4mm;color:white;overflow-wrap:anywhere">{{ p.title }}</h1>
+    <h1 style="font-size:20pt;font-weight:300;color:#DCE6EF;margin-top:3mm">{% for line in p.subtitle %}{{ line }}{% if not loop.last %}<br>{% endif %}{% endfor %}</h1>
+  </div>
+  <div style="position:absolute;left:16mm;bottom:34mm;display:grid;grid-template-columns:1fr;gap:1.5mm">
+    {%- for s in p.strip %}
+    <div style="display:flex;align-items:baseline;gap:3mm"><span style="font-family:'Inter Display';font-weight:700;font-size:26pt;color:{{ s.color }};letter-spacing:-.03em">{{ s.score }}</span><span style="font-size:9pt;color:#B8C4D0;letter-spacing:.1em;text-transform:uppercase">{{ s.name }}</span></div>
+    {%- endfor %}
+  </div>
+  <div style="position:absolute;left:16mm;right:16mm;bottom:14mm;display:flex;justify-content:space-between;gap:6mm;font-size:8pt;color:#8A98A8;letter-spacing:.08em;text-transform:uppercase;border-top:1px solid #243746;padding-top:3mm">
+    <span>{{ p.footer_left }}</span><span style="text-align:right">{{ p.footer_right }}</span></div>
+  {%- if demo_watermark %}<div class="watermark"><span>DEMO</span></div>{% endif %}
+</div>
+
+{%- elif p.kind == 'verdict' %}
+<div class="page" data-kind="verdict">
+  <div class="kicker">The verdict</div>
+  <h2 style="font-size:28pt;margin-top:3mm">{{ p.headline }}</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10mm;margin-top:8mm">
+    <div>
+      <p class="lede" style="margin:0 0 6mm 0;font-size:15pt">{{ p.lede }}</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:7mm 6mm;margin-top:8mm">
+        {%- for s in p.stats %}
+        <div class="stat"{% if s.color %} style="color:{{ s.color }}"{% endif %}>{{ s.value }}<small>{{ s.label }}</small></div>
+        {%- endfor %}
+      </div>
+    </div>
+    <div>
+      <h3>{{ p.ladder_title }}</h3>
+      {%- for r in p.ladder %}
+      {%- if r.scored %}
+      <div style="display:grid;grid-template-columns:34mm 1fr 30mm;align-items:center;gap:3mm;padding:2.2mm 0;border-bottom:1px solid {{ C.line }}"><span style="font-weight:600">{{ r.name }}</span><div style="height:7px;background:#EEF2F5;border-radius:4px"><div style="width:{{ r.score }}%;height:7px;border-radius:4px;background:{{ r.color }}"></div></div><span style="font-family:'Inter Display';font-weight:700;font-size:15pt;letter-spacing:-.02em;text-align:right">{{ r.score }}<span style="font-size:7.5pt;font-weight:500;color:{{ C.grey }};margin-left:2mm;letter-spacing:.05em">{{ r.band_short }}</span></span></div>
+      {%- else %}
+      <div style="display:grid;grid-template-columns:34mm 1fr 30mm;align-items:center;gap:3mm;padding:2.2mm 0;border-bottom:1px solid {{ C.line }};color:{{ C.grey }}"><span>{{ r.name }}</span><div style="height:7px;background:#EEF2F5;border-radius:4px"></div><span style="font-size:7.5pt;text-align:right;letter-spacing:.05em">NO EVIDENCE</span></div>
+      {%- endif %}
+      {%- endfor %}
+      <p class="cap">{{ p.caption }}</p>
+    </div>
+  </div>
+  <div style="position:absolute;left:16mm;right:16mm;bottom:22mm;display:grid;grid-template-columns:repeat({{ p.guide|length }}, 1fr);gap:6mm;font-size:9pt;border-top:1.5px solid {{ C.ink }};padding-top:4mm">
+    {%- for title, text in p.guide %}<div><b>{{ title }}</b> {{ text }}</div>{% endfor %}
+  </div>
+  {{ foot(p) }}
+</div>
+
+{%- elif p.kind == 'nova' %}
+<div class="page" data-kind="nova">
+  <div class="kicker">CosmOmics Pathway Nova</div>
+  <h2 style="font-size:26pt;margin-top:2mm">Every pathway behind every claim, in one picture.</h2>
+  <div style="margin:2mm -6mm 0 -6mm">{{ p.svg }}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6mm;font-size:8.8pt;margin-top:2mm">
+    <div><b>One sector per claim.</b> Its width is the importance of the evidence (sum of −log<sub>10</sub> p of all its terms); the hatched part is the share of evidence that goes against the claim.</div>
+    <div><b>One bubble per pathway sub-group.</b> Further from the centre = more significant (Stouffer-combined p). Green = terms for the claim, coral = against; small dots are the individual ontology terms.</div>
+    <div><b>Grey sector.</b> {% if p.unlinked_total %}{{ p.unlinked_total }} significant pathway sub-group{{ 's' if p.unlinked_total != 1 }} linked to no claim — reported for completeness, not scored.{% else %}Significant pathways linked to no claim would appear here; none in this comparison.{% endif %} Claim referential{% if p.version %} v{{ p.version }}{% endif %}, undisclosed.</div>
+  </div>
+  {%- if p.ai_html %}<div style="margin-top:5mm">{{ ai_box(p) }}</div>{% endif %}
+  {{ foot(p) }}
+</div>
+
+{%- elif p.kind == 'nova_reading' %}
+<div class="page" data-kind="nova_reading">
+  <div class="kicker">CosmOmics Pathway Nova · AI reading</div>
+  <h2>What the nova says, claim by claim</h2>
+  {{ ai_box(p) }}
+  {{ foot(p) }}
+</div>
+
+{%- elif p.kind == 'claim' %}
+{{ claim_page(p) }}
+
+{%- elif p.kind == 'reservations' %}
+<div class="page" data-kind="reservations">
+  <div class="kicker">{{ p.kicker }}</div>
+  <h2 style="font-size:22pt">{{ p.headline }}</h2>
+  {%- if p.blocks %}<div style="display:grid;gap:9mm;margin-top:4mm">{% for c in p.blocks %}{{ half(c) }}{% endfor %}</div>{% endif %}
+  {%- if p.strip %}
+  <div style="margin-top:8mm;border-top:1.5px solid {{ C.ink }};padding-top:3mm;display:grid;grid-template-columns:1fr 1fr 1fr;gap:5mm 6mm;font-size:9pt">
+    {%- for s in p.strip %}<div data-claim="{{ s.name }}" data-kind="no-evidence"><div class="kicker">{{ s.name }}</div><div style="margin-top:1.5mm"><b>{{ s.title }}</b> {{ s.text }}</div></div>{% endfor %}
+  </div>
+  {%- endif %}
+  {{ foot(p) }}
+</div>
+
+{%- elif p.kind == 'science_design' %}
+<div class="page" data-kind="science">
+  <div class="kicker">Scientific results · I</div>
+  <h2>Study design and quality</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8mm">
+    <div><p style="margin-top:0">{{ p.design_text }}</p>
+      <p>{{ p.qc_sentence }}</p>
+      {%- if p.design_rows %}
+      <div class="card" style="margin-top:4mm"><h3>Design</h3><table><tr><th>Condition</th><th class="num">n</th><th class="num">DEGs up</th><th class="num">DEGs down</th></tr>
+      {%- for r in p.design_rows %}<tr><td>{{ r.condition }}</td><td class="num">{{ r.n if r.n else '—' }}</td><td class="num">{{ r.up }}</td><td class="num">{{ r.down }}</td></tr>{% endfor %}</table></div>
+      {%- endif %}
+    </div>
+    <div>
+      {%- if p.pca %}{% set ns.fig = ns.fig + 1 %}<div class="figure">{{ p.pca }}</div><p class="cap">Fig. {{ ns.fig }} — Principal component analysis of the {{ p.n_samples }} samples of the analysis (VST-normalised expression, all genes, scaled). Samples are coloured by condition.</p>
+      {%- else %}<p class="empty">No normalised expression matrix is stored with this comparison; the principal component analysis is not available.</p>{% endif %}
+    </div>
+  </div>
+  {{ foot(p) }}
+</div>
+
+{%- elif p.kind == 'science_deg' %}
+<div class="page" data-kind="science">
+  <div class="kicker">Scientific results · II</div>
+  <h2>{{ p.title }}</h2>
+  <div style="display:grid;grid-template-columns:1.05fr 1fr;gap:8mm">
+    <div>
+      {%- if p.volcano %}{% set ns.fig = ns.fig + 1 %}<div class="figure">{{ p.volcano }}</div><p class="cap">Fig. {{ ns.fig }} — Volcano plot. Each point is a gene: x = log<sub>2</sub> fold-change (test/control), y = −log<sub>10</sub> adjusted p-value. {{ p.n_up }} genes up, {{ p.n_down }} down.</p>{% endif %}
+      {%- if p.has_analysis %}<p style="font-size:9.5pt">DEGs were called with DESeq2; edgeR and limma-voom were run on the same counts to show how many methods support each call — they do not change the DEG list.</p>{% endif %}
+    </div>
+    <div><h3>Most significant differentially expressed genes</h3>
+      {%- if p.deg_rows %}<table><tr><th>Gene</th><th class="num">log<sub>2</sub> FC</th><th class="num">Adj. p</th></tr>
+      {%- for g in p.deg_rows %}<tr><td><i>{{ g.gene }}</i></td><td class="num" style="color:{{ C.green if g.lfc > 0 else C.blue }};font-weight:600">{{ '%+.2f' % g.lfc }}</td><td class="num">{{ g.padj }}</td></tr>{% endfor %}</table>
+      {%- else %}<p class="empty">No differentially expressed gene.</p>{% endif %}
+    </div>
+  </div>
+  {{ foot(p) }}
+</div>
+
+{%- elif p.kind == 'science_enrichment' %}
+<div class="page" data-kind="science">
+  <div class="kicker">Scientific results · III</div>
+  <h2>Functional enrichment</h2>
+  <p style="margin-top:0">Over-representation analysis of the up- and down-regulated genes (hypergeometric test, Benjamini–Hochberg adjusted p ≤ {{ p.fdr }}). Dot size = number of genes, colour = significance.</p>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6mm">
+    <div><h3 style="color:{{ C.green }}">Up-regulated genes</h3>{% if p.dot_up %}<div class="figure">{{ p.dot_up }}</div>{% else %}<p class="empty">No enriched term.</p>{% endif %}</div>
+    <div><h3 style="color:{{ C.blue }}">Down-regulated genes</h3>{% if p.dot_down %}<div class="figure">{{ p.dot_down }}</div>{% else %}<p class="empty">No enriched term.</p>{% endif %}</div>
+  </div>
+  {%- if p.dot_up or p.dot_down %}{% set ns.fig = ns.fig + 1 %}<p class="cap">Fig. {{ ns.fig }} — Enriched terms, most significant first.</p>{% endif %}
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6mm;margin-top:4mm;font-size:8.5pt;align-items:start">
+    {%- for rows, label in ((p.rows_up, 'Term (up)'), (p.rows_down, 'Term (down)')) %}
+    {%- if rows %}
+    <table><tr><th>{{ label }}</th><th>DB</th><th class="num">Genes</th><th class="num">Adj. p</th></tr>
+      {%- for r in rows %}<tr><td>{{ r.term }}</td><td>{{ r.db }}</td><td class="num">{{ r.genes if r.genes is not none else '—' }}</td><td class="num">{{ r.padj }}</td></tr>{% endfor %}</table>
+    {%- else %}<div></div>{% endif %}
+    {%- endfor %}
+  </div>
+  {{ foot(p) }}
+</div>
+
+{%- elif p.kind == 'science_heatmap' %}
+<div class="page" data-kind="science">
+  <div class="kicker">Scientific results · IV</div>
+  <h2>{% if p.heatmap %}Top genes across conditions{% else %}Interpretation{% endif %}</h2>
+  {%- if p.heatmap and not p.ai %}
+  <div style="max-width:120mm">{% set ns.fig = ns.fig + 1 %}<div class="figure">{{ p.heatmap }}</div><p class="cap">Fig. {{ ns.fig }} — Expression of the most significant up- and down-regulated genes (log<sub>2</sub> VST, centred on the control mean).</p></div>
+  {%- elif p.heatmap %}
+  <div style="display:grid;grid-template-columns:1fr 1.1fr;gap:8mm">
+    <div>{% set ns.fig = ns.fig + 1 %}<div class="figure">{{ p.heatmap }}</div><p class="cap">Fig. {{ ns.fig }} — Expression of the most significant up- and down-regulated genes (log<sub>2</sub> VST, centred on the control mean).</p></div>
+    {{ ai_box(p) }}
+  </div>
+  {%- else %}
+  {{ ai_box(p) }}
+  {%- endif %}
+  {{ foot(p) }}
+</div>
+
+{%- elif p.kind == 'method' %}
+<div class="page" data-kind="method">
+  <div class="kicker">Method and traceability</div>
+  <h2>How the score is built, and every version behind it</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8mm;font-size:8.8pt">
+    <div><h3>CosmOmics Pathway Nova</h3><p style="margin-top:0">{{ p.method_nova }}</p><h3>OmicSkin score</h3><p style="margin-top:0">{{ p.method_score }}</p>
+      <h3>Scientific review and scope</h3><p style="margin-top:0">{{ p.scope }}</p></div>
+    <div><h3>Versions</h3><table>{% for k, v in p.versions %}<tr><td style="width:32mm;color:{{ C.grey }}">{{ k }}</td><td>{{ v }}</td></tr>{% endfor %}</table>
+      {%- if p.signoff %}
+      <div style="margin-top:5mm;display:grid;grid-template-columns:repeat({{ p.signoff|length }}, 1fr);gap:3mm;font-size:8pt">{% for k, v in p.signoff %}<div><div class="kicker">{{ k }}</div>{{ v }}</div>{% endfor %}</div>
+      {%- endif %}</div>
+  </div>
+  <div style="position:absolute;left:16mm;right:16mm;bottom:20mm;background:{{ C.navy }};color:white;border-radius:3mm;padding:6mm 8mm;display:flex;justify-content:space-between;align-items:center;gap:8mm">
+    <div><div style="font-family:'Inter Display';font-weight:700;font-size:16pt;letter-spacing:-.02em">{{ p.institute }}</div><div style="font-size:8.5pt;color:#B8C4D0">{{ p.contact }}</div></div>
+    <div style="text-align:right;font-size:8.5pt;color:#B8C4D0">The DEG and enrichment tables, the CosmOmics nova and the claim scores<br>behind this report remain available in GenoLens.</div>
+  </div>
+  {{ foot(p) }}
+</div>
+{%- endif %}
+{%- endfor %}
+</body>
+</html>

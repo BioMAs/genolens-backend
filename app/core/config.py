@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     ENVIRONMENT: str = Field(default="development", description="Environment: development, staging, production")
     DEBUG: bool = Field(default=True, description="Debug mode")
+    SQL_ECHO_PARAMETERS: bool = Field(
+        default=False,
+        description="Log the bound parameters of the SQL that DEBUG echoes (development only: they carry user data "
+        "and service-token hashes)",
+    )
 
     # API
     API_V1_PREFIX: str = "/api/v1"

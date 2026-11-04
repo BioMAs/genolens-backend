@@ -538,17 +538,17 @@ Answer DIRECTLY without repeating raw data."""
             raise
 
 
-async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparison_name, language: str = "fr"):
+async def build_comparison_ai_context(db, deg_dataset_id, enrichment_dataset_id, comparison_name):
     """
-    Build the AI context from the DB and generate + persist an AIInterpretation.
+    Inputs of `interpret_comparison` read from the DB: DEG counts, the top pathways and the
+    genes with the largest fold changes. Returns None when the comparison has no DEG.
 
     Genes come from the DEG dataset; pathways from the (separate) annoDB ENRICHMENT
     dataset. Pass `enrichment_dataset_id` when the caller already knows it, otherwise it
-    is resolved here — see `app.services.enrichment_source`. Returns the AIInterpretation,
-    or None if the LLM is unavailable / there is no DEG data (graceful for report use).
+    is resolved here — see `app.services.enrichment_source`.
     """
     from sqlalchemy import select, func
-    from app.models.models import DegGene, EnrichmentPathway, AIInterpretation
+    from app.models.models import DegGene, EnrichmentPathway
 
     up = (await db.execute(select(func.count()).where(
         DegGene.dataset_id == deg_dataset_id,
@@ -559,7 +559,7 @@ async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparis
         DegGene.comparison_name == comparison_name,
         DegGene.regulation == "DOWN"))).scalar() or 0
     if up + down == 0:
-        logger.info("generate_and_store: no DEG data for %s", comparison_name)
+        logger.info("build_comparison_ai_context: no DEG data for %s", comparison_name)
         return None
 
     deg_summary = {"up_count": up, "down_count": down, "total": up + down}
@@ -596,6 +596,50 @@ async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparis
     top_genes = [{"gene_id": g.gene_id, "gene_name": g.gene_name or g.gene_id,
                   "log_fc": g.log_fc, "padj": g.padj, "regulation": g.regulation}
                  for g in top_genes_rows]
+    return {"deg_summary": deg_summary, "top_pathways": top_pathways, "top_genes": top_genes}
+
+
+async def generate_comparison_text(db, deg_dataset_id, enrichment_dataset_id, comparison_name,
+                                   language: str = "en"):
+    """
+    Generate a comparison interpretation WITHOUT persisting it — for a deliverable that needs
+    another language than the cached `AIInterpretation` row, which stays untouched.
+    Returns (text, model) or None when there is no DEG data or the LLM is unavailable.
+    """
+    context = await build_comparison_ai_context(
+        db, deg_dataset_id, enrichment_dataset_id, comparison_name)
+    if context is None:
+        return None
+    interpreter = LocalAIInterpreter()
+    availability = await interpreter.check_availability()
+    if not availability.get("available") or not availability.get("model_available"):
+        logger.info("generate_comparison_text: LLM endpoint unavailable for %s", comparison_name)
+        return None
+    text = await interpreter.interpret_comparison(
+        comparison_name=comparison_name, language=language, **context)
+    return text, interpreter.model
+
+
+async def generate_and_store(db, deg_dataset_id, enrichment_dataset_id, comparison_name, language: str = "fr"):
+    """
+    Build the AI context from the DB and generate + persist an AIInterpretation.
+
+    See `build_comparison_ai_context` for where genes and pathways come from. Returns the
+    AIInterpretation, or None if the LLM is unavailable / there is no DEG data (graceful for
+    report use).
+    """
+    from sqlalchemy import select
+    from app.models.models import AIInterpretation
+
+    context = await build_comparison_ai_context(
+        db, deg_dataset_id, enrichment_dataset_id, comparison_name)
+    if context is None:
+        logger.info("generate_and_store: no DEG data for %s", comparison_name)
+        return None
+    deg_summary = context["deg_summary"]
+    top_pathways = context["top_pathways"]
+    top_genes = context["top_genes"]
+    up, down = deg_summary["up_count"], deg_summary["down_count"]
 
     interpreter = LocalAIInterpreter()
     availability = await interpreter.check_availability()

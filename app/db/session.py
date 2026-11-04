@@ -9,6 +9,9 @@ from app.core.config import settings
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
+    # The echoed SQL keeps its parameters out of the log (user data, the sha256 a service-token lookup binds)
+    # unless SQL_ECHO_PARAMETERS asks for them.
+    hide_parameters=not settings.SQL_ECHO_PARAMETERS,
     future=True,
     pool_pre_ping=True,
 )

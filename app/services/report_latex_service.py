@@ -38,6 +38,7 @@ from app.models.models import (
     Project, SelfServiceAnalysis,
 )
 from app.services.enrichment_source import match_enrichment_dataset
+from app.services.report_common import merge_cover_info
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +178,8 @@ EXPLANATORY = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _save_fig(fig, path: str) -> None:
-    fig.savefig(path, format="pdf", bbox_inches="tight")
+    fmt = "svg" if str(path).lower().endswith(".svg") else "pdf"
+    fig.savefig(path, format=fmt, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -483,7 +485,15 @@ class ReportLatexService:
 
     async def collect_comparison_data(self, db: AsyncSession, dataset_id: UUID,
                                       comparison_name: str, work_dir: str,
-                                      generate_ai: bool = False) -> dict[str, Any]:
+                                      generate_ai: bool = False,
+                                      make_figures: bool = True,
+                                      include_ai: bool = True) -> dict[str, Any]:
+        """Data of one comparison report.
+
+        make_figures=False (editorial report) skips the LaTeX PDF figures and returns the raw
+        expression data instead, under "expression" (see `_expression_data`).
+        include_ai=False reads no stored AI interpretation and generates none.
+        """
         deg_ds = await db.get(Dataset, dataset_id)
         if not deg_ds:
             raise ValueError(f"Dataset {dataset_id} not found")
@@ -495,6 +505,7 @@ class ReportLatexService:
         enr_datasets = []
         comp_conditions: dict[str, dict] = {}
         pca_fig = None
+        expression: Optional[dict] = None
         qc_rows: list[dict] = []
         if analysis:
             result_ids = [UUID(x) for x in (analysis.result_dataset_ids or [])]
@@ -504,11 +515,15 @@ class ReportLatexService:
                 )).scalars().all()
                 enr_datasets = [d for d in datasets if d.type == DatasetType.ENRICHMENT]
             comp_conditions = await self._load_comparison_conditions(db, analysis.comparisons_dataset_id)
-            pca_fig = await self._make_pca(db, analysis, work_dir)
+            if make_figures:
+                pca_fig = await self._make_pca(db, analysis, work_dir)
+            else:
+                expression = await self._expression_data(db, analysis)
             qc_rows = await self._make_qc(db, analysis)
 
         comp = await self._build_comparison(db, deg_ds, enr_datasets, comp_conditions,
-                                            work_dir, generate_ai, comparison_name=comparison_name)
+                                            work_dir, generate_ai, comparison_name=comparison_name,
+                                            make_figures=make_figures, include_ai=include_ai)
 
         return {
             "project": project,
@@ -519,6 +534,7 @@ class ReportLatexService:
             "comparisons": [comp],
             "pca_fig": pca_fig,
             "qc_rows": qc_rows,
+            "expression": expression,
         }
 
     async def _load_comparison_conditions(self, db, comparisons_dataset_id) -> dict[str, dict]:
@@ -545,7 +561,8 @@ class ReportLatexService:
             return {}
 
     async def _build_comparison(self, db, deg_ds, enr_datasets, comp_conditions,
-                                work_dir, generate_ai, comparison_name: Optional[str] = None) -> dict:
+                                work_dir, generate_ai, comparison_name: Optional[str] = None,
+                                make_figures: bool = True, include_ai: bool = True) -> dict:
         meta = deg_ds.dataset_metadata if isinstance(deg_ds.dataset_metadata, dict) else {}
         comp_name = comparison_name or meta.get("comparison_name") or deg_ds.name
         safe_id = re.sub(r"[^a-zA-Z0-9]+", "-", comp_name).strip("-")
@@ -586,19 +603,22 @@ class ReportLatexService:
             "n_up": n_up, "n_down": n_down,
             "degs": deg_dicts, "enr_up": enr_up, "enr_down": enr_down,
         }
-        vfig = f"volcano_{safe_id}.pdf"
-        if await asyncio.to_thread(_plot_volcano, deg_dicts, os.path.join(work_dir, vfig)):
-            comp["volcano_fig"] = vfig
-        if enr_up:
-            f = f"enr_up_{safe_id}.pdf"
-            if await asyncio.to_thread(_plot_enrichment_dotplot, enr_up, os.path.join(work_dir, f)):
-                comp["dotplot_up_fig"] = f
-        if enr_down:
-            f = f"enr_down_{safe_id}.pdf"
-            if await asyncio.to_thread(_plot_enrichment_dotplot, enr_down, os.path.join(work_dir, f)):
-                comp["dotplot_down_fig"] = f
+        if make_figures:
+            vfig = f"volcano_{safe_id}.pdf"
+            if await asyncio.to_thread(_plot_volcano, deg_dicts, os.path.join(work_dir, vfig)):
+                comp["volcano_fig"] = vfig
+            if enr_up:
+                f = f"enr_up_{safe_id}.pdf"
+                if await asyncio.to_thread(_plot_enrichment_dotplot, enr_up, os.path.join(work_dir, f)):
+                    comp["dotplot_up_fig"] = f
+            if enr_down:
+                f = f"enr_down_{safe_id}.pdf"
+                if await asyncio.to_thread(_plot_enrichment_dotplot, enr_down, os.path.join(work_dir, f)):
+                    comp["dotplot_down_fig"] = f
 
-        # AI interpretation (existing, or generate)
+        # AI interpretation (existing, or generate); none at all without include_ai
+        if not include_ai:
+            return comp
         ai = await db.scalar(
             select(AIInterpretation).where(
                 AIInterpretation.dataset_id == deg_ds.id,
@@ -624,12 +644,39 @@ class ReportLatexService:
             comp["ai_interpretation"] = ai.interpretation
         return comp
 
-    async def _make_pca(self, db, analysis, work_dir) -> Optional[str]:
+    async def _vst_dataset(self, db, analysis) -> Optional[Dataset]:
+        """The analysis's VST-normalised matrix, when it has a stored one."""
         vst_id = (analysis.intermediate_dataset_ids or {}).get("vst")
         if not vst_id:
             return None
         vst = await db.get(Dataset, UUID(vst_id) if isinstance(vst_id, str) else vst_id)
         if not vst or not vst.parquet_file_path:
+            return None
+        return vst
+
+    async def _expression_data(self, db, analysis) -> dict:
+        """Raw expression data for reports that draw their own figures.
+
+        {"vst": parquet bytes | None, "pca": calculate_pca output | None,
+         "sample_conditions": {sample: condition}}
+        """
+        out: dict[str, Any] = {"vst": None, "pca": None, "sample_conditions": {}}
+        vst = await self._vst_dataset(db, analysis)
+        out["sample_conditions"] = await self._sample_conditions(db, analysis.samples_dataset_id)
+        if vst is None:
+            return out
+        try:
+            from app.services.storage import storage_service
+            from app.services.data_processor import data_processor
+            out["vst"] = await storage_service.download_file(vst.parquet_file_path)
+            out["pca"] = await data_processor.calculate_pca(out["vst"], n_components=2)
+        except Exception as exc:
+            logger.warning("Expression data for the report failed: %s", exc)
+        return out
+
+    async def _make_pca(self, db, analysis, work_dir) -> Optional[str]:
+        vst = await self._vst_dataset(db, analysis)
+        if vst is None:
             return None
         try:
             from app.services.storage import storage_service
@@ -915,10 +962,12 @@ class ReportLatexService:
                                     last_page_type: Optional[str] = None,
                                     cover_info: Optional[dict] = None,
                                     generate_ai: bool = False,
-                                    demo_watermark: bool = False) -> bytes:
+                                    demo_watermark: bool = False,
+                                    use_ai: bool = True) -> bytes:
         with tempfile.TemporaryDirectory(prefix="report_") as work_dir:
             data = await self.collect_comparison_data(
-                db, dataset_id, comparison_name, work_dir, generate_ai
+                db, dataset_id, comparison_name, work_dir, generate_ai and use_ai,
+                include_ai=use_ai,
             )
             data["demo_watermark"] = demo_watermark
             branding = await self._load_branding(db, requested_by, work_dir)
@@ -940,10 +989,7 @@ class ReportLatexService:
             data["last_page_type"] = last_page_type or defaults.get("last_page_type") or "color"
 
             # Cover info: merge user defaults with per-report overrides (override wins)
-            merged_cover = dict(defaults.get("cover_info") or {})
-            if cover_info:
-                merged_cover.update({k: v for k, v in cover_info.items() if v})
-            data["cover_info"] = merged_cover
+            data["cover_info"] = merge_cover_info(branding, cover_info)
 
             tex_str = self.assemble_tex(data)
             return await asyncio.to_thread(self.compile_pdf, tex_str, work_dir)

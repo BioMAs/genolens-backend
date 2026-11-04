@@ -2,6 +2,7 @@
 CosmOmics Pathway Nova endpoints — the Skin claims add-on.
 
   GET  /datasets/{dataset_id}/comparisons/{comparison_name}/cosmomics-nova
+  GET  /datasets/{dataset_id}/comparisons/{comparison_name}/cosmomics-nova.svg
   POST /datasets/{dataset_id}/comparisons/{comparison_name}/cosmomics-nova/interpret
 
 Both are gated by the existing per-user add-on flag (`require_cosmetics_access`, 403 without
@@ -10,10 +11,10 @@ never leaves the server: the payload only carries the terms enriched in this com
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import and_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,11 +32,11 @@ from app.models.models import CosmeticInterpretation, Dataset, User
 from app.services.ai_interpreter import LocalAIInterpreter
 from app.services.cosmomics_nova import (
     DEFAULT_ALPHA,
-    build_nova,
-    condition_label,
-    default_claim_subgroups,
+    NOVA_MODEL_TAG,
     fetch_term_hits,
+    nova_from_hits,
 )
+from app.services.cosmomics_nova_svg import render_nova_svg
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +45,6 @@ router = APIRouter(
     tags=["CosmOmics"],
     dependencies=[Depends(require_active_license)],
 )
-
-# `cosmetic_interpretations` holds one row per comparison, shared with the legacy Skin claims
-# narrative. The nova's rows carry this prefix in `model`, so a legacy text is never served as
-# a nova interpretation (it is regenerated, then overwritten).
-NOVA_MODEL_TAG = "cosmomics-nova:"
 
 
 async def _readable_dataset(db: AsyncSession, dataset_id: UUID, user: User) -> Dataset:
@@ -63,13 +59,7 @@ async def _readable_dataset(db: AsyncSession, dataset_id: UUID, user: User) -> D
 
 async def _nova(db: AsyncSession, dataset: Dataset, comparison_name: str, alpha: float) -> dict:
     hits = await fetch_term_hits(db, dataset, comparison_name)
-    return build_nova(
-        hits,
-        default_claim_subgroups(),
-        alpha=alpha,
-        contrast=comparison_name,
-        condition=condition_label(comparison_name),
-    )
+    return nova_from_hits(hits, comparison_name, alpha)
 
 
 def _interpretation_payload(row: CosmeticInterpretation, cached: bool) -> dict[str, Any]:
@@ -95,6 +85,26 @@ async def get_cosmomics_nova(
     """Pathway sub-groups for and against each cosmetic claim, for one comparison."""
     dataset = await _readable_dataset(db, dataset_id, user)
     return await _nova(db, dataset, comparison_name, alpha)
+
+
+@router.get("/{dataset_id}/comparisons/{comparison_name}/cosmomics-nova.svg")
+async def get_cosmomics_nova_svg(
+    dataset_id: UUID,
+    comparison_name: str,
+    theme: Literal["light", "dark"] = Query("light", description="Colour theme of the wheel"),
+    alpha: float = Query(
+        DEFAULT_ALPHA, gt=0, le=0.25, description="Significance threshold on adjusted p-values"
+    ),
+    user: User = Depends(require_cosmetics_access),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """The nova wheel as a standalone SVG (same payload as `cosmomics-nova`)."""
+    dataset = await _readable_dataset(db, dataset_id, user)
+    nova = await _nova(db, dataset, comparison_name, alpha)
+    svg = render_nova_svg(nova, theme=theme, wheel_only=True)
+    return Response(
+        content=svg, media_type="image/svg+xml", headers={"Cache-Control": "no-store"}
+    )
 
 
 @router.post("/{dataset_id}/comparisons/{comparison_name}/cosmomics-nova/interpret")

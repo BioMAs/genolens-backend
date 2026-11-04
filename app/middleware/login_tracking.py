@@ -15,6 +15,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from app.core.config import settings
+from app.core.service_tokens import is_service_token
 from app.db.session import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,8 @@ def _extract_user_id(authorization: str) -> str | None:
         if not authorization or not authorization.startswith("Bearer "):
             return None
         token = authorization.removeprefix("Bearer ").strip()
+        if is_service_token(token):
+            return None  # never a JWT, and not a login
         payload = jwt.decode(
             token,
             settings.SUPABASE_JWT_SECRET,

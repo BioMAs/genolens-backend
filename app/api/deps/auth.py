@@ -3,12 +3,14 @@ Authentication dependencies for FastAPI.
 """
 
 from typing import Optional
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps.service_token import resolve_service_token
 from app.core.security import verify_token, get_user_from_token, CurrentUser
+from app.core.service_tokens import is_service_token
 from app.db.session import get_db
 from app.models.models import User, UserRole
 
@@ -18,11 +20,16 @@ security = HTTPBearer()
 
 
 async def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> CurrentUser:
     """
     Dependency to get the current authenticated user from JWT token.
+
+    A service token (`glst_…`) is never parsed as a JWT: it stands for its owner, and only on
+    the routes its scopes open (`app.api.deps.service_token`; 401 if invalid or revoked, 403
+    elsewhere).
 
     Usage:
         @app.get("/protected")
@@ -40,12 +47,15 @@ async def get_current_user(
         HTTPException: If authentication fails
     """
     token = credentials.credentials
-    token_payload = verify_token(token)
-    user_id = get_user_from_token(token_payload)
+    if is_service_token(token):
+        db_user = (await resolve_service_token(request, token, db)).owner
+    else:
+        token_payload = verify_token(token)
+        user_id = get_user_from_token(token_payload)
 
-    # Load user from database
-    result = await db.execute(select(User).where(User.id == user_id))
-    db_user = result.scalar_one_or_none()
+        # Load user from database
+        result = await db.execute(select(User).where(User.id == user_id))
+        db_user = result.scalar_one_or_none()
 
     if not db_user:
         raise HTTPException(
@@ -94,7 +104,8 @@ async def get_current_user_optional(
     Returns:
         Optional[CurrentUser]: User if authenticated, None otherwise
     """
-    if not credentials:
+    # A service token is never a JWT, and opens no optional route: anonymous.
+    if not credentials or is_service_token(credentials.credentials):
         return None
 
     try:

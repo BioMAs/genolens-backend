@@ -66,3 +66,6 @@ weasyprint==62.3
 pydyf==0.11.0
 jinja2>=3.1.0
 matplotlib>=3.8.0
+# OmicSkin editorial report: HTML → PDF with headless Chromium (the browser itself is
+# installed in the worker image only — see Dockerfile)
+playwright==1.63.0

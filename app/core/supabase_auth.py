@@ -12,6 +12,7 @@ from pydantic import BaseModel
 import httpx
 
 from app.core.config import settings
+from app.core.service_tokens import is_service_token
 from app.models.models import UserRole, SubscriptionPlan
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,8 @@ class SupabaseUser(BaseModel):
     max_projects: int = 1
     features_access: dict = {}
     user_metadata: dict = {}
+    # Set when the request came with a service token: the user is then the token's owner.
+    service_token_id: Optional[UUID] = None
 
 
 async def fetch_user_role_from_supabase(user_id: UUID) -> Optional[str]:
@@ -172,6 +175,8 @@ async def verify_supabase_token(token: str) -> Optional[SupabaseUser]:
     Returns:
         SupabaseUser if token is valid, None otherwise
     """
+    if is_service_token(token):
+        return None  # never a JWT (see app/core/service_tokens.py)
     try:
         # Decode JWT using Supabase JWT secret
         payload = jwt.decode(
