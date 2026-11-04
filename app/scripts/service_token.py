@@ -151,10 +151,16 @@ async def run(
 
 
 async def _main(argv: list[str]) -> int:
-    from app.db.session import AsyncSessionLocal, engine
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+    from app.core.config import settings
+
+    # An engine of its own with the SQL echo off, whatever DEBUG says: SQLAlchemy's echo writes to standard
+    # output, where the token must be alone.
+    engine = create_async_engine(settings.DATABASE_URL, echo=False, hide_parameters=True, pool_pre_ping=True)
+    sessions = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False)
     try:
-        return await run(argv, session_factory=AsyncSessionLocal)
+        return await run(argv, session_factory=sessions)
     finally:
         await engine.dispose()
 

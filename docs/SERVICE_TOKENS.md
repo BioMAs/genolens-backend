@@ -6,7 +6,7 @@ Un jeton de service permet à un client machine (le pipeline d'analyse) d'appele
 
 - Il commence par `glst_`, suivi de 43 caractères base64url (`secrets.token_urlsafe(32)`). Le préfixe le distingue d'un JWT avant toute lecture : un jeton de service n'est jamais décodé comme un JWT, ni par l'authentification, ni par les middlewares (suivi des connexions, limitation de débit).
 - Il s'envoie dans l'en-tête `Authorization: Bearer glst_…`, comme un JWT.
-- La base n'en garde que l'empreinte sha256 (`service_tokens.token_sha256`). Le jeton lui-même n'est affiché qu'une fois, à sa création. Il n'apparaît ensuite dans aucun journal, aucune réponse et aucun message d'erreur.
+- La base n'en garde que l'empreinte sha256 (`service_tokens.token_sha256`). Le jeton lui-même n'est affiché qu'une fois, à sa création. Il n'apparaît ensuite dans aucun journal, aucune réponse et aucun message d'erreur. Le SQL que DEBUG fait écrire au journal garde ses paramètres masqués, l'empreinte comprise, sauf si `SQL_ECHO_PARAMETERS` les demande (en développement seulement).
 - Il porte les droits, la licence, le plan et les modules de son propriétaire. Les gardes de son propriétaire s'appliquent : licence de l'application, abonnement expiré, plan TEAM ou ON_PREMISE pour les rapports PDF, module cosmétique pour le rapport éditorial, quota d'analyses DEG, accès au projet. Un jeton ne crée jamais de compte et ne modifie jamais celui de son propriétaire (rôle, statut).
 - Une règle s'y ajoute, propre aux jetons : son propriétaire doit être un compte **actif** (`active`), même s'il est administrateur. La connexion d'un administrateur, elle, ne dépend pas de son statut. Un compte en attente d'invitation (`pending`), suspendu ou résilié n'obtient pas de jeton. Le jeton d'un compte qui cesse d'être actif est refusé sur toutes ses routes, avant toute création de projet, tout dépôt, toute unité de quota et toute demande de rapport. Un jeton n'active jamais une invitation en attente.
 
@@ -55,7 +55,8 @@ Avec `false` :
 Dans l'image de l'API (variables d'environnement de l'application chargées) :
 
 ```bash
-# Créer : le jeton est écrit seul sur la sortie standard, le reste sur la sortie d'erreur.
+# Créer : le jeton est écrit seul sur la sortie standard, le reste sur la sortie d'erreur, même avec DEBUG
+# (la commande n'affiche pas le SQL).
 # Le propriétaire doit être actif (voir « Préparer le compte propriétaire ») ; sinon, refus.
 python -m app.scripts.service_token create --owner <e-mail ou id> --name pipeline
 python -m app.scripts.service_token create --owner <e-mail ou id> --name essai \

@@ -800,3 +800,51 @@ async def test_jwt_users_are_unchanged(client, sessions):
         assert (
             await client.get(f"{API}/projects/", headers=bearer(forged))
         ).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Local acceptance test (lot 23): the command's output and the SQL log
+# ---------------------------------------------------------------------------
+
+def test_the_command_runs_on_an_engine_with_the_sql_echo_off(monkeypatch):
+    """SQLAlchemy's echo writes to standard output, where the token must be alone: the command opens its own
+    engine with the echo off and the parameters hidden, even with DEBUG on."""
+    import asyncio
+
+    from app.core.config import settings
+    from app.scripts import service_token as cli
+
+    monkeypatch.setattr(settings, "DEBUG", True)
+    seen = {}
+
+    async def fake_run(argv, *, session_factory, **_):
+        engine = session_factory.kw["bind"]
+        seen["echo"] = engine.echo
+        seen["hide_parameters"] = engine.sync_engine.hide_parameters
+        return 0
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    assert asyncio.run(cli._main(["list"])) == 0
+    assert seen == {"echo": False, "hide_parameters": True}
+
+
+def test_the_app_engine_hides_sql_parameters_unless_asked():
+    """With DEBUG on, the echoed SQL would carry its bound parameters (user data, the sha256 a token lookup
+    binds): they stay out of the log unless SQL_ECHO_PARAMETERS asks for them."""
+    from app.core.config import settings
+    from app.db.session import engine
+
+    assert settings.SQL_ECHO_PARAMETERS is False
+    assert engine.sync_engine.hide_parameters is True
+
+
+def test_the_development_compose_passes_the_licence_to_every_service():
+    """Without the licence settings a local stack answers "no license configured" and refuses every upload."""
+    from pathlib import Path
+
+    import yaml
+
+    compose = yaml.safe_load((Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text())
+    for service in ("api", "worker", "beat"):
+        names = {entry.split("=", 1)[0] for entry in compose["services"][service]["environment"]}
+        assert {"GENOLENS_LICENSE_KEY", "LICENSE_SECRET_KEY", "LICENSE_PRODUCT"} <= names, service
