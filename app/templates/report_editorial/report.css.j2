@@ -1,0 +1,47 @@
+{#- OmicSkin editorial report — CSS of docs/omicskin-report-editorial/build_D.py, with the
+    vendored Inter fonts (app/assets/fonts/inter, OFL) declared through file:// URLs. -#}
+@font-face { font-family: 'Inter'; src: url('{{ font_uri }}/InterVariable.ttf') format('truetype'); font-weight: 100 900; font-style: normal; }
+@font-face { font-family: 'Inter'; src: url('{{ font_uri }}/InterVariable-Italic.ttf') format('truetype'); font-weight: 100 900; font-style: italic; }
+@font-face { font-family: 'Inter Variable'; src: url('{{ font_uri }}/InterVariable.ttf') format('truetype'); font-weight: 100 900; font-style: normal; }
+@font-face { font-family: 'Inter Variable'; src: url('{{ font_uri }}/InterVariable-Italic.ttf') format('truetype'); font-weight: 100 900; font-style: italic; }
+@font-face { font-family: 'Inter Display'; src: url('{{ font_uri }}/InterDisplay-Light.ttf') format('truetype'); font-weight: 300; }
+@font-face { font-family: 'Inter Display'; src: url('{{ font_uri }}/InterDisplay-SemiBold.ttf') format('truetype'); font-weight: 600; }
+@font-face { font-family: 'Inter Display'; src: url('{{ font_uri }}/InterDisplay-Bold.ttf') format('truetype'); font-weight: 700; }
+
+@page { size: A4; margin: 0; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: #FFFFFF; color: {{ colors.ink }}; font-family: Inter, sans-serif; font-size: 10.5pt; line-height: 1.45; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+.page { width: 210mm; height: 297mm; position: relative; overflow: hidden; page-break-after: always; break-after: page; padding: 18mm 16mm 16mm 16mm; }
+.page:last-of-type { page-break-after: auto; break-after: auto; }
+.foot { position: absolute; left: 16mm; right: 16mm; bottom: 9mm; display: flex; justify-content: space-between; font-size: 8pt; color: {{ colors.grey }}; letter-spacing: .04em; text-transform: uppercase; }
+.kicker { font-size: 8.5pt; letter-spacing: .18em; text-transform: uppercase; color: {{ colors.grey }}; font-weight: 600; }
+h1 { font-family: 'Inter Display', Inter, sans-serif; font-weight: 700; letter-spacing: -0.02em; line-height: 1.02; margin: 0; }
+h2 { font-family: 'Inter Display', Inter, sans-serif; font-weight: 600; font-size: 24pt; letter-spacing: -0.02em; margin: 0 0 4mm 0; line-height: 1.1; }
+h3 { font-size: 9pt; letter-spacing: .14em; text-transform: uppercase; color: {{ colors.grey }}; margin: 0 0 2mm 0; font-weight: 600; }
+.lede { font-family: 'Inter Display', Inter, sans-serif; font-weight: 300; font-size: 17pt; line-height: 1.35; letter-spacing: -0.01em; }
+.grid { display: grid; gap: 6mm; }
+.chip { display: inline-block; border: 1.2px solid; border-radius: 999px; padding: 1px 8px; font-size: 9pt; margin: 0 3px 4px 0; white-space: nowrap; }
+.chip i { font-style: italic; }
+.card { border-top: 1.5px solid {{ colors.ink }}; padding-top: 3mm; }
+.stat { font-family: 'Inter Display', Inter, sans-serif; font-weight: 700; font-size: 34pt; letter-spacing: -0.03em; line-height: 1; }
+.stat small { display: block; font-family: Inter, sans-serif; font-weight: 500; font-size: 8.5pt; letter-spacing: .08em; text-transform: uppercase; color: {{ colors.grey }}; margin-top: 2mm; line-height: 1.25; }
+table { border-collapse: collapse; width: 100%; font-size: 8.5pt; }
+th { white-space: nowrap; text-align: left; font-size: 7.5pt; letter-spacing: .1em; text-transform: uppercase; color: {{ colors.grey }}; font-weight: 600; padding: 1.5mm 2mm 1.5mm 0; border-bottom: 1px solid {{ colors.ink }}; }
+td { padding: 1.3mm 2mm 1.3mm 0; border-bottom: 1px solid {{ colors.line }}; vertical-align: top; }
+td.num, th.num { font-variant-numeric: tabular-nums; text-align: right; }
+.sig { font-size: 8.5pt; color: {{ colors.grey }}; border-left: 2px solid {{ colors.green }}; padding-left: 3mm; }
+.sig.pending { border-left-color: {{ colors.grey }}; }
+.tight td { padding: 0.7mm 2mm 0.7mm 0; }
+.cap { font-size: 8pt; color: {{ colors.grey }}; margin-top: 1.5mm; }
+.side { position: absolute; left: 0; top: 0; bottom: 0; width: 9mm; }
+.side span { position: absolute; left: 50%; top: 18mm; transform-origin: left top; transform: rotate(90deg) translate(0, -50%); white-space: nowrap; color: white; font-family: 'Inter Display', Inter, sans-serif; font-weight: 700; font-size: 16pt; letter-spacing: .02em; }
+.ai { background: #F4F7F9; border-radius: 3mm; padding: 5mm 6mm; font-size: 9.5pt; }
+.ai h3 { color: {{ colors.navy }}; }
+.ai h4 { font-size: 9pt; margin: 3mm 0 1mm 0; color: {{ colors.navy }}; }
+.ai p { margin: 0 0 2mm 0; }
+.ai ul { margin: 0 0 2mm 0; padding-left: 4mm; }
+.ai .notice { color: {{ colors.grey }}; font-style: italic; }
+.figure svg { max-width: 100%; }
+.empty { color: {{ colors.grey }}; font-size: 9pt; }
+.watermark { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; z-index: 50; }
+.watermark span { font-family: 'Inter Display', Inter, sans-serif; font-weight: 700; font-size: 150pt; letter-spacing: .05em; color: rgba(255, 95, 95, .13); transform: rotate(-32deg); }

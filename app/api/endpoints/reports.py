@@ -25,6 +25,7 @@ from app.models.report_job import ReportJob, ReportJobStatus
 from app.schemas.report import (
     ComparisonReportTriggerRequest,
     ReportJobResponse,
+    ReportTemplate,
     ReportTriggerResponse,
 )
 
@@ -35,6 +36,12 @@ router = APIRouter(prefix="/analyses", tags=["reports"])
 # logical pair (DEG dataset, comparison_name); comparison_name is a query param
 # because it may contain characters unsafe in a path segment.
 comparison_router = APIRouter(prefix="/datasets", tags=["reports"])
+
+
+def report_filename(comparison_name: str, template: Optional[str]) -> str:
+    """Download name of a comparison report; it carries the format ("…_editorial.pdf")."""
+    raw = f"report_{comparison_name}_{template or 'latex'}.pdf"
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in raw)
 
 
 async def _get_analysis_or_404(
@@ -182,6 +189,10 @@ async def trigger_comparison_report(
     user: Annotated[User, Depends(get_or_create_user)],
     comparison_name: Annotated[str, Query(...)],
     payload: Annotated[Optional[ComparisonReportTriggerRequest], Body()] = None,
+    template: Annotated[
+        ReportTemplate,
+        Query(description="Report format: 'latex' (classic) or 'editorial' (OmicSkin)"),
+    ] = "latex",
 ):
     """Trigger background PDF report generation for a single comparison.
 
@@ -189,6 +200,14 @@ async def trigger_comparison_report(
     applied when the requesting user has the report customization module.
     """
     dataset = await _get_dataset_or_404(dataset_id, db, user.id)
+
+    # The OmicSkin editorial report is built on the CosmOmics nova: same add-on gate as the
+    # nova endpoints (403 without the cosmetics module).
+    if template == "editorial" and not user.has_cosmetics_module:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="The OmicSkin editorial report requires the cosmetics module.",
+        )
 
     # Return existing in-progress job rather than spawning a duplicate — but only
     # if it is *recent*. A job that has been PENDING/RUNNING for too long is stale
@@ -199,6 +218,7 @@ async def trigger_comparison_report(
         .where(
             ReportJob.dataset_id == dataset_id,
             ReportJob.comparison_name == comparison_name,
+            ReportJob.template == template,
             ReportJob.status.in_([ReportJobStatus.PENDING, ReportJobStatus.RUNNING]),
             ReportJob.created_at >= recent_cutoff,
         )
@@ -234,6 +254,7 @@ async def trigger_comparison_report(
         first_page_type=first_page_type,
         last_page_type=last_page_type,
         cover_info=cover_info,
+        template=template,
         requested_by=user.id,
         status=ReportJobStatus.PENDING,
     )
@@ -242,8 +263,16 @@ async def trigger_comparison_report(
     await db.refresh(job)
 
     try:
-        from app.worker.tasks.report_task import generate_comparison_report
-        task = generate_comparison_report.delay(str(job.id))
+        from app.worker.tasks.report_task import (
+            generate_comparison_report,
+            generate_comparison_report_editorial,
+        )
+        # LaTeX → r-worker (texlive); editorial → worker (Chromium).
+        task_fn = (
+            generate_comparison_report_editorial if template == "editorial"
+            else generate_comparison_report
+        )
+        task = task_fn.delay(str(job.id))
         job.celery_task_id = task.id
         await db.commit()
     except Exception as exc:
@@ -267,18 +296,17 @@ async def comparison_report_status(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
     comparison_name: Annotated[str, Query(...)],
+    template: Annotated[Optional[ReportTemplate], Query()] = None,
 ):
-    """Get the status of the latest report job for a comparison."""
+    """Get the status of the latest report job for a comparison (of one format if given)."""
     await _get_dataset_or_404(dataset_id, db, current_user.id)
-    stmt = (
-        select(ReportJob)
-        .where(
-            ReportJob.dataset_id == dataset_id,
-            ReportJob.comparison_name == comparison_name,
-        )
-        .order_by(desc(ReportJob.created_at))
-        .limit(1)
+    stmt = select(ReportJob).where(
+        ReportJob.dataset_id == dataset_id,
+        ReportJob.comparison_name == comparison_name,
     )
+    if template:
+        stmt = stmt.where(ReportJob.template == template)
+    stmt = stmt.order_by(desc(ReportJob.created_at)).limit(1)
     job = (await db.execute(stmt)).scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="No report job found for this comparison")
@@ -301,19 +329,18 @@ async def download_comparison_report(
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
     comparison_name: Annotated[str, Query(...)],
+    template: Annotated[Optional[ReportTemplate], Query()] = None,
 ):
-    """Download the generated PDF report for a comparison."""
+    """Download the latest generated PDF report for a comparison (of one format if given)."""
     await _get_dataset_or_404(dataset_id, db, current_user.id)
-    stmt = (
-        select(ReportJob)
-        .where(
-            ReportJob.dataset_id == dataset_id,
-            ReportJob.comparison_name == comparison_name,
-            ReportJob.status == ReportJobStatus.DONE,
-        )
-        .order_by(desc(ReportJob.created_at))
-        .limit(1)
+    stmt = select(ReportJob).where(
+        ReportJob.dataset_id == dataset_id,
+        ReportJob.comparison_name == comparison_name,
+        ReportJob.status == ReportJobStatus.DONE,
     )
+    if template:
+        stmt = stmt.where(ReportJob.template == template)
+    stmt = stmt.order_by(desc(ReportJob.created_at)).limit(1)
     job = (await db.execute(stmt)).scalar_one_or_none()
     if not job or not job.pdf_path:
         raise HTTPException(status_code=404, detail="No completed report available")
@@ -321,9 +348,7 @@ async def download_comparison_report(
     from app.services.storage import storage_service
     pdf_bytes = await storage_service.download_file(job.pdf_path)
 
-    filename = "".join(
-        c if c.isalnum() or c in "-_." else "_" for c in f"report_{comparison_name}.pdf"
-    )
+    filename = report_filename(comparison_name, job.template)
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",

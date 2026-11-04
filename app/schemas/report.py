@@ -1,8 +1,11 @@
 from uuid import UUID
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel
 from app.models.report_job import ReportJobStatus
+
+# Comparison report formats: the branded LaTeX report, or the OmicSkin editorial PDF.
+ReportTemplate = Literal["latex", "editorial"]
 
 
 class ReportJobResponse(BaseModel):
@@ -11,6 +14,7 @@ class ReportJobResponse(BaseModel):
     analysis_id: Optional[UUID] = None
     dataset_id: Optional[UUID] = None
     comparison_name: Optional[str] = None
+    template: str = "latex"
     celery_task_id: Optional[str]
     status: ReportJobStatus
     pdf_path: Optional[str]

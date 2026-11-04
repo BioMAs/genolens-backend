@@ -43,6 +43,10 @@ class ReportJob(Base, TimestampMixin):
     first_page_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     last_page_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     cover_info: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # Report format: "latex" (branded LaTeX report) or "editorial" (OmicSkin editorial PDF).
+    template: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="latex", server_default="latex"
+    )
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[ReportJobStatus] = mapped_column(
         SQLEnum(ReportJobStatus, name="report_job_status"),
