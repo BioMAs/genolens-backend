@@ -7,8 +7,8 @@ Un jeton de service permet à un client machine (le pipeline d'analyse) d'appele
 - Il commence par `glst_`, suivi de 43 caractères base64url (`secrets.token_urlsafe(32)`). Le préfixe le distingue d'un JWT avant toute lecture : un jeton de service n'est jamais décodé comme un JWT, ni par l'authentification, ni par les middlewares (suivi des connexions, limitation de débit).
 - Il s'envoie dans l'en-tête `Authorization: Bearer glst_…`, comme un JWT.
 - La base n'en garde que l'empreinte sha256 (`service_tokens.token_sha256`). Le jeton lui-même n'est affiché qu'une fois, à sa création. Il n'apparaît ensuite dans aucun journal, aucune réponse et aucun message d'erreur.
-- Il porte les droits, la licence, le plan et les modules de son propriétaire. Toutes les gardes s'appliquent sans changement : licence de l'application, abonnement expiré, plan TEAM ou ON_PREMISE pour les rapports PDF, module cosmétique pour le rapport éditorial, quota d'analyses DEG, accès au projet. Un jeton ne crée jamais de compte et ne modifie jamais celui de son propriétaire (rôle, statut).
-- Son propriétaire doit être un compte **actif** (`active`). Un compte en attente d'invitation (`pending`), suspendu ou résilié n'obtient pas de jeton. Le jeton d'un compte qui cesse d'être actif est refusé sur toutes ses routes, avant toute création de projet, tout dépôt, toute unité de quota et toute demande de rapport. Un jeton n'active jamais une invitation en attente.
+- Il porte les droits, la licence, le plan et les modules de son propriétaire. Les gardes de son propriétaire s'appliquent : licence de l'application, abonnement expiré, plan TEAM ou ON_PREMISE pour les rapports PDF, module cosmétique pour le rapport éditorial, quota d'analyses DEG, accès au projet. Un jeton ne crée jamais de compte et ne modifie jamais celui de son propriétaire (rôle, statut).
+- Une règle s'y ajoute, propre aux jetons : son propriétaire doit être un compte **actif** (`active`), même s'il est administrateur. La connexion d'un administrateur, elle, ne dépend pas de son statut. Un compte en attente d'invitation (`pending`), suspendu ou résilié n'obtient pas de jeton. Le jeton d'un compte qui cesse d'être actif est refusé sur toutes ses routes, avant toute création de projet, tout dépôt, toute unité de quota et toute demande de rapport. Un jeton n'active jamais une invitation en attente.
 
 ## Droits (`scopes`)
 
@@ -75,7 +75,7 @@ Un jeton perdu ne peut pas être réaffiché : on le révoque et on en crée un 
 Un compte invité par un administrateur reste `pending` tant que la personne invitée ne s'est pas connectée. Un compte machine ne se connecte jamais : un administrateur doit donc le rendre actif lui-même avant de créer le jeton.
 
 1. Inviter le compte dédié depuis l'administration des utilisateurs, avec le plan TEAM (ou ON_PREMISE) et le module cosmétique s'il doit demander le rapport éditorial.
-2. Le passer au statut actif. Dans l'administration des utilisateurs, choisir le statut « actif » sur sa ligne. Ou, par l'API, avec un jeton de connexion d'administrateur : `PATCH /api/v1/admin/users/<id>/status` avec le corps `{"status": "active"}`. La réponse rend `"status": "active"`.
+2. Le passer au statut actif par l'API, avec un jeton de connexion d'administrateur : `PATCH /api/v1/admin/users/<id>/status` avec le corps `{"status": "active"}`. La réponse rend `"status": "active"`. Pour un compte en attente, c'est la seule voie : l'administration des utilisateurs ne propose alors que de renvoyer l'invitation. Elle n'offre « Activer le compte » qu'une fois le compte sorti de l'attente (suspendu ou résilié).
 3. Créer le jeton : `python -m app.scripts.service_token create --owner <e-mail du compte> --name pipeline`.
 
 Pour une instance de recette dont la base est remplie par un script, poser directement `status = 'active'` sur la ligne du compte dans `users` revient au même.

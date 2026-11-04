@@ -435,7 +435,9 @@ async def test_service_token_inherits_the_owner_gates(client, sessions):
     resp = await upload(client, spent_token, project.json()["id"])
     assert resp.status_code == 429, resp.text
 
-    # An account that is not ACTIVE gets no token from the command...
+    # An account that is not ACTIVE gets no token from the command, and no row is stored...
+    async with sessions() as s:
+        issued = await s.scalar(text("SELECT count(*) FROM service_tokens"))
     for inactive in (UserStatus.PENDING, UserStatus.SUSPENDED):
         account = await seed_owner(sessions, status=inactive)
         code, printed = await run_command(
@@ -444,7 +446,7 @@ async def test_service_token_inherits_the_owner_gates(client, sessions):
         assert code == 1 and "not active" in printed, printed
         assert not TOKEN_RE.search(printed)
     async with sessions() as s:
-        issued = await s.scalar(text("SELECT count(*) FROM service_tokens"))
+        assert await s.scalar(text("SELECT count(*) FROM service_tokens")) == issued
 
     # ...and a token whose owner is no longer ACTIVE is refused on every scoped route, before
     # any project, upload, quota unit or report job. A pending invitation stays pending: the
