@@ -154,12 +154,12 @@ def test_every_subgroup_is_counted_once():
 
 
 def _two_subgroups() -> dict:
-    """Collagen goes the expected way (p = 1e-4), Barrier goes against it (p = 1e-9)."""
+    """Group A goes the expected way (p = 1e-4), Group B goes against it (p = 1e-9)."""
     rows = [
-        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
-        SubgroupTerm("Firming", "Barrier", "GO:0000002", "Barrier", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up"),
+        SubgroupTerm("Firming", "Group B", "GO:0000002", "Group B", "up"),
     ]
-    hits = [TermHit("GO:0000001", "Collagen", 1e-4, "up"), TermHit("GO:0000002", "Barrier", 1e-9, "down")]
+    hits = [TermHit("GO:0000001", "Group A", 1e-4, "up"), TermHit("GO:0000002", "Group B", 1e-9, "down")]
     return build_nova(hits, ClaimSubgroupMap(rows))
 
 
@@ -187,9 +187,9 @@ def test_best_supporting_subgroup_is_not_the_most_significant_one_when_that_one_
     """`best_subgroup` stays the most significant sub-group whatever its direction (the fixture
     pins it); `best_for_*` is the most significant one among those going the expected way."""
     claim = _two_subgroups()["claims"][0]
-    assert claim["best_subgroup"] == "Barrier"
+    assert claim["best_subgroup"] == "Group B"
     assert claim["best_nl"] == pytest.approx(9.0)
-    assert claim["best_for_subgroup"] == "Collagen"
+    assert claim["best_for_subgroup"] == "Group A"
     assert claim["best_for_nl"] == pytest.approx(4.0)
 
 
@@ -202,11 +202,11 @@ def test_best_supporting_subgroup_is_the_best_subgroup_when_it_goes_the_expected
 
 def test_claim_without_significant_term_is_not_evaluated():
     rows = [
-        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
-        SubgroupTerm("Soothing", "TRP", "GO:0000002", "TRP", "down"),
-        SubgroupTerm("Healing", "Wound", "GO:0000003", "Wound", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up"),
+        SubgroupTerm("Soothing", "Group B", "GO:0000002", "Group B", "down"),
+        SubgroupTerm("Healing", "Group C", "GO:0000003", "Group C", "up"),
     ]
-    hits = [TermHit("GO:0000001", "Collagen", 1e-4, "up"), TermHit("GO:0000002", "TRP", 0.12, "down")]
+    hits = [TermHit("GO:0000001", "Group A", 1e-4, "up"), TermHit("GO:0000002", "Group B", 0.12, "down")]
     nova = build_nova(hits, ClaimSubgroupMap(rows))
     assert [c["name"] for c in nova["claims"]] == ["Firming"]
     # Referential order; the claim that has a term below alpha is not in the list.
@@ -224,10 +224,10 @@ def test_term_at_or_above_alpha_is_marked_and_counted():
     """A stored term at padj = alpha is not significant: it is marked so and counted, and it
     still weighs in the sums exactly as it did before the mark existed."""
     rows = [
-        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
-        SubgroupTerm("Firming", "Collagen", "GO:0000002", "Fibre", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000002", "Term B", "up"),
     ]
-    hits = [TermHit("GO:0000001", "Collagen", 1e-4, "up"), TermHit("GO:0000002", "Fibre", 0.05, "up")]
+    hits = [TermHit("GO:0000001", "Group A", 1e-4, "up"), TermHit("GO:0000002", "Term B", 0.05, "up")]
     nova = build_nova(hits, ClaimSubgroupMap(rows), alpha=0.05)
     sub = nova["claims"][0]["subgroups"][0]
     terms = {t["id"]: t for t in sub["terms"]}
@@ -257,10 +257,10 @@ def test_reference_coverage_counts_the_stored_terms_at_or_above_alpha(reference)
 
 def test_term_without_padj_is_left_out_and_counted():
     rows = [
-        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
-        SubgroupTerm("Firming", "Collagen", "GO:0000002", "Fibre", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000002", "Term B", "up"),
     ]
-    hits = [TermHit("GO:0000001", "Collagen", 1e-4, "up"), TermHit("GO:0000002", "Fibre", None, "up")]
+    hits = [TermHit("GO:0000001", "Group A", 1e-4, "up"), TermHit("GO:0000002", "Term B", None, "up")]
     nova = build_nova(hits, ClaimSubgroupMap(rows))
     sub = nova["claims"][0]["subgroups"][0]
     assert [t["id"] for t in sub["terms"]] == ["GO:0000001"]
@@ -272,35 +272,35 @@ def test_term_without_padj_is_left_out_and_counted():
 
 
 def test_a_row_with_a_padj_wins_over_a_repeat_without_one():
-    rows = [SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up")]
-    hits = [TermHit("GO:0000001", "Collagen", None, "up"), TermHit("GO:0000001", "Collagen", 1.0, "up")]
+    rows = [SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up")]
+    hits = [TermHit("GO:0000001", "Group A", None, "up"), TermHit("GO:0000001", "Group A", 1.0, "up")]
     nova = build_nova(hits, ClaimSubgroupMap(rows))
     assert nova["coverage"]["n_terms_without_padj"] == 0
 
 
 def test_term_in_both_directions_is_flagged():
     rows = [
-        SubgroupTerm("Firming", "Collagen", "GO:0030199", "Collagen fibril", "up"),
-        SubgroupTerm("Firming", "Collagen", "GO:0000002", "Fibre", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000010", "Term A", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000002", "Term B", "up"),
     ]
     mapping = ClaimSubgroupMap(rows)
     hits = [
-        TermHit("GO:0030199", "Collagen fibril", 1e-5, "up", genes=("G1", "G2")),
-        TermHit("GO:0030199", "Collagen fibril", 1e-2, "down", genes=("G3",)),
-        TermHit("GO:0000002", "Fibre", 1e-4, "up", genes=("G4",)),
+        TermHit("GO:0000010", "Term A", 1e-5, "up", genes=("G1", "G2")),
+        TermHit("GO:0000010", "Term A", 1e-2, "down", genes=("G3",)),
+        TermHit("GO:0000002", "Term B", 1e-4, "up", genes=("G4",)),
     ]
     sub = build_nova(hits, mapping)["claims"][0]["subgroups"][0]
     by_id = {}
     for t in sub["terms"]:
         by_id.setdefault(t["id"], []).append(t)
-    assert [t["both_directions"] for t in by_id["GO:0030199"]] == [True, True]
+    assert [t["both_directions"] for t in by_id["GO:0000010"]] == [True, True]
     assert [t["both_directions"] for t in by_id["GO:0000002"]] == [False]
     assert sub["n_terms_both_directions"] == 1  # one term, however many entries it has
 
     # The genes of each entry come from its own list only.
     genes = term_gene_map(hits, mapping)
-    assert genes[("GO:0030199", "up")] == {"G1", "G2"}
-    assert genes[("GO:0030199", "down")] == {"G3"}
+    assert genes[("GO:0000010", "up")] == {"G1", "G2"}
+    assert genes[("GO:0000010", "down")] == {"G3"}
     assert genes[("GO:0000002", "up")] == {"G4"}
 
 
@@ -629,7 +629,7 @@ def test_label_helpers():
 # ── Data access and provenance ──────────────────────────────────────────────
 
 ANALYSIS_ID = "7f1d2c9e-0b6a-4a38-9d57-3c1d9c3f2a10"
-FIRMING = [SubgroupTerm("Firming", "Collagen", "GO:0030199", "Collagen fibril", "up")]
+FIRMING = [SubgroupTerm("Firming", "Group A", "GO:0000010", "Term A", "up")]
 
 
 def _dataset(
@@ -645,10 +645,10 @@ def _dataset(
     return d
 
 
-def _row(pathway_id="GO:0030199", padj=1e-4, regulation="UP", pvalue=1e-5, comparison="A_vs_B"):
+def _row(pathway_id="GO:0000010", padj=1e-4, regulation="UP", pvalue=1e-5, comparison="A_vs_B"):
     return SimpleNamespace(
         pathway_id=pathway_id,
-        pathway_name="Collagen fibril",
+        pathway_name="Term A",
         category="GO:BP",
         pvalue=pvalue,
         padj=padj,
@@ -708,7 +708,12 @@ async def test_fetch_does_not_fall_back_to_the_raw_pvalue():
 async def test_payload_carries_provenance():
     dataset = _dataset({"analysis_id": ANALYSIS_ID})
     enrichment = _dataset(
-        {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "source": "annodb"},
+        {
+            "analysis_id": ANALYSIS_ID,
+            "comparison_name": "A_vs_B",
+            "source": "annodb",
+            "padj_cutoff": 0.1,
+        },
         type_=DatasetType.ENRICHMENT,
     )
     params = {"enrichment_fdr": 0.1, "enrichment_databases": ["GO", "Reactome"]}
@@ -734,15 +739,65 @@ async def test_payload_carries_provenance():
     json.dumps(nova)  # the payload is what the route serves
 
 
-async def test_an_analysis_without_enrichment_fdr_ran_at_the_script_default():
+async def _fdr_of(params, recorded=None, *, with_analysis=True):
+    """`provenance.enrichment_fdr` of an annoDB enrichment, `recorded` being the cut-off the
+    worker stored on the ENRICHMENT dataset (None = a dataset that predates the record)."""
+    meta = {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "source": "annodb"}
+    if recorded is not None:
+        meta["padj_cutoff"] = recorded
     dataset = _dataset({"analysis_id": ANALYSIS_ID})
-    enrichment = _dataset(
-        {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "source": "annodb"},
-        type_=DatasetType.ENRICHMENT,
+    enrichment = _dataset(meta, type_=DatasetType.ENRICHMENT)
+    db = _Db(
+        enrichment_datasets=[enrichment],
+        analysis_params=params if with_analysis else None,
+        rows=[_row()],
     )
-    db = _Db(enrichment_datasets=[enrichment], analysis_params={}, rows=[_row()])
     nova, _ = await _nova_of(dataset, db)
-    assert nova["provenance"]["enrichment_fdr"] == 0.05
+    return nova["provenance"]["enrichment_fdr"]
+
+
+async def test_the_cutoff_the_worker_recorded_wins_over_the_analysis_params():
+    """The params hold what the wizard asked for; the record holds what the script was given."""
+    assert await _fdr_of({"enrichment_fdr": 0.1}, recorded=0.02) == 0.02
+    assert await _fdr_of({"enrichment_fdr": 0.05}, recorded=0.01) == 0.01
+    assert await _fdr_of({}, recorded=0.1) == 0.1
+
+
+async def test_the_recorded_cutoff_needs_no_analysis_row():
+    assert await _fdr_of(None, recorded=0.03, with_analysis=False) == 0.03
+
+
+@pytest.mark.parametrize("params", [{}, {"enrichment_fdr": 0.05}, {"enrichment_fdr": None}])
+async def test_an_unrecorded_cutoff_is_005_when_the_params_ask_for_005_or_for_nothing(params):
+    """Before the record, the script ran at 0.05 whatever the params said, and since the params
+    began to be passed it ran at what they said: 0.05 is right in both eras for these params."""
+    assert await _fdr_of(params) == 0.05
+
+
+async def test_an_unrecorded_cutoff_the_params_set_elsewhere_is_not_recorded():
+    """Params at 0.1 may have run at 0.05 (before the cut-off was passed) or at 0.1 (after): say
+    nothing rather than guess."""
+    assert await _fdr_of({"enrichment_fdr": 0.1}) is None
+
+
+async def test_an_unrecorded_cutoff_without_an_analysis_is_not_recorded():
+    assert await _fdr_of(None, with_analysis=False) is None
+
+
+async def test_an_analysis_without_enrichment_databases_ran_on_all_of_them():
+    nova, _ = await _nova_of(
+        _dataset({"analysis_id": ANALYSIS_ID}),
+        _Db(
+            enrichment_datasets=[
+                _dataset(
+                    {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "source": "annodb"},
+                    type_=DatasetType.ENRICHMENT,
+                )
+            ],
+            analysis_params={},
+            rows=[_row()],
+        ),
+    )
     assert nova["provenance"]["enrichment_databases"] is None
 
 

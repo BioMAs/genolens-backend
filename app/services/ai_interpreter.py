@@ -12,6 +12,7 @@ import httpx
 from openai import APIConnectionError, AsyncOpenAI
 
 from app.core.config import settings
+from app.services.cosmomics_nova import subgroup_side
 
 logger = logging.getLogger(__name__)
 
@@ -185,16 +186,19 @@ class LocalAIInterpreter:
         claim_lines = []
         for c in nova.get("claims", [])[:9]:
             subs = c.get("subgroups", [])
-            pro = [s for s in subs if s.get("delta", 0) > 0][:3]
-            con = [s for s in subs if s.get("delta", 0) <= 0][:3]
-            line = (
-                f"- {c['name']}: coherence {round(100 * c.get('coherence', 0))}% "
-                f"({c.get('n_for', 0)} pathways for, {c.get('n_against', 0)} against)"
-            )
+            pro = [s for s in subs if subgroup_side(s) == "for"][:3]
+            con = [s for s in subs if subgroup_side(s) == "against"][:3]
+            tied = [s for s in subs if subgroup_side(s) == "balanced"][:3]
+            counts = f"{c.get('n_for', 0)} pathways for, {c.get('n_against', 0)} against"
+            if c.get("n_balanced"):
+                counts += f", {c['n_balanced']} balanced"
+            line = f"- {c['name']}: coherence {round(100 * c.get('coherence', 0))}% ({counts})"
             if pro:
                 line += "; supporting: " + ", ".join(sub_text(s) for s in pro)
             if con:
                 line += "; contradicting: " + ", ".join(sub_text(s) for s in con)
+            if tied:
+                line += "; balanced: " + ", ".join(sub_text(s) for s in tied)
             claim_lines.append(line)
         claims_text = "\n".join(claim_lines) or (
             "- No cosmetic claim has a significant pathway in this comparison."

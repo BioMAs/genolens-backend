@@ -268,6 +268,31 @@ class DatabaseTask(Task):
     pass
 
 
+def enrichment_padj_cutoff(params: dict) -> float:
+    """The term cut-off an analysis's annoDB enrichment runs at: the `--padj-cutoff` it is given.
+
+    The wizard's ``enrichment_fdr``; 0.05 when the parameters carry none (analyses created before
+    the field). The ENRICHMENT dataset records this value (`enrichment_dataset_metadata`) so the
+    nova can print the cut-off the run really had, not the one the parameters might say.
+    """
+    return float(params.get("enrichment_fdr", 0.05))
+
+
+def enrichment_dataset_metadata(analysis_id: str, comparison: str, params: dict) -> dict:
+    """The metadata an annoDB ENRICHMENT dataset is registered with.
+
+    `padj_cutoff` is what `build_functional_enrichment_cmd` passes to the script: it is recorded
+    when the enrichment runs, and it is the only record of the cut-off that does not depend on
+    when the analysis was created.
+    """
+    return {
+        "analysis_id": analysis_id,
+        "comparison_name": comparison,
+        "source": "annodb",
+        "padj_cutoff": enrichment_padj_cutoff(params),
+    }
+
+
 def build_functional_enrichment_cmd(
     script: Path,
     deg_csv: Path,
@@ -298,7 +323,7 @@ def build_functional_enrichment_cmd(
         "--output", str(output),
         "--fdr", str(params.get("fdr", 0.05)),
         "--min-log2fc", str(params.get("min_log2fc", 1.0)),
-        "--padj-cutoff", str(params.get("enrichment_fdr", 0.05)),
+        "--padj-cutoff", str(enrichment_padj_cutoff(params)),
     ]
     names = [d.strip() for d in params.get("enrichment_databases") or [] if d and d.strip()]
     if names:
@@ -1382,11 +1407,9 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                                             type=DatasetType.ENRICHMENT,
                                             status=DatasetStatus.PENDING,
                                             raw_file_path=enrich_storage,
-                                            dataset_metadata={
-                                                "analysis_id": str(analysis_id),
-                                                "comparison_name": comp_id,
-                                                "source": "annodb",
-                                            },
+                                            dataset_metadata=enrichment_dataset_metadata(
+                                                str(analysis_id), comp_id, params
+                                            ),
                                             column_mapping={},
                                         )
                                         db.add(enrich_ds)

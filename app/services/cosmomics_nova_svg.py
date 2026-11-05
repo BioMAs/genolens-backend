@@ -23,6 +23,8 @@ from typing import Any, Literal, Optional
 
 import numpy as np
 
+from app.services.cosmomics_nova import subgroup_side
+
 Theme = Literal["light", "dark"]
 
 FONT = "Inter, 'Helvetica Neue', Arial, sans-serif"
@@ -340,8 +342,10 @@ class _Nova:
             else:
                 s0, s1, s2 = band[key]
                 subs = by_name[key].get("subgroups") or []
-                con = [s for s in subs if (s.get("delta") or 0) <= 0]
-                items = place([s for s in subs if (s.get("delta") or 0) > 0], s0, s1)
+                con = [s for s in subs if subgroup_side(s) == "against"]
+                # A balanced sub-group is neither for nor against: it sits with the plain arc,
+                # grey, never in the hatched one.
+                items = place([s for s in subs if subgroup_side(s) != "against"], s0, s1)
                 items += place(con, s1, s2) if s2 - s1 > 3 else place(con, s0, s2)
             best = by_name[key].get("best_subgroup") if key != "other" else None
             for s, a in items:

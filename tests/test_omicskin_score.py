@@ -128,12 +128,12 @@ def _claim_with_a_contrary_best_subgroup() -> dict:
     """The most significant sub-group (p = 1e-10) goes against the claim; the best one going the
     expected way is at p = 1e-4. Coherence = 4 / (4 + 10)."""
     rows = [
-        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
-        SubgroupTerm("Firming", "Barrier", "GO:0000002", "Barrier", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up"),
+        SubgroupTerm("Firming", "Group B", "GO:0000002", "Group B", "up"),
     ]
     hits = [
-        TermHit("GO:0000001", "Collagen", 1e-4, "up"),
-        TermHit("GO:0000002", "Barrier", 1e-10, "down"),
+        TermHit("GO:0000001", "Group A", 1e-4, "up"),
+        TermHit("GO:0000002", "Group B", 1e-10, "down"),
     ]
     return build_nova(hits, ClaimSubgroupMap(rows))
 
@@ -150,8 +150,8 @@ def test_score_uses_the_best_supporting_subgroup():
 
 
 def test_a_claim_without_a_supporting_subgroup_scores_zero():
-    rows = [SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up")]
-    nova = build_nova([TermHit("GO:0000001", "Collagen", 1e-9, "down")], ClaimSubgroupMap(rows))
+    rows = [SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up")]
+    nova = build_nova([TermHit("GO:0000001", "Group A", 1e-9, "down")], ClaimSubgroupMap(rows))
     assert nova["claims"][0]["best_for_nl"] is None
     (scored,) = [s for s in score_claims(nova) if s.scored]
     assert scored.score == 0

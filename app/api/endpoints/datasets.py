@@ -439,11 +439,16 @@ _CLIENT_PROTECTED_METADATA_KEYS = frozenset(
         "source",
         "geo_accession",
         # Ce que la nova de CosmOmics imprime de l'enrichissement : la version déclarée à
-        # l'upload (contrôlée là, pas ici), et ce que le worker a lu ou écarté
+        # l'upload (contrôlée là, pas ici), ce que le worker a lu ou écarté, et le seuil
+        # qu'il a passé à R
         "source_version",
         "padj_column",
         "padj_unparsable",
         "rows_without_padj",
+        "padj_cutoff",
+        # Marque d'un compte de démonstration : la nova et les exports la reprennent, et ce
+        # compte possède ses datasets, donc pourrait la retirer par PATCH
+        "demo",
     }
 )
 

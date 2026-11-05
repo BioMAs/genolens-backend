@@ -18,6 +18,7 @@ from app.api.endpoints.analyses import AnalysisParams
 from app.worker.tasks import (
     _build_pipeline_command,
     build_functional_enrichment_cmd,
+    enrichment_dataset_metadata,
     enrichment_requested,
 )
 
@@ -71,6 +72,24 @@ def test_default_is_the_cutoff_the_script_always_used():
 def test_out_of_range_cutoff_is_rejected(bad):
     with pytest.raises(ValidationError):
         AnalysisParams(enrichment_fdr=bad)
+
+
+def test_the_enrichment_dataset_records_the_cutoff_the_script_was_given():
+    """The nova prints this value as the enrichment FDR: it is the flag, not the wizard's field."""
+    for params in ({"enrichment_fdr": 0.01}, {"enrichment_fdr": 0.2}, {}):
+        meta = enrichment_dataset_metadata("an-1", "A_vs_B", params)
+        assert meta["padj_cutoff"] == float(_flag(_cmd(params), "--padj-cutoff"))
+    assert enrichment_dataset_metadata("an-1", "A_vs_B", {})["padj_cutoff"] == 0.05
+
+
+def test_the_enrichment_dataset_keeps_the_metadata_the_pipeline_matches_it_on():
+    meta = enrichment_dataset_metadata("an-1", "A_vs_B", {"enrichment_fdr": 0.01})
+    assert meta == {
+        "analysis_id": "an-1",
+        "comparison_name": "A_vs_B",
+        "source": "annodb",
+        "padj_cutoff": 0.01,
+    }
 
 
 # ── the database pick ─────────────────────────────────────────────────────────────

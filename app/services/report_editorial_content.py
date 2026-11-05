@@ -25,6 +25,7 @@ from markupsafe import Markup, escape
 
 from app.services.cosmetics_taxonomy import normalize_pathway_id
 from app.services.cosmomics_grouping import clean_label
+from app.services.cosmomics_nova import subgroup_side
 from app.services.cosmomics_nova_svg import claim_color
 from app.services.omicskin_score import ALL_CLAIMS, BAND_LABELS, ClaimScore, claim_score
 from app.services.report_editorial_svg import (
@@ -294,7 +295,7 @@ def claim_statement(cs: ClaimScore, test: str, control: str) -> str:
         f"{coherence} % of the evidence goes in the direction of the claim"
     )
     if n_against:
-        against = [x.get("name") for x in subs if (x.get("delta") or 0) <= 0][:2]
+        against = [x.get("name") for x in subs if subgroup_side(x) == "against"][:2]
         verb = "goes" if n_against == 1 else "go"
         s += (
             f"; {number_word(n_against)} sub-group{'s' if n_against != 1 else ''} "

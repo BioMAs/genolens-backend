@@ -33,11 +33,12 @@ Definitions (reference: docs/reference/cosmomics/cosmomics_pathway_nova.py):
 What the p-values are, and what is stored (the payload's `provenance` and `p_source` say which):
 
   * p is the `padj` of each term. From an analysis run in GenoLens it is the Benjamini-Hochberg
-    figure of the annoDB over-representation, and only the terms below the analysis's
-    `enrichment_fdr` (0.05 by default) are stored; the enrichment GenoLens runs on a DEG upload
-    stores its Benjamini-Hochberg terms at fdr <= 0.05. For tables uploaded to GenoLens it is the
-    column the parser read as adjusted p (`provenance.padj_columns`), and the tables are stored
-    as deposited, not filtered by anyone. A row without an adjusted p is never stored as if it
+    figure of the annoDB over-representation, and only the terms below the cut-off the run was
+    given are stored (`provenance.enrichment_fdr`: 0.05 unless the wizard chose another, and
+    recorded as `padj_cutoff` on the ENRICHMENT dataset); the enrichment GenoLens runs on a DEG
+    upload stores its Benjamini-Hochberg terms at fdr <= 0.05. For tables uploaded to GenoLens it
+    is the column the parser read as adjusted p (`provenance.padj_columns`), and the tables are
+    stored as deposited, not filtered by anyone. A row without an adjusted p is never stored as if it
     had one, and a term without a padj is left out of the nova and counted
     (`coverage.n_terms_without_padj`).
   * `alpha` marks each term `significant` and keeps a claim only if one of its terms is. A stored
@@ -79,13 +80,14 @@ from app.services.enrichment_source import find_enrichment_dataset
 logger = logging.getLogger(__name__)
 
 Direction = Literal["up", "down"]
+Side = Literal["for", "against", "balanced"]
 
 P_FLOOR = 1e-300
 # Φ⁻¹(1 − p) diverges at p = 1; a padj of exactly 1 is treated as "no evidence at all".
 _P_CEIL = 1.0 - 1e-15
 
 DEFAULT_ALPHA = 0.05
-# The enrichment cut-off an analysis ran at when its parameters name none (the R script's default).
+# The R enrichment script's own term cut-off: what an analysis ran at when no other was passed.
 DEFAULT_ENRICHMENT_FDR = 0.05
 # Sub-groups whose delta is within this of zero are balanced: float sums of equal evidence need
 # not cancel exactly.
@@ -415,9 +417,25 @@ def _dedupe(hits: Iterable[TermHit]) -> list[TermHit]:
     return list(best.values())
 
 
+def subgroup_side(subgroup: dict[str, Any]) -> Side:
+    """Which side of its claim a sub-group of the payload stands on.
+
+    "for" when delta > 0, "against" when delta < 0, "balanced" when the evidence for and against
+    cancels (delta within `_TIE_EPS` of 0). The one rule behind `n_for` / `n_against` /
+    `n_balanced`, the wheel, the editorial sentences and the AI prompt: a balanced sub-group is
+    never presented as contrary.
+    """
+    delta = subgroup.get("delta") or 0.0
+    if delta > _TIE_EPS:
+        return "for"
+    if delta < -_TIE_EPS:
+        return "against"
+    return "balanced"
+
+
 def best_supporting_subgroup(subgroups: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """The most significant sub-group whose evidence goes the expected way (delta > 0), if any."""
-    supporting = [s for s in subgroups if s["delta"] > _TIE_EPS]
+    supporting = [s for s in subgroups if subgroup_side(s) == "for"]
     return min(supporting, key=lambda s: (-s["nl"], s["name"]), default=None)
 
 
@@ -538,8 +556,8 @@ def build_nova(
         s_anti = sum(s["s_anti"] for s in subgroups)
         best = subgroups[0]
         best_for = best_supporting_subgroup(subgroups)
-        n_for = sum(1 for s in subgroups if s["delta"] > _TIE_EPS)
-        n_against = sum(1 for s in subgroups if s["delta"] < -_TIE_EPS)
+        sides = [subgroup_side(s) for s in subgroups]
+        n_for, n_against = sides.count("for"), sides.count("against")
         claims.append(
             {
                 "name": claim,
@@ -550,7 +568,7 @@ def build_nova(
                 "coherence": coherence_of(s_pro, s_anti),
                 "n_for": n_for,
                 "n_against": n_against,
-                "n_balanced": len(subgroups) - n_for - n_against,
+                "n_balanced": sides.count("balanced"),
                 "best_subgroup": best["name"],
                 "best_nl": best["nl"],
                 "best_for_subgroup": best_for["name"] if best_for else None,
@@ -634,6 +652,25 @@ async def _analysis_params(db: AsyncSession, analysis_id: Any) -> Optional[dict]
     return params if isinstance(params, dict) else None
 
 
+def _enrichment_fdr(recorded: Any, params: Optional[dict]) -> Optional[float]:
+    """The term cut-off an annoDB enrichment ran at, None when it cannot be told.
+
+    The worker records the `--padj-cutoff` it passes to the script (`padj_cutoff` on the
+    ENRICHMENT dataset): that is the answer. A dataset that predates the record falls back on the
+    analysis parameters, which are only trustworthy when they ask for 0.05 (or for nothing): until
+    the cut-off was passed to the script (2026-09-29) it ran at 0.05 whatever the parameters
+    said, and since then it runs at what they say, so any other value may be either.
+    """
+    if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+        return float(recorded)
+    if params is None:
+        return None
+    asked = params.get("enrichment_fdr")
+    if asked is None or asked == DEFAULT_ENRICHMENT_FDR:
+        return DEFAULT_ENRICHMENT_FDR
+    return None
+
+
 def _distinct(values: Iterable[Any]) -> tuple[str, ...]:
     seen: dict[str, None] = {}
     for value in values:
@@ -650,8 +687,8 @@ async def resolve_nova_source(
     The rows are read where the enrichment panel reads them: the ENRICHMENT dataset of the same
     analysis when there is one, else the DEG dataset (the legacy Python enrichment stores its rows
     there). An enrichment GenoLens ran itself (`source` "annodb", or the legacy path) is described
-    by the analysis's `enrichment_fdr` and `enrichment_databases`; a deposited table by the column
-    read as adjusted p.
+    by the term cut-off it ran at (`_enrichment_fdr`) and the analysis's `enrichment_databases`; a
+    deposited table by the column read as adjusted p.
     """
     enrichment = await find_enrichment_dataset(db, deg_dataset, comparison_name)
     deg_meta = deg_dataset.dataset_metadata or {}
@@ -661,10 +698,10 @@ async def resolve_nova_source(
     analysis_id = deg_meta.get("analysis_id") or enr_meta.get("analysis_id")
     fdr: Optional[float] = None
     databases: Optional[tuple[str, ...]] = None
-    if analysis_id and not uploaded:
-        params = await _analysis_params(db, analysis_id)
+    if not uploaded:
+        params = await _analysis_params(db, analysis_id) if analysis_id else None
+        fdr = _enrichment_fdr(enr_meta.get("padj_cutoff"), params)
         if params is not None:
-            fdr = float(params.get("enrichment_fdr") or DEFAULT_ENRICHMENT_FDR)
             databases = tuple(d for d in params.get("enrichment_databases") or [] if d) or None
 
     return NovaSource(
