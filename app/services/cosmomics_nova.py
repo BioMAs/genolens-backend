@@ -448,6 +448,14 @@ def claim_state(s_pro: float, s_anti: float) -> str:
     return "both_ways"
 
 
+def claim_state_of(claim: dict[str, Any]) -> str:
+    """The state of a payload claim: its `state`, or (a payload that predates the field) the one
+    its sums give."""
+    return claim.get("state") or claim_state(
+        float(claim.get("s_pro") or 0.0), float(claim.get("s_anti") or 0.0)
+    )
+
+
 def _referential_version(mapping: ClaimSubgroupMap) -> Optional[int]:
     if mapping.version is None:
         return None

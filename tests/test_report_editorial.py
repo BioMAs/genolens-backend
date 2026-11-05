@@ -330,8 +330,8 @@ P_SOURCE_GENOLENS = "padj (Benjamini–Hochberg, GenoLens enrichment)"
 GENOLENS_PROVENANCE = {
     "dataset_id": "d-1",
     "comparison": "AL-7_vs_Vehicle",
-    "enrichment_dataset_ids": [],
-    "analysis_id": None,
+    "enrichment_dataset_ids": ["e-1"],
+    "analysis_id": "a-1",  # an analysis run in GenoLens, its enrichment on a dataset of its own
     "enrichment_fdr": 0.05,
     "enrichment_databases": ["GO", "Reactome"],
     "padj_columns": [],
@@ -459,15 +459,44 @@ def test_methods_name_the_differential_method_from_the_dataset_metadata():
     assert "DESeq2" not in text and "edgeR" not in text
 
 
+def test_methods_of_a_legacy_enrichment_name_no_test():
+    """Rows stored by an earlier GenoLens enrichment (no analysis, no enrichment dataset, no
+    uploaded table): the report says the parameters are not recorded, and names none (R-T4-3)."""
+    legacy = _honest_nova(
+        analysis_id=None, enrichment_dataset_ids=[], enrichment_fdr=None, enrichment_databases=None
+    )
+    params = {"species": "human", "fdr": 0.01, "min_log2fc": 0.585}
+    text = _text(_page(legacy, params=params))
+    assert (
+        "earlier GenoLens method whose parameters (test, correction, cut-off, databases) are not recorded"
+        in text
+    )
+    assert "hypergeometric" not in text.lower() and "benjamini" not in text.lower()
+    assert "all categories" not in text and "cut-off not recorded" not in text
+    assert "adjusted p < 0.05" not in text and "≤ 0.05" not in text
+    # An analysis run in GenoLens keeps its test and its cut-off.
+    assert "hypergeometric" in _text(_page(params=params))
+
+
 def test_stouffer_text_says_unsigned_and_not_independent():
     method = next(p for p in _context()["pages"] if p["kind"] == "method")
     text = _text(method["method_nova"])
     assert "unsigned" in text and "independent" in text and "not weighted" in text
     # R-P1: a term at or above alpha is marked, not filtered.
     assert "terms not significant at α still contribute with their weight" in text
-    # The referential is described by its structure only.
-    assert "Gene Ontology, Reactome and Cell Ontology identifiers" in text
-    assert "KEGG" not in text and "STRING" not in text
+    # The referential is described by what it does (R-T4-2): no identifier family is listed, so
+    # no database appears that the run did not list.
+    assert "links it to that claim" in text
+    for family in ("Gene Ontology", "Reactome", "Cell Ontology", "STRING", "KEGG", "WikiPathways"):
+        assert family not in text, family
+    for databases in (["GO", "KEGG"], None):
+        method = next(
+            p
+            for p in _context(_honest_nova(enrichment_databases=databases))["pages"]
+            if p["kind"] == "method"
+        )
+        assert "Ontology" not in _text(method["method_nova"])
+    assert "Cell Ontology" not in _text(_page())
 
 
 def test_strings_recorded_with_the_data_are_escaped():
@@ -515,16 +544,95 @@ def test_zero_against_is_not_presented_as_a_confirmation():
         "Only terms present in the enrichment results can count against a claim; "
         "no contrary term is not a confirmation."
     )
-    # Barrier, Soothing and Firming have no sub-group against them in the reference mock: their
-    # pages carry the note, the claims that have one against do not.
-    page = _text(_page())
-    assert page.count(note) == 3 + 2  # the three pages, and the wheel of the cover and of page 3
-    blocks = {
-        p["claim"]["name"]: p["claim"]["zero_against_note"]
-        for p in _context()["pages"]
-        if p["kind"] == "claim"
-    }
-    assert {name for name, n in blocks.items() if n} == {"Barrier", "Soothing", "Firming"}
+
+    def notes(nova):
+        ctx = _context(nova)
+        blocks = {
+            p["claim"]["name"]: p["claim"]["zero_against_note"]
+            for p in ctx["pages"]
+            if p["kind"] == "claim"
+        }
+        return {name for name, n in blocks.items() if n}, _text(render_html(ctx)).count(note)
+
+    # Barrier, Soothing and Firming have no sub-group against them in the reference mock, but
+    # each has a contrary term (S_anti > 0): "0 against" is then no absence of contrary evidence,
+    # and the note is not printed (R-T4-4 a).
+    assert notes(_honest_nova()) == (set(), 0)
+
+    def no_contrary_term(nova):
+        claim = next(c for c in nova["claims"] if c["name"] == "Barrier")
+        claim.update(s_anti=0.0, coherence=1.0, state="for_only")
+
+    # A claim with no contrary term at all carries it: on its page, and on the wheel (the cover's
+    # and page 3's).
+    names, count = notes(_honest_nova(no_contrary_term))
+    assert names == {"Barrier"} and count == 1 + 2
+
+
+def test_sub_groups_are_not_called_pathways():
+    """A sub-group is a group of pathways, not a pathway (R-T4-4 b)."""
+    text = _text(_page())
+    assert "5 significant sub-groups linked to no claim" in text
+    assert "pathways going" not in text and "Significant pathways" not in text
+    assert "significant pathway sub-group" not in text
+    none = _text(_page(_honest_nova(lambda n: n.update(unlinked=[], unlinked_total=0))))
+    assert "Significant sub-groups linked to no claim would appear here" in none
+    # The reservations page: "Supported, but with sub-groups going the other way."
+    with_against = _context(_honest_nova())
+    headlines = [p["headline"] for p in with_against["pages"] if p["kind"] == "reservations"]
+    assert headlines == ["Supported, but with sub-groups going the other way."]
+
+
+def _guide(ctx) -> str:
+    return dict(ctx["pages"][1]["guide"])["How to read this review."]
+
+
+def test_reading_guide_follows_the_bands():
+    import copy
+
+    default = _guide(_context())
+    assert "dossier" not in default.lower() and "without evidence" not in default
+    assert default.endswith(
+        "— then the claims supported with reservations and the claims with weak evidence or "
+        "not evaluated (n.e.)."
+    )
+
+    def weaken(nova):
+        for claim in nova["claims"]:
+            claim["best_nl"] = claim["best_for_nl"] = 1.0
+            claim["coherence"] = 0.5
+
+    # Every scored claim under 25: they are scored (they print "Score N · weak evidence"), the
+    # others are not evaluated; the guide says neither "none is scored" nor "without evidence".
+    ctx = _context(_honest_nova(weaken))
+    text = _guide(ctx)
+    assert text == (
+        "Page 4 lists the claims with weak evidence (score below 25) and the claims not "
+        "evaluated (n.e.)."
+    )
+    assert "Score 6 · weak evidence." in _text(render_html(ctx))
+
+    def all_scored(nova):
+        weaken(nova)
+        for name in nova["not_evaluated"]:
+            extra = copy.deepcopy(nova["claims"][0])
+            extra["name"] = name
+            nova["claims"].append(extra)
+        nova["not_evaluated"] = []
+
+    text = _guide(_context(_honest_nova(all_scored)))
+    assert text == "Page 4 lists the claims, all with weak evidence (score below 25)."
+
+    # Nothing significant, or no result at all: said as such.
+    empty = {"contrast": "A_vs_B", "claims": [], "unlinked": [], "not_evaluated": []}
+    assert "why none of them is evaluated (n.e.): no term of theirs is significant" in _guide(
+        _context(empty)
+    )
+    none = {"contrast": "A_vs_B", "status": "no_enrichment", "claims": [], "unlinked": []}
+    assert "why none is evaluated: this comparison has no enrichment result" in _guide(
+        _context(none, enr_up=[], enr_down=[])
+    )
+    assert "none of them is scored" not in default + text
 
 
 def test_lowest_band_is_weak_evidence():
@@ -660,6 +768,11 @@ def test_no_enrichment_is_not_reported_as_no_significant_claim():
     text = _text(render_html(ctx))
     assert "No enrichment result is stored for this comparison" in text
     assert "No claim has a significant term" not in text
+    # Every claim is n.e. for want of a result, not for want of a significant term (R-T4-4 c).
+    strip = [s for p in ctx["pages"] if p["kind"] == "reservations" for s in p["strip"]]
+    assert len(strip) == 9
+    assert all(s["title"] == "n.e. — no enrichment result for this comparison." for s in strip)
+    assert "no significant term for this claim" not in text
 
 
 def test_claim_pages_keep_the_users_own_signoff_card(html):

@@ -25,7 +25,7 @@ from typing import Any, Literal, Optional
 
 import numpy as np
 
-from app.services.cosmomics_nova import subgroup_side
+from app.services.cosmomics_nova import claim_state_of, subgroup_side
 
 Theme = Literal["light", "dark"]
 
@@ -175,7 +175,8 @@ def _bsize(d: float) -> float:
 
 
 AXIS_TITLE = "−log10 combined p (Stouffer, unsigned)"
-# Said wherever a claim shows "0 against": the absence of a contrary term is not evidence for.
+# Said wherever a claim has no contrary term at all (state "for_only"): the absence of a contrary
+# term is not evidence for.
 ZERO_AGAINST_NOTE = (
     "Only terms present in the enrichment results can count against a claim; "
     "no contrary term is not a confirmation."
@@ -530,7 +531,7 @@ class _Nova:
         o: list[str] = []
         if self.claims or self.other:
             o.append(_text(20, 944, f"Radius: {AXIS_TITLE}", 12.5, th["muted"], weight=500))
-        if any(not int(c.get("n_against") or 0) for c in self.claims):
+        if any(claim_state_of(c) == "for_only" for c in self.claims):
             first, second = ZERO_AGAINST_NOTE.split("; ")
             o.append(_text(20, 960, first + ";", 11, th["dim"]))
             o.append(_text(20, 974, second, 11, th["dim"]))

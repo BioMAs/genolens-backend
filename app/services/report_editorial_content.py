@@ -29,7 +29,7 @@ from app.services.cosmomics_nova import (
     DEFAULT_ALPHA,
     P_SOURCE_UPLOADED,
     best_supporting_subgroup,
-    claim_state,
+    claim_state_of,
     subgroup_side,
 )
 from app.services.cosmomics_nova_svg import ZERO_AGAINST_NOTE, claim_color
@@ -298,11 +298,8 @@ def supporting_subgroup(claim: dict) -> Optional[tuple[str, float]]:
 
 
 def state_of(claim: dict) -> str:
-    """for_only / both_ways / against_only, from the payload (or from its sums, when it predates
-    the field)."""
-    return claim.get("state") or claim_state(
-        float(claim.get("s_pro") or 0.0), float(claim.get("s_anti") or 0.0)
-    )
+    """for_only / both_ways / against_only (see `cosmomics_nova.claim_state_of`)."""
+    return claim_state_of(claim)
 
 
 def _n_balanced(claim: dict) -> int:
@@ -586,6 +583,8 @@ class EnrichmentFacts:
     `databases` (None: all the categories of the annotation database). kind "deposited": tables
     somebody uploaded, kept as deposited, whose adjusted p is the column(s) read as such
     (`columns`, empty when not recorded); there is no cut-off and no database to name. kind
+    "legacy": rows stored by an earlier GenoLens enrichment (no analysis, no enrichment dataset,
+    no uploaded table): its test, correction, cut-off and databases are not recorded. kind
     "unknown": a payload without provenance.
     """
 
@@ -602,6 +601,8 @@ def enrichment_facts(nova: dict) -> EnrichmentFacts:
     columns = tuple(str(c) for c in prov.get("padj_columns") or [])
     if columns or str(nova.get("p_source") or "").startswith(P_SOURCE_UPLOADED):
         return EnrichmentFacts("deposited", columns)
+    if not prov.get("analysis_id") and not prov.get("enrichment_dataset_ids"):
+        return EnrichmentFacts("legacy")
     fdr = prov.get("enrichment_fdr")
     databases = prov.get("enrichment_databases")
     return EnrichmentFacts(
@@ -643,6 +644,11 @@ def enrichment_method(facts: EnrichmentFacts) -> str:
         return (
             "The enrichment tables were deposited with the dataset; their adjusted p-value is "
             f"read from {_column_phrase(facts)}, and the test that produced it is not described here"
+        )
+    if facts.kind == "legacy":
+        return (
+            "The enrichment results come from an earlier GenoLens method whose parameters (test, "
+            "correction, cut-off, databases) are not recorded"
         )
     return (
         "The enrichment results are those stored with the dataset; their test and correction "
@@ -823,15 +829,19 @@ def method_nova(inp: EditorialInputs) -> Markup:
         )
     elif facts.kind == "deposited":
         p_values = f"adjusted p-values read from {_column_phrase(facts)} of the deposited tables"
+    elif facts.kind == "legacy":
+        p_values = (
+            "adjusted p-values stored by an earlier GenoLens enrichment method, whose parameters "
+            "are not recorded"
+        )
     else:
         p_values = "adjusted p-values as stored with the enrichment results"
     return Markup(
         f"For each comparison, the enrichment results ({escape(p_values)}) are joined to the "
         f"SciLicium claim referential, a curated table that assigns ontology terms to "
         f"{number_word(len(ALL_CLAIMS))} cosmetic claims and groups them into pathway "
-        "sub-groups, each with the expected direction of regulation. The referential "
-        "identifies terms by Gene Ontology, Reactome and Cell Ontology identifiers; an enriched "
-        "term is joined by identifier or, without one, by name. A term counts <i>for</i> a claim "
+        "sub-groups, each with the expected direction of regulation. An enriched term counts "
+        "toward a claim when the curated referential links it to that claim — <i>for</i> it "
         "when its observed direction matches the expected one, <i>against</i> otherwise; a term "
         "enriched in both lists (↑↓) counts once each way. "
         f"A term is significant when its adjusted p is below α (α = {alpha:g}); a claim with no "
@@ -944,8 +954,10 @@ def _claim_block(
         "terms": rows,
         "n_terms": n_terms,
         "terms_truncated": n_terms > len(rows),
-        # 0 sub-groups against is not a confirmation: said under the sub-groups.
-        "zero_against_note": ZERO_AGAINST_NOTE if not int(c.get("n_against") or 0) else None,
+        # A claim with no contrary term at all (state for_only): no contrary term is not a
+        # confirmation. A claim whose sub-groups are all for it but that has a contrary term does
+        # not need the note.
+        "zero_against_note": ZERO_AGAINST_NOTE if state_of(c) == "for_only" else None,
         "has_not_significant": any(not r["significant"] for r in rows),
         "has_both": any(r["both"] for r in rows),
         "review": reviewer_text,
@@ -1175,8 +1187,10 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                         {
                             "name": s.name,
                             "title": (
-                                f"{NOT_EVALUATED} — no significant term for this claim in the "
-                                "enrichment results."
+                                f"{NOT_EVALUATED} — no enrichment result for this comparison."
+                                if no_enrichment
+                                else f"{NOT_EVALUATED} — no significant term for this claim in "
+                                "the enrichment results."
                             ),
                             "text": _not_evaluated_text(inp.nova),
                         }
@@ -1188,7 +1202,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 f" · with reservations"
             )
             headline = (
-                "Supported, but with pathways going the other way."
+                "Supported, but with sub-groups going the other way."
                 if any(b["n_against"] for b in blocks)
                 else "Moderately or weakly supported."
             )
@@ -1399,23 +1413,42 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             f"Page {first_claim_page}" if single else f"Pages {first_claim_page}–{last_claim_page}"
         )
         verb = "gives" if single else "give"
-        if strong:
-            text = (
-                f"{span} {verb} one page per strongly supported claim — the score, a "
-                f"statement built from the data, the pathways and genes behind it — then "
-                f"the claims supported with reservations and those without evidence."
+        n_weak = sum(1 for s in strip_claims if s.scored)
+        reading = "the claims with weak evidence or not evaluated (n.e.)"
+        if strong or reserved:
+            lead = (
+                "one page per strongly supported claim — the score, a statement built from the "
+                "data, the pathways and genes behind it"
+                if strong
+                else "the claims supported with reservations — score, statement, pathways and genes"
             )
-        elif reserved:
-            text = (
-                f"{span} {verb} the claims supported with reservations — score, statement, "
-                f"pathways and genes — then those without evidence."
+            # What follows, by what is there: the claims with reservations (when the first pages
+            # were the strong ones), then those with weak evidence or not evaluated.
+            then = (["the claims supported with reservations"] if strong and reserved else []) + (
+                [reading] if strip_claims else []
             )
+            text = f"{span} {verb} {lead}" + (f" — then {' and '.join(then)}" if then else "") + "."
         else:
-            text = (
-                f"{span} {'lists' if single else 'list'} the {len(ALL_CLAIMS)} claims and "
-                f"why none of them is scored in this comparison."
-            )
-        guide.append(("How to read this dossier.", text))
+            lists = "lists" if single else "list"
+            if no_enrichment:
+                what = (
+                    f"the {len(ALL_CLAIMS)} claims and why none is evaluated: this comparison "
+                    "has no enrichment result"
+                )
+            elif n_weak and n_weak < len(strip_claims):
+                what = (
+                    "the claims with weak evidence (score below 25) and the claims not "
+                    f"evaluated ({NOT_EVALUATED})"
+                )
+            elif n_weak:
+                what = "the claims, all with weak evidence (score below 25)"
+            else:
+                what = (
+                    f"the {len(ALL_CLAIMS)} claims and why none of them is evaluated "
+                    f"({NOT_EVALUATED}): no term of theirs is significant"
+                )
+            text = f"{span} {lists} {what}."
+        guide.append(("How to read this review.", text))
     guide.append(
         (
             "Where the evidence comes from.",

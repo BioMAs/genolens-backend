@@ -210,13 +210,15 @@ def test_zero_against_is_written(nova):
     svg = render_nova_svg(_payload(), "light", id_prefix="x")
     assert "1 sub-group for" in svg and "0 against" in svg
     assert "1 against" in svg and "1 balanced" in svg
-    # A claim with nothing against says "0 against" too (Firming of the reference mock), and the
-    # wheel says what that does not mean.
+    # A claim with no sub-group against it says "0 against" too (the reference mock), but each of
+    # them has a contrary term: nothing is said about the absence of one.
     mock = render_nova_svg(nova, "light", id_prefix="y")
-    assert "0 against" in mock
-    assert "Only terms present in the enrichment results can count against a claim;" in mock
-    assert "no contrary term is not a confirmation." in mock
-    # Every claim has something against: nothing to qualify.
+    assert "0 against" in mock and "not a confirmation" not in mock
+    # A claim with no contrary term at all (S_anti = 0) carries the note: Barrier of _payload().
+    note = render_nova_svg(_payload(), "light", id_prefix="n")
+    assert "Only terms present in the enrichment results can count against a claim;" in note
+    assert "no contrary term is not a confirmation." in note
+    # Every claim has a contrary term: nothing to qualify.
     both = {**_payload(), "claims": _payload()["claims"][:1]}
     assert "not a confirmation" not in render_nova_svg(both, "light", id_prefix="z")
 

@@ -154,7 +154,7 @@
   <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6mm;font-size:8.8pt;margin-top:2mm">
     <div><b>One sector per claim.</b> Its width is the importance of the evidence (sum of −log<sub>10</sub> p of all its terms); the hatched part is the share of evidence that goes against the claim.</div>
     <div><b>One bubble per pathway sub-group.</b> Further out = more significant (unsigned Stouffer p). Green = for the claim, coral = against, grey = balanced; dots = terms.</div>
-    <div><b>Grey sector.</b> {% if p.no_enrichment %}No enrichment result is stored for this comparison.{% elif p.unlinked_total %}{{ p.unlinked_total }} significant pathway sub-group{{ 's' if p.unlinked_total != 1 }} linked to no claim — reported for completeness, not scored.{% else %}Significant pathways linked to no claim would appear here; none in this comparison.{% endif %} Claim referential{% if p.version %} v{{ p.version }}{% endif %}, undisclosed.</div>
+    <div><b>Grey sector.</b> {% if p.no_enrichment %}No enrichment result is stored for this comparison.{% elif p.unlinked_total %}{{ p.unlinked_total }} significant sub-group{{ 's' if p.unlinked_total != 1 }} linked to no claim — reported for completeness, not scored.{% else %}Significant sub-groups linked to no claim would appear here; none in this comparison.{% endif %} Claim referential{% if p.version %} v{{ p.version }}{% endif %}, undisclosed.</div>
   </div>
   {%- if p.ai_html %}<div style="margin-top:5mm">{{ ai_box(p) }}</div>{% endif %}
   {{ foot(p) }}
