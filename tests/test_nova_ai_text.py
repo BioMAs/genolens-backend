@@ -20,7 +20,9 @@ from app.models.models import CosmeticInterpretation, User
 from app.services.ai_interpreter import LocalAIInterpreter
 from app.services.cosmomics_nova import (
     NOVA_MODEL_TAG,
+    ZERO_AGAINST_NOTE,
     ClaimSubgroupMap,
+    NovaSource,
     SubgroupTerm,
     TermHit,
     build_nova,
@@ -31,7 +33,9 @@ MODEL = "test-model-1"
 URL = "/api/v1/datasets/{ds}/comparisons/A_vs_B/cosmomics-nova"
 
 
-def synthetic_nova(alpha: float = 0.05, version: str = "1") -> dict:
+def synthetic_nova(
+    alpha: float = 0.05, version: str = "1", source: NovaSource | None = None
+) -> dict:
     """One claim with a sub-group for it (A) and a sub-group against it (B)."""
     rows = [
         SubgroupTerm("Firming", "Group A", "GO:0000001", "Term A", "up"),
@@ -42,8 +46,36 @@ def synthetic_nova(alpha: float = 0.05, version: str = "1") -> dict:
         TermHit("GO:0000002", "Term B", 1e-5, "down"),
     ]
     return build_nova(
-        hits, ClaimSubgroupMap(rows, version=version), alpha=alpha, contrast="A_vs_B"
+        hits, ClaimSubgroupMap(rows, version=version), alpha=alpha, contrast="A_vs_B", source=source
     )
+
+
+def annodb_nova(**kwargs) -> dict:
+    """The nova of an enrichment GenoLens ran itself (annoDB)."""
+    return synthetic_nova(
+        source=NovaSource(enrichment_dataset_ids=("e-1",), enrichment_source="annodb"), **kwargs
+    )
+
+
+def for_only_nova() -> dict:
+    """One claim, one sub-group for it and no contrary term at all (state for_only)."""
+    rows = [SubgroupTerm("Firming", "Group A", "GO:0000001", "Term A", "up")]
+    hits = [TermHit("GO:0000001", "Term A", 1e-6, "up")]
+    return build_nova(hits, ClaimSubgroupMap(rows, version="1"), contrast="A_vs_B")
+
+
+def zero_against_both_ways_nova() -> dict:
+    """A claim with 0 sub-groups against it yet evidence both ways: a strong term for it and a
+    weaker contrary term in the same sub-group (state both_ways, n_against 0)."""
+    rows = [
+        SubgroupTerm("Firming", "Group A", "GO:0000001", "Term A", "up"),
+        SubgroupTerm("Firming", "Group A", "GO:0000002", "Term B", "up"),
+    ]
+    hits = [
+        TermHit("GO:0000001", "Term A", 1e-8, "up"),
+        TermHit("GO:0000002", "Term B", 1e-3, "down"),
+    ]
+    return build_nova(hits, ClaimSubgroupMap(rows, version="1"), contrast="A_vs_B")
 
 
 def many_claims_nova(n: int) -> dict:
@@ -115,6 +147,35 @@ def test_inputs_hash_covers_exactly_what_the_text_was_written_from():
     assert nova_inputs_sha256(later, MODEL) == digest
 
 
+def test_the_fingerprint_documents_what_it_really_covers():
+    """R-T3-2: the model is hashed from the row's own value on both sides, so a change of the
+    configured model never makes a text stale. The docstrings that said the fingerprint covers
+    "the model" (the function's, the migration's) say what it does cover."""
+    from pathlib import Path
+
+    doc = " ".join((nova_inputs_sha256.__doc__ or "").split())
+    assert "the enrichment datasets the terms come from, and the model" not in doc
+    assert "never makes a text stale" in doc
+    for covered in ("claims", "unlinked", "alpha", "referential version", "enrichment datasets"):
+        assert covered in doc
+    migration = (
+        Path(__file__).resolve().parents[1] / "alembic" / "versions" / "2026_11_05_1000-nova_honesty.py"
+    ).read_text()
+    head = " ".join(migration.split("Revision ID")[0].split())
+    assert "enrichment datasets, model)" not in head
+    assert "never makes a text stale" in head
+
+
+def test_a_changed_model_alone_does_not_change_the_row_fingerprint():
+    """What the docstring says, as behaviour: a text is read with its own row's model, so the model
+    configured today is not an input of staleness (the label discloses it instead)."""
+    nova = synthetic_nova()
+    written = nova_inputs_sha256(nova, "model-A")
+    read_back = nova_inputs_sha256(nova, "model-A")  # `_model_of(row)`, not `settings.LLM_MODEL`
+    assert written == read_back
+    assert written != nova_inputs_sha256(nova, "model-B")  # the hash itself still names its model
+
+
 # ── The prompt ──────────────────────────────────────────────────────────────
 
 
@@ -127,8 +188,11 @@ def test_prompt_has_no_marketing_or_regulatory_section():
     # A reading claim by claim, then a summary, that stay inside the data supplied.
     assert "## Claim-by-claim reading" in prompt and "## Summary" in prompt
     assert re.search(r"nothing beyond the data", prompt)
-    # A claim with no evidence against it is flagged, never read as confirmed.
-    assert re.search(r"no pathway (sub-group )?against", prompt)
+    # The removed wording (R-T6-1) is not dictated any more, and the sentence of a claim with
+    # evidence both ways is not the zero-against one.
+    assert "among the significant terms stored" not in prompt
+    assert not re.search(r"no pathway (sub-group )?against", prompt)
+    assert ZERO_AGAINST_NOTE not in prompt
     assert not re.search(r"\d+ of \d+ claims", prompt)  # nothing is cut: no "N of M"
 
 
@@ -144,14 +208,73 @@ def test_prompt_says_how_many_claims_it_carries_when_the_list_is_cut():
 
 def test_prompt_says_what_the_p_values_are_in_its_own_words():
     interpreter = LocalAIInterpreter(base_url="http://127.0.0.1:9/v1")
-    own = interpreter._build_cosmomics_prompt(synthetic_nova(), "A_vs_B")
+    own = interpreter._build_cosmomics_prompt(annodb_nova(), "A_vs_B")
     assert "Benjamini–Hochberg adjusted p-value" in own
-    uploaded = synthetic_nova()
-    uploaded["p_source"] = "adjusted p from uploaded tables (column ZQX_qvalue)"
+    uploaded = synthetic_nova(
+        source=NovaSource(enrichment_source="uploaded", padj_columns=("ZQX_qvalue",))
+    )
     prompt = interpreter._build_cosmomics_prompt(uploaded, "A_vs_B")
     assert "read from uploaded tables" in prompt
     assert "Benjamini" not in prompt  # it does not assert what the payload does not say
     assert "ZQX_qvalue" not in prompt  # the column name is the user's text: it does not leave
+
+
+def test_the_p_value_label_follows_the_enrichment_source_not_the_p_source_prefix():
+    """R-F1: legacy rows state no test, an uploaded table is told by its source and not by the
+    beginning of a string, and a payload with no source says no more than "adjusted p-value"."""
+    interpreter = LocalAIInterpreter(base_url="http://127.0.0.1:9/v1")
+
+    def label(kind, **changes):
+        nova = synthetic_nova(source=NovaSource(enrichment_source=kind))
+        nova.update(changes)
+        prompt = interpreter._build_cosmomics_prompt(nova, "A_vs_B")
+        return re.search(r"The p-value of a term is (.+?);", prompt).group(1)
+
+    assert label("annodb") == "a Benjamini–Hochberg adjusted p-value"
+    assert label("uploaded") == "an adjusted p-value read from uploaded tables"
+    assert label("legacy") == "an adjusted p-value"
+    assert label("none") == "an adjusted p-value"
+    # A p_source that begins as an uploaded table's does not make the nova one, nor the other way.
+    assert label("annodb", p_source="adjusted p from uploaded tables (column q)") == (
+        "a Benjamini–Hochberg adjusted p-value"
+    )
+    assert label("uploaded", p_source="padj (Benjamini–Hochberg, GenoLens enrichment)") == (
+        "an adjusted p-value read from uploaded tables"
+    )
+    # No provenance at all: nothing is inferred from the p_source.
+    bare = synthetic_nova()
+    bare.pop("provenance")
+    bare["p_source"] = "padj (Benjamini–Hochberg, GenoLens enrichment)"
+    prompt = interpreter._build_cosmomics_prompt(bare, "A_vs_B")
+    assert "The p-value of a term is an adjusted p-value;" in prompt and "Benjamini" not in prompt
+
+
+def test_the_zero_against_sentence_is_asked_for_only_when_no_contrary_term_exists():
+    """R-F1/R-T4-4 (a): the ruled sentence, from the one constant, for the claims in state
+    for_only; a claim with 0 sub-groups against but a contrary term (both_ways) gets none."""
+    interpreter = LocalAIInterpreter(base_url="http://127.0.0.1:9/v1")
+    only = interpreter._build_cosmomics_prompt(for_only_nova(), "A_vs_B")
+    assert "evidence for only, none against" in only
+    assert only.count(ZERO_AGAINST_NOTE) == 1
+    assert "among the significant terms stored" not in only
+    assert not re.search(r"no pathway (sub-group )?against", only)
+
+    nova = zero_against_both_ways_nova()
+    claim = nova["claims"][0]
+    assert (claim["n_for"], claim["n_against"], claim["state"]) == (1, 0, "both_ways")
+    both = interpreter._build_cosmomics_prompt(nova, "A_vs_B")
+    assert "1 sub-group for, 0 against; evidence both for and against" in both
+    assert ZERO_AGAINST_NOTE not in both
+    assert "no pathway" not in both and "none against" not in both
+    assert "contrary term is not a confirmation" not in both
+
+    # Several claims: the instruction is there once the list holds one for_only claim.
+    mixed = many_claims_nova(3)
+    mixed["claims"][1]["state"] = "both_ways"
+    assert interpreter._build_cosmomics_prompt(mixed, "A_vs_B").count(ZERO_AGAINST_NOTE) == 1
+    for claim in mixed["claims"]:
+        claim["state"] = "both_ways"
+    assert ZERO_AGAINST_NOTE not in interpreter._build_cosmomics_prompt(mixed, "A_vs_B")
 
 
 def llm_client(text: str = "Reading A."):

@@ -27,12 +27,12 @@ from app.services.cosmetics_taxonomy import normalize_pathway_id
 from app.services.cosmomics_grouping import clean_label
 from app.services.cosmomics_nova import (
     DEFAULT_ALPHA,
-    P_SOURCE_UPLOADED,
+    ZERO_AGAINST_NOTE,
     best_supporting_subgroup,
     claim_state_of,
     subgroup_side,
 )
-from app.services.cosmomics_nova_svg import ZERO_AGAINST_NOTE, claim_color
+from app.services.cosmomics_nova_svg import claim_color
 from app.services.omicskin_score import ALL_CLAIMS, BAND_LABELS, ClaimScore, claim_score
 from app.services.report_common import ai_label, ai_text_record
 from app.services.report_editorial_figures import volcano_sampling
@@ -484,6 +484,10 @@ class EditorialInputs:
     # analysis asked for (`de_method`: all, deseq2, edger or limma). None = not recorded.
     de_primary_method: Optional[str] = None
     de_method_run: Optional[str] = None
+    # The DEG dataset's metadata names the analysis that produced it, and that analysis cannot be
+    # found any more (deleted): the results are orphaned, not imported (the LaTeX report says the
+    # same, `report_latex_methods.not_described_tex`).
+    analysis_gone: bool = False
 
 
 def nova_alpha(nova: dict) -> float:
@@ -578,37 +582,59 @@ def analysis_thresholds(params: dict[str, Any]) -> tuple[Optional[float], Option
 class EnrichmentFacts:
     """What the nova's provenance says about the enrichment behind the claims.
 
-    kind "genolens": the over-representation GenoLens ran (hypergeometric test, Benjamini–
-    Hochberg correction), kept below `fdr` (None: the cut-off of the run was not recorded) over
-    `databases` (None: all the categories of the annotation database). kind "deposited": tables
-    somebody uploaded, kept as deposited, whose adjusted p is the column(s) read as such
-    (`columns`, empty when not recorded); there is no cut-off and no database to name. kind
-    "legacy": rows stored by an earlier GenoLens enrichment (no analysis, no enrichment dataset,
-    no uploaded table): its test, correction, cut-off and databases are not recorded. kind
-    "unknown": a payload without provenance.
+    The kind comes from `provenance.enrichment_source` and from nothing else: not from the analysis
+    id, the enrichment dataset ids or the start of `p_source`. kind "genolens" (source "annodb"):
+    the over-representation GenoLens ran (hypergeometric test, Benjamini–Hochberg correction),
+    kept below `fdr` (None: the cut-off of the run was not recorded); `categories` are what the run
+    recorded about itself, else `databases` is the analysis's pick (an empty tuple: it picked none,
+    so all the categories ran; None: not known, the analysis is gone). kind "deposited" (source
+    "uploaded"): tables somebody uploaded, kept as deposited, whose adjusted p is the column(s)
+    read as such (`columns`, empty when not recorded); there is no cut-off and no database to
+    name. kind "legacy": rows stored by an earlier GenoLens enrichment (no enrichment dataset): its
+    test, correction, cut-off and databases are not recorded. kind "none": no enrichment result is
+    stored (source "none", or a payload whose status says so, whatever else it carries): nothing
+    more than that is said. kind "unknown": a payload without provenance, or whose provenance
+    names no source.
     """
 
     kind: str
     columns: tuple[str, ...] = ()
     fdr: Optional[float] = None
     databases: Optional[tuple[str, ...]] = None
+    categories: Optional[tuple[str, ...]] = None
+
+
+_FACT_KIND_OF_SOURCE = {
+    "annodb": "genolens",
+    "uploaded": "deposited",
+    "legacy": "legacy",
+    "none": "none",
+}
 
 
 def enrichment_facts(nova: dict) -> EnrichmentFacts:
+    if nova.get("status") == "no_enrichment":
+        return EnrichmentFacts("none")
     prov = nova.get("provenance")
     if not isinstance(prov, dict):
         return EnrichmentFacts("unknown")
-    columns = tuple(str(c) for c in prov.get("padj_columns") or [])
-    if columns or str(nova.get("p_source") or "").startswith(P_SOURCE_UPLOADED):
-        return EnrichmentFacts("deposited", columns)
-    if not prov.get("analysis_id") and not prov.get("enrichment_dataset_ids"):
-        return EnrichmentFacts("legacy")
+    kind = _FACT_KIND_OF_SOURCE.get(str(prov.get("enrichment_source")), "unknown")
+    if kind == "deposited":
+        return EnrichmentFacts("deposited", tuple(str(c) for c in prov.get("padj_columns") or []))
+    if kind != "genolens":
+        return EnrichmentFacts(kind)
     fdr = prov.get("enrichment_fdr")
     databases = prov.get("enrichment_databases")
+    categories = prov.get("enrichment_categories")
     return EnrichmentFacts(
         "genolens",
         fdr=float(fdr) if isinstance(fdr, (int, float)) and not isinstance(fdr, bool) else None,
-        databases=tuple(str(d) for d in databases) if databases is not None else None,
+        databases=tuple(str(d) for d in databases) if isinstance(databases, list) else None,
+        categories=(
+            tuple(str(c) for c in categories)
+            if isinstance(categories, list) and categories
+            else None
+        ),
     )
 
 
@@ -626,11 +652,17 @@ def _cutoff_phrase(facts: EnrichmentFacts) -> str:
 
 
 def _databases_phrase(facts: EnrichmentFacts) -> str:
-    """The databases of an enrichment GenoLens ran: the listed ones, or "all categories" when the
-    analysis named none. Never a database that is not in the list."""
+    """What the enrichment GenoLens ran was run over: the categories the run recorded, else the
+    analysis's pick, "all categories" only for an analysis that is known and picked none, and
+    "not recorded" when nothing is known (a deleted analysis). Never a database that is not in the
+    list."""
+    if facts.categories:
+        return ", ".join(facts.categories)
     if facts.databases:
         return ", ".join(facts.databases)
-    return "all categories of the annotation database"
+    if facts.databases is not None:
+        return "all categories of the annotation database"
+    return "not recorded"
 
 
 def enrichment_method(facts: EnrichmentFacts) -> str:
@@ -650,6 +682,8 @@ def enrichment_method(facts: EnrichmentFacts) -> str:
             "The enrichment results come from an earlier GenoLens method whose parameters (test, "
             "correction, cut-off, databases) are not recorded"
         )
+    if facts.kind == "none":
+        return "No enrichment result is stored for this comparison"
     return (
         "The enrichment results are those stored with the dataset; their test and correction "
         "are not recorded"
@@ -666,6 +700,8 @@ def enrichment_text(facts: EnrichmentFacts) -> str:
             f"{enrichment_method(facts)}. The terms are listed as deposited: GenoLens applied "
             f"no cut-off. "
         )
+    elif facts.kind == "none":
+        return f"{enrichment_method(facts)}."  # no result, so no figure to explain
     else:
         text = f"{enrichment_method(facts)}. "
     return text + "Dot size = number of genes, colour = significance."
@@ -691,11 +727,18 @@ def _de_thresholds(params: dict[str, Any]) -> list[str]:
 def de_sentence(inp: EditorialInputs) -> Markup:
     """How the differentially expressed genes were called, from what the DEG dataset records: the
     method that decided the calls, and the others only when the analysis ran them. Imported
-    results name no method."""
+    results name no method, and results whose analysis was deleted say so (`analysis_gone`)."""
     primary = inp.de_primary_method
     thr = _de_thresholds(inp.params)
     cut = f" ({', '.join(thr)})" if thr else ""
-    if primary:
+    if inp.analysis_gone:
+        # Whatever the dataset still records: the analysis is not there to describe, as in the
+        # LaTeX report.
+        s = (
+            "The analysis that produced these results is no longer available; its methods are "
+            "not described here."
+        )
+    elif primary:
         name = _de_name(primary)
         s = f"Differentially expressed genes were called with {escape(name)}{cut}"
         if str(inp.de_method_run or "").lower() == "all":
@@ -720,6 +763,8 @@ def de_sentence(inp: EditorialInputs) -> Markup:
 
 
 def _de_row(inp: EditorialInputs) -> str:
+    if inp.analysis_gone:
+        return "analysis no longer available (method not described)"
     if inp.de_primary_method:
         name = _de_name(inp.de_primary_method)
         if str(inp.de_method_run or "").lower() == "all":

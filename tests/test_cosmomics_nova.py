@@ -27,6 +27,8 @@ from app.services.cosmomics_grouping import (
 from app.services.cosmomics_nova import (
     CLAIM_NAMES,
     P_FLOOR,
+    P_SOURCE_UPLOADED,
+    ZERO_AGAINST_NOTE,
     ClaimSubgroupMap,
     SubgroupTerm,
     TermHit,
@@ -798,7 +800,28 @@ async def test_an_analysis_without_enrichment_databases_ran_on_all_of_them():
             rows=[_row()],
         ),
     )
-    assert nova["provenance"]["enrichment_databases"] is None
+    # An analysis that is known and named no database: all of them. Unknown (None) is another fact.
+    assert nova["provenance"]["enrichment_databases"] == []
+
+
+async def test_an_analysis_that_cannot_be_found_leaves_the_databases_unknown():
+    """A deleted analysis: its pick is not known, so it is neither the list nor "all of them"."""
+    nova, _ = await _nova_of(
+        _dataset({"analysis_id": ANALYSIS_ID}),
+        _Db(
+            enrichment_datasets=[
+                _dataset(
+                    {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "source": "annodb"},
+                    type_=DatasetType.ENRICHMENT,
+                )
+            ],
+            analysis_params=None,
+            rows=[_row()],
+        ),
+    )
+    prov = nova["provenance"]
+    assert prov["enrichment_source"] == "annodb"
+    assert prov["enrichment_databases"] is None and prov["enrichment_categories"] is None
 
 
 async def test_enrichment_stored_on_the_deg_dataset_names_no_enrichment_dataset():
@@ -1025,3 +1048,138 @@ async def test_the_deg_rows_tell_which_comparisons_a_dataset_has():
     async with client as c:
         resp = await c.get(f"/api/v1/datasets/{dataset.id}/comparisons/C_vs_D/cosmomics-nova")
     assert resp.status_code == 404
+
+
+# ── R-F1: the provenance says what kind of enrichment the rows are ────────────────
+
+P_ANNODB = "padj (Benjamini–Hochberg, GenoLens enrichment)"
+P_LEGACY = "adjusted p from an earlier GenoLens enrichment (test and correction not recorded)"
+P_NONE = "no enrichment result is stored"
+
+
+def _annodb(**meta):
+    return _dataset(
+        {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "source": "annodb", **meta},
+        type_=DatasetType.ENRICHMENT,
+    )
+
+
+async def test_an_annodb_enrichment_is_annodb_with_the_categories_recorded_at_run_time():
+    categories = ["GO_BP", "kegg_pathway"]
+    db = _Db(
+        enrichment_datasets=[_annodb(padj_cutoff=0.05, categories=categories)],
+        analysis_params={"enrichment_databases": ["GO_BP", "kegg_pathway", "reactome"]},
+        rows=[_row()],
+    )
+    nova, _ = await _nova_of(_dataset({"analysis_id": ANALYSIS_ID}), db)
+    prov = nova["provenance"]
+    assert prov["enrichment_source"] == "annodb"
+    assert prov["enrichment_categories"] == categories  # observed, not the pick
+    assert prov["enrichment_databases"] == ["GO_BP", "kegg_pathway", "reactome"]
+    assert nova["p_source"] == P_ANNODB
+    # A run that recorded none (before Task 5): not recorded, never the analysis's pick.
+    old, _ = await _nova_of(
+        _dataset({"analysis_id": ANALYSIS_ID}),
+        _Db(enrichment_datasets=[_annodb()], analysis_params={}, rows=[_row()]),
+    )
+    assert old["provenance"]["enrichment_categories"] is None
+    # A malformed record is no record.
+    bad, _ = await _nova_of(
+        _dataset({"analysis_id": ANALYSIS_ID}),
+        _Db(enrichment_datasets=[_annodb(categories="GO_BP")], analysis_params={}, rows=[_row()]),
+    )
+    assert bad["provenance"]["enrichment_categories"] is None
+
+
+async def test_an_uploaded_table_is_uploaded_whatever_its_p_source_says():
+    enrichment = _dataset({"comparison_name": "A_vs_B", "padj_column": "qvalue"}, type_=DatasetType.ENRICHMENT)
+    nova, _ = await _nova_of(_dataset(), _Db(enrichment_datasets=[enrichment], rows=[_row()]))
+    prov = nova["provenance"]
+    assert prov["enrichment_source"] == "uploaded"
+    assert prov["enrichment_categories"] is None
+    assert nova["p_source"].startswith(P_SOURCE_UPLOADED)
+    # Not even a column is needed: the kind is the dataset's, not the p_source prefix.
+    bare = _dataset({"comparison_name": "A_vs_B"}, type_=DatasetType.ENRICHMENT)
+    nova, _ = await _nova_of(_dataset(), _Db(enrichment_datasets=[bare], rows=[_row()]))
+    assert nova["provenance"]["enrichment_source"] == "uploaded"
+    assert nova["provenance"]["padj_columns"] == []
+
+
+async def test_rows_stored_under_the_deg_dataset_are_a_legacy_enrichment():
+    nova, _ = await _nova_of(_dataset(), _Db(rows=[_row()]))
+    prov = nova["provenance"]
+    assert prov["enrichment_source"] == "legacy"
+    assert (prov["enrichment_fdr"], prov["enrichment_databases"], prov["enrichment_categories"]) == (
+        None,
+        None,
+        None,
+    )
+    assert nova["p_source"] == P_LEGACY
+    assert "Benjamini" not in nova["p_source"]
+    # An analysis-linked DEG dataset with a legacy (rerun) enrichment under it is legacy too: the
+    # analysis's parameters describe the annoDB run, which did not make these rows.
+    linked, _ = await _nova_of(
+        _dataset({"analysis_id": ANALYSIS_ID}),
+        _Db(analysis_params={"enrichment_fdr": 0.05, "enrichment_databases": ["GO"]}, rows=[_row()]),
+    )
+    prov = linked["provenance"]
+    assert prov["enrichment_source"] == "legacy"
+    assert (prov["enrichment_fdr"], prov["enrichment_databases"]) == (None, None)
+
+
+@pytest.mark.parametrize("params", [{"enrichment_databases": []}, {"enrichment_fdr": 0.05}, {}])
+async def test_no_enrichment_dataset_and_no_rows_is_not_a_genolens_run(params):
+    """The provenance does not describe an enrichment that never ran: the analysis's cut-off and
+    database pick are not facts of a run when no result is stored."""
+    nova, hits = await _nova_of(
+        _dataset({"analysis_id": ANALYSIS_ID}), _Db(analysis_params=params, rows=[])
+    )
+    assert hits == [] and nova["status"] == "no_enrichment"
+    prov = nova["provenance"]
+    assert prov["enrichment_source"] == "none"
+    assert prov["enrichment_dataset_ids"] == []
+    assert prov["enrichment_fdr"] is None and prov["enrichment_databases"] is None
+    assert prov["enrichment_categories"] is None and prov["padj_columns"] == []
+    assert nova["p_source"] == P_NONE
+
+
+async def test_a_dataset_with_no_row_for_the_comparison_is_none_too():
+    """An ENRICHMENT dataset exists but holds nothing for this comparison: no result is stored."""
+    db = _Db(
+        enrichment_datasets=[_annodb(padj_cutoff=0.05, categories=["GO_BP"])],
+        analysis_params={"enrichment_databases": ["GO_BP"]},
+        rows=[],
+    )
+    nova, _ = await _nova_of(_dataset({"analysis_id": ANALYSIS_ID}), db)
+    prov = nova["provenance"]
+    assert nova["status"] == "no_enrichment" and prov["enrichment_source"] == "none"
+    assert (prov["enrichment_fdr"], prov["enrichment_databases"], prov["enrichment_categories"]) == (
+        None,
+        None,
+        None,
+    )
+    assert nova["p_source"] == P_NONE
+
+
+def test_a_nova_built_from_hits_alone_names_no_run():
+    """No source: nothing says where the rows come from, so none is claimed."""
+    from app.services.cosmomics_nova import nova_from_hits
+
+    nova = nova_from_hits([TermHit("GO:0000001", "Term A", 1e-6, "up")], "A_vs_B")
+    assert nova["provenance"]["enrichment_source"] == "legacy"
+    assert "Benjamini" not in nova["p_source"]
+    empty = nova_from_hits([], "A_vs_B")
+    assert empty["provenance"]["enrichment_source"] == "none"
+    assert empty["p_source"] == P_NONE
+
+
+def test_the_zero_against_sentence_has_one_definition():
+    """The wheel, the editorial pages and the AI prompt print the ruled sentence from one constant."""
+    from app.services import cosmomics_nova_svg, report_editorial_content
+
+    assert ZERO_AGAINST_NOTE == (
+        "Only terms present in the enrichment results can count against a claim; "
+        "no contrary term is not a confirmation."
+    )
+    assert cosmomics_nova_svg.ZERO_AGAINST_NOTE is ZERO_AGAINST_NOTE
+    assert report_editorial_content.ZERO_AGAINST_NOTE is ZERO_AGAINST_NOTE

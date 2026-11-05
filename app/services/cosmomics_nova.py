@@ -41,6 +41,14 @@ What the p-values are, and what is stored (the payload's `provenance` and `p_sou
     stored as deposited, not filtered by anyone. A row without an adjusted p is never stored as if it
     had one, and a term without a padj is left out of the nova and counted
     (`coverage.n_terms_without_padj`).
+  * `provenance.enrichment_source` says what kind of enrichment the rows are, once, for every
+    reader (the p-value label, the poster header, the editorial and LaTeX methods, the AI prompt):
+    "annodb" (an ENRICHMENT dataset GenoLens registered, `source` "annodb"), "uploaded" (any other
+    ENRICHMENT dataset: tables somebody deposited), "legacy" (rows stored under the DEG dataset
+    by an earlier GenoLens method, no ENRICHMENT dataset) and "none" (no enrichment result is
+    stored: the cut-off, the databases and the columns are then not facts of any run and stay
+    empty). `provenance.enrichment_categories` is what the annoDB run recorded about itself (the
+    categories it enriched), None when it recorded none.
   * `alpha` marks each term `significant` and keeps a claim only if one of its terms is. A stored
     term at p >= alpha is not dropped: it weighs in the sums like any other and is counted in
     `coverage.n_terms_not_significant`. Such terms are rare with GenoLens's own enrichment at its
@@ -59,7 +67,7 @@ import logging
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -142,13 +150,21 @@ class TermHit:
     genes: tuple[str, ...] = ()
 
 
+ENRICHMENT_SOURCES = ("annodb", "uploaded", "legacy", "none")
+
+
 @dataclass(frozen=True)
 class NovaSource:
     """What the nova's enrichment rows came from: the facts `provenance` and `p_source` state.
 
-    `uploaded` is True when the rows come from tables somebody deposited rather than from an
-    enrichment GenoLens ran itself; `padj_columns` are then the headers the parser read as
-    adjusted p. All fields default to "unknown", so a nova built from hits alone still has a
+    `enrichment_source` is the kind of enrichment (`ENRICHMENT_SOURCES`). As read from the
+    database it is "annodb" or "uploaded" when an ENRICHMENT dataset exists and "none" when it does
+    not; `build_nova` settles it: no row at all is "none", and rows with no ENRICHMENT dataset are
+    "legacy" (the earlier GenoLens method stores them under the DEG dataset). `padj_columns` are
+    the headers the parser read as adjusted p of an uploaded table. `enrichment_databases` is the
+    analysis's own pick (an empty tuple: it picked none, so all the categories ran; None: not
+    known, e.g. the analysis was deleted) and `enrichment_categories` what the run recorded about
+    itself. All fields default to "unknown", so a nova built from hits alone still has a
     provenance block.
     """
 
@@ -158,7 +174,8 @@ class NovaSource:
     analysis_id: Optional[str] = None
     enrichment_fdr: Optional[float] = None
     enrichment_databases: Optional[tuple[str, ...]] = None
-    uploaded: bool = False
+    enrichment_categories: Optional[tuple[str, ...]] = None
+    enrichment_source: str = "none"
     padj_columns: tuple[str, ...] = ()
     source_versions: tuple[str, ...] = ()
     demo: bool = False
@@ -439,6 +456,16 @@ def best_supporting_subgroup(subgroups: Iterable[dict[str, Any]]) -> Optional[di
     return min(supporting, key=lambda s: (-s["nl"], s["name"]), default=None)
 
 
+# Said wherever a claim has no contrary term at all (state "for_only"): on the wheel, on the
+# editorial pages and in what the AI is asked to write. The absence of a contrary term is not
+# evidence for; and it is said of the enrichment results, whatever their origin (an uploaded table
+# is not filtered, GenoLens's own enrichment is stored under its cut-off).
+ZERO_AGAINST_NOTE = (
+    "Only terms present in the enrichment results can count against a claim; "
+    "no contrary term is not a confirmation."
+)
+
+
 def claim_state(s_pro: float, s_anti: float) -> str:
     """"for_only" without evidence against, "against_only" without evidence for, else "both_ways"."""
     if s_anti == 0:
@@ -465,18 +492,47 @@ def _referential_version(mapping: ClaimSubgroupMap) -> Optional[int]:
         return None
 
 
-# How `p_source` begins when the p-values come from deposited tables: a report tells them from the
-# enrichment GenoLens ran itself by it.
+# What the p-values are, by the kind of enrichment (`NovaSource.enrichment_source`). One function
+# for the payload's `p_source`, the poster header and the AI prompt's label, so they cannot differ.
+# P_SOURCE_UPLOADED is how the uploaded wording begins; nothing reads the kind from it any more.
+P_SOURCE_ANNODB = "padj (Benjamini–Hochberg, GenoLens enrichment)"
 P_SOURCE_UPLOADED = "adjusted p from uploaded tables"
+P_SOURCE_LEGACY = "adjusted p from an earlier GenoLens enrichment (test and correction not recorded)"
+P_SOURCE_NONE = "no enrichment result is stored"
 
 
-def _p_source(source: NovaSource) -> str:
-    """What the adjusted p-values are, in words: GenoLens's own enrichment, or the uploaded column."""
-    if not source.uploaded:
-        return "padj (Benjamini–Hochberg, GenoLens enrichment)"
-    noun = "columns" if len(source.padj_columns) > 1 else "column"
-    named = ", ".join(source.padj_columns) or "not recorded"
-    return f"{P_SOURCE_UPLOADED} ({noun} {named})"
+def p_source_of(kind: Optional[str], padj_columns: Iterable[str] = ()) -> Optional[str]:
+    """What the adjusted p-values are, in words, for an enrichment source; None for a kind that is
+    not one (a payload that predates the field: its own `p_source` stands)."""
+    if kind == "annodb":
+        return P_SOURCE_ANNODB
+    if kind == "uploaded":
+        columns = [str(c) for c in padj_columns or ()]
+        noun = "columns" if len(columns) > 1 else "column"
+        return f"{P_SOURCE_UPLOADED} ({noun} {', '.join(columns) or 'not recorded'})"
+    if kind == "legacy":
+        return P_SOURCE_LEGACY
+    if kind == "none":
+        return P_SOURCE_NONE
+    return None
+
+
+def _settled(source: NovaSource, has_rows: bool) -> NovaSource:
+    """The source with its kind settled by what was found: no enrichment row at all is "none"
+    (nothing is stored, so no cut-off, database or column is a fact of any run); rows with no
+    ENRICHMENT dataset behind them are "legacy"."""
+    if not has_rows:
+        return replace(
+            source,
+            enrichment_source="none",
+            enrichment_fdr=None,
+            enrichment_databases=None,
+            enrichment_categories=None,
+            padj_columns=(),
+        )
+    if source.enrichment_source == "none":
+        return replace(source, enrichment_source="legacy")
+    return source
 
 
 def _provenance(
@@ -487,9 +543,13 @@ def _provenance(
         "comparison": comparison,
         "enrichment_dataset_ids": list(source.enrichment_dataset_ids),
         "analysis_id": source.analysis_id,
+        "enrichment_source": source.enrichment_source,
         "enrichment_fdr": source.enrichment_fdr,
         "enrichment_databases": (
             list(source.enrichment_databases) if source.enrichment_databases is not None else None
+        ),
+        "enrichment_categories": (
+            list(source.enrichment_categories) if source.enrichment_categories is not None else None
         ),
         "padj_columns": list(source.padj_columns),
         "source_versions": list(source.source_versions),
@@ -515,8 +575,8 @@ def build_nova(
     Pure but for `provenance.generated_at`, which is the clock. The condition shown on the
     central disc is the numerator of `contrast`.
     """
-    source = source or NovaSource()
     unique_hits = _dedupe(hits)
+    source = _settled(source or NovaSource(), bool(unique_hits))
     # (term, its adjusted p): a term without one is left out of everything but the counts.
     scored = [(h, h.p) for h in unique_hits if h.p is not None and not math.isnan(h.p)]
     n_without_padj = len(unique_hits) - len(scored)
@@ -613,7 +673,7 @@ def build_nova(
         "contrast": contrast,
         "condition": condition_label(contrast),
         "alpha": alpha,
-        "p_source": _p_source(source),
+        "p_source": p_source_of(source.enrichment_source, source.padj_columns),
         "claims": claims,
         "not_evaluated": not_evaluated,
         "unlinked": unlinked[:unlinked_limit],
@@ -692,6 +752,13 @@ def _distinct(values: Iterable[Any]) -> tuple[str, ...]:
     return tuple(seen)
 
 
+def _recorded_categories(raw: Any) -> Optional[tuple[str, ...]]:
+    """The categories an annoDB run recorded about itself; None for no record or a malformed one."""
+    if isinstance(raw, list) and raw and all(isinstance(c, str) and c.strip() for c in raw):
+        return tuple(c.strip() for c in raw)
+    return None
+
+
 async def resolve_nova_source(
     db: AsyncSession, deg_dataset: Dataset, comparison_name: str
 ) -> NovaSource:
@@ -699,23 +766,34 @@ async def resolve_nova_source(
 
     The rows are read where the enrichment panel reads them: the ENRICHMENT dataset of the same
     analysis when there is one, else the DEG dataset (the legacy Python enrichment stores its rows
-    there). An enrichment GenoLens ran itself (`source` "annodb", or the legacy path) is described
-    by the term cut-off it ran at (`_enrichment_fdr`) and the analysis's `enrichment_databases`; a
-    deposited table by the column read as adjusted p.
+    there). An enrichment GenoLens ran itself (`source` "annodb") is described by the term cut-off
+    it ran at (`_enrichment_fdr`), the analysis's `enrichment_databases` pick and the categories the
+    run recorded; a deposited table by the column read as adjusted p. With no ENRICHMENT dataset
+    nothing says an enrichment ran, so the analysis's parameters are not read as if one had: the
+    kind is "none" here, which `build_nova` settles to "legacy" when rows exist under the DEG
+    dataset.
     """
     enrichment = await find_enrichment_dataset(db, deg_dataset, comparison_name)
     deg_meta = deg_dataset.dataset_metadata or {}
     enr_meta = (enrichment.dataset_metadata or {}) if enrichment is not None else {}
-    uploaded = enrichment is not None and enr_meta.get("source") != "annodb"
+    if enrichment is None:
+        kind = "none"
+    elif enr_meta.get("source") == "annodb":
+        kind = "annodb"
+    else:
+        kind = "uploaded"
 
     analysis_id = deg_meta.get("analysis_id") or enr_meta.get("analysis_id")
     fdr: Optional[float] = None
     databases: Optional[tuple[str, ...]] = None
-    if not uploaded:
+    categories: Optional[tuple[str, ...]] = None
+    if kind == "annodb":
         params = await _analysis_params(db, analysis_id) if analysis_id else None
         fdr = _enrichment_fdr(enr_meta.get("padj_cutoff"), params)
         if params is not None:
-            databases = tuple(d for d in params.get("enrichment_databases") or [] if d) or None
+            raw = params.get("enrichment_databases")
+            databases = tuple(d for d in raw if d) if isinstance(raw, list) else ()
+        categories = _recorded_categories(enr_meta.get("categories"))
 
     return NovaSource(
         dataset_id=str(deg_dataset.id),
@@ -724,8 +802,9 @@ async def resolve_nova_source(
         analysis_id=str(analysis_id) if analysis_id else None,
         enrichment_fdr=fdr,
         enrichment_databases=databases,
-        uploaded=uploaded,
-        padj_columns=_distinct([enr_meta.get("padj_column")]) if uploaded else (),
+        enrichment_categories=categories,
+        enrichment_source=kind,
+        padj_columns=_distinct([enr_meta.get("padj_column")]) if kind == "uploaded" else (),
         source_versions=_distinct([deg_meta.get("source_version"), enr_meta.get("source_version")]),
         demo=bool(deg_meta.get("demo") or enr_meta.get("demo")),
     )

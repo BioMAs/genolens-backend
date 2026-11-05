@@ -1,9 +1,11 @@
 """AI texts tied to their inputs: cosmetic_interpretations.inputs_sha256, report_jobs.ai_texts
 
 cosmetic_interpretations.inputs_sha256: the fingerprint of the nova a cached AI reading was written
-from (claims, unlinked sub-groups, alpha, referential version, enrichment datasets, model). A text
-whose fingerprint is not the current nova's is stale: it is neither served as current nor printed.
-Rows written before this revision have no fingerprint (NULL) and so count as stale.
+from (claims, unlinked sub-groups, alpha, referential version, enrichment datasets). A text whose
+fingerprint is not the current nova's is stale: it is neither served as current nor printed. The
+text's own model is hashed on both sides (the row's, not the configured one), so a change of model
+never makes a text stale. Rows written before this revision have no fingerprint (NULL) and so count
+as stale.
 report_jobs.ai_texts: the AI texts a report really printed, [{kind, model, generated_at}]
 (NULL: not recorded, [] : none printed).
 Both columns are nullable. Idempotent so it is safe to re-run on partially migrated databases.

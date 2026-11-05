@@ -83,10 +83,15 @@ def nova_inputs_sha256(nova: dict[str, Any], model: str) -> str:
     """The fingerprint of what an AI reading of the nova is written from.
 
     The sha256 of the canonical JSON of the nova's `claims` and `unlinked` sub-groups, its `alpha`,
-    the referential version, the enrichment datasets the terms come from, and the model. It leaves
-    out the clock (`provenance.generated_at`) and everything else that is not an input of the text,
-    so two novas that read the same give the same fingerprint, and the text of one is not served
-    for the other.
+    the referential version and the enrichment datasets the terms come from. It leaves out the
+    clock (`provenance.generated_at`) and everything else that is not an input of the text, so two
+    novas that read the same give the same fingerprint, and the text of one is not served for the
+    other.
+
+    `model` goes into the hash, but a change of model never makes a text stale: both the write and
+    the read pass the model of the text's own row (`CosmeticInterpretation.model`), never the
+    model configured today, so the two sides always hash the same value. A text written by an
+    older model stays current while its data do, and is labelled with the model that wrote it.
     """
     provenance = nova.get("provenance") or {}
     datasets = provenance.get("enrichment_dataset_ids")

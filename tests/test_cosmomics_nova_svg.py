@@ -333,3 +333,43 @@ async def test_svg_endpoint_rejects_an_unknown_theme():
             params={"theme": "sepia"},
         )
     assert resp.status_code == 422
+
+
+# ── R-F1: the poster header says what the p-values are from the enrichment's kind ─────
+
+P_ANNODB = "padj (Benjamini–Hochberg, GenoLens enrichment)"
+
+
+def _header(payload) -> str:
+    """The line under the poster's title (what the p-values are, and α)."""
+    svg = render_nova_svg(payload, "light", id_prefix="h", wheel_only=False)
+    return " ".join(re.findall(r"<text[^>]*y=\"126.0\"[^>]*>([^<]*)</text>", svg))
+
+
+def _with_kind(nova, kind, **extra):
+    return {
+        **nova,
+        "p_source": P_ANNODB,  # a stale or hand-made p_source never decides the header
+        "provenance": {"enrichment_source": kind, "padj_columns": [], **extra},
+    }
+
+
+def test_the_header_follows_the_enrichment_source_not_the_p_source(nova):
+    assert _header(_with_kind(nova, "annodb")) == f"{P_ANNODB} · α = 0.05"
+    legacy = _header(_with_kind(nova, "legacy"))
+    assert "earlier GenoLens enrichment" in legacy and "not recorded" in legacy
+    assert "Benjamini" not in legacy and "α = 0.05" in legacy
+    uploaded = _header(_with_kind(nova, "uploaded", padj_columns=["qvalue"]))
+    assert uploaded == "adjusted p from uploaded tables (column qvalue) · α = 0.05"
+    assert "Benjamini" not in uploaded
+
+
+def test_the_header_of_a_comparison_with_no_enrichment_says_only_that_none_is_stored(nova):
+    for payload in (
+        _with_kind(nova, "none"),
+        {**_with_kind(nova, "annodb"), "status": "no_enrichment"},
+        {**_with_kind(nova, "legacy"), "status": "no_enrichment"},
+    ):
+        header = _header(payload)
+        assert header == "No enrichment result is stored for this comparison"
+        assert "Benjamini" not in header and "α" not in header

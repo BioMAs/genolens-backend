@@ -12,7 +12,7 @@ import httpx
 from openai import APIConnectionError, AsyncOpenAI
 
 from app.core.config import settings
-from app.services.cosmomics_nova import subgroup_side
+from app.services.cosmomics_nova import ZERO_AGAINST_NOTE, claim_state_of, subgroup_side
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,17 @@ CLAIM_STATE_TEXT = {
     "against_only": "evidence against only, none for",
     "both_ways": "evidence both for and against",
 }
+
+
+# What the term p-values are, in a fixed vocabulary, by `provenance.enrichment_source`. Only an
+# enrichment GenoLens ran itself is told to be a Benjamini–Hochberg adjustment; a deposited table
+# is told by its source (never by its column name, which is the user's text); anything else
+# (legacy rows, no enrichment, a payload with no provenance) is no more than an adjusted p-value.
+P_KIND_BY_SOURCE = {
+    "annodb": "a Benjamini–Hochberg adjusted p-value",
+    "uploaded": "an adjusted p-value read from uploaded tables",
+}
+P_KIND_UNSPECIFIED = "an adjusted p-value"
 
 
 def prompt_claims_sent(claims_total: int) -> int:
@@ -217,6 +228,7 @@ class LocalAIInterpreter:
         all_claims = nova.get("claims", [])
         shown_claims = all_claims[:PROMPT_CLAIMS_LIMIT]
         claim_lines = []
+        for_only_shown = False
         for c in shown_claims:
             subs = c.get("subgroups", [])
             pro = [s for s in subs if subgroup_side(s) == "for"][:PROMPT_SUBGROUPS_PER_SIDE]
@@ -225,7 +237,10 @@ class LocalAIInterpreter:
             counts = f"{count(c.get('n_for', 0), 'sub-group')} for, {c.get('n_against', 0)} against"
             if c.get("n_balanced"):
                 counts += f", {c['n_balanced']} balanced"
-            state = CLAIM_STATE_TEXT.get(c.get("state"))
+            claim_state = claim_state_of(c)
+            if claim_state == "for_only":
+                for_only_shown = True
+            state = CLAIM_STATE_TEXT.get(claim_state)
             if state:
                 counts += f"; {state}"
             line = f"- {c['name']} ({counts})"
@@ -252,15 +267,20 @@ class LocalAIInterpreter:
         if unlinked_total > len(unlinked_shown) and unlinked_shown:
             unlinked_text += f" ({len(unlinked_shown)} of {unlinked_total} sub-groups)"
 
-        # What the p-values are, in a fixed vocabulary: the payload's own wording may carry the
-        # column name of an uploaded table, which is the user's text and does not leave.
-        p_source = str(nova.get("p_source") or "")
-        if p_source.startswith("adjusted p from uploaded"):
-            p_kind = "an adjusted p-value read from uploaded tables"
-        elif p_source:
-            p_kind = "a Benjamini–Hochberg adjusted p-value"
-        else:
-            p_kind = "an adjusted p-value"
+        # What the p-values are, in a fixed vocabulary read from the kind of enrichment, never from
+        # the payload's own wording (which may carry the column name of an uploaded table, the
+        # user's text, and does not leave).
+        kind = (nova.get("provenance") or {}).get("enrichment_source")
+        p_kind = P_KIND_BY_SOURCE.get(kind, P_KIND_UNSPECIFIED)
+
+        # The one ruled sentence, asked for only on the claims that have no contrary term at all
+        # (state for_only): a claim with 0 sub-groups against but a contrary term is not that.
+        zero_against = (
+            f' For a claim whose line says "{CLAIM_STATE_TEXT["for_only"]}", end its reading with '
+            f'this sentence, word for word: "{ZERO_AGAINST_NOTE}"'
+            if for_only_shown
+            else ""
+        )
 
         return f"""You are a scientist helping an R&D team read transcriptomic results.
 
@@ -282,8 +302,7 @@ Write your answer in ENGLISH, in markdown, with EXACTLY these two sections:
 ## Claim-by-claim reading
 For each claim listed above, in the order given, write 2-3 sentences: the sub-groups that \
 support it, and those that go against it or are balanced, with their direction and p-value as \
-given. When a claim has no pathway sub-group against it, say "no pathway sub-group against it \
-among the significant terms stored" and do not present that as a confirmation of the claim.
+given.{zero_against}
 
 ## Summary
 One short paragraph (3-5 sentences) that restates, claim by claim, how many sub-groups go for \

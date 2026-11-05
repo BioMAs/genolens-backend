@@ -29,6 +29,8 @@ from app.services.report_editorial_content import (
     EditorialInputs,
     build_editorial_context,
     cap_text,
+    enrichment_facts,
+    enrichment_text,
     looks_english,
     md_to_html,
 )
@@ -332,8 +334,10 @@ GENOLENS_PROVENANCE = {
     "comparison": "AL-7_vs_Vehicle",
     "enrichment_dataset_ids": ["e-1"],
     "analysis_id": "a-1",  # an analysis run in GenoLens, its enrichment on a dataset of its own
+    "enrichment_source": "annodb",
     "enrichment_fdr": 0.05,
     "enrichment_databases": ["GO", "Reactome"],
+    "enrichment_categories": None,
     "padj_columns": [],
     "source_versions": [],
     "referential_version": 1,
@@ -408,14 +412,21 @@ def test_scope_does_not_promise_a_dossier():
 
 
 def test_methods_follow_the_provenance_of_a_deposited_table():
-    nova = _honest_nova(padj_columns=["qvalue"], enrichment_fdr=None, enrichment_databases=None)
+    nova = _honest_nova(
+        enrichment_source="uploaded",
+        padj_columns=["qvalue"],
+        enrichment_fdr=None,
+        enrichment_databases=None,
+    )
     nova["p_source"] = "adjusted p from uploaded tables (column qvalue)"
     text = _text(_page(nova))
     assert "column qvalue" in text
     assert "hypergeometric" not in text.lower() and "benjamini" not in text.lower()
     assert "kegg" not in text.lower() and "wikipathways" not in text.lower()
     # A deposited table whose column was not recorded says so, and still names no test.
-    unrecorded = _honest_nova(padj_columns=[], enrichment_fdr=None, enrichment_databases=None)
+    unrecorded = _honest_nova(
+        enrichment_source="uploaded", padj_columns=[], enrichment_fdr=None, enrichment_databases=None
+    )
     unrecorded["p_source"] = "adjusted p from uploaded tables (column not recorded)"
     text = _text(_page(unrecorded))
     assert "column not recorded" in text and "hypergeometric" not in text.lower()
@@ -433,14 +444,22 @@ def test_methods_print_the_recorded_enrichment_cutoff_never_a_default():
 
 
 def test_methods_list_only_the_databases_that_were_run():
-    for databases, kegg in ((["GO", "KEGG"], True), (["GO", "Reactome"], False), (None, False)):
+    for databases, kegg in (
+        (["GO", "KEGG"], True),
+        (["GO", "Reactome"], False),
+        ([], False),
+        (None, False),
+    ):
         text = _text(_page(_honest_nova(enrichment_databases=databases)))
         assert ("KEGG" in text) is kegg
         assert "WikiPathways" not in text and "MSigDB" not in text
     listed = _text(_page(_honest_nova(enrichment_databases=["GO", "WikiPathways"])))
     assert "GO, WikiPathways" in listed
-    # None on an enrichment GenoLens ran is "all categories", and says no more than that.
-    assert "all categories" in _text(_page(_honest_nova(enrichment_databases=None)))
+    # An analysis that is known and picked nothing ran "all categories", and says no more than
+    # that; an unknown pick (the analysis is gone) is not "all categories" (R-F1).
+    assert "all categories" in _text(_page(_honest_nova(enrichment_databases=[])))
+    unknown = _text(_page(_honest_nova(enrichment_databases=None)))
+    assert "all categories" not in unknown and "Databases: not recorded" in unknown
 
 
 def test_methods_name_the_differential_method_from_the_dataset_metadata():
@@ -463,7 +482,11 @@ def test_methods_of_a_legacy_enrichment_name_no_test():
     """Rows stored by an earlier GenoLens enrichment (no analysis, no enrichment dataset, no
     uploaded table): the report says the parameters are not recorded, and names none (R-T4-3)."""
     legacy = _honest_nova(
-        analysis_id=None, enrichment_dataset_ids=[], enrichment_fdr=None, enrichment_databases=None
+        enrichment_source="legacy",
+        analysis_id=None,
+        enrichment_dataset_ids=[],
+        enrichment_fdr=None,
+        enrichment_databases=None,
     )
     params = {"species": "human", "fdr": 0.01, "min_log2fc": 0.585}
     text = _text(_page(legacy, params=params))
@@ -502,7 +525,9 @@ def test_stouffer_text_says_unsigned_and_not_independent():
 def test_strings_recorded_with_the_data_are_escaped():
     """A column header, a source version or a method name comes from an upload or a metadata
     record: it is printed as text, never as markup."""
-    nova = _honest_nova(padj_columns=["<b>q</b>"], source_versions=["<i>v1</i>"])
+    nova = _honest_nova(
+        enrichment_source="uploaded", padj_columns=["<b>q</b>"], source_versions=["<i>v1</i>"]
+    )
     nova["p_source"] = "adjusted p from uploaded tables (column <b>q</b>)"
     page = _page(nova, de_primary_method="<u>x</u>", de_method_run="all")
     for markup in ("<b>q</b>", "<i>v1</i>", "<u>x</u>"):
@@ -531,7 +556,9 @@ def test_not_evaluated_claim_prints_ne():
     assert "NO EVIDENCE" not in page and "not evidenced" not in text
     assert "No significant evidence" not in text
     # What was stored is not said: a deposited table is kept as it was given (R-T6-1).
-    deposited = _honest_nova(padj_columns=["qvalue"], enrichment_fdr=None)
+    deposited = _honest_nova(
+        enrichment_source="uploaded", padj_columns=["qvalue"], enrichment_fdr=None
+    )
     deposited["p_source"] = "adjusted p from uploaded tables (column qvalue)"
     for page in (text, _text(_page(deposited))):
         assert "n.e. — no significant term for this claim in the enrichment results" in page
@@ -812,11 +839,23 @@ def test_enrichment_table_has_no_pvalue_copied_from_padj():
     assert up[0].get("pvalue") is None  # the raw p-value is unknown here, not the adjusted one
 
 
-async def _collected(nova, *, requester_is_demo=False, test="AL-7", metadata=None):
+async def _collected(
+    nova, *, requester_is_demo=False, test="AL-7", metadata=None, methods=None
+):
     from app.services import report_editorial_service as module
 
     data = {
-        "comparisons": [{"test": test, "control": "Vehicle", "degs": [], "n_up": 0, "n_down": 0}],
+        "comparisons": [
+            {
+                "test": test,
+                "control": "Vehicle",
+                "degs": [],
+                "n_up": 0,
+                "n_down": 0,
+                # `report_latex_methods.methods_context` of the comparison
+                "methods": methods or {},
+            }
+        ],
         "params": {},
         "expression": {},
         "qc_rows": [],
@@ -1158,3 +1197,150 @@ def test_editorial_task_runs_on_the_chromium_worker_queue():
 
     assert generate_comparison_report_editorial.queue == "default"
     assert generate_comparison_report.queue == "r_analysis"
+
+
+# ── R-F1: the methods say what the provenance's enrichment_source says ────────────────
+
+
+def _no_enrichment(**provenance):
+    """A nova with no stored enrichment result (status no_enrichment) and the given provenance."""
+
+    def mutate(nova):
+        nova.update(status="no_enrichment", claims=[], unlinked=[], unlinked_total=0)
+
+    return _honest_nova(mutate, **provenance)
+
+
+NO_RESULT = "No enrichment result is stored for this comparison"
+RUN_CLAIMS = (
+    "hypergeometric",
+    "benjamini",
+    "over-representation",
+    "cut-off",
+    "all categories",
+    "databases:",
+    "earlier genolens method",
+    "terms kept",
+)
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        # What the payload of an analysis whose enrichment never ran carried (R-F1): the analysis
+        # parameters stood in for a run, and the methods asserted an ORA.
+        dict(enrichment_source="none", enrichment_fdr=None, enrichment_databases=None,
+             enrichment_dataset_ids=[]),
+        # A reader that meets the status first must not trust a stale GenoLens provenance either.
+        dict(enrichment_source="annodb", enrichment_fdr=0.05, enrichment_databases=[]),
+        dict(enrichment_source="legacy", analysis_id=None, enrichment_dataset_ids=[],
+             enrichment_fdr=None, enrichment_databases=None),
+        dict(enrichment_source="uploaded", padj_columns=["qvalue"], enrichment_fdr=None),
+    ],
+    ids=["none", "annodb-status", "legacy-status", "uploaded-status"],
+)
+def test_methods_of_a_comparison_with_no_enrichment_say_only_that_none_is_stored(provenance):
+    nova = _no_enrichment(**provenance)
+    ctx = _context(nova, enr_up=[], enr_down=[])
+    pages = {p["kind"]: p for p in ctx["pages"]}
+    method = pages["method"]
+    # The places that used to state a run: the design sentence, the Versions rows, the nova
+    # paragraph, and the sentence above the enrichment figures.
+    texts = {
+        "design": _text(pages["science_design"]["design_text"]),
+        "versions": " ".join(f"{k} {v}" for k, v in method["versions"]),
+        "nova": _text(method["method_nova"]),
+        "figures": enrichment_text(enrichment_facts(nova)),
+    }
+    assert NO_RESULT in texts["design"] and NO_RESULT in texts["figures"]
+    assert dict(method["versions"])["Enrichment"] == NO_RESULT
+    assert "Enrichment databases" not in dict(method["versions"])
+    page = _text(render_html(ctx))
+    assert NO_RESULT in page
+    for where, text in {**texts, "page": page}.items():
+        for phrase in RUN_CLAIMS:
+            assert phrase not in text.lower(), (where, phrase)
+
+
+def test_methods_of_a_deleted_analysis_do_not_print_all_categories():
+    """The analysis is gone: its pick, its cut-off and its categories are not known (R-F1)."""
+    nova = _honest_nova(enrichment_fdr=None, enrichment_databases=None, enrichment_categories=None)
+    text = _text(_page(nova))
+    assert "all categories" not in text
+    assert "Databases: not recorded" in text and "cut-off not recorded" in text
+    assert "hypergeometric" in text  # a GenoLens annoDB run: its test is still known
+
+
+def test_methods_print_the_categories_recorded_at_run_time():
+    nova = _honest_nova(
+        enrichment_databases=["GO", "Reactome", "KEGG"], enrichment_categories=["GO_BP", "reactome"]
+    )
+    text = _text(_page(nova))
+    assert "Databases: GO_BP, reactome" in text
+    assert "KEGG" not in text and "all categories" not in text  # observed, not the pick
+    assert dict(next(p for p in _context(nova)["pages"] if p["kind"] == "method")["versions"])[
+        "Enrichment databases"
+    ] == "GO_BP, reactome"
+
+
+def test_uploaded_is_told_by_the_source_not_by_the_p_source_prefix():
+    # A deposited table whose p_source was lost is still a deposited table.
+    nova = _honest_nova(enrichment_source="uploaded", padj_columns=["qvalue"], enrichment_fdr=None)
+    nova["p_source"] = ""
+    text = _text(_page(nova))
+    assert "column qvalue" in text and "hypergeometric" not in text.lower()
+    # And a p_source that merely looks like one does not turn a GenoLens run into a deposit.
+    nova = _honest_nova()
+    nova["p_source"] = "adjusted p from uploaded tables (column q)"
+    text = _text(_page(nova))
+    assert "hypergeometric" in text and "deposited" not in text.lower()
+
+
+def test_a_provenance_without_enrichment_source_infers_nothing():
+    nova = _honest_nova()
+    del nova["provenance"]["enrichment_source"]
+    text = _text(_page(nova))
+    assert "hypergeometric" not in text.lower() and "benjamini" not in text.lower()
+    assert "all categories" not in text and "stored with the dataset" in text
+
+
+# ── R-F3: an orphaned analysis is "no longer available", not "imported" ──────────────────
+
+
+def test_an_orphaned_analysis_is_not_called_imported():
+    gone = _text(_page(has_analysis=False, analysis_gone=True, analysis_label=None, params={}))
+    assert "The analysis that produced these results is no longer available" in gone
+    assert "its methods are not described here" in gone
+    assert "imported" not in gone.lower()
+    assert "DESeq2" not in gone and "edgeR" not in gone and "limma" not in gone
+    ctx = _context(has_analysis=False, analysis_gone=True, analysis_label=None, params={})
+    method = next(p for p in ctx["pages"] if p["kind"] == "method")
+    assert dict(method["versions"])["Differential expression"] == (
+        "analysis no longer available (method not described)"
+    )
+    # Even when the dataset still records the method that decided the calls, like the LaTeX report.
+    named = _text(
+        _page(
+            has_analysis=False,
+            analysis_gone=True,
+            analysis_label=None,
+            params={},
+            de_primary_method="DESeq2",
+            de_method_run="all",
+        )
+    )
+    assert "no longer available" in named and "called with DESeq2" not in named
+    # Results that were never produced by an analysis keep the imported sentence.
+    never = _text(_page(has_analysis=False, analysis_label=None, params={}))
+    assert "imported with the dataset" in never and "no longer available" not in never
+
+
+async def test_the_collected_inputs_name_an_orphaned_analysis():
+    """`collect` hands the editorial what the LaTeX methods record: the DEG metadata names an
+    analysis that cannot be found (R-F3)."""
+    gone = await _collected(_honest_nova(), methods={"analysis_gone": True, "imported": True})
+    assert gone.analysis_gone is True and gone.has_analysis is False
+    text = _text(render_html(build_editorial_context(gone)))
+    assert "no longer available" in text and "imported" not in text.lower()
+    for methods in ({}, {"analysis_gone": False, "imported": True}):
+        assert (await _collected(_honest_nova(), methods=methods)).analysis_gone is False

@@ -25,7 +25,12 @@ from typing import Any, Literal, Optional
 
 import numpy as np
 
-from app.services.cosmomics_nova import claim_state_of, subgroup_side
+from app.services.cosmomics_nova import (
+    ZERO_AGAINST_NOTE,
+    claim_state_of,
+    p_source_of,
+    subgroup_side,
+)
 
 Theme = Literal["light", "dark"]
 
@@ -175,12 +180,6 @@ def _bsize(d: float) -> float:
 
 
 AXIS_TITLE = "−log10 combined p (Stouffer, unsigned)"
-# Said wherever a claim has no contrary term at all (state "for_only"): the absence of a contrary
-# term is not evidence for.
-ZERO_AGAINST_NOTE = (
-    "Only terms present in the enrichment results can count against a claim; "
-    "no contrary term is not a confirmation."
-)
 
 
 def _plural(n: int, noun: str) -> str:
@@ -661,8 +660,18 @@ def render_nova_svg(
         f'<tspan fill="{th["green"]}">Omics</tspan></text>',
         _text(50, 104, subtitle, 16, th["muted"]),
     ]
-    if payload.get("p_source"):  # what the p-values are, and where significance starts
-        o.append(_text(50, 126, f"{payload['p_source']} · α = {alpha:g}", 12, th["dim"]))
+    # What the p-values are, and where significance starts: read from the kind of enrichment
+    # (`provenance.enrichment_source`), the payload's own `p_source` only for a payload that
+    # predates it. With no enrichment result the header says that and nothing else: there is no
+    # p-value, hence no threshold, to state.
+    kind = (payload.get("provenance") or {}).get("enrichment_source")
+    if kind == "none" or payload.get("status") == "no_enrichment":
+        o.append(_text(50, 126, "No enrichment result is stored for this comparison", 12, th["dim"]))
+    else:
+        p_source = p_source_of(kind, (payload.get("provenance") or {}).get("padj_columns") or [])
+        p_source = p_source or payload.get("p_source")
+        if p_source:
+            o.append(_text(50, 126, f"{p_source} · α = {alpha:g}", 12, th["dim"]))
     if logo_data_uri:
         lw = 170
         lh = lw * 190 / 1024

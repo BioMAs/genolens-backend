@@ -159,9 +159,13 @@ async def _main(argv: list[str]) -> int:
     from app.core.config import settings
     from app.db.session import engine_options
 
-    # An engine of its own, with the app's options but the SQL echo off whatever DEBUG says: SQLAlchemy's echo
-    # writes to standard output, where the token must be alone.
-    engine = create_async_engine(settings.DATABASE_URL, echo=False, **engine_options())
+    # An engine of its own, with the app's options but the SQL echo off whatever DEBUG says (SQLAlchemy's echo
+    # writes to standard output, where the token must be alone) and the statement parameters hidden whatever
+    # SQL_ECHO_PARAMETERS says: that setting is the app's, for development, and a database error of this command
+    # would otherwise print its parameters, the sha256 of a token among them, to the terminal.
+    engine = create_async_engine(
+        settings.DATABASE_URL, echo=False, **{**engine_options(), "hide_parameters": True}
+    )
     sessions = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False)
     try:
         return await run(argv, session_factory=sessions)

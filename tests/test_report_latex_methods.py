@@ -186,6 +186,10 @@ def test_a_run_whose_dataset_has_no_parent_analysis_is_imported():
 
 
 IMPORTED_ENRICHMENT = "Enrichment results of imported data are not included in this report."
+GONE_ENRICHMENT = (
+    "Enrichment results are not included in this report: the analysis that produced these "
+    "results is no longer available."
+)
 NOT_RUN = "The differential analysis was not run in GenoLens; its methods are not described here"
 GONE = "The analysis that produced these results is no longer available; its methods are not described here."
 
@@ -199,10 +203,10 @@ def _imported(analysis_id=None) -> dict:
 def test_imported_results_never_say_that_no_enrichment_is_stored():
     """The legacy Python enrichment writes its rows under the DEG dataset's own id, and a delivered
     ENRICHMENT dataset may exist: the report does not read them, and does not deny them either."""
-    for ctx in (_imported(), _imported("an-9")):
+    for ctx, line in ((_imported(), IMPORTED_ENRICHMENT), (_imported("an-9"), GONE_ENRICHMENT)):
         for text in (_text(ctx), rl.build_comparison_section(_comp(methods=ctx))):
             assert "No enrichment result is stored" not in text
-            assert IMPORTED_ENRICHMENT in text
+            assert line in text
     # A GenoLens analysis with no ENRICHMENT dataset is another matter: nothing is stored there.
     assert "No enrichment result is stored" in _text(_ctx(enr=()))
 
@@ -217,6 +221,12 @@ def test_results_whose_analysis_is_gone_say_so():
     assert never["imported"] is True and never["analysis_gone"] is False
     for text in (_text(never), rl.build_comparison_section(_comp(methods=never))):
         assert NOT_RUN in text and GONE not in text
+    # The enrichment line of an orphaned analysis does not call its data imported (R-F3), and says
+    # what the DE paragraph says; the line of results that were never GenoLens's is unchanged.
+    for text in (_text(gone), rl.build_comparison_section(_comp(methods=gone))):
+        assert "imported data" not in text and GONE_ENRICHMENT in text
+    for text in (_text(never), rl.build_comparison_section(_comp(methods=never))):
+        assert IMPORTED_ENRICHMENT in text and GONE_ENRICHMENT not in text
     # A GenoLens analysis is neither.
     assert _ctx()["analysis_gone"] is False
     # Neither names a method.
@@ -749,3 +759,121 @@ def test_the_report_of_each_kind_of_run_compiles(tmp_path, variant):
     data["comparisons"][0]["methods"] = methods
     pdf = svc.compile_pdf(svc.assemble_tex(data), str(tmp_path))
     assert pdf.startswith(b"%PDF")
+
+
+# ── R-F2: no ENRICHMENT dataset is "no result stored", not "no term passed" ──────
+
+
+def test_no_enrichment_dataset_says_no_result_is_stored_not_that_no_term_passed():
+    """With no ENRICHMENT dataset registered the record cannot tell "ran, nothing passed" from
+    "did not run" (the worker registers none when the script fails): the body says what the
+    Material and Methods and the editorial say."""
+    none = _comp(methods=_ctx(enr=()))
+    for no_gene in (False, True):
+        section = rl.build_comparison_section({**none, "n_up": 0 if no_gene else 1, "n_down": 0})
+        assert "No enrichment result is stored for this comparison." in section
+        assert "No term passed" not in section
+        assert "adjusted p $<$" not in section and "cut-off of the run" not in section
+    # The cut-off is no business of a comparison that has no result.
+    zero = rl.build_comparison_section(_comp(n_up=0, n_down=0, methods=_ctx(enr=())))
+    assert "No enrichment result is stored for this comparison." in zero
+    assert "none was called" in zero  # the enrichment tests the DEGs: what explains it
+    # An enrichment result that exists with no kept term keeps the sentence with its cut-off.
+    kept = rl.build_comparison_section(_comp())
+    assert "No term passed (adjusted p $<$ 0.05)" in kept
+    assert "No enrichment result is stored" not in kept
+    # No result, no run: no cut-off is a fact of this comparison either.
+    assert _ctx(enr=())["enrichment"]["fdr"] is None
+    # No database picked: nothing ran, and it says so.
+    picked_none = _comp(methods=_ctx(enr=(), params_enrichment_databases=[]))
+    assert "No annotation database was selected" in rl.build_comparison_section(picked_none)
+
+
+# ── D1: a recorded threshold prints exactly ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "value, printed",
+    [
+        (1000000, "1000000"),
+        (1234567, "1234567"),
+        (1000000.0, "1000000"),
+        (5, "5"),
+        (5.0, "5"),
+        (0.05, "0.05"),
+        (0.585, "0.585"),
+        (1e-05, "1e-05"),
+        (1234567.5, "1234567.5"),
+    ],
+)
+def test_a_recorded_number_prints_exactly(value, printed):
+    assert rl.fmt_g(value) == printed
+    assert rm.format_number(value) == printed
+
+
+def test_a_recorded_minimum_count_of_a_million_is_not_written_in_scientific_notation():
+    text = _text(_ctx(vst_min_count_threshold=1000000, vst_min_reps_threshold=2))
+    assert "reached 1000000 in at least 2 samples" in text
+    assert "1e+06" not in text
+    reads = _text(_ctx(vst_min_reads_threshold=1234567))
+    assert "at least 1234567 total counts" in reads and "1.23457e+06" not in reads
+    thresholds = rm.thresholds_tex({"fdr": 0.05, "min_log2fc": 1000000})
+    assert "1000000" in thresholds and "e+06" not in thresholds
+
+
+# ── D2: comparisons that disagree on the deciding method ─────────────────────────
+
+
+def _de_section(text: str) -> str:
+    return text.split("Differential Gene Expression Analysis")[1].split("Functional Enrichment")[0]
+
+
+def _merged_ctx(*metas):
+    merged = rm.merge_deg_metas(list(metas))
+    return rm.methods_context(PARAMS, merged, VST_META, [ENR_META])
+
+
+def test_comparisons_that_disagree_on_the_method_are_named_one_by_one():
+    ctx = _merged_ctx(
+        {**DEG_META, "comparison_name": "A_vs_B", "primary_method": "DESeq2"},
+        {**DEG_META, "comparison_name": "A_vs_C", "primary_method": "edgeR"},
+    )
+    assert ctx["primary_method"] is None
+    assert ctx["primary_by_comparison"] == [("A_vs_B", "DESeq2"), ("A_vs_C", "edgeR")]
+    section = _de_section(_text(ctx))
+    assert "differs between the comparisons" in section
+    assert "A\\_vs\\_B, DESeq2" in section and "A\\_vs\\_C, edgeR" in section
+    assert "is not recorded for this analysis" not in section
+    # The BH sentence and the recorded thresholds stay: every method of the pipeline adjusts so.
+    assert "Benjamini-Hochberg (BH) False Discovery Rate" in section
+    assert re.search(r"adjusted \\textit\{p\}-value was below 0\.05", section)
+    assert re.search(r"fold-change was at or above 1\b", section)
+    assert "are not recorded for this analysis" not in section
+
+
+def test_a_method_that_only_some_comparisons_record_is_listed_for_those_alone():
+    ctx = _merged_ctx(
+        {**DEG_META, "comparison_name": "A_vs_B", "primary_method": "DESeq2"},
+        _drop({**DEG_META, "comparison_name": "A_vs_C"}, "primary_method"),
+    )
+    assert ctx["primary_method"] is None and ctx["primary_by_comparison"] == [("A_vs_B", "DESeq2")]
+    section = _de_section(_text(ctx))
+    assert "not recorded for every comparison" in section
+    sentence = section.split("not recorded for every comparison")[1].split("Benjamini")[0]
+    assert "A\\_vs\\_B, DESeq2" in sentence
+    assert "A\\_vs\\_C" not in sentence and "edgeR" not in sentence
+    assert "Benjamini-Hochberg (BH) False Discovery Rate" in section
+
+
+def test_comparisons_that_agree_on_the_method_keep_the_single_sentence():
+    ctx = _merged_ctx(
+        {**DEG_META, "comparison_name": "A_vs_B"}, {**DEG_META, "comparison_name": "A_vs_C"}
+    )
+    assert ctx["primary_method"] == "DESeq2" and not ctx["primary_by_comparison"]
+    assert "differs between the comparisons" not in _text(ctx)
+    # No comparison records one: the paragraph says so and keeps nothing it cannot back.
+    none = _merged_ctx(*(_drop({**DEG_META, "comparison_name": n}, "primary_method") for n in "AB"))
+    section = _de_section(_text(none))
+    assert none["primary_by_comparison"] == []
+    assert "calls is not recorded for this analysis" in section
+    assert "Benjamini-Hochberg (BH)" not in section

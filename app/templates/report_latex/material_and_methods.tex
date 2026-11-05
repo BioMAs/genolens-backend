@@ -45,13 +45,18 @@ Differentially expressed genes (DEGs) were called with \textbf{DESeq2} (Love et 
 Differentially expressed genes (DEGs) were called with \textbf{edgeR} (Robinson et al., 2010), which fits a negative binomial model on TMM-normalised counts and performs quasi-likelihood F-tests to account for overdispersion.
 \JINJABLOCK{elif m.primary_method == 'limma'}
 Differentially expressed genes (DEGs) were called with \textbf{limma-voom} (Ritchie et al., 2015), which models log-transformed data with precision weights derived from the mean--variance trend and employs empirical Bayes shrinkage of variance estimates.
+\JINJABLOCK{elif m.primary_by_comparison}
+The method that decided the differentially expressed gene (DEG) calls \JINJAVAR{'differs between the comparisons' if m.primary_differs else 'is not recorded for every comparison'}:
+\JINJABLOCK{for name, method in m.primary_by_comparison}
+\JINJABLOCK{if name}\JINJAVAR{name|tex_escape}, \JINJABLOCK{endif}\JINJAVAR{method}\JINJAVAR{'; ' if not loop.last else '.'}
+\JINJABLOCK{endfor}
 \JINJABLOCK{else}
 The method that decided the differentially expressed gene (DEG) calls is not recorded for this analysis.
 \JINJABLOCK{endif}
 \JINJABLOCK{if m.ahead_methods}
 \JINJAVAR{m.ahead_methods|join(' and ')} gave no result, so \JINJAVAR{m.primary_method|method_name} decided the calls.
 \JINJABLOCK{endif}
-\JINJABLOCK{if m.primary_method}
+\JINJABLOCK{if m.primary_method or m.primary_by_comparison}
 P-values were corrected for multiple testing using the Benjamini-Hochberg (BH) False Discovery Rate.
 \JINJABLOCK{if m.fdr is not none and m.min_log2fc is not none}
 A gene was classified as a DEG if (i) its adjusted \textit{p}-value was below \JINJAVAR{m.fdr|fmt_g} and (ii) the absolute value of its log$_2$ fold-change was at or above \JINJAVAR{m.min_log2fc|fmt_g}.
@@ -128,7 +133,7 @@ The enrichment results are those stored with the dataset; the test and the corre
 \JINJABLOCK{if enr.kind == 'none'}
 
 \JINJABLOCK{if m.imported}
-Enrichment results of imported data are not included in this report.
+\JINJAVAR{'Enrichment results are not included in this report: the analysis that produced these results is no longer available.' if m.analysis_gone else 'Enrichment results of imported data are not included in this report.'}
 \JINJABLOCK{else}
 No enrichment result is stored for the comparisons of this report.
 \JINJABLOCK{if not enr.requested}

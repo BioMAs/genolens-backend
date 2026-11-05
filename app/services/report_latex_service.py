@@ -156,10 +156,11 @@ def subrender_filter(context, value):
 
 
 def fmt_g(value) -> str:
-    """A recorded number as it is written in the text: 5 not 5.0, 0.05, 1e-05."""
+    """A recorded number as it is written in the text: 5 not 5.0, 0.05, 1e-05, and an integer in
+    full (1000000, never 1e+06: see `report_latex_methods.format_number`)."""
     try:
-        return f"{float(value):g}"
-    except (ValueError, TypeError):
+        return rm.format_number(value)
+    except (ValueError, TypeError, OverflowError):
         return ""
 
 

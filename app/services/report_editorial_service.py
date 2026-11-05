@@ -399,6 +399,9 @@ class ReportEditorialService:
             use_ai=use_ai,
             de_primary_method=dataset_meta.get("primary_method"),
             de_method_run=dataset_meta.get("de_method"),
+            # What the LaTeX methods of this comparison record: its DEG metadata names an analysis
+            # that no longer exists.
+            analysis_gone=bool((comp.get("methods") or {}).get("analysis_gone")),
         )
 
     async def render_comparison_pdf(

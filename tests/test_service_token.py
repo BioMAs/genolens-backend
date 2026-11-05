@@ -1115,7 +1115,8 @@ def test_the_cli_and_the_app_share_the_engine_options(monkeypatch):
     assert app_db.engine.sync_engine.hide_parameters == app_options["hide_parameters"]
     assert app_db.engine.sync_engine.pool._pre_ping == app_options["pool_pre_ping"]
 
-    # Options that differ from the defaults everywhere: only the shared function can have set them.
+    # Options that differ from the defaults everywhere: only the shared function can have set them
+    # (but for `hide_parameters`, which the command forces on: see the next test).
     marked = {"hide_parameters": False, "pool_pre_ping": False, "pool_recycle": 1234}
     monkeypatch.setattr(app_db, "engine_options", lambda *_: marked)
     seen = {}
@@ -1131,7 +1132,31 @@ def test_the_cli_and_the_app_share_the_engine_options(monkeypatch):
 
     monkeypatch.setattr(cli, "run", fake_run)
     assert asyncio.run(cli._main(["list"])) == 0
-    assert seen == marked
+    assert seen == {**marked, "hide_parameters": True}
+
+
+def test_the_cli_never_echoes_sql_parameters_whatever_sql_echo_parameters_says(monkeypatch):
+    """R-F4: the sha256 a token lookup binds never reaches a message of the command. The app's
+    engine may show parameters when SQL_ECHO_PARAMETERS asks (development); the command's engine
+    hides them anyway: an error of its own would otherwise print them to the terminal."""
+    import asyncio
+
+    from app.core.config import settings
+    from app.scripts import service_token as cli
+
+    monkeypatch.setattr(settings, "SQL_ECHO_PARAMETERS", True)
+    monkeypatch.setattr(settings, "DEBUG", True)
+    seen = {}
+
+    async def fake_run(argv, *, session_factory, **_):
+        engine = session_factory.kw["bind"]
+        seen["hide_parameters"] = engine.sync_engine.hide_parameters
+        seen["echo"] = engine.echo
+        return 0
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    assert asyncio.run(cli._main(["list"])) == 0
+    assert seen == {"hide_parameters": True, "echo": False}
 
 
 def _compose(name: str) -> dict:

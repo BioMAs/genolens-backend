@@ -152,10 +152,8 @@ def _enrichment(metas: list[dict], params: Optional[dict]) -> dict[str, Any]:
         fdr = recorded[0]
     elif annodb and any(v is not None for v in recorded):
         fdr = None  # records that disagree
-    elif kind == "none":
-        fdr = _enrichment_fdr(None, params)
-    elif kind == "stored":
-        fdr = None
+    elif kind in ("none", "stored"):
+        fdr = None  # no run stands behind a cut-off: no result, or tables deposited as they are
     else:
         fdr = _enrichment_fdr(None, params)
 
@@ -208,6 +206,16 @@ def methods_context(
 
     de_method = _de_method(p.get("de_method"), deg_meta.get("de_method"))
     primary = _canonical_method(deg_meta.get("primary_method"))
+    per_comparison = deg_meta.get("primary_methods")
+    primary_by_comparison = (
+        [
+            (str(name), method_name(method))
+            for name, method in per_comparison.items()
+            if _canonical_method(method) and isinstance(name, str)
+        ]
+        if primary is None and isinstance(per_comparison, dict)
+        else []
+    )
     if primary is None and de_method in ("deseq2", "edger", "limma"):
         primary = _CANONICAL[de_method]  # a single method run is the one that decided
     other_methods = (
@@ -227,6 +235,11 @@ def methods_context(
         "analysis_gone": analysis_gone,
         "de_method": de_method,
         "primary_method": primary,
+        # [(comparison, method)]: the deciding method of each comparison that records one, when
+        # the comparisons of the report do not all share it; `primary_differs` when they name more
+        # than one.
+        "primary_by_comparison": primary_by_comparison,
+        "primary_differs": len({method for _name, method in primary_by_comparison}) > 1,
         "other_methods": other_methods,
         "ahead_methods": ahead,
         "fdr": _first(_num(p.get("fdr")), _num(deg_meta.get("fdr"))),
@@ -251,8 +264,9 @@ def merge_deg_metas(metas: list[dict]) -> dict:
     """One `deg_meta` out of those of several comparisons, for a report that covers them all.
 
     A setting the comparisons agree on is kept; one they disagree on, or that one of them does not
-    record, is dropped (the text then says "not recorded"); the designs are listed per comparison;
-    the sample thresholds were relaxed if they were for any of them.
+    record, is dropped (the text then says "not recorded"); the designs are listed per comparison,
+    and so is the method that decided the calls when it is not the same for all of them
+    (`primary_methods`); the sample thresholds were relaxed if they were for any of them.
     """
     metas = [m for m in metas if isinstance(m, dict)]
     if not metas:
@@ -262,6 +276,14 @@ def merge_deg_metas(metas: list[dict]) -> dict:
         values = [m.get(key) for m in metas]
         if values[0] is not None and all(v == values[0] for v in values):
             merged[key] = values[0]
+    if "primary_method" not in merged:
+        # The comparisons disagree on the method that decided their calls (or some record none):
+        # name it comparison by comparison, for those that record one.
+        primary = {
+            str(m.get("comparison_name") or ""): _canonical_method(m.get("primary_method"))
+            for m in metas
+        }
+        merged["primary_methods"] = {name: method for name, method in primary.items() if method}
     relaxed = [m.get("qc_relaxed") for m in metas if isinstance(m.get("qc_relaxed"), bool)]
     if relaxed:
         merged["qc_relaxed"] = any(relaxed)
@@ -276,8 +298,18 @@ def merge_deg_metas(metas: list[dict]) -> dict:
 # ── sentences of the report body, from the same record ─────────────────────────────
 
 
-def _g(value: Any) -> str:
-    return f"{float(value):g}"
+def format_number(value: Any) -> str:
+    """A recorded number as it is written in the text: 5 not 5.0, 0.05, 1e-05, and an integer in
+    full (1000000, never 1e+06; a recorded integer is never rounded to six digits). Raises on a
+    value that is not a number."""
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    short = f"{number:g}"
+    return short if float(short) == number else repr(number)
+
+
+_g = format_number
 
 
 def thresholds_tex(ctx: dict) -> str:
@@ -355,16 +387,35 @@ def no_gene_tex(ctx: dict) -> str:
     return "0 genes passed the thresholds (the thresholds are not recorded)."
 
 
+def no_enrichment_import_tex(ctx: dict) -> str:
+    """The enrichment line of results that have no parent analysis: what the report omits, and why.
+
+    The LaTeX report does not read the rows an import carries (the legacy Python enrichment stores
+    them under the DEG dataset, a delivered ENRICHMENT dataset may exist), so it neither shows nor
+    denies them. For an orphaned analysis the results are not imported ones: the sentence names the
+    analysis that is gone, as the differential paragraph does.
+    """
+    if ctx.get("analysis_gone"):
+        return (
+            "Enrichment results are not included in this report: the analysis that produced "
+            "these results is no longer available."
+        )
+    return "Enrichment results of imported data are not included in this report."
+
+
 def no_term_tex(ctx: dict, no_gene: bool = False) -> str:
     """The enrichment section of a comparison that has no enriched term."""
     enr = ctx["enrichment"]
     if ctx["imported"]:
-        # Not read for imported results: the rows the legacy Python enrichment stores under the
-        # DEG dataset, or a delivered ENRICHMENT dataset, may exist. Say what the report omits.
-        return "Enrichment results of imported data are not included in this report."
+        return no_enrichment_import_tex(ctx)
     if not enr["requested"]:
         return "No annotation database was selected for this analysis: no enrichment was run."
-    if enr["fdr"] is not None:
+    if enr["kind"] == "none":
+        # No ENRICHMENT dataset is registered: the record cannot tell "ran, nothing passed" from
+        # "did not run" (the worker registers none when the script fails), so no cut-off and no
+        # "no term passed" is stated, as in the Material and Methods and in the editorial.
+        text = "No enrichment result is stored for this comparison."
+    elif enr["fdr"] is not None:
         text = f"No term passed (adjusted p $<$ {_g(enr['fdr'])})."
     else:
         text = "No term passed (the cut-off of the run is not recorded)."
