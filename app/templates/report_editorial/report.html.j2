@@ -79,7 +79,7 @@
 
 {%- macro ai_box(p) -%}
 <div class="ai">
-  <h3>{{ p.ai_label if p.ai_html else 'AI interpretation' }}</h3>
+  {% if p.ai_html %}<h3 class="ai-label">{{ p.ai_label }}</h3>{% else %}<h3>AI interpretation</h3>{% endif %}
   {%- if p.ai_html %}{{ p.ai_html }}{% if p.truncated %}<p class="cap">Shortened to fit the page; the full text is available in GenoLens.</p>{% endif %}
   {%- else %}<p class="notice">{{ p.ai_notice }}</p>{% endif %}
 </div>

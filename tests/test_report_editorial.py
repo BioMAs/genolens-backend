@@ -923,11 +923,85 @@ def _dated(**overrides) -> EditorialInputs:
 def test_editorial_ai_label_names_model_and_date():
     page = render_html(build_editorial_context(_dated()))
     # The reading of the nova (page 3) and the comparison text each carry the label.
-    assert page.count(f"<h3>{LABEL}</h3>") == 2
+    assert page.count(f'<h3 class="ai-label">{LABEL}</h3>') == 2
     # Without a date the label still names the model.
     undated = render_html(build_editorial_context(_inputs()))
-    assert "<h3>AI-generated text (model google/gemma-4-E4B-it)</h3>" in undated
+    assert '<h3 class="ai-label">AI-generated text (model google/gemma-4-E4B-it)</h3>' in undated
     assert "generated 2026" not in undated
+
+
+def _css_text_transform(css: str, tag: str, classes: set, ancestors: list) -> str:
+    """The `text-transform` the cascade gives an element: the declaration of the rule with the
+    highest specificity (then the last one) among the rules whose selector matches it. `ancestors`
+    are the class sets of its parents, nearest first. Selectors of the form `tag.class .class tag`
+    only (what this stylesheet uses); `inherit`/initial values are out of scope."""
+
+    def compound(sel):
+        m = re.fullmatch(r"([a-z0-9]*)((?:\.[\w-]+)*)", sel)
+        return (m.group(1), set(m.group(2).split(".")[1:])) if m else None
+
+    def matches(sel_tag, sel_classes, el_tag, el_classes):
+        return (not sel_tag or sel_tag == el_tag) and sel_classes <= el_classes
+
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    best = (-1, -1, -1, None)  # (classes, tags, order, value)
+    order = 0
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+        decl = re.search(r"(?<![\w-])text-transform\s*:\s*([\w-]+)", body)
+        if not decl:
+            continue
+        for selector in selectors.split(","):
+            order += 1
+            parts = [compound(p) for p in selector.split()]
+            if not parts or None in parts:
+                continue
+            last_tag, last_classes = parts[-1]
+            if not matches(last_tag, last_classes, tag, classes):
+                continue
+            remaining = list(ancestors)
+            ok = True
+            for part_tag, part_classes in reversed(parts[:-1]):
+                while remaining and not matches(part_tag, part_classes, "div", remaining[0]):
+                    remaining.pop(0)
+                if not remaining:
+                    ok = False
+                    break
+                remaining.pop(0)
+            if not ok:
+                continue
+            specificity = (
+                sum(len(c) for _t, c in parts),
+                sum(1 for t, _c in parts if t),
+                order,
+                decl.group(1),
+            )
+            if specificity[:3] > best[:3]:
+                best = specificity
+    return best[3] or "none"
+
+
+def test_the_ai_label_prints_as_written_not_uppercased():
+    """The label names the model by its id and the day: the h3 headings of the page are uppercased
+    by CSS, which would turn `gemma-4-E4B-it` into `GEMMA-4-E4B-IT` in the PDF (recette D4)."""
+    page = render_html(build_editorial_context(_dated()))
+    css = "\n".join(re.findall(r"<style[^>]*>(.*?)</style>", page, re.S))
+    assert css
+    labels = re.findall(
+        r'<div class="ai">\s*<h3([^>]*)>' + re.escape(LABEL) + "</h3>", page
+    )
+    assert len(labels) == 2  # the reading of the nova and the comparison text
+    for attrs in labels:
+        classes = set(re.findall(r'class="([^"]*)"', attrs)[0].split()) if "class=" in attrs else set()
+        assert "text-transform" not in attrs  # no inline style that transforms it either
+        assert _css_text_transform(css, "h3", classes, [{"ai"}, {"page"}]) == "none"
+    # The rule engine of this test sees the headings that stay uppercased: the other h3 of the
+    # page, and the heading of an AI box that holds no text.
+    assert _css_text_transform(css, "h3", set(), [{"card"}, {"page"}]) == "uppercase"
+    assert _css_text_transform(css, "h3", set(), [{"ai"}, {"page"}]) == "uppercase"
+    empty = render_html(
+        build_editorial_context(_dated(comparison_ai=None, comparison_ai_model=None))
+    )
+    assert re.search(r'<div class="ai">\s*<h3>AI interpretation</h3>', empty)
 
 
 def test_editorial_has_no_reviewed_by():
@@ -956,7 +1030,7 @@ def test_editorial_leaves_out_a_stale_nova_text():
     assert "The <b>barrier</b> programme" not in page and "Soothing is supported" not in page
     assert "Nova AI text</td><td>not included (generated on other data)</td>" in page
     # The comparison text, still current, is printed with its label.
-    assert page.count(f"<h3>{LABEL}</h3>") == 1
+    assert page.count(f'<h3 class="ai-label">{LABEL}</h3>') == 1
 
 
 def test_editorial_leaves_out_a_stale_comparison_text():

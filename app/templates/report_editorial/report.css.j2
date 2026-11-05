@@ -37,6 +37,8 @@ td.num, th.num { font-variant-numeric: tabular-nums; text-align: right; }
 .side span { position: absolute; left: 50%; top: 18mm; transform-origin: left top; transform: rotate(90deg) translate(0, -50%); white-space: nowrap; color: white; font-family: 'Inter Display', Inter, sans-serif; font-weight: 700; font-size: 16pt; letter-spacing: .02em; }
 .ai { background: #F4F7F9; border-radius: 3mm; padding: 5mm 6mm; font-size: 9.5pt; }
 .ai h3 { color: {{ colors.navy }}; }
+{# The AI label names the model by its id and the day it was written: it prints as written, not in capitals. Not a CSS comment: a report without AI must carry no "AI" in its source. #}
+.ai h3.ai-label { text-transform: none; letter-spacing: .02em; }
 .ai h4 { font-size: 9pt; margin: 3mm 0 1mm 0; color: {{ colors.navy }}; }
 .ai p { margin: 0 0 2mm 0; }
 .ai ul { margin: 0 0 2mm 0; padding-left: 4mm; }
