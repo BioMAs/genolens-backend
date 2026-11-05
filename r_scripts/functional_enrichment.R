@@ -17,6 +17,7 @@ suppressPackageStartupMessages({
   library(tidyverse)
   library(Matrix)
   library(data.table)
+  library(jsonlite)
 })
 
 option_list <- list(
@@ -33,7 +34,9 @@ option_list <- list(
   make_option("--padj-cutoff", type = "double",    default = 0.05, help = "Adjusted p-value (BH) cutoff for output"),
   make_option("--r-cutoff",    type = "integer",   default = 3L,   help = "Minimum query genes per term"),
   make_option("--databases",   type = "character", default = NULL,
-              help = "Comma-separated anno.db categories to run (default: all available)")
+              help = "Comma-separated anno.db categories to run (default: all available)"),
+  make_option("--meta-out",    type = "character", default = NULL,
+              help = "Write a JSON record of this run (anno.db file, categories, background) to this path")
 )
 opt <- parse_args(OptionParser(option_list = option_list))
 stopifnot(!is.null(opt$`anno-db-dir`), !is.null(opt$output), !is.null(opt$comparison))
@@ -145,7 +148,8 @@ if (length(anno_db_files) == 0) {
                           gene.cluster = character()), opt$output)
   quit(save = "no", status = 0)
 }
-anno.db.obj <- readRDS(sort(anno_db_files, decreasing = TRUE)[1])
+anno_db_file <- sort(anno_db_files, decreasing = TRUE)[1]
+anno.db.obj <- readRDS(anno_db_file)
 description_sources <- anno.db.obj$descriptions
 message("Loaded anno.db with ", length(names(anno.db.obj$annotations)), " categories")
 
@@ -271,3 +275,20 @@ if (length(rows) == 0) {
 dir.create(dirname(opt$output), recursive = TRUE, showWarnings = FALSE)
 readr::write_csv(out, opt$output)
 message("Wrote ", nrow(out), " enriched terms → ", opt$output)
+
+# -----------------------------------------------------------------------------
+# Run record: what the report prints about this enrichment, as observed here.
+# The background is the one fa.function uses: for each category, the genes annotated to at
+# least one of its terms (all_ids, the genes of any category, narrows it no further).
+# -----------------------------------------------------------------------------
+if (!is.null(opt$`meta-out`)) {
+  record <- list(
+    annodb_file = basename(anno_db_file),
+    categories  = as.list(categories),
+    background  = "genes annotated to at least one term of the category tested"
+  )
+  dir.create(dirname(opt$`meta-out`), recursive = TRUE, showWarnings = FALSE)
+  tmp <- paste0(opt$`meta-out`, ".tmp")
+  jsonlite::write_json(record, tmp, auto_unbox = TRUE)
+  file.rename(tmp, opt$`meta-out`)
+}

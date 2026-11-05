@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 from uuid import UUID
 from celery import Task
 from sqlalchemy import select, update, delete, and_, insert
@@ -278,19 +279,53 @@ def enrichment_padj_cutoff(params: dict) -> float:
     return float(params.get("enrichment_fdr", 0.05))
 
 
-def enrichment_dataset_metadata(analysis_id: str, comparison: str, params: dict) -> dict:
+def read_enrichment_run_meta(path: Path) -> dict:
+    """What `functional_enrichment.R --meta-out` recorded about its run, as far as it can be read.
+
+    The anno.db file, the categories enriched and the background: kept only when they have the
+    expected type, so a record that is missing, unreadable or malformed gives `{}` (the report then
+    says "not recorded") and never a made-up value.
+    """
+    try:
+        raw = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    record: dict = {}
+    for key in ("annodb_file", "background"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            record[key] = value
+    categories = raw.get("categories")
+    if isinstance(categories, list) and categories and all(
+        isinstance(c, str) and c.strip() for c in categories
+    ):
+        record["categories"] = list(categories)
+    return record
+
+
+def enrichment_dataset_metadata(
+    analysis_id: str, comparison: str, params: dict, run_meta: Optional[dict] = None
+) -> dict:
     """The metadata an annoDB ENRICHMENT dataset is registered with.
 
     `padj_cutoff` is what `build_functional_enrichment_cmd` passes to the script: it is recorded
     when the enrichment runs, and it is the only record of the cut-off that does not depend on
-    when the analysis was created.
+    when the analysis was created. `run_meta` is what the script wrote about itself
+    (`read_enrichment_run_meta`): the anno.db file it loaded, the categories it ran over and its
+    background, so the report prints them as observed.
     """
-    return {
+    meta = {
         "analysis_id": analysis_id,
         "comparison_name": comparison,
         "source": "annodb",
         "padj_cutoff": enrichment_padj_cutoff(params),
     }
+    for key in ("annodb_file", "categories", "background"):
+        if run_meta and run_meta.get(key):
+            meta[key] = run_meta[key]
+    return meta
 
 
 def build_functional_enrichment_cmd(
@@ -300,6 +335,7 @@ def build_functional_enrichment_cmd(
     comparison: str,
     output: Path,
     params: dict,
+    meta_out: Optional[Path] = None,
 ) -> list[str]:
     """
     The Rscript call for one comparison's annoDB enrichment.
@@ -313,6 +349,9 @@ def build_functional_enrichment_cmd(
 
     ``--databases`` restricts the anno.db categories to the wizard's pick (``enrichment_databases``,
     the same category names). ``None`` means all, so the flag is omitted.
+
+    ``--meta-out`` asks the script to write a JSON record of its run (anno.db file, categories,
+    background); `read_enrichment_run_meta` reads it back.
     """
     cmd = [
         "Rscript", str(script),
@@ -328,6 +367,8 @@ def build_functional_enrichment_cmd(
     names = [d.strip() for d in params.get("enrichment_databases") or [] if d and d.strip()]
     if names:
         cmd.extend(["--databases", ",".join(names)])
+    if meta_out is not None:
+        cmd.extend(["--meta-out", str(meta_out)])
     return cmd
 
 
@@ -995,9 +1036,19 @@ def deg_dataset_metadata(analysis_id: str, comp_id: str, params: dict, manifest:
         "min_log2fc": params.get("min_log2fc", 1.0),
         "de_method": params.get("de_method", "all"),
     }
-    stats = ((manifest or {}).get("comparison_stats") or {}).get(comp_id) or {}
+    manifest = manifest or {}
+    stats = (manifest.get("comparison_stats") or {}).get(comp_id) or {}
     if stats.get("primary_method"):
         meta["primary_method"] = stats["primary_method"]
+    # What the run observed about itself, for the LaTeX report to print. Each is copied only when
+    # the manifest records it (older runs record none: the report says "not recorded").
+    if isinstance(stats.get("design_used"), str) and stats["design_used"]:
+        meta["design_used"] = stats["design_used"]
+    versions = manifest.get("software_versions")
+    if isinstance(versions, dict) and versions and all(isinstance(v, str) for v in versions.values()):
+        meta["software_versions"] = versions
+    if isinstance(manifest.get("qc_relaxed"), bool):
+        meta["qc_relaxed"] = manifest["qc_relaxed"]
     return meta
 
 
@@ -1371,6 +1422,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                             enrich_script = Path("/app/r_scripts/functional_enrichment.R")
                             anno_db_dir = os.environ.get("ANNO_DB_PATH", "/app/anno_db")
                             enrich_local = comp_dir / "genolens_enrichment.csv"
+                            enrich_meta_local = comp_dir / "genolens_enrichment_meta.json"
                             if not enrichment_requested(params):
                                 logger.info(
                                     "[ANALYSIS] No enrichment database selected — skipping %s",
@@ -1379,6 +1431,7 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                             elif enrich_script.exists():
                                 enrich_cmd = build_functional_enrichment_cmd(
                                     enrich_script, deg_csv, anno_db_dir, comp_id, enrich_local, params,
+                                    meta_out=enrich_meta_local,
                                 )
                                 enrich_proc = subprocess.run(
                                     enrich_cmd, capture_output=True, text=True, timeout=1800
@@ -1408,7 +1461,8 @@ def run_self_service_analysis(self, analysis_id: str) -> dict:
                                             status=DatasetStatus.PENDING,
                                             raw_file_path=enrich_storage,
                                             dataset_metadata=enrichment_dataset_metadata(
-                                                str(analysis_id), comp_id, params
+                                                str(analysis_id), comp_id, params,
+                                                read_enrichment_run_meta(enrich_meta_local),
                                             ),
                                             column_mapping={},
                                         )

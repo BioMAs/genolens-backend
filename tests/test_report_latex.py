@@ -39,7 +39,8 @@ def test_enrichment_and_qc_generators():
         [{"sample": "s1", "library_size": 1234567, "detected_genes": 12000, "condition": "CTL"}],
         "Proj",
     )
-    assert "1.23M" in qc and "12,000" in qc
+    # No thousands comma: siunitx's S column reads "12,000" as 12.000 (twelve) and prints it so.
+    assert "1.23M" in qc and "12000" in qc and "12,000" not in qc
 
 
 def test_empty_generators():

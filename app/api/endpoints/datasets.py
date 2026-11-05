@@ -449,6 +449,15 @@ _CLIENT_PROTECTED_METADATA_KEYS = frozenset(
         # Marque d'un compte de démonstration : la nova et les exports la reprennent, et ce
         # compte possède ses datasets, donc pourrait la retirer par PATCH
         "demo",
+        # Ce que le rapport LaTeX imprime de l'exécution, relevé par les scripts R : versions
+        # observées, design de chaque comparaison, seuils d'échantillons assouplis (jeu DEG) ;
+        # fichier anno.db, catégories et fond de l'enrichissement (jeu ENRICHMENT)
+        "software_versions",
+        "design_used",
+        "qc_relaxed",
+        "annodb_file",
+        "categories",
+        "background",
     }
 )
 

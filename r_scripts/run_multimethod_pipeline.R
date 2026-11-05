@@ -227,7 +227,10 @@ message("[2/5] QC filtering...")
 col_reads <- colSums(counts_mat)
 col_genes <- colSums(counts_mat > 0)
 keep_samples <- col_reads >= opt$`min-reads` & col_genes >= opt$`min-genes`
+# Recorded in the manifest: when fewer than 2 samples pass, the thresholds are not what kept them.
+qc_relaxed <- FALSE
 if (sum(keep_samples) < 2) {
+  qc_relaxed <- TRUE
   warning("All samples failed QC filter — relaxing to keep at least 2")
   keep_samples <- order(col_reads, decreasing = TRUE)[1:2]
   keep_mask <- seq_along(col_reads) %in% keep_samples
@@ -284,10 +287,21 @@ qc_genes_after <- nrow(counts_mat)
 message("  Retained ", nrow(counts_mat), " genes and ", ncol(counts_mat), " samples")
 
 qc_removed_ids <- setdiff(qc_input_sample_ids, sample_ids)
+
+# What ran, as observed where it ran: the LaTeX report prints these instead of any fixed version.
+software_versions <- list(
+  R      = paste(R.version$major, R.version$minor, sep = "."),
+  DESeq2 = as.character(packageVersion("DESeq2")),
+  edgeR  = as.character(packageVersion("edgeR")),
+  limma  = as.character(packageVersion("limma"))
+)
+
 manifest <- list(
   has_vst = FALSE,
   comparisons = c(),
   comparison_stats = list(),
+  software_versions = software_versions,
+  qc_relaxed = qc_relaxed,
   qc_report = list(
     total_input_samples  = qc_total_samples,
     samples_passed       = length(sample_ids),
