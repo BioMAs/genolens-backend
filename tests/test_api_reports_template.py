@@ -181,6 +181,16 @@ async def test_status_reports_the_format():
     assert resp.json()["template"] == "editorial"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["status", "download"])
+async def test_a_job_id_must_be_a_uuid(route):
+    async with _client(_user(cosmetics=True)) as c:
+        resp = await c.get(
+            f"{URL}/{route}", params={"comparison_name": "KO_vs_WT", "job_id": "not-a-uuid"}
+        )
+    assert resp.status_code == 422
+
+
 def test_report_filename_is_sanitised():
     from app.api.endpoints.reports import report_filename
 

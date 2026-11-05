@@ -20,7 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.service_tokens import ALL_SCOPES, hash_service_token, new_service_token
-from app.models.models import User, UserStatus
+from app.models.models import User, UserRole, UserStatus
 from app.models.service_token import ServiceToken
 
 
@@ -35,6 +35,9 @@ async def _owner(db: AsyncSession, owner: str) -> User:
         user = await db.scalar(select(User).where(User.email == owner))
     if user is None:
         raise CommandError(f"no GenoLens user {owner!r}: the owner must have an account")
+    if user.role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
+        # Least privilege: a token acts as its owner, and an admin's rights go well past the three scopes.
+        raise CommandError("an admin account cannot own a service token")
     if user.status != UserStatus.ACTIVE:
         # A token of an inactive account would be refused on every request (403).
         raise CommandError(
@@ -154,10 +157,11 @@ async def _main(argv: list[str]) -> int:
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from app.core.config import settings
+    from app.db.session import engine_options
 
-    # An engine of its own with the SQL echo off, whatever DEBUG says: SQLAlchemy's echo writes to standard
-    # output, where the token must be alone.
-    engine = create_async_engine(settings.DATABASE_URL, echo=False, hide_parameters=True, pool_pre_ping=True)
+    # An engine of its own, with the app's options but the SQL echo off whatever DEBUG says: SQLAlchemy's echo
+    # writes to standard output, where the token must be alone.
+    engine = create_async_engine(settings.DATABASE_URL, echo=False, **engine_options())
     sessions = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False, autoflush=False)
     try:
         return await run(argv, session_factory=sessions)

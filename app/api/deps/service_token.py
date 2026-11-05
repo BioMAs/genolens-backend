@@ -13,7 +13,7 @@ any project, upload or quota is touched (a token never activates a pending invit
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Collection, Optional, TypeVar
 from uuid import UUID
 
@@ -27,6 +27,10 @@ from app.models.service_token import ServiceToken
 
 _RULE_ATTR = "__service_token_rule__"
 _STATE_ATTR = "service_principal"
+
+# `last_used_at` tells when a token was last in use, to the minute: a busy client does not write the row on every
+# request (a write per request would also lock it against concurrent requests of the same token).
+LAST_USED_RESOLUTION = timedelta(seconds=60)
 
 Endpoint = TypeVar("Endpoint", bound=Callable)
 
@@ -63,6 +67,20 @@ def service_token_scope(scope: str, **query: str) -> Callable[[Endpoint], Endpoi
 class ServicePrincipal:
     token_id: UUID
     owner: User
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _note_use(row: ServiceToken) -> None:
+    """Writes `last_used_at` only when it is empty or older than LAST_USED_RESOLUTION."""
+    now = _now()
+    last = row.last_used_at
+    if last is not None and last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)  # a database that keeps no time zone (SQLite)
+    if last is None or now - last > LAST_USED_RESOLUTION:
+        row.last_used_at = now
 
 
 def _unauthorized() -> HTTPException:
@@ -123,7 +141,7 @@ async def resolve_service_token(
             },
         )
     # Committed with the request's own work: a request that fails leaves it as it was.
-    row.last_used_at = datetime.now(timezone.utc)
+    _note_use(row)
     principal = ServicePrincipal(token_id=row.id, owner=owner)
     setattr(request.state, _STATE_ATTR, principal)
     return principal
