@@ -439,7 +439,7 @@ def best_supporting_subgroup(subgroups: Iterable[dict[str, Any]]) -> Optional[di
     return min(supporting, key=lambda s: (-s["nl"], s["name"]), default=None)
 
 
-def _claim_state(s_pro: float, s_anti: float) -> str:
+def claim_state(s_pro: float, s_anti: float) -> str:
     """"for_only" without evidence against, "against_only" without evidence for, else "both_ways"."""
     if s_anti == 0:
         return "for_only"
@@ -457,13 +457,18 @@ def _referential_version(mapping: ClaimSubgroupMap) -> Optional[int]:
         return None
 
 
+# How `p_source` begins when the p-values come from deposited tables: a report tells them from the
+# enrichment GenoLens ran itself by it.
+P_SOURCE_UPLOADED = "adjusted p from uploaded tables"
+
+
 def _p_source(source: NovaSource) -> str:
     """What the adjusted p-values are, in words: GenoLens's own enrichment, or the uploaded column."""
     if not source.uploaded:
         return "padj (Benjamini–Hochberg, GenoLens enrichment)"
     noun = "columns" if len(source.padj_columns) > 1 else "column"
     named = ", ".join(source.padj_columns) or "not recorded"
-    return f"adjusted p from uploaded tables ({noun} {named})"
+    return f"{P_SOURCE_UPLOADED} ({noun} {named})"
 
 
 def _provenance(
@@ -561,7 +566,7 @@ def build_nova(
         claims.append(
             {
                 "name": claim,
-                "state": _claim_state(s_pro, s_anti),
+                "state": claim_state(s_pro, s_anti),
                 "importance": s_pro + s_anti,
                 "s_pro": s_pro,
                 "s_anti": s_anti,

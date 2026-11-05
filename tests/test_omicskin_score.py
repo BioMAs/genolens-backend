@@ -75,6 +75,12 @@ def test_bands(score, band):
     assert BAND_LABELS[band]
 
 
+def test_the_lowest_band_is_called_weak_evidence_not_unsupported():
+    # A low score is a small amount of evidence, not a finding against the claim.
+    assert BAND_LABELS["not_supported"] == "Weak evidence"
+    assert "supported" not in BAND_LABELS["not_supported"].lower()
+
+
 def test_score_claims_matches_the_validated_report():
     nova = json.loads(FIXTURE.read_text())
     scores = score_claims(nova)
@@ -109,7 +115,7 @@ def test_claims_absent_from_the_nova_have_no_significant_evidence():
     unscored = [s for s in scores if not s.scored]
     assert sorted(s.name for s in unscored) == ["Anti-wrinkles", "Energising", "Healing"]
     assert all(s.band == "no_evidence" and s.score is None and s.claim is None for s in unscored)
-    assert all(s.label == "No significant evidence" for s in unscored)
+    assert all(s.label == "n.e." for s in unscored)  # not evaluated: no score, no band to name
     # Scored claims come first, highest score first.
     values = [s.score for s in scores if s.scored]
     assert values == sorted(values, reverse=True)

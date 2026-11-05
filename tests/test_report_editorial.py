@@ -6,6 +6,7 @@ Fixture: the mock nova of the validated report (tests/fixtures/cosmomics_nova_mo
 synthetic comparison "AL-7" versus "Vehicle".
 """
 
+import html as html_lib
 import io
 import json
 import re
@@ -21,9 +22,9 @@ import pytest
 import yaml
 
 from app.services.cosmetics_taxonomy import normalize_pathway_id
-from app.services.cosmomics_nova import CLAIM_SUBGROUPS_PATH
+from app.services.cosmomics_nova import CLAIM_SUBGROUPS_PATH, TermHit
 from app.services.cosmomics_nova_svg import render_nova_svg
-from app.services.omicskin_score import ALL_CLAIMS, score_claims
+from app.services.omicskin_score import ALL_CLAIMS, BAND_LABELS, score_claims
 from app.services.report_editorial_content import (
     EditorialInputs,
     build_editorial_context,
@@ -31,9 +32,11 @@ from app.services.report_editorial_content import (
     looks_english,
     md_to_html,
 )
+from app.services.report_editorial_figures import volcano_sampling
 from app.services.report_editorial_service import (
     build_figures,
     chromium_available,
+    hits_to_enrichment,
     html_to_pdf,
     render_html,
     split_comparison,
@@ -275,8 +278,9 @@ def test_page_sequence_and_numbering(context, html):
 
 def test_verdict_headline_and_ladder(context):
     verdict = context["pages"][1]
+    # Descriptive, by state: no claim is "supported" or "evidenced" by the headline.
     assert verdict["headline"] == (
-        "Five claims strongly supported, one moderately, three not evidenced."
+        "Six claims with evidence for and against, three not evaluated (n.e.)."
     )
     assert [r["name"] for r in verdict["ladder"]][:6] == [
         "Barrier",
@@ -309,6 +313,446 @@ def test_claim_figures_and_genes(html):
     assert "UPG1" in html  # key gene chips from the claim's supporting terms
     assert html.count('class="ring"') >= 6
     assert "Fig. 1" in html and "Fig. 4" in html
+
+
+# ── What the report says is what was computed (D23b-7) ─────────────────────
+
+OVERSTATED = (
+    "proof of efficacy",
+    "substantiation",
+    "every pathway behind every claim",
+    "converges",
+    "proven",
+    "validated",
+    "confirmed",
+)
+P_SOURCE_GENOLENS = "padj (Benjamini–Hochberg, GenoLens enrichment)"
+GENOLENS_PROVENANCE = {
+    "dataset_id": "d-1",
+    "comparison": "AL-7_vs_Vehicle",
+    "enrichment_dataset_ids": [],
+    "analysis_id": None,
+    "enrichment_fdr": 0.05,
+    "enrichment_databases": ["GO", "Reactome"],
+    "padj_columns": [],
+    "source_versions": [],
+    "referential_version": 1,
+    "alpha": 0.05,
+    "app_version": "1.0.0",
+    "generated_at": "2026-11-05T09:30:00+00:00",
+    "demo": False,
+}
+
+
+def _text(page: str) -> str:
+    """The page as the reader sees it: tags dropped, entities decoded, one space between words."""
+    plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", str(page)))
+    return " ".join(plain.replace("\u202f", " ").replace("\xa0", " ").split())
+
+
+def _honest_nova(mutate=None, **provenance):
+    """The mock nova with the facts a current payload carries (alpha, p_source, provenance)."""
+    nova = json.loads(FIXTURE.read_text())
+    nova.update(
+        alpha=0.05,
+        p_source=P_SOURCE_GENOLENS,
+        not_evaluated=["Anti-wrinkles", "Energising", "Healing"],
+        provenance={**GENOLENS_PROVENANCE, **provenance},
+    )
+    if mutate:
+        mutate(nova)
+    return nova
+
+
+def _inputs_for(nova, **overrides) -> EditorialInputs:
+    return _inputs(
+        nova=nova,
+        scores=score_claims(nova),
+        nova_light=render_nova_svg(
+            nova, "light", id_prefix="nova-light", center_label="AL-7", demo_mark=False
+        ),
+        nova_dark=render_nova_svg(
+            nova, "dark", id_prefix="nova-dark", center_label="AL-7", demo_mark=False
+        ),
+        **overrides,
+    )
+
+
+def _context(nova=None, **overrides):
+    return build_editorial_context(_inputs_for(nova or _honest_nova(), **overrides))
+
+
+def _page(nova=None, **overrides) -> str:
+    return render_html(_context(nova, **overrides))
+
+
+def test_editorial_has_no_overstated_wording(html):
+    for page in (html, _page(), _page(use_ai=False)):
+        text = _text(page).lower()
+        for phrase in OVERSTATED:
+            assert phrase not in text, phrase
+
+
+def test_cover_and_nova_page_describe_the_content():
+    text = _text(_page())
+    assert "Transcriptomic evidence review" in text and "Pathway evidence by claim" in text
+    assert "The enriched terms of the referential, by claim" in text
+    # The cover prints the engine version, not a document version nobody maintains.
+    assert "Version 1.0" not in text and "GenoLens 1.0.0" in text
+
+
+def test_scope_does_not_promise_a_dossier():
+    scope = next(p["scope"] for p in _context()["pages"] if p["kind"] == "method")
+    assert "does not by itself establish a clinical effect" in scope
+    assert "substantiation" not in scope.lower()
+
+
+def test_methods_follow_the_provenance_of_a_deposited_table():
+    nova = _honest_nova(padj_columns=["qvalue"], enrichment_fdr=None, enrichment_databases=None)
+    nova["p_source"] = "adjusted p from uploaded tables (column qvalue)"
+    text = _text(_page(nova))
+    assert "column qvalue" in text
+    assert "hypergeometric" not in text.lower() and "benjamini" not in text.lower()
+    assert "kegg" not in text.lower() and "wikipathways" not in text.lower()
+    # A deposited table whose column was not recorded says so, and still names no test.
+    unrecorded = _honest_nova(padj_columns=[], enrichment_fdr=None, enrichment_databases=None)
+    unrecorded["p_source"] = "adjusted p from uploaded tables (column not recorded)"
+    text = _text(_page(unrecorded))
+    assert "column not recorded" in text and "hypergeometric" not in text.lower()
+
+
+def test_methods_print_the_recorded_enrichment_cutoff_never_a_default():
+    params = {"species": "human", "fdr": 0.01, "min_log2fc": 0.585, "enrichment_fdr": 0.05}
+    text = _text(_page(_honest_nova(enrichment_fdr=0.1), params=params))
+    assert "adjusted p < 0.1" in text
+    assert "adjusted p < 0.05" not in text and "≤ 0.05" not in text
+    # Not recorded: the report says so, and the 0.05 of the analysis parameters is not printed.
+    text = _text(_page(_honest_nova(enrichment_fdr=None), params=params))
+    assert "cut-off not recorded" in text
+    assert "adjusted p < 0.05" not in text and "≤ 0.05" not in text
+
+
+def test_methods_list_only_the_databases_that_were_run():
+    for databases, kegg in ((["GO", "KEGG"], True), (["GO", "Reactome"], False), (None, False)):
+        text = _text(_page(_honest_nova(enrichment_databases=databases)))
+        assert ("KEGG" in text) is kegg
+        assert "WikiPathways" not in text and "MSigDB" not in text
+    listed = _text(_page(_honest_nova(enrichment_databases=["GO", "WikiPathways"])))
+    assert "GO, WikiPathways" in listed
+    # None on an enrichment GenoLens ran is "all categories", and says no more than that.
+    assert "all categories" in _text(_page(_honest_nova(enrichment_databases=None)))
+
+
+def test_methods_name_the_differential_method_from_the_dataset_metadata():
+    text = _text(_page(de_primary_method="edgeR", de_method_run="edger"))
+    assert "called with edgeR" in text and "DESeq2" not in text and "limma" not in text
+    text = _text(_page(de_primary_method="DESeq2", de_method_run="all"))
+    assert "called with DESeq2" in text
+    assert "edgeR and limma-voom were run on the same counts" in text
+    # Imported results: no method is named, none is described.
+    text = _text(_page(has_analysis=False, analysis_label=None, params={}))
+    assert "imported results" in text
+    assert "DESeq2" not in text and "edgeR" not in text and "limma" not in text
+    # An analysis run in GenoLens before the method was recorded: not guessed either.
+    text = _text(_page())
+    assert "the method that decided the calls is not recorded" in text
+    assert "DESeq2" not in text and "edgeR" not in text
+
+
+def test_stouffer_text_says_unsigned_and_not_independent():
+    method = next(p for p in _context()["pages"] if p["kind"] == "method")
+    text = _text(method["method_nova"])
+    assert "unsigned" in text and "independent" in text and "not weighted" in text
+    # R-P1: a term at or above alpha is marked, not filtered.
+    assert "terms not significant at α still contribute with their weight" in text
+    # The referential is described by its structure only.
+    assert "Gene Ontology, Reactome and Cell Ontology identifiers" in text
+    assert "KEGG" not in text and "STRING" not in text
+
+
+def test_strings_recorded_with_the_data_are_escaped():
+    """A column header, a source version or a method name comes from an upload or a metadata
+    record: it is printed as text, never as markup."""
+    nova = _honest_nova(padj_columns=["<b>q</b>"], source_versions=["<i>v1</i>"])
+    nova["p_source"] = "adjusted p from uploaded tables (column <b>q</b>)"
+    page = _page(nova, de_primary_method="<u>x</u>", de_method_run="all")
+    for markup in ("<b>q</b>", "<i>v1</i>", "<u>x</u>"):
+        assert markup not in page
+    assert "&lt;b&gt;q&lt;/b&gt;" in page and "&lt;i&gt;v1&lt;/i&gt;" in page
+    assert "&lt;u&gt;x&lt;/u&gt;" in page
+
+
+def test_traceability_names_the_source_versions():
+    text = _text(_page(_honest_nova(source_versions=["pipeline 1.2.3", "tables 2026-10"])))
+    assert "Data source version pipeline 1.2.3, tables 2026-10" in text
+    assert "Data source version not recorded" in _text(_page(_honest_nova(source_versions=[])))
+    assert "Significance threshold α = 0.05" in text
+
+
+def test_not_evaluated_claim_prints_ne():
+    ctx = _context()
+    strip = [s for p in ctx["pages"] if p["kind"] == "reservations" for s in p["strip"]]
+    not_evaluated = [s for s in strip if s["name"] in ("Anti-wrinkles", "Energising", "Healing")]
+    assert len(not_evaluated) == 3 and all(s["title"].startswith("n.e.") for s in not_evaluated)
+    ladder = ctx["pages"][1]["ladder"]
+    assert [r["band_short"] for r in ladder if not r["scored"]] == ["n.e."] * 3
+    page = render_html(ctx)
+    text = _text(page)
+    assert "n.e. — no significant term for this claim in the enrichment results" in text
+    assert "NO EVIDENCE" not in page and "not evidenced" not in text
+    assert "No significant evidence" not in text
+    # What was stored is not said: a deposited table is kept as it was given (R-T6-1).
+    deposited = _honest_nova(padj_columns=["qvalue"], enrichment_fdr=None)
+    deposited["p_source"] = "adjusted p from uploaded tables (column qvalue)"
+    for page in (text, _text(_page(deposited))):
+        assert "n.e. — no significant term for this claim in the enrichment results" in page
+        assert "not stored" not in page.replace("is stored for this comparison", "")
+        assert "only significant terms are stored" not in page.lower()
+
+
+def test_zero_against_is_not_presented_as_a_confirmation():
+    note = (
+        "Only terms present in the enrichment results can count against a claim; "
+        "no contrary term is not a confirmation."
+    )
+    # Barrier, Soothing and Firming have no sub-group against them in the reference mock: their
+    # pages carry the note, the claims that have one against do not.
+    page = _text(_page())
+    assert page.count(note) == 3 + 2  # the three pages, and the wheel of the cover and of page 3
+    blocks = {
+        p["claim"]["name"]: p["claim"]["zero_against_note"]
+        for p in _context()["pages"]
+        if p["kind"] == "claim"
+    }
+    assert {name for name, n in blocks.items() if n} == {"Barrier", "Soothing", "Firming"}
+
+
+def test_lowest_band_is_weak_evidence():
+    def weaken(nova):
+        claim = next(c for c in nova["claims"] if c["name"] == "Antioxidant")
+        claim["best_nl"] = claim["best_for_nl"] = 1.0
+        claim["coherence"] = 0.5
+
+    nova = _honest_nova(weaken)
+    antioxidant = next(s for s in score_claims(nova) if s.name == "Antioxidant")
+    assert (antioxidant.score, antioxidant.band) == (6, "not_supported")
+    assert antioxidant.label == "Weak evidence" == BAND_LABELS["not_supported"]
+    assert BAND_LABELS["no_evidence"] == "n.e."
+    text = _text(_page(nova))
+    assert "Score 6 · weak evidence." in text
+    assert "< 25 weak evidence" in text
+    assert "not supported" not in text.lower()
+
+
+def test_both_direction_term_is_marked():
+    def both(nova):
+        for sg in nova["claims"][0]["subgroups"]:
+            for term in sg["terms"]:
+                term["both_directions"] = True
+
+    # The mark of the terms table (the methods mention the symbol too, in a sentence).
+    assert ">↑↓</td>" not in _page()
+    page = _page(_honest_nova(both))
+    assert ">↑↓</td>" in page
+    assert "↑↓ = enriched in both" in _text(page)
+
+
+def test_a_term_not_significant_at_alpha_is_marked_and_still_counted():
+    def not_significant(nova):
+        for sg in nova["claims"][0]["subgroups"]:
+            for term in sg["terms"]:
+                term["significant"] = False
+
+    assert "· n.s.</span>" not in _page()
+    page = _page(_honest_nova(not_significant))
+    assert "· n.s.</span>" in page
+    text = _text(page)
+    assert "n.s. = not significant at α" in text and "counted with its weight" in text
+
+
+def _claim(**overrides) -> dict:
+    claim = {
+        "name": "Barrier",
+        "state": "both_ways",
+        "importance": 20.0,
+        "s_pro": 14.0,
+        "s_anti": 6.0,
+        "coherence": 0.7,
+        "n_for": 1,
+        "n_against": 1,
+        "n_balanced": 1,
+        "best_subgroup": "Group A",
+        "best_nl": 9.0,
+        "best_for_subgroup": "Group B",
+        "best_for_nl": 6.0,
+        "subgroups": [
+            {
+                "name": "Group A",
+                "nl": 9.0,
+                "s_pro": 0.0,
+                "s_anti": 6.0,
+                "delta": -6.0,
+                "balance": -1.0,
+                "obs": "down",
+                "terms": [],
+            },
+            {
+                "name": "Group B",
+                "nl": 6.0,
+                "s_pro": 14.0,
+                "s_anti": 0.0,
+                "delta": 14.0,
+                "balance": 1.0,
+                "obs": "up",
+                "terms": [],
+            },
+            {
+                "name": "Group C",
+                "nl": 2.0,
+                "s_pro": 0.0,
+                "s_anti": 0.0,
+                "delta": 0.0,
+                "balance": 0.0,
+                "obs": "up",
+                "terms": [],
+            },
+        ],
+    }
+    claim.update(overrides)
+    return claim
+
+
+def test_a_claim_is_led_by_its_best_supporting_subgroup():
+    from app.services.report_editorial_content import claim_statement
+
+    claim = _claim()
+    text = claim_statement(score_claims({"claims": [claim]})[0], "AL-7", "Vehicle")
+    # The most significant sub-group (Group A) goes the other way: it does not lead the claim.
+    assert "led by Group B" in text and "led by Group A" not in text
+    assert "Group A" in text and "other way" in text
+    assert "Group C" not in text and "balanced" in text  # a balanced sub-group is not contrary
+    # No supporting sub-group: the statement says so instead of naming a leader.
+    bare = _claim(best_for_subgroup=None, best_for_nl=None, n_for=0, coherence=0.0)
+    text = claim_statement(score_claims({"claims": [bare]})[0], "AL-7", "Vehicle")
+    assert text.startswith("No pathway sub-group supports the Barrier claim")
+    assert "led by" not in text
+
+
+def test_a_balanced_subgroup_is_not_greyed_like_a_contrary_one():
+    from app.services.report_editorial_svg import subgroup_bars
+
+    bars = str(
+        subgroup_bars(
+            [
+                {"name": "Group A", "nl": 5.0, "delta": 2.0, "balance": 0.4},
+                {"name": "Group B", "nl": 4.0, "delta": 0.0, "balance": 0.0},
+                {"name": "Group C", "nl": 3.0, "delta": -2.0, "balance": -0.4},
+            ]
+        )
+    )
+    opacity = {name: float(o) for o, name in re.findall(r'opacity="([\d.]+)">(Group [ABC])<', bars)}
+    assert opacity == {"Group A": 1.0, "Group B": 1.0, "Group C": 0.55}
+
+
+def test_no_enrichment_is_not_reported_as_no_significant_claim():
+    nova = {"contrast": "A_vs_B", "status": "no_enrichment", "claims": [], "unlinked": []}
+    ctx = _context(nova, enr_up=[], enr_down=[])
+    text = _text(render_html(ctx))
+    assert "No enrichment result is stored for this comparison" in text
+    assert "No claim has a significant term" not in text
+
+
+def test_claim_pages_keep_the_users_own_signoff_card(html):
+    # The "Scientific review" card is the sign-off of the cover form, not an AI claim.
+    assert "Report checked by J. Doe." in html and "Not yet reviewed." not in html
+    assert "Not yet reviewed." in _page(cover_info={})
+
+
+def test_thinned_volcano_says_sample():
+    def gene(i, regulation):
+        return {
+            "gene_id": f"g{i}",
+            "gene_name": f"G{i}",
+            "log_fc": 2.0 if regulation == "UP" else 0.1,
+            "padj": 0.001 if regulation == "UP" else 0.9,
+            "regulation": regulation,
+        }
+
+    degs = [gene(i, "NS") for i in range(9000)] + [gene(9000 + i, "UP") for i in range(20)]
+    assert volcano_sampling(degs) == (7980, 9000)
+    assert "a sample of 7 980 of 9 000 genes" in _text(_page(degs=degs))
+    # Nothing thinned: every point is a gene, and the caption says no more than that.
+    assert volcano_sampling(degs[8000:]) is None
+    text = _text(_page())
+    assert "Each point is a gene" in text and "a sample of" not in text
+
+
+def test_enrichment_table_has_no_pvalue_copied_from_padj():
+    up, down = hits_to_enrichment(
+        [
+            TermHit("GO:0000001", "Term A", 1e-4, "up", "GO:BP", 5),
+            TermHit("GO:0000002", "Term B", None, "down"),
+        ]
+    )
+    assert [r["pathway_id"] for r in up] == ["GO:0000001"] and down == []
+    assert up[0]["padj"] == 1e-4
+    assert up[0].get("pvalue") is None  # the raw p-value is unknown here, not the adjusted one
+
+
+async def _collected(nova, *, requester_is_demo=False, test="AL-7", metadata=None):
+    from app.services import report_editorial_service as module
+
+    data = {
+        "comparisons": [{"test": test, "control": "Vehicle", "degs": [], "n_up": 0, "n_down": 0}],
+        "params": {},
+        "expression": {},
+        "qc_rows": [],
+        "project": None,
+        "analysis": None,
+    }
+    db = MagicMock()
+    db.get = AsyncMock(return_value=SimpleNamespace(dataset_metadata=metadata or {}))
+    with (
+        patch.object(
+            module.report_latex_service, "collect_comparison_data", AsyncMock(return_value=data)
+        ),
+        patch.object(module, "compute_nova", AsyncMock(return_value=(nova, []))),
+        patch.object(module, "build_figures", MagicMock(return_value={})),
+    ):
+        return await module.report_editorial_service.collect(
+            db,
+            uuid4(),
+            "LongNameTreatment_vs_Vehicle",
+            "/nonexistent",
+            demo_watermark=requester_is_demo,
+            use_ai=False,
+            use_branding=False,
+        )
+
+
+async def test_demo_dataset_report_is_watermarked():
+    # The mark follows the dataset, not only the account that asks for the report.
+    inputs = await _collected(_honest_nova(demo=True))
+    assert inputs.demo_watermark is True
+    assert '<div class="watermark"><span>DEMO</span></div>' in render_html(
+        build_editorial_context(inputs)
+    )
+    # The page carries the mark over the picture: the inlined wheels do not repeat it.
+    assert ">DEMO<" not in inputs.nova_light and ">DEMO<" not in inputs.nova_dark
+    plain = await _collected(_honest_nova(demo=False))
+    assert plain.demo_watermark is False
+    assert 'class="watermark"' not in render_html(build_editorial_context(plain))
+    # A demo account's request stays marked whatever the dataset says.
+    assert (await _collected(_honest_nova(demo=False), requester_is_demo=True)).demo_watermark
+
+
+async def test_the_dataset_records_the_method_and_the_wheel_names_no_invented_condition():
+    inputs = await _collected(
+        _honest_nova(), metadata={"primary_method": "limma", "de_method": "limma"}
+    )
+    assert (inputs.de_primary_method, inputs.de_method_run) == ("limma", "limma")
+    # A condition too long for the disc and none recorded on the nova: the disc stays empty.
+    assert "Active" not in inputs.nova_light and "Active" not in inputs.nova_dark
 
 
 # ── AI texts ────────────────────────────────────────────────────────────────
@@ -528,7 +972,7 @@ def test_sparse_comparison_still_renders():
         "method",
     ]
     page = render_html(ctx)
-    assert "No claim shows significant evidence" in page
+    assert "No claim has a significant term" in page
     assert page.count('data-kind="no-evidence"') == 9
 
 

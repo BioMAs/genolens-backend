@@ -11,9 +11,9 @@ OmicSkin score — one 0–100 figure per cosmetic claim, read off the CosmOmics
                  significant sub-group may well be one that goes against it, and that is no
                  support.
 
-Bands: ≥ 75 strong support · 50–74 moderate · 25–49 weak · < 25 not supported. A claim with no
+Bands: ≥ 75 strong support · 50–74 moderate · 25–49 weak · < 25 weak evidence. A claim with no
 term at adjusted p < alpha is absent from the nova payload (`build_nova` lists it in
-`not_evaluated`) and receives no score: "no significant evidence".
+`not_evaluated`) and receives no score: it is "n.e." (not evaluated).
 """
 
 from __future__ import annotations
@@ -25,14 +25,18 @@ from app.services.cosmomics_nova import CLAIM_NAMES, best_supporting_subgroup
 
 SATURATION_NL = 8.0
 
+# Band keys: "not_supported" is the lowest scored band, "no_evidence" a claim without a score.
 Band = Literal["strong", "moderate", "weak", "not_supported", "no_evidence"]
 
+# What a score band is called. The lowest band says the evidence is weak, not that the claim is
+# "not supported": a low score is a small amount of evidence, and no finding against the claim.
+# A claim the nova did not evaluate has no score and reads "n.e.".
 BAND_LABELS: dict[str, str] = {
     "strong": "Strong support",
     "moderate": "Moderate support",
     "weak": "Weak support",
-    "not_supported": "Not supported",
-    "no_evidence": "No significant evidence",
+    "not_supported": "Weak evidence",
+    "no_evidence": "n.e.",
 }
 
 # All nine claims of the referential, in the order the nova names them.

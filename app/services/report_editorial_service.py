@@ -123,7 +123,10 @@ def split_comparison(name: str) -> tuple[str, str]:
 
 def hits_to_enrichment(hits: list[TermHit]) -> tuple[list[dict], list[dict]]:
     """Enrichment rows (up, down) rebuilt from the nova's directional hits — used when the
-    comparison has no analysis-linked ENRICHMENT dataset (rows stored on the DEG dataset)."""
+    comparison has no analysis-linked ENRICHMENT dataset (rows stored on the DEG dataset).
+
+    A hit carries the adjusted p-value only: the rows have no `pvalue`, since the raw p-value is
+    not known here and the adjusted one must not stand in for it."""
     up, down = [], []
     for h in hits:
         if h.p is None:  # no adjusted p-value: left out of the nova, left out of the plots
@@ -133,7 +136,6 @@ def hits_to_enrichment(hits: list[TermHit]) -> tuple[list[dict], list[dict]]:
             "pathway_name": h.label,
             "category": h.category,
             "padj": h.p,
-            "pvalue": h.p,
             "gene_count": h.gene_count,
             "regulation": h.obs.upper(),
         }
@@ -293,6 +295,10 @@ class ReportEditorialService:
 
         dataset = await db.get(Dataset, dataset_id)
         nova, hits = await compute_nova(db, dataset, comparison_name)
+        # How the differential expression was called, as the dataset records it (a pipeline run
+        # records the method that decided the calls; imported tables record none).
+        recorded = getattr(dataset, "dataset_metadata", None)
+        dataset_meta = recorded if isinstance(recorded, dict) else {}
         mapping = default_claim_subgroups()
         scores = score_claims(nova)
         term_genes = term_gene_map(hits, mapping)
@@ -329,9 +335,15 @@ class ReportEditorialService:
             control,
             params,
         )
-        center = test if 0 < len(test) <= 8 else str(nova.get("condition") or "Active")
-        nova_light = render_nova_svg(nova, "light", id_prefix="nova-light", center_label=center)
-        nova_dark = render_nova_svg(nova, "dark", id_prefix="nova-dark", center_label=center)
+        center = test if 0 < len(test) <= 8 else str(nova.get("condition") or "")
+        # A demo report carries its DEMO mark over every page, the wheels included: the wheels do
+        # not repeat it.
+        nova_light = render_nova_svg(
+            nova, "light", id_prefix="nova-light", center_label=center, demo_mark=False
+        )
+        nova_dark = render_nova_svg(
+            nova, "dark", id_prefix="nova-dark", center_label=center, demo_mark=False
+        )
 
         cmp_ai = nova_ai = AIText()
         if use_ai:
@@ -382,8 +394,11 @@ class ReportEditorialService:
             referential_version=mapping.version,
             app_version=settings.APP_VERSION,
             generated_at=datetime.now(timezone.utc),
-            demo_watermark=demo_watermark,
+            # The mark follows the data: a demo dataset is marked whoever asks for the report.
+            demo_watermark=demo_watermark or bool((nova.get("provenance") or {}).get("demo")),
             use_ai=use_ai,
+            de_primary_method=dataset_meta.get("primary_method"),
+            de_method_run=dataset_meta.get("de_method"),
         )
 
     async def render_comparison_pdf(

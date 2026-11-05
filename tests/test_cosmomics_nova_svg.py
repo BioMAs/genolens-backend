@@ -122,6 +122,152 @@ def test_colours_match_the_app_palette():
     assert balance_color(0) == "#C9D1D9"
 
 
+# ── What the wheel says is what was computed ───────────────────────────────
+
+
+def _group(name, nl, delta, obs="up", n_terms=1):
+    s_pro, s_anti = max(delta, 0.0), max(-delta, 0.0)
+    return {
+        "name": name,
+        "nl": nl,
+        "s_pro": s_pro,
+        "s_anti": s_anti,
+        "delta": delta,
+        "balance": delta / (s_pro + s_anti) if s_pro + s_anti else 0.0,
+        "obs": obs,
+        "terms": [
+            {
+                "id": f"GO:{i:07d}",
+                "label": f"Term {name} {i}",
+                "nl": nl / n_terms,
+                "effect": 1 if delta > 0 else -1 if delta < 0 else 0,
+                "obs": obs,
+            }
+            for i in range(n_terms)
+        ],
+    }
+
+
+def _payload(**overrides):
+    groups = [
+        _group("Group A", 6.0, 4.0),
+        _group("Group B", 4.0, 0.0),
+        _group("Group C", 3.0, -2.0),
+    ]
+    payload = {
+        "contrast": "AL-7_vs_Vehicle",
+        "condition": "AL-7",
+        "alpha": 0.05,
+        "claims": [
+            {
+                "name": "Firming",
+                "s_pro": 10.0,
+                "s_anti": 2.0,
+                "coherence": 0.83,
+                "n_for": 1,
+                "n_against": 1,
+                "n_balanced": 1,
+                "best_subgroup": "Group A",
+                "best_nl": 6.0,
+                "subgroups": groups,
+            },
+            {
+                "name": "Barrier",
+                "s_pro": 8.0,
+                "s_anti": 0.0,
+                "coherence": 1.0,
+                "n_for": 1,
+                "n_against": 0,
+                "n_balanced": 0,
+                "best_subgroup": "Group D",
+                "best_nl": 8.0,
+                "subgroups": [_group("Group D", 8.0, 8.0)],
+            },
+        ],
+        "unlinked": [_group("Group U", 3.0, 0.0)],
+        "unlinked_total": 1,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_wheel_has_an_axis_title_and_no_decorative_dots(nova):
+    svg = render_nova_svg(nova, "light", id_prefix="x")
+    assert "−log10 combined p (Stouffer, unsigned)" in svg
+    # Every dot is a term or a sub-group: none is drawn to fill a sector. The only other circles
+    # are the significance rings and the centre disc.
+    n_terms = sum(len(s["terms"]) for c in nova["claims"] for s in c["subgroups"])
+    n_terms += sum(len(s["terms"]) for s in nova["unlinked"])
+    n_groups = sum(len(c["subgroups"]) for c in nova["claims"]) + len(nova["unlinked"])
+    circles = re.findall(r"<circle ", svg)
+    assert n_terms + n_groups < len(circles) <= n_terms + n_groups + 6
+    assert 'r="0.70"' not in svg  # the former dust
+    for theme in ("light", "dark"):
+        assert "−log10 combined p (Stouffer, unsigned)" in render_nova_svg(nova, theme)
+
+
+def test_zero_against_is_written(nova):
+    svg = render_nova_svg(_payload(), "light", id_prefix="x")
+    assert "1 sub-group for" in svg and "0 against" in svg
+    assert "1 against" in svg and "1 balanced" in svg
+    # A claim with nothing against says "0 against" too (Firming of the reference mock), and the
+    # wheel says what that does not mean.
+    mock = render_nova_svg(nova, "light", id_prefix="y")
+    assert "0 against" in mock
+    assert "Only terms present in the enrichment results can count against a claim;" in mock
+    assert "no contrary term is not a confirmation." in mock
+    # Every claim has something against: nothing to qualify.
+    both = {**_payload(), "claims": _payload()["claims"][:1]}
+    assert "not a confirmation" not in render_nova_svg(both, "light", id_prefix="z")
+
+
+def test_subgroups_are_not_called_pathways(nova):
+    for payload in (nova, _payload()):
+        for wheel_only in (True, False):
+            svg = render_nova_svg(payload, "light", id_prefix="x", wheel_only=wheel_only)
+            assert " pathways" not in svg and ">1 pathway" not in svg
+    assert ">5 sub-groups<" in render_nova_svg(nova, "light", id_prefix="x")
+    assert ">1 sub-group<" in render_nova_svg(_payload(), "light", id_prefix="x")
+
+
+def test_demo_wheel_is_marked(nova):
+    demo = {**nova, "provenance": {"demo": True}}
+    for theme in ("light", "dark"):
+        for wheel_only in (True, False):
+            assert ">DEMO<" in render_nova_svg(demo, theme, wheel_only=wheel_only)
+    assert ">DEMO<" not in render_nova_svg(nova, "light")
+    assert ">DEMO<" not in render_nova_svg({**nova, "provenance": {"demo": False}}, "light")
+
+
+def test_the_disc_never_names_a_condition_it_was_not_given():
+    svg = render_nova_svg({"claims": [], "unlinked": []}, "light", id_prefix="e")
+    assert "Active" not in svg
+    named = render_nova_svg({"claims": [], "unlinked": [], "condition": "Cond"}, "light")
+    assert ">Cond<" in named
+
+
+def test_a_comparison_without_enrichment_is_not_drawn_as_a_comparison_without_claim():
+    empty = {"status": "no_enrichment", "claims": [], "unlinked": []}
+    svg = render_nova_svg(empty, "light", id_prefix="e")
+    assert "No enrichment result for this comparison" in svg
+    assert "No claim with significant evidence" not in svg
+
+
+def test_a_balanced_subgroup_is_neutral_in_the_claim_cards():
+    svg = render_nova_svg(_payload(), "light", id_prefix="p", wheel_only=False)
+
+    def fill_of(text):
+        return re.search(rf'fill="(#[0-9A-Fa-f]{{6}})"[^>]*>{text}</text>', svg).group(1)
+
+    ink, against = "#3A4150", "#7D8B9C"
+    assert fill_of("Group A") == ink  # for the claim
+    assert fill_of("Group B") == ink  # balanced: neither for nor against
+    assert fill_of("Group C") == against  # against the claim
+    # The balanced sub-group's arrow is not the grey of the evidence against.
+    arrows = re.findall(r'fill="(#[0-9A-Fa-f]{6})"[^>]*>(?:↑|↓)</text>', svg)
+    assert arrows.count(against) == 1
+
+
 # ── Endpoint ────────────────────────────────────────────────────────────────
 
 

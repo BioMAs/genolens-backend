@@ -17,12 +17,13 @@
     <td>{{ t.label }}</td>
     <td style="color:{{ C.grey }};font-size:{{ font - 0.8 }}pt">{{ t.id }}</td>
     <td class="num">{{ '%.1f' % t.nl }}</td>
-    <td style="text-align:center;color:{{ C.green if t.up else C.blue }};font-weight:700">{{ '↑' if t.up else '↓' }}</td>
-    <td><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{{ C.green if t.pro else C.coral }};margin-right:2mm"></span>{{ 'for' if t.pro else 'against' }}</td>
+    <td style="text-align:center;color:{{ C.green if t.up else C.blue }};font-weight:700">{{ '↑↓' if t.both else ('↑' if t.up else '↓') }}</td>
+    <td style="white-space:nowrap"><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{{ C.green if t.pro else C.coral }};margin-right:2mm"></span>{{ 'for' if t.pro else 'against' }}{% if not t.significant %} <span style="color:{{ C.grey }}">· n.s.</span>{% endif %}</td>
   </tr>
   {%- endfor %}
 </table>
 {%- if c.terms_truncated %}<p class="cap" style="margin-top:1mm">Showing the first {{ c.terms|length }} of {{ c.n_terms }} terms (sub-groups in decreasing significance); the complete table is available in GenoLens.</p>{% endif -%}
+{%- if c.has_both or c.has_not_significant %}<p class="cap" style="margin-top:1mm">{% if c.has_both %}↑↓ = enriched in both lists: one entry per direction, counted once for and once against. {% endif %}{% if c.has_not_significant %}n.s. = not significant at α, still counted with its weight.{% endif %}</p>{% endif -%}
 {%- endmacro -%}
 
 {%- macro claim_page(p) -%}
@@ -37,9 +38,9 @@
     </div>
   </div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:8mm;margin-top:6mm">
-    <div class="card"><h3>Pathway sub-groups · {{ c.n_for }} for · {{ c.n_against }} against · coherence {{ c.coherence }} %</h3>
+    <div class="card"><h3>Pathway sub-groups · {{ c.n_for }} for · {{ c.n_against }} against{% if c.n_balanced %} · {{ c.n_balanced }} balanced{% endif %} · coherence {{ c.coherence }} %</h3>
       {{ c.bars }}
-      <p class="cap">Bar: significance of the sub-group (−log<sub>10</sub> p, Stouffer). Colour: balance of the evidence, green = for the claim, coral = against. Greyed names: sub-groups whose evidence goes against the claim.{% if c.n_subgroups > 9 %} The 9 most significant of {{ c.n_subgroups }} sub-groups are shown.{% endif %}</p></div>
+      <p class="cap">Bar: significance of the sub-group (−log<sub>10</sub> p, unsigned Stouffer combination of its terms). Colour: balance of the evidence, green = for the claim, coral = against, grey = balanced. Greyed names: sub-groups whose evidence goes against the claim. Coherence: share of the claim's evidence that goes in its direction.{% if c.zero_against_note %} {{ c.zero_against_note }}{% endif %}{% if c.n_subgroups > 9 %} The 9 most significant of {{ c.n_subgroups }} sub-groups are shown.{% endif %}</p></div>
     <div class="card"><h3>Key genes · log<sub>2</sub> FC</h3>
       {%- if c.genes %}<div style="margin-top:2mm">{{ c.genes }}</div>
       {%- else %}<p class="empty">No differentially expressed gene is annotated to the supporting terms.</p>{% endif %}
@@ -50,7 +51,7 @@
       {%- endif %}</div>
   </div>
   <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:6mm;margin-top:5mm">
-    <div class="card"><h3>Strongest sub-group</h3><div style="font-size:9pt"><b>{{ c.best }}</b><br>p = {{ c.best_p }}</div></div>
+    <div class="card"><h3>Leading sub-group</h3><div style="font-size:9pt">{% if c.lead %}<b>{{ c.lead.name }}</b><br>p = {{ c.lead.p }}{% else %}No sub-group goes in the direction of the claim.{% endif %}</div></div>
     <div class="card"><h3>Evidence</h3><div style="font-size:9pt">{{ c.n_subgroups }} sub-groups · {{ c.n_terms }} terms<br>coherence {{ c.coherence }} %</div></div>
     <div class="card"><h3>Scientific review</h3><p class="sig{% if c.review.startswith('Not') %} pending{% endif %}" style="margin:0;font-size:8pt">{{ c.review }}</p></div>
   </div>
@@ -70,7 +71,7 @@
     <div>
       {%- if c.genes %}{{ c.genes }}{% else %}<p class="empty" style="margin:0">No differentially expressed gene is annotated to the supporting terms.</p>{% endif %}
       {%- if c.dose %}<div style="margin-top:3mm">{{ c.dose }}</div>{% endif %}
-      <p class="cap">Strongest sub-group: <b>{{ c.best }}</b> (p = {{ c.best_p }}) · coherence {{ c.coherence }} %</p>
+      <p class="cap">{% if c.lead %}Led by <b>{{ c.lead.name }}</b> (p = {{ c.lead.p }}){% else %}No sub-group goes in the direction of the claim{% endif %} · coherence {{ c.coherence }} %{% if c.zero_against_note %} · 0 against: {{ c.zero_against_note }}{% endif %}</p>
     </div>
   </div>
 </div>
@@ -98,9 +99,9 @@
   <div style="position:absolute;right:-66mm;top:78mm;width:205mm;opacity:.95">{{ p.nova }}</div>
   <div style="position:absolute;left:16mm;top:16mm;display:flex;align-items:center;gap:4mm">
     {%- if logo %}<img src="{{ logo }}" alt="" style="height:7mm;filter:brightness(0) invert(1)">{% endif %}
-    <span style="font-size:8.5pt;letter-spacing:.2em;text-transform:uppercase;color:#B8C4D0">OmicSkin PLUS · Transcriptomic proof of efficacy</span></div>
+    <span style="font-size:8.5pt;letter-spacing:.2em;text-transform:uppercase;color:#B8C4D0">OmicSkin PLUS · Transcriptomic evidence review</span></div>
   <div style="position:absolute;left:16mm;top:48mm;width:100mm">
-    <div class="kicker" style="color:#42E2BA">Claim substantiation dossier</div>
+    <div class="kicker" style="color:#42E2BA">Pathway evidence by claim</div>
     <h1 style="font-size:{{ p.title_size }}pt;margin-top:4mm;color:white;overflow-wrap:anywhere">{{ p.title }}</h1>
     <h1 style="font-size:20pt;font-weight:300;color:#DCE6EF;margin-top:3mm">{% for line in p.subtitle %}{{ line }}{% if not loop.last %}<br>{% endif %}{% endfor %}</h1>
   </div>
@@ -133,7 +134,7 @@
       {%- if r.scored %}
       <div style="display:grid;grid-template-columns:34mm 1fr 30mm;align-items:center;gap:3mm;padding:2.2mm 0;border-bottom:1px solid {{ C.line }}"><span style="font-weight:600">{{ r.name }}</span><div style="height:7px;background:#EEF2F5;border-radius:4px"><div style="width:{{ r.score }}%;height:7px;border-radius:4px;background:{{ r.color }}"></div></div><span style="font-family:'Inter Display';font-weight:700;font-size:15pt;letter-spacing:-.02em;text-align:right">{{ r.score }}<span style="font-size:7.5pt;font-weight:500;color:{{ C.grey }};margin-left:2mm;letter-spacing:.05em">{{ r.band_short }}</span></span></div>
       {%- else %}
-      <div style="display:grid;grid-template-columns:34mm 1fr 30mm;align-items:center;gap:3mm;padding:2.2mm 0;border-bottom:1px solid {{ C.line }};color:{{ C.grey }}"><span>{{ r.name }}</span><div style="height:7px;background:#EEF2F5;border-radius:4px"></div><span style="font-size:7.5pt;text-align:right;letter-spacing:.05em">NO EVIDENCE</span></div>
+      <div style="display:grid;grid-template-columns:34mm 1fr 30mm;align-items:center;gap:3mm;padding:2.2mm 0;border-bottom:1px solid {{ C.line }};color:{{ C.grey }}"><span>{{ r.name }}</span><div style="height:7px;background:#EEF2F5;border-radius:4px"></div><span style="font-size:7.5pt;text-align:right;letter-spacing:.05em">{{ r.band_short }}</span></div>
       {%- endif %}
       {%- endfor %}
       <p class="cap">{{ p.caption }}</p>
@@ -148,12 +149,12 @@
 {%- elif p.kind == 'nova' %}
 <div class="page" data-kind="nova">
   <div class="kicker">CosmOmics Pathway Nova</div>
-  <h2 style="font-size:26pt;margin-top:2mm">Every pathway behind every claim, in one picture.</h2>
+  <h2 style="font-size:26pt;margin-top:2mm">The enriched terms of the referential, by claim.</h2>
   <div style="margin:2mm -6mm 0 -6mm">{{ p.svg }}</div>
   <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6mm;font-size:8.8pt;margin-top:2mm">
     <div><b>One sector per claim.</b> Its width is the importance of the evidence (sum of −log<sub>10</sub> p of all its terms); the hatched part is the share of evidence that goes against the claim.</div>
-    <div><b>One bubble per pathway sub-group.</b> Further from the centre = more significant (Stouffer-combined p). Green = terms for the claim, coral = against; small dots are the individual ontology terms.</div>
-    <div><b>Grey sector.</b> {% if p.unlinked_total %}{{ p.unlinked_total }} significant pathway sub-group{{ 's' if p.unlinked_total != 1 }} linked to no claim — reported for completeness, not scored.{% else %}Significant pathways linked to no claim would appear here; none in this comparison.{% endif %} Claim referential{% if p.version %} v{{ p.version }}{% endif %}, undisclosed.</div>
+    <div><b>One bubble per pathway sub-group.</b> Further out = more significant (unsigned Stouffer p). Green = for the claim, coral = against, grey = balanced; dots = terms.</div>
+    <div><b>Grey sector.</b> {% if p.no_enrichment %}No enrichment result is stored for this comparison.{% elif p.unlinked_total %}{{ p.unlinked_total }} significant pathway sub-group{{ 's' if p.unlinked_total != 1 }} linked to no claim — reported for completeness, not scored.{% else %}Significant pathways linked to no claim would appear here; none in this comparison.{% endif %} Claim referential{% if p.version %} v{{ p.version }}{% endif %}, undisclosed.</div>
   </div>
   {%- if p.ai_html %}<div style="margin-top:5mm">{{ ai_box(p) }}</div>{% endif %}
   {{ foot(p) }}
@@ -209,8 +210,8 @@
   <h2>{{ p.title }}</h2>
   <div style="display:grid;grid-template-columns:1.05fr 1fr;gap:8mm">
     <div>
-      {%- if p.volcano %}{% set ns.fig = ns.fig + 1 %}<div class="figure">{{ p.volcano }}</div><p class="cap">Fig. {{ ns.fig }} — Volcano plot. Each point is a gene: x = log<sub>2</sub> fold-change (test/control), y = −log<sub>10</sub> adjusted p-value. {{ p.n_up }} genes up, {{ p.n_down }} down.</p>{% endif %}
-      {%- if p.has_analysis %}<p style="font-size:9.5pt">DEGs were called with DESeq2; edgeR and limma-voom were run on the same counts to show how many methods support each call — they do not change the DEG list.</p>{% endif %}
+      {%- if p.volcano %}{% set ns.fig = ns.fig + 1 %}<div class="figure">{{ p.volcano }}</div><p class="cap">Fig. {{ ns.fig }} — Volcano plot. Each point is a gene: x = log<sub>2</sub> fold-change (test/control), y = −log<sub>10</sub> adjusted p-value. {{ p.n_up }} genes up, {{ p.n_down }} down.{% if p.volcano_note %} {{ p.volcano_note }}{% endif %}</p>{% endif %}
+      <p style="font-size:9.5pt">{{ p.de_text }}</p>
     </div>
     <div><h3>Most significant differentially expressed genes</h3>
       {%- if p.deg_rows %}<table><tr><th>Gene</th><th class="num">log<sub>2</sub> FC</th><th class="num">Adj. p</th></tr>
@@ -225,7 +226,7 @@
 <div class="page" data-kind="science">
   <div class="kicker">Scientific results · III</div>
   <h2>Functional enrichment</h2>
-  <p style="margin-top:0">Over-representation analysis of the up- and down-regulated genes (hypergeometric test, Benjamini–Hochberg adjusted p ≤ {{ p.fdr }}). Dot size = number of genes, colour = significance.</p>
+  <p style="margin-top:0">{{ p.text }}</p>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:6mm">
     <div><h3 style="color:{{ C.green }}">Up-regulated genes</h3>{% if p.dot_up %}<div class="figure">{{ p.dot_up }}</div>{% else %}<p class="empty">No enriched term.</p>{% endif %}</div>
     <div><h3 style="color:{{ C.blue }}">Down-regulated genes</h3>{% if p.dot_down %}<div class="figure">{{ p.dot_down }}</div>{% else %}<p class="empty">No enriched term.</p>{% endif %}</div>
@@ -263,7 +264,7 @@
 <div class="page" data-kind="method">
   <div class="kicker">Method and traceability</div>
   <h2>How the score is built, and every version behind it</h2>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8mm;font-size:8.8pt">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:8mm;font-size:8.2pt">
     <div><h3>CosmOmics Pathway Nova</h3><p style="margin-top:0">{{ p.method_nova }}</p><h3>OmicSkin score</h3><p style="margin-top:0">{{ p.method_score }}</p>
       <h3>Scientific review and scope</h3><p style="margin-top:0">{{ p.scope }}</p></div>
     <div><h3>Versions</h3><table>{% for k, v in p.versions %}<tr><td style="width:32mm;color:{{ C.grey }}">{{ k }}</td><td>{{ v }}</td></tr>{% endfor %}</table>
