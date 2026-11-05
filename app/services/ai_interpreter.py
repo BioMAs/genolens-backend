@@ -196,6 +196,12 @@ class LocalAIInterpreter:
         paragraph, no regulatory wording written by the model. What is cut to fit (claims beyond
         `PROMPT_CLAIMS_LIMIT`, sub-groups beyond `PROMPT_SUBGROUPS_PER_SIDE` per side) is said in
         the prompt, as "N of M".
+
+        What leaves for the hosted model is what the user agrees to before the first call: claim
+        names, sub-group names, directions, counts and p-values, and nothing else. So the prompt
+        carries no comparison name (it often holds the user's own condition or product names;
+        `comparison_name` is accepted so callers need not change, and is never used), no dataset
+        or analysis identifier, no column name of an uploaded table, no score and no setting.
         """
 
         def p_text(nl: float) -> str:
@@ -222,7 +228,7 @@ class LocalAIInterpreter:
             state = CLAIM_STATE_TEXT.get(c.get("state"))
             if state:
                 counts += f"; {state}"
-            line = f"- {c['name']}: coherence {round(100 * c.get('coherence', 0))}% ({counts})"
+            line = f"- {c['name']} ({counts})"
             if pro:
                 line += "; supporting: " + ", ".join(sub_text(s) for s in pro)
             if con:
@@ -246,21 +252,24 @@ class LocalAIInterpreter:
         if unlinked_total > len(unlinked_shown) and unlinked_shown:
             unlinked_text += f" ({len(unlinked_shown)} of {unlinked_total} sub-groups)"
 
-        comp = f" for the comparison '{comparison_name}'" if comparison_name else ""
-        p_source = nova.get("p_source") or "an adjusted p-value"
-        alpha = nova.get("alpha")
-        threshold = f" The significance threshold is alpha = {alpha:g}." if alpha else ""
+        # What the p-values are, in a fixed vocabulary: the payload's own wording may carry the
+        # column name of an uploaded table, which is the user's text and does not leave.
+        p_source = str(nova.get("p_source") or "")
+        if p_source.startswith("adjusted p from uploaded"):
+            p_kind = "an adjusted p-value read from uploaded tables"
+        elif p_source:
+            p_kind = "a Benjamini–Hochberg adjusted p-value"
+        else:
+            p_kind = "an adjusted p-value"
 
-        return f"""You are a scientist helping an R&D team read transcriptomic results{comp}.
+        return f"""You are a scientist helping an R&D team read transcriptomic results.
 
 The data below comes from the CosmOmics Pathway Nova: the enriched terms of this comparison are \
 mapped onto a curated catalogue of cosmetic claims and grouped into pathway sub-groups. A \
 sub-group counts FOR a claim when the direction in which its terms are observed (up / down) \
 matches the one the claim expects, and AGAINST it otherwise; a sub-group whose evidence for and \
-against cancels out is BALANCED. The p-value of a term is {p_source}; the p shown for a \
-sub-group is a combined p-value of its terms (unsigned Stouffer), not an adjusted p-value.\
-{threshold} Coherence is the share of the evidence that goes the way the claim expects: it \
-indicates a direction, not an effect.
+against cancels out is BALANCED. The p-value of a term is {p_kind}; the p shown for a \
+sub-group is a combined p-value of its terms (unsigned Stouffer), not an adjusted p-value.
 
 CLAIMS (strongest supporting evidence first; at most {PROMPT_SUBGROUPS_PER_SIDE} sub-groups per \
 side are listed{cut}):

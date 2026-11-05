@@ -7,8 +7,10 @@ No LLM is ever called: the interpreter of the endpoint is replaced by a counting
 sub-group and claim names are synthetic.
 """
 
+import json
 import re
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -134,19 +136,80 @@ def test_prompt_says_how_many_claims_it_carries_when_the_list_is_cut():
     interpreter = LocalAIInterpreter(base_url="http://127.0.0.1:9/v1")
     prompt = interpreter._build_cosmomics_prompt(many_claims_nova(12), "A_vs_B")
     assert "9 of 12 claims" in prompt
-    assert "- Claim 8:" in prompt and "- Claim 9:" not in prompt
+    assert "- Claim 8 (" in prompt and "- Claim 9 (" not in prompt
     assert not re.search(r"\d+ of \d+ claims", interpreter._build_cosmomics_prompt(
         many_claims_nova(9), "A_vs_B"
     ))
 
 
-def test_prompt_follows_the_payload_for_what_the_p_values_are():
+def test_prompt_says_what_the_p_values_are_in_its_own_words():
     interpreter = LocalAIInterpreter(base_url="http://127.0.0.1:9/v1")
-    nova = synthetic_nova()
-    nova["p_source"] = "adjusted p from uploaded tables (column qvalue)"
-    prompt = interpreter._build_cosmomics_prompt(nova, "A_vs_B")
-    assert "column qvalue" in prompt
-    assert "Benjamini" not in prompt  # the prompt no longer asserts what the payload does not say
+    own = interpreter._build_cosmomics_prompt(synthetic_nova(), "A_vs_B")
+    assert "Benjamini–Hochberg adjusted p-value" in own
+    uploaded = synthetic_nova()
+    uploaded["p_source"] = "adjusted p from uploaded tables (column ZQX_qvalue)"
+    prompt = interpreter._build_cosmomics_prompt(uploaded, "A_vs_B")
+    assert "read from uploaded tables" in prompt
+    assert "Benjamini" not in prompt  # it does not assert what the payload does not say
+    assert "ZQX_qvalue" not in prompt  # the column name is the user's text: it does not leave
+
+
+def llm_client(text: str = "Reading A."):
+    """A stand-in for the OpenAI-compatible client of the interpreter: nothing leaves the process."""
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    )
+    create = AsyncMock(return_value=response)
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), create
+
+
+async def test_the_comparison_name_never_reaches_the_llm():
+    """The consent says what leaves: claim and sub-group names, p-values. A comparison name often
+    holds the user's own condition or product names."""
+    name = "ZQX-Vehicle_vs_ZQX-Product7"
+    interpreter = LocalAIInterpreter(base_url="http://127.0.0.1:9/v1")
+    interpreter.client, create = llm_client()
+    text = await interpreter.interpret_cosmomics(synthetic_nova(), name)
+    assert text == "Reading A."
+    create.assert_awaited_once()
+    messages = create.await_args.kwargs["messages"]
+    assert [m["role"] for m in messages] == ["user"]
+    # Every argument of the call, not only the prompt text.
+    sent = json.dumps(create.await_args.kwargs, default=str)
+    for part in (name, "ZQX", "Vehicle", "Product7"):
+        assert part not in sent, part
+    assert "this comparison" in messages[0]["content"]  # it refers to the comparison anonymously
+    assert "A_vs_B" not in interpreter._build_cosmomics_prompt(synthetic_nova(), "A_vs_B")
+
+
+def test_only_names_directions_counts_and_p_values_reach_the_prompt():
+    """Nothing of the payload but claim names, sub-group names, directions, counts and p-values."""
+    nova = synthetic_nova(alpha=0.0123)
+    nova["contrast"], nova["condition"] = "ZQX-contrast", "ZQX-condition"
+    nova["p_source"] = "adjusted p from uploaded tables (column ZQX_col)"
+    nova["provenance"].update(
+        dataset_id="ZQX-dataset",
+        analysis_id="ZQX-analysis",
+        enrichment_dataset_ids=["ZQX-enrichment"],
+        padj_columns=["ZQX_col"],
+        source_versions=["ZQX-v1"],
+        app_version="ZQX-app",
+    )
+    nova["claims"][0]["coherence"] = 0.7777
+    nova["claims"][0]["importance"] = 123.456
+    interpreter = LocalAIInterpreter(base_url="http://127.0.0.1:9/v1")
+    prompt = interpreter._build_cosmomics_prompt(nova, "ZQX-comparison")
+
+    assert "ZQX" not in prompt
+    # No score, no setting.
+    for leaked in ("0.0123", "alpha", "78%", "0.78", "coherence", "123.4", "importance"):
+        assert leaked not in prompt, leaked
+    # What is meant to go is there: the claim, its sub-groups with direction and p, the counts.
+    line = next(line for line in prompt.splitlines() if line.startswith("- Firming"))
+    assert "1 sub-group for, 1 against" in line
+    assert "supporting: Group A (up, p = 1.0e-06)" in line
+    assert "contradicting: Group B (down, p = 1.0e-05)" in line
 
 
 # ── The endpoints ───────────────────────────────────────────────────────────
