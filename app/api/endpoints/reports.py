@@ -25,6 +25,7 @@ from app.core.service_tokens import SCOPE_REPORTS_EDITORIAL
 from app.models.models import Dataset, SelfServiceAnalysis, User
 from app.models.report_job import ReportJob, ReportJobStatus
 from app.schemas.report import (
+    AnalysisReportTriggerRequest,
     ComparisonReportTriggerRequest,
     ReportJobResponse,
     ReportTemplate,
@@ -67,13 +68,21 @@ async def trigger_report(
     analysis_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    payload: Annotated[Optional[AnalysisReportTriggerRequest], Body()] = None,
 ):
-    """Trigger background SciLicium PDF report generation for an analysis."""
+    """Trigger background SciLicium PDF report generation for an analysis.
+
+    `use_ai` (default true) False gives a report without any AI text: no LLM call, no stored
+    interpretation read, no AI label.
+    """
+    use_ai = payload.use_ai if payload is not None else True
     analysis = await _get_analysis_or_404(analysis_id, db, current_user.id)
 
-    # Return existing in-progress job rather than spawning a duplicate
+    # Return existing in-progress job rather than spawning a duplicate — one made the same way:
+    # a flip of `use_ai` never hands back the job made with the other setting.
     stmt = select(ReportJob).where(
         ReportJob.analysis_id == analysis_id,
+        ReportJob.use_ai == use_ai,
         ReportJob.status.in_([ReportJobStatus.PENDING, ReportJobStatus.RUNNING]),
     )
     existing = (await db.execute(stmt)).scalar_one_or_none()
@@ -87,6 +96,7 @@ async def trigger_report(
         id=uuid4(),
         project_id=analysis.project_id,
         analysis_id=analysis_id,
+        use_ai=use_ai,
         requested_by=current_user.id,
         status=ReportJobStatus.PENDING,
     )

@@ -28,6 +28,7 @@ from app.services.cosmomics_grouping import clean_label
 from app.services.cosmomics_nova import subgroup_side
 from app.services.cosmomics_nova_svg import claim_color
 from app.services.omicskin_score import ALL_CLAIMS, BAND_LABELS, ClaimScore, claim_score
+from app.services.report_common import ai_label, ai_text_record
 from app.services.report_editorial_svg import (
     clean_inline_svg,
     dose_ladder,
@@ -399,10 +400,17 @@ class EditorialInputs:
     figures: dict[str, Optional[str]]  # pca, volcano, dot_up, dot_down, heatmap (raw SVG)
     nova_light: str
     nova_dark: str
-    comparison_ai: Optional[str] = None  # text as stored / generated
+    # The AI texts: as stored / generated, with the model and the moment of generation the label
+    # names. `*_stale`: a stored text was left out because it was written from other data than
+    # these (the traceability page says so).
+    comparison_ai: Optional[str] = None
     comparison_ai_model: Optional[str] = None
+    comparison_ai_generated_at: Optional[datetime] = None
+    comparison_ai_stale: bool = False
     nova_ai: Optional[str] = None
     nova_ai_model: Optional[str] = None
+    nova_ai_generated_at: Optional[datetime] = None
+    nova_ai_stale: bool = False
     cover_info: dict[str, Any] = field(default_factory=dict)
     branding: Optional[dict[str, Any]] = None
     logo_data_uri: Optional[str] = None
@@ -414,13 +422,6 @@ class EditorialInputs:
     use_ai: bool = True
     illustrative: bool = False
     dose_series: Optional[list[tuple[str, dict]]] = None
-
-
-def _reviewer_label(cover_info: dict[str, Any]) -> tuple[str, bool]:
-    reviewer = (cover_info or {}).get("checked_by")
-    if reviewer:
-        return f"AI-generated interpretation — reviewed by {reviewer}", True
-    return "AI-generated, not yet reviewed", False
 
 
 def _headline(scores: list[ClaimScore]) -> str:
@@ -572,6 +573,14 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
     models = [m for m in (inp.comparison_ai_model, inp.nova_ai_model) if m]
     if models and inp.use_ai:
         rows.append(("Interpretation model", ", ".join(dict.fromkeys(models))))
+    if inp.use_ai:
+        # A stored text written from other data is left out, and the report says so.
+        for stale, name in (
+            (inp.nova_ai_stale and not inp.nova_ai, "Nova AI text"),
+            (inp.comparison_ai_stale and not inp.comparison_ai, "Comparison AI text"),
+        ):
+            if stale:
+                rows.append((name, "not included (generated on other data)"))
     rows.append(("Report generated", inp.generated_at.strftime("%d %B %Y, %H:%M UTC")))
     return rows
 
@@ -679,7 +688,6 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     branding = inp.branding or {}
     institute = branding.get("institute_name") or DEFAULT_INSTITUTE
     cover = inp.cover_info or {}
-    reviewer_label, reviewed = _reviewer_label(cover)
     checked_by = cover.get("checked_by")
     review_card = f"Report checked by {checked_by}." if checked_by else "Not yet reviewed."
     n_by_cond = _samples_by_condition(inp.qc_rows)
@@ -806,14 +814,18 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
 
     # 3. nova (+ optional AI reading page)
     nova_text = (inp.nova_ai or "").strip() if inp.use_ai else ""
+    nova_label = ai_label(inp.nova_ai_model or "", inp.nova_ai_generated_at)
     nova_inline = bool(nova_text) and len(nova_text) <= NOVA_READING_INLINE_CHARS
+    ai_texts: list[dict[str, Any]] = []
+    if nova_text:
+        ai_texts.append(ai_text_record("nova", inp.nova_ai_model, inp.nova_ai_generated_at))
     pages.append(
         {
             "kind": "nova",
             "svg": clean_inline_svg(inp.nova_light, "page-nova", "width:100%;height:auto"),
             "version": inp.referential_version,
             "ai_html": md_to_html(nova_text) if nova_inline else None,
-            "ai_label": reviewer_label,
+            "ai_label": nova_label,
             "unlinked_total": int(
                 inp.nova.get("unlinked_total") or len(inp.nova.get("unlinked") or [])
             ),
@@ -826,7 +838,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 "kind": "nova_reading",
                 "ai_html": md_to_html(capped),
                 "truncated": truncated,
-                "ai_label": reviewer_label,
+                "ai_label": nova_label,
             }
         )
 
@@ -1000,7 +1012,12 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
         capped, truncated = cap_text(
             cmp_text, COMPARISON_AI_WIDE_CHARS if wide else COMPARISON_AI_CHARS
         )
-        if not cmp_text:
+        if not cmp_text and inp.comparison_ai_stale:
+            notice = (
+                "The stored AI interpretation of this comparison was generated on other data "
+                "and is not included."
+            )
+        elif not cmp_text:
             notice = "No AI interpretation has been generated for this comparison."
         elif not english:
             notice = "No English AI interpretation is available for this comparison."
@@ -1013,11 +1030,16 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 "ai": True,
                 "ai_html": md_to_html(capped) if english else None,
                 "ai_notice": notice,
-                "ai_label": reviewer_label,
-                "ai_reviewed": reviewed,
+                "ai_label": ai_label(inp.comparison_ai_model or "", inp.comparison_ai_generated_at),
                 "truncated": truncated and english,
             }
         )
+        if cmp_text and english:
+            ai_texts.append(
+                ai_text_record(
+                    "comparison", inp.comparison_ai_model, inp.comparison_ai_generated_at
+                )
+            )
     last_science_page = len(pages)
 
     # 10. method + versions + contact
@@ -1041,8 +1063,8 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             "method_nova": Markup(METHOD_NOVA),
             "method_score": Markup(METHOD_SCORE + (METHOD_DOSE if inp.dose_series else "")),
             "scope": (
-                "All AI-generated texts in this report are labelled as such and state whether "
-                "they were reviewed. " + SCOPE
+                "All AI-generated texts in this report are labelled with the model and the date "
+                "of their generation. " + SCOPE
                 if inp.use_ai
                 else SCOPE
             ),
@@ -1095,7 +1117,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             f"Pages {first_science_page}–{last_science_page} give the scientific results: "
             + (
                 "study design, differential expression, functional enrichment and the AI "
-                "interpretation, labelled with its review status."
+                "interpretation, labelled with its model and date."
                 if inp.use_ai
                 else "study design, differential expression and functional enrichment."
             ),
@@ -1119,6 +1141,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     return {
         "pages": pages,
         "total": total,
+        "ai_texts": ai_texts,  # the AI texts printed, as recorded on the report job
         "footer": footer,
         "title": f"OmicSkin PLUS — {inp.test}",
         "logo": inp.logo_data_uri,

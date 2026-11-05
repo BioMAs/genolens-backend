@@ -28,7 +28,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.models import AIInterpretation, CosmeticInterpretation, Dataset
+from app.models.models import CosmeticInterpretation, Dataset
 from app.services import report_editorial_figures as figs
 from app.services.cosmomics_nova import (
     NOVA_MODEL_TAG,
@@ -39,7 +39,7 @@ from app.services.cosmomics_nova import (
 )
 from app.services.cosmomics_nova_svg import render_nova_svg
 from app.services.omicskin_score import score_claims
-from app.services.report_common import merge_cover_info
+from app.services.report_common import AIText, merge_cover_info, nova_inputs_sha256
 from app.services.report_editorial_content import (
     EditorialInputs,
     analysis_thresholds,
@@ -177,23 +177,25 @@ class ReportEditorialService:
         db: AsyncSession,
         dataset_id: UUID,
         comparison_name: str,
-        cached_text: Optional[str],
+        comp: dict[str, Any],
         generate_ai: bool,
         demo: bool,
-    ) -> tuple[Optional[str], Optional[str]]:
-        """English comparison interpretation: the cached row when it is English, else (on
-        request, never for demo accounts) a fresh English text that is NOT stored — the
-        user's cached interpretation stays as it is."""
-        model = None
-        if cached_text:
-            model = await db.scalar(
-                select(AIInterpretation.model).where(
-                    AIInterpretation.dataset_id == dataset_id,
-                    AIInterpretation.comparison_name == comparison_name,
-                )
-            )
-        if cached_text and looks_english(cached_text):
-            return cached_text, model
+    ) -> AIText:
+        """English comparison interpretation: the cached row when it is current and English, else
+        (on request, never for demo accounts) a fresh English text that is NOT stored — the
+        user's cached interpretation stays as it is.
+
+        `comp` is the comparison of the LaTeX collector, which has already left out a cached text
+        written from other counts of genes and pathways (`ai_stale`)."""
+        cached = comp.get("ai_interpretation")
+        stored = AIText(
+            cached,
+            comp.get("ai_model"),
+            comp.get("ai_generated_at"),
+            stale=bool(comp.get("ai_stale")),
+        )
+        if cached and looks_english(cached):
+            return stored
         if generate_ai and not demo:
             try:
                 from app.services.ai_interpreter import generate_comparison_text
@@ -203,10 +205,11 @@ class ReportEditorialService:
                     timeout=AI_TIMEOUT_S,
                 )
                 if res:
-                    return res
+                    text, model = res
+                    return AIText(text, model, datetime.now(timezone.utc))
             except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
                 logger.info("English AI interpretation skipped for %s: %s", comparison_name, exc)
-        return cached_text, model  # non-English text: the content layer shows a notice
+        return stored  # non-English text: the content layer shows a notice
 
     async def _nova_ai(
         self,
@@ -216,7 +219,12 @@ class ReportEditorialService:
         nova: dict[str, Any],
         generate_ai: bool,
         demo: bool,
-    ) -> tuple[Optional[str], Optional[str]]:
+    ) -> AIText:
+        """The cached AI reading of the nova, while it is written from this very nova.
+
+        A cached reading of another nova (another alpha, referential or enrichment) or with no
+        fingerprint is left out and reported `stale`: it is never printed as the reading of this
+        report's data."""
         row = (
             await db.execute(
                 select(CosmeticInterpretation).where(
@@ -227,8 +235,12 @@ class ReportEditorialService:
                 )
             )
         ).scalar_one_or_none()
+        stale = False
         if row and (row.model or "").startswith(NOVA_MODEL_TAG):
-            return row.interpretation, (row.model or "").removeprefix(NOVA_MODEL_TAG)
+            model = (row.model or "").removeprefix(NOVA_MODEL_TAG)
+            if row.inputs_sha256 == nova_inputs_sha256(nova, model):
+                return AIText(row.interpretation, model, row.updated_at or row.created_at)
+            stale = True
         if generate_ai and not demo and nova.get("claims"):
             try:
                 from app.services.ai_interpreter import LocalAIInterpreter
@@ -237,10 +249,10 @@ class ReportEditorialService:
                 text = await asyncio.wait_for(
                     interpreter.interpret_cosmomics(nova, comparison_name), timeout=AI_TIMEOUT_S
                 )
-                return text, interpreter.model
+                return AIText(text, interpreter.model, datetime.now(timezone.utc))
             except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
                 logger.info("Nova AI reading skipped for %s: %s", comparison_name, exc)
-        return None, None
+        return AIText(stale=stale)
 
     async def collect(
         self,
@@ -321,17 +333,12 @@ class ReportEditorialService:
         nova_light = render_nova_svg(nova, "light", id_prefix="nova-light", center_label=center)
         nova_dark = render_nova_svg(nova, "dark", id_prefix="nova-dark", center_label=center)
 
-        cmp_text = cmp_model = nova_text = nova_model = None
+        cmp_ai = nova_ai = AIText()
         if use_ai:
-            cmp_text, cmp_model = await self._comparison_ai(
-                db,
-                dataset_id,
-                comparison_name,
-                comp.get("ai_interpretation"),
-                generate_ai,
-                demo_watermark,
+            cmp_ai = await self._comparison_ai(
+                db, dataset_id, comparison_name, comp, generate_ai, demo_watermark
             )
-            nova_text, nova_model = await self._nova_ai(
+            nova_ai = await self._nova_ai(
                 db, dataset_id, comparison_name, nova, generate_ai, demo_watermark
             )
 
@@ -361,10 +368,14 @@ class ReportEditorialService:
             figures=figures,
             nova_light=nova_light,
             nova_dark=nova_dark,
-            comparison_ai=cmp_text,
-            comparison_ai_model=cmp_model,
-            nova_ai=nova_text,
-            nova_ai_model=nova_model,
+            comparison_ai=cmp_ai.text,
+            comparison_ai_model=cmp_ai.model,
+            comparison_ai_generated_at=cmp_ai.generated_at,
+            comparison_ai_stale=cmp_ai.stale,
+            nova_ai=nova_ai.text,
+            nova_ai_model=nova_ai.model,
+            nova_ai_generated_at=nova_ai.generated_at,
+            nova_ai_stale=nova_ai.stale,
             cover_info=cover,
             branding=branding,
             logo_data_uri=logo or data_uri(LOGO_PATH),
@@ -386,7 +397,10 @@ class ReportEditorialService:
         demo_watermark: bool = False,
         use_ai: bool = True,
         use_branding: bool = True,
+        ai_texts: Optional[list[dict]] = None,
     ) -> bytes:
+        """The PDF. When a list is given as `ai_texts` it receives one record per AI text the
+        report printed, `{kind, model, generated_at}` (none when `use_ai` is False)."""
         with tempfile.TemporaryDirectory(prefix="report_editorial_") as work_dir:
             inputs = await self.collect(
                 db,
@@ -400,7 +414,10 @@ class ReportEditorialService:
                 use_ai=use_ai,
                 use_branding=use_branding,
             )
-            html = render_html(build_editorial_context(inputs))
+            context = build_editorial_context(inputs)
+            if ai_texts is not None:
+                ai_texts.extend(context["ai_texts"])
+            html = render_html(context)
             pdf, overflow = await html_to_pdf(html, work_dir)
             if overflow:
                 logger.warning(

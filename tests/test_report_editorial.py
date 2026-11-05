@@ -9,9 +9,11 @@ synthetic comparison "AL-7" versus "Vehicle".
 import io
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -312,14 +314,143 @@ def test_claim_figures_and_genes(html):
 # ── AI texts ────────────────────────────────────────────────────────────────
 
 
-def test_reviewer_label_when_checked(html):
-    assert "AI-generated interpretation — reviewed by J. Doe" in html
+GENERATED_AT = datetime(2026, 11, 5, 9, 30, tzinfo=timezone.utc)
+LABEL = "AI-generated text (model google/gemma-4-E4B-it, generated 2026-11-05)"
 
 
-def test_reviewer_label_without_reviewer():
-    page = render_html(build_editorial_context(_inputs(cover_info={})))
-    assert "AI-generated, not yet reviewed" in page
-    assert "reviewed by" not in page
+def _dated(**overrides) -> EditorialInputs:
+    return _inputs(
+        comparison_ai_generated_at=GENERATED_AT, nova_ai_generated_at=GENERATED_AT, **overrides
+    )
+
+
+def test_editorial_ai_label_names_model_and_date():
+    page = render_html(build_editorial_context(_dated()))
+    # The reading of the nova (page 3) and the comparison text each carry the label.
+    assert page.count(f"<h3>{LABEL}</h3>") == 2
+    # Without a date the label still names the model.
+    undated = render_html(build_editorial_context(_inputs()))
+    assert "<h3>AI-generated text (model google/gemma-4-E4B-it)</h3>" in undated
+    assert "generated 2026" not in undated
+
+
+def test_editorial_has_no_reviewed_by():
+    """A form field does not prove a review: the sign-off block stays, the AI label never says it."""
+    for cover in ({"checked_by": "J. Doe", "prepared_by": "A. B."}, {}):
+        page = render_html(build_editorial_context(_dated(cover_info=cover)))
+        assert "reviewed by" not in page.lower()
+        assert "AI-generated, not yet reviewed" not in page
+        assert "AI-generated interpretation" not in page
+    signed = render_html(build_editorial_context(_dated()))
+    assert "Checked by" in signed and "J. Doe" in signed  # the sign-off block is the user's own
+
+
+def test_editorial_guide_and_scope_name_the_label_not_a_review_status():
+    ctx = build_editorial_context(_dated())
+    guide = " ".join(text for page in ctx["pages"] for _t, text in page.get("guide", []))
+    assert "labelled with its model and date" in guide
+    scope = next(p["scope"] for p in ctx["pages"] if p["kind"] == "method")
+    assert "model and the date" in scope and "reviewed" not in scope
+
+
+def test_editorial_leaves_out_a_stale_nova_text():
+    page = render_html(
+        build_editorial_context(_dated(nova_ai=None, nova_ai_model=None, nova_ai_stale=True))
+    )
+    assert "The <b>barrier</b> programme" not in page and "Soothing is supported" not in page
+    assert "Nova AI text</td><td>not included (generated on other data)</td>" in page
+    # The comparison text, still current, is printed with its label.
+    assert page.count(f"<h3>{LABEL}</h3>") == 1
+
+
+def test_editorial_leaves_out_a_stale_comparison_text():
+    page = render_html(
+        build_editorial_context(
+            _dated(comparison_ai=None, comparison_ai_model=None, comparison_ai_stale=True)
+        )
+    )
+    assert "cornified-envelope genes" not in page
+    assert "Comparison AI text" in page and "not included (generated on other data)" in page
+    # The box says why it is empty, rather than that nothing was ever generated.
+    assert "generated on other data and is not included" in page
+    assert "No AI interpretation has been generated" not in page
+
+
+def test_nothing_is_said_about_stale_texts_in_a_report_without_ai():
+    page = render_html(
+        build_editorial_context(
+            _inputs(use_ai=False, nova_ai=None, comparison_ai=None, nova_ai_stale=True)
+        )
+    )
+    assert "generated on other data" not in page
+
+
+def test_context_lists_the_ai_texts_it_prints():
+    ctx = build_editorial_context(_dated())
+    assert ctx["ai_texts"] == [
+        {"kind": "nova", "model": "google/gemma-4-E4B-it", "generated_at": GENERATED_AT.isoformat()},
+        {
+            "kind": "comparison",
+            "model": "google/gemma-4-E4B-it",
+            "generated_at": GENERATED_AT.isoformat(),
+        },
+    ]
+    # A text that is not printed is not listed: a French comparison text, a report without AI,
+    # a stale nova text.
+    french = build_editorial_context(_dated(comparison_ai=FRENCH_AI))
+    assert [t["kind"] for t in french["ai_texts"]] == ["nova"]
+    assert build_editorial_context(_dated(use_ai=False))["ai_texts"] == []
+    stale = build_editorial_context(_dated(nova_ai=None, nova_ai_stale=True))
+    assert [t["kind"] for t in stale["ai_texts"]] == ["comparison"]
+
+
+async def test_the_cached_nova_text_is_printed_only_while_its_data_stand():
+    from app.models.models import CosmeticInterpretation
+    from app.services.cosmomics_nova import NOVA_MODEL_TAG
+    from app.services.report_common import nova_inputs_sha256
+    from app.services.report_editorial_service import report_editorial_service
+
+    nova = json.loads(FIXTURE.read_text())
+    nova.setdefault("provenance", {})
+    row = CosmeticInterpretation(
+        interpretation=NOVA_AI,
+        model=f"{NOVA_MODEL_TAG}m-1",
+        claims_count=len(nova["claims"]),
+        inputs_sha256=nova_inputs_sha256(nova, "m-1"),
+        created_at=GENERATED_AT,
+        updated_at=GENERATED_AT,
+    )
+
+    def db_with(cached):
+        db = MagicMock()
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = cached
+        db.execute = AsyncMock(return_value=result)
+        return db
+
+    current = await report_editorial_service._nova_ai(
+        db_with(row), uuid4(), "AL-7_vs_Vehicle", nova, False, False
+    )
+    assert (current.text, current.model, current.generated_at) == (NOVA_AI, "m-1", GENERATED_AT)
+    assert current.stale is False
+
+    # The data moved on since the text was written (here: another alpha) ...
+    moved = {**nova, "alpha": 0.01}
+    left_out = await report_editorial_service._nova_ai(
+        db_with(row), uuid4(), "AL-7_vs_Vehicle", moved, False, False
+    )
+    assert left_out.text is None and left_out.stale is True
+    # ... or the text predates the fingerprint: it is left out too, and never regenerated here.
+    row.inputs_sha256 = None
+    undated = await report_editorial_service._nova_ai(
+        db_with(row), uuid4(), "AL-7_vs_Vehicle", nova, False, False
+    )
+    assert undated.text is None and undated.stale is True
+    # No cached row: nothing printed, and nothing to be stale.
+    none = await report_editorial_service._nova_ai(
+        db_with(None), uuid4(), "AL-7_vs_Vehicle", nova, False, False
+    )
+    assert none.text is None and none.stale is False
 
 
 def test_french_interpretation_is_not_printed():

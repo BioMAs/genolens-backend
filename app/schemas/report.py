@@ -8,6 +8,15 @@ from app.models.report_job import ReportJobStatus
 ReportTemplate = Literal["latex", "editorial"]
 
 
+class AITextRecord(BaseModel):
+    """One AI text a report printed: which one ("nova": the reading of the nova; "comparison": the
+    interpretation of the comparison), the model that wrote it, and when."""
+
+    kind: Literal["nova", "comparison"]
+    model: str
+    generated_at: Optional[datetime] = None
+
+
 class ReportJobResponse(BaseModel):
     id: UUID
     project_id: UUID
@@ -16,6 +25,9 @@ class ReportJobResponse(BaseModel):
     comparison_name: Optional[str] = None
     template: str = "latex"
     use_ai: bool = True
+    # The AI texts the report printed (null: not recorded, e.g. a job not finished or made by an
+    # older server; []: none printed).
+    ai_texts: Optional[list[AITextRecord]] = None
     celery_task_id: Optional[str]
     status: ReportJobStatus
     pdf_path: Optional[str]
@@ -65,6 +77,13 @@ class CoverInfo(BaseModel):
 # Allowed page-layout values
 FIRST_PAGE_TYPES = ("detailed", "simple", "cover")
 LAST_PAGE_TYPES = ("color", "contact")
+
+
+class AnalysisReportTriggerRequest(BaseModel):
+    """Optional body of the analysis report request. `use_ai` False gives a report without any AI
+    text (no LLM call, no stored interpretation read, no AI label)."""
+
+    use_ai: bool = True
 
 
 class ComparisonReportTriggerRequest(BaseModel):

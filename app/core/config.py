@@ -74,7 +74,10 @@ class Settings(BaseSettings):
     )
     LLM_MODEL: str = Field(
         default="google/gemma-4-E4B-it",
-        description="Model id served by the LLM endpoint",
+        description=(
+            "Model id served by the LLM endpoint. It is printed in the label of every AI text, "
+            "next to the date of generation: it should name a frozen build of the server."
+        ),
     )
 
     # Drug Discovery service (genolens-dd) — separate service, called over HTTP.

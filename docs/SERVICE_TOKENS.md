@@ -51,6 +51,17 @@ Avec `false` :
 
 `use_ai` est enregistré sur le job (`report_jobs.use_ai`) et rendu par `GET …/report/status`. Il fait partie de la clé de réutilisation d'un job en cours (15 dernières minutes), avec le format et le demandeur (l'utilisateur, ou tel jeton : jamais le job d'un autre jeton). Changer `use_ai` ne renvoie donc jamais un job fait avec l'autre réglage. Le rapport LaTeX suit le même interrupteur.
 
+### Textes IA imprimés (`ai_texts`)
+
+Chaque texte IA d'un rapport porte le libellé `AI-generated text (model <id>, generated <AAAA-MM-JJ>)` : le modèle qui l'a écrit et la date de génération (UTC). Le libellé ne dit rien d'une relecture.
+
+Le job enregistre les textes réellement imprimés dans `report_jobs.ai_texts`, une entrée `{kind, model, generated_at}` par texte (`kind` vaut `nova` pour la lecture de la nova, `comparison` pour l'interprétation de la comparaison). `GET …/report/status` les rend :
+
+- `[]` : aucun texte imprimé (`use_ai` faux, ou aucun texte à jour) ;
+- `null` : non enregistré (job pas terminé, ou fait par un serveur d'avant cette version).
+
+Un texte en cache écrit sur d'autres données n'est ni imprimé ni listé. La lecture de la nova est liée à l'empreinte de la nova qui l'a produite (`cosmetic_interpretations.inputs_sha256`) ; l'interprétation de la comparaison, aux comptes de gènes et de voies qu'elle a enregistrés. Un texte d'avant l'empreinte n'a pas d'empreinte, donc il est périmé : le rapport éditorial le dit dans la traçabilité (« not included (generated on other data) »).
+
 ## Commande
 
 Dans l'image de l'API (variables d'environnement de l'application chargées) :

@@ -2090,6 +2090,9 @@ class CosmeticInterpretation(Base, TimestampMixin):
     interpretation: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
     claims_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Fingerprint of the nova the text was written from (`nova_inputs_sha256`). A text whose
+    # fingerprint is not the current nova's is stale; NULL (rows from before it existed) is stale.
+    inputs_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     dataset: Mapped["Dataset"] = relationship()
 
