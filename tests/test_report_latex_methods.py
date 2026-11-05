@@ -174,7 +174,7 @@ def test_imported_results_say_methods_not_described():
     ctx = rm.methods_context(None, {}, {}, [])
     assert ctx["imported"] is True
     text = _text(ctx)
-    assert "The differential analysis was not run in GenoLens; its methods are not described here" in text
+    assert NOT_RUN in text
     for word in ("DESeq2", "edgeR", "limma", "Benjamini", "Wald", "filterByExpr"):
         assert word not in text
 
@@ -183,6 +183,45 @@ def test_a_run_whose_dataset_has_no_parent_analysis_is_imported():
     # Even when its metadata carries a method or a threshold: the run is not GenoLens's.
     ctx = rm.methods_context(None, {"de_method": "all", "min_log2fc": 0.5}, {}, [])
     assert ctx["imported"] is True and ctx["de_method"] is None and ctx["min_log2fc"] is None
+
+
+IMPORTED_ENRICHMENT = "Enrichment results of imported data are not included in this report."
+NOT_RUN = "The differential analysis was not run in GenoLens; its methods are not described here"
+GONE = "The analysis that produced these results is no longer available; its methods are not described here."
+
+
+def _imported(analysis_id=None) -> dict:
+    """The record of results with no parent analysis; `analysis_id` is what their DEG dataset's
+    metadata still names (an analysis that no longer exists)."""
+    return rm.methods_context(None, {"analysis_id": analysis_id} if analysis_id else {}, {}, [])
+
+
+def test_imported_results_never_say_that_no_enrichment_is_stored():
+    """The legacy Python enrichment writes its rows under the DEG dataset's own id, and a delivered
+    ENRICHMENT dataset may exist: the report does not read them, and does not deny them either."""
+    for ctx in (_imported(), _imported("an-9")):
+        for text in (_text(ctx), rl.build_comparison_section(_comp(methods=ctx))):
+            assert "No enrichment result is stored" not in text
+            assert IMPORTED_ENRICHMENT in text
+    # A GenoLens analysis with no ENRICHMENT dataset is another matter: nothing is stored there.
+    assert "No enrichment result is stored" in _text(_ctx(enr=()))
+
+
+def test_results_whose_analysis_is_gone_say_so():
+    gone = _imported("an-9")
+    assert gone["imported"] is True and gone["analysis_gone"] is True
+    for text in (_text(gone), rl.build_comparison_section(_comp(methods=gone))):
+        assert GONE in text and NOT_RUN not in text
+    # No analysis id in the metadata: the results were never produced by a GenoLens analysis.
+    never = _imported()
+    assert never["imported"] is True and never["analysis_gone"] is False
+    for text in (_text(never), rl.build_comparison_section(_comp(methods=never))):
+        assert NOT_RUN in text and GONE not in text
+    # A GenoLens analysis is neither.
+    assert _ctx()["analysis_gone"] is False
+    # Neither names a method.
+    for ctx in (gone, never):
+        assert all(w not in _text(ctx) for w in ("DESeq2", "edgeR", "limma", "Benjamini"))
 
 
 def test_thresholds_come_from_params():
@@ -336,7 +375,7 @@ def test_zero_deg_and_no_enrichment_states():
     assert "0 genes passed" not in some and "No term passed (adjusted p $<$ 0.05)" in some
     # An imported result has no cut-off to print, and no term it can say did not pass.
     imported = rl.build_comparison_section(_comp(methods=rm.methods_context(None, {}, {}, [])))
-    assert "No enrichment result is stored" in imported and "No term passed" not in imported
+    assert IMPORTED_ENRICHMENT in imported and "No term passed" not in imported
     assert "adjusted p $<$" not in imported
     assert "The differential analysis was not run in GenoLens" in imported
 
@@ -528,6 +567,10 @@ async def test_a_comparison_carries_its_methods_and_the_demo_mark():
     assert comp["demo"] is True
     imported = await _built(params=None, deg_meta={}, make_figures=False)
     assert imported["methods"]["imported"] is True and imported["demo"] is False
+    assert imported["methods"]["analysis_gone"] is False
+    # The metadata names an analysis that is no longer a parent: its results are not imported ones.
+    gone = await _built(params=None, deg_meta={"analysis_id": "an-9"}, make_figures=False)
+    assert gone["methods"]["imported"] is True and gone["methods"]["analysis_gone"] is True
     # The enrichment dataset's own mark counts too.
     marked = await _built(
         params=PARAMS, deg_meta=DEG_META, vst_meta=VST_META,
@@ -692,12 +735,13 @@ def test_compile_accepts_references_the_second_pass_resolves(tmp_path):
 @pytest.mark.skipif(shutil.which("pdflatex") is None, reason="pdflatex is not installed")
 @pytest.mark.parametrize(
     "variant",
-    ["recorded", "imported", "upload", "unrecorded"],
+    ["recorded", "imported", "gone", "upload", "unrecorded"],
 )
 def test_the_report_of_each_kind_of_run_compiles(tmp_path, variant):
     methods = {
         "recorded": _ctx(deg_qc_relaxed=True, vst_removed_sample_ids=["S_3", "S4"]),
         "imported": rm.methods_context(None, {}, {}, []),
+        "gone": rm.methods_context(None, {"analysis_id": "an-9"}, {}, []),
         "upload": _ctx(enr_source="upload"),
         "unrecorded": rm.methods_context({}, {"analysis_id": "an-1"}, {}, []),
     }[variant]

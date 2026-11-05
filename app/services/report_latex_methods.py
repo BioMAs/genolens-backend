@@ -17,7 +17,9 @@ that was the gene ratio. `methods_context` replaces it with what the run recorde
 A value that is not recorded comes back `None` (or an empty dict / list where that is its natural
 absence) and the text says "not recorded": never a default, never the analysis parameters alone
 where the script ran at something else (the enrichment cut-off, see `cosmomics_nova._enrichment_fdr`).
-Results without a parent analysis are imported: their methods are not described.
+Results without a parent analysis are imported: their methods are not described. When their DEG
+dataset's metadata still names the analysis that produced them, that analysis is gone (deleted):
+the report says so instead of saying the results were not produced in GenoLens.
 
 Everything here is pure: no database, no TeX. The Material and Methods template
 (`templates/report_latex/material_and_methods.tex`) is rendered from `methods_context`, and the
@@ -195,6 +197,9 @@ def methods_context(
     vst_meta = vst_meta if isinstance(vst_meta, dict) else {}
     metas = [m for m in (enrichment_metas or []) if isinstance(m, dict)]
     imported = params is None
+    # The metadata of results produced by an analysis keeps naming it; if the analysis cannot be
+    # found any more, the results are not imported ones, only orphaned.
+    analysis_gone = imported and bool(deg_meta.get("analysis_id"))
     p = params if isinstance(params, dict) else {}
     qc_report = vst_meta.get("qc_report") if isinstance(vst_meta.get("qc_report"), dict) else {}
     if imported:
@@ -219,6 +224,7 @@ def methods_context(
     relaxed = deg_meta.get("qc_relaxed")
     return {
         "imported": imported,
+        "analysis_gone": analysis_gone,
         "de_method": de_method,
         "primary_method": primary,
         "other_methods": other_methods,
@@ -285,10 +291,20 @@ def thresholds_tex(ctx: dict) -> str:
     return " and ".join(parts)
 
 
+def not_described_tex(ctx: dict) -> str:
+    """Why the methods of results with no parent analysis are not described."""
+    if ctx.get("analysis_gone"):
+        return (
+            "The analysis that produced these results is no longer available; "
+            "its methods are not described here."
+        )
+    return "The differential analysis was not run in GenoLens; its methods are not described here."
+
+
 def de_overview_tex(ctx: dict) -> str:
     """The sentence of a comparison's overview on how its DEGs were called."""
     if ctx["imported"]:
-        return "The differential analysis was not run in GenoLens; its methods are not described here."
+        return not_described_tex(ctx)
     thresholds = thresholds_tex(ctx)
     primary = ctx.get("primary_method")
     if not primary:
@@ -334,7 +350,7 @@ def no_gene_tex(ctx: dict) -> str:
     thresholds = thresholds_tex(ctx)
     if thresholds:
         return f"0 genes passed the thresholds ({thresholds})."
-    if ctx["imported"]:
+    if ctx["imported"] and not ctx.get("analysis_gone"):
         return "0 genes passed the thresholds of the imported results."
     return "0 genes passed the thresholds (the thresholds are not recorded)."
 
@@ -343,7 +359,9 @@ def no_term_tex(ctx: dict, no_gene: bool = False) -> str:
     """The enrichment section of a comparison that has no enriched term."""
     enr = ctx["enrichment"]
     if ctx["imported"]:
-        return "No enrichment result is stored for this comparison."
+        # Not read for imported results: the rows the legacy Python enrichment stores under the
+        # DEG dataset, or a delivered ENRICHMENT dataset, may exist. Say what the report omits.
+        return "Enrichment results of imported data are not included in this report."
     if not enr["requested"]:
         return "No annotation database was selected for this analysis: no enrichment was run."
     if enr["fdr"] is not None:

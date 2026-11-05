@@ -31,7 +31,12 @@ The filter that removes genes with very low expression is not recorded for this 
 \subsection{Differential Gene Expression Analysis}
 \JINJABLOCK{if m.imported}
 
-The differential analysis was not run in GenoLens; its methods are not described here. The calls (up- and down-regulated genes), the log$_2$ fold-changes and the adjusted \textit{p}-values are shown as they were imported with the dataset; the statistical model and the versions of the software that produced them are not reported.
+\JINJABLOCK{if m.analysis_gone}
+The analysis that produced these results is no longer available; its methods are not described here.
+\JINJABLOCK{else}
+The differential analysis was not run in GenoLens; its methods are not described here.
+\JINJABLOCK{endif}
+The calls (up- and down-regulated genes), the log$_2$ fold-changes and the adjusted \textit{p}-values are shown as they \JINJAVAR{'are stored' if m.analysis_gone else 'were imported'} with the dataset; the statistical model and the versions of the software that produced them are not reported.
 \JINJABLOCK{else}
 
 \JINJABLOCK{if m.primary_method == 'DESeq2'}
@@ -122,9 +127,13 @@ The enrichment results are those stored with the dataset; the test and the corre
 \JINJABLOCK{endif}
 \JINJABLOCK{if enr.kind == 'none'}
 
+\JINJABLOCK{if m.imported}
+Enrichment results of imported data are not included in this report.
+\JINJABLOCK{else}
 No enrichment result is stored for the comparisons of this report.
 \JINJABLOCK{if not enr.requested}
 No annotation database was selected for this analysis.
+\JINJABLOCK{endif}
 \JINJABLOCK{endif}
 \JINJABLOCK{else}
 
