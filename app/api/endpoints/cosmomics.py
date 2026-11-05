@@ -7,7 +7,9 @@ CosmOmics Pathway Nova endpoints — the Skin claims add-on.
 
 Both are gated by the existing per-user add-on flag (`require_cosmetics_access`, 403 without
 it), then by project read access (owner or member, 404 otherwise). The claim referential itself
-never leaves the server: the payload only carries the terms enriched in this comparison.
+never leaves the server: the payload only carries the terms enriched in this comparison, and
+says what it was computed from. A comparison the dataset does not have is a 404; one it has but
+with no enrichment rows is a payload with `status` "no_enrichment".
 """
 
 import logging
@@ -30,13 +32,9 @@ from app.api.deps.subscription import (
 )
 from app.models.models import CosmeticInterpretation, Dataset, User
 from app.services.ai_interpreter import LocalAIInterpreter
-from app.services.cosmomics_nova import (
-    DEFAULT_ALPHA,
-    NOVA_MODEL_TAG,
-    fetch_term_hits,
-    nova_from_hits,
-)
+from app.services.cosmomics_nova import DEFAULT_ALPHA, NOVA_MODEL_TAG, compute_nova
 from app.services.cosmomics_nova_svg import render_nova_svg
+from app.services.enrichment_source import recorded_comparison_names
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +56,16 @@ async def _readable_dataset(db: AsyncSession, dataset_id: UUID, user: User) -> D
 
 
 async def _nova(db: AsyncSession, dataset: Dataset, comparison_name: str, alpha: float) -> dict:
-    hits = await fetch_term_hits(db, dataset, comparison_name)
-    return nova_from_hits(hits, comparison_name, alpha)
+    # A dataset that records its comparisons refuses one it does not have. One that records none
+    # (no metadata, no DEG rows) cannot tell: it answers "no_enrichment" when no row matches.
+    recorded = await recorded_comparison_names(db, dataset)
+    if recorded and comparison_name not in recorded:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No comparison '{comparison_name}' in this dataset",
+        )
+    nova, _hits = await compute_nova(db, dataset, comparison_name, alpha)
+    return nova
 
 
 def _interpretation_payload(row: CosmeticInterpretation, cached: bool) -> dict[str, Any]:

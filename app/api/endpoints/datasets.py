@@ -5,6 +5,7 @@ import io
 import logging
 import json
 import hashlib
+import re
 import numpy as np
 import pandas as pd
 from uuid import UUID
@@ -64,7 +65,7 @@ from app.schemas.dataset import (
 )
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor, padj_display_floor
-from app.services.enrichment_source import resolve_pathway_dataset_id
+from app.services.enrichment_source import resolve_pathway_dataset_id, split_by_adjusted_p
 from app.services.cache_service import cache_service
 from app.services.external_integrations import geo_service
 from app.worker.tasks import process_dataset_upload, import_geo_dataset
@@ -90,6 +91,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 
+# What a table's producer calls its version (`pipe_scilicium v3.0.0`): printed in the provenance
+# of the nova and of the reports, so it is plain text and short.
+_SOURCE_VERSION_RE = re.compile(r"[A-Za-z0-9._ +-]{1,100}")
+
+
+def _clean_source_version(value: Optional[str]) -> Optional[str]:
+    """The `source_version` form field, stripped; None when blank; 422 when it is not plain text."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if not _SOURCE_VERSION_RE.fullmatch(value):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="source_version: at most 100 characters among letters, digits, '.', '_', '+', '-' and space",
+        )
+    return value
+
 
 @router.post("/upload", response_model=DatasetUploadResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_active_license)])
 @service_token_scope(SCOPE_DATASETS_UPLOAD)
@@ -104,11 +122,17 @@ async def upload_dataset(
     comparison_name: str = Form(None),
     is_normalized: bool = Form(False),
     contains_all_genes: bool = Form(True),
+    source_version: Optional[str] = Form(None),
     file: UploadFile = File(...)
 ) -> dict:
     """
     Upload a dataset file.
+
+    `source_version` (optional) is the version of the tool that produced the table, for tables
+    made outside GenoLens; the nova and the reports print it as the data version.
     """
+    source_version = _clean_source_version(source_version)
+
     # Validate file extension
     file_extension = Path(file.filename).suffix.lower()
     if file_extension not in settings.ALLOWED_FILE_EXTENSIONS:
@@ -170,6 +194,8 @@ async def upload_dataset(
     
     if comparison_name:
         metadata["comparison_name"] = comparison_name
+    if source_version:
+        metadata["source_version"] = source_version
 
     # Upload raw file to Local Storage
     file_path = f"projects/{project_id}/raw/{file.filename}"
@@ -412,6 +438,12 @@ _CLIENT_PROTECTED_METADATA_KEYS = frozenset(
         "comparison_name",
         "source",
         "geo_accession",
+        # Ce que la nova de CosmOmics imprime de l'enrichissement : la version déclarée à
+        # l'upload (contrôlée là, pas ici), et ce que le worker a lu ou écarté
+        "source_version",
+        "padj_column",
+        "padj_unparsable",
+        "rows_without_padj",
     }
 )
 
@@ -1031,7 +1063,11 @@ async def rerun_enrichment(
     meta = dataset.dataset_metadata or {}
     min_log2fc = float(meta.get("min_log2fc", 1.0))
 
-    await _auto_run_enrichment(db, str(dataset_id), min_log2fc=min_log2fc)
+    n_without_padj = await _auto_run_enrichment(db, str(dataset_id), min_log2fc=min_log2fc)
+    # The run replaced the stored rows: what it left out for want of an adjusted p replaces the
+    # count of the run before.
+    dataset.dataset_metadata = {**meta, "rows_without_padj": n_without_padj}
+    await db.commit()
     return {"status": "done", "dataset_id": str(dataset_id), "min_log2fc": min_log2fc}
 
 
@@ -5485,7 +5521,9 @@ async def run_go_enrichment_analysis(
             EnrichmentPathway.category.in_(["GO:BP", "GO:MF", "GO:CC"]),
         )
     )
-    for _r in enrichment_results:
+    # A row with no adjusted p is not stored (the raw p-value is never stored in its place).
+    _storable, _n_without_padj = split_by_adjusted_p(enrichment_results)
+    for _r in _storable:
         _cat = _NS_TO_CAT.get(_r.get("namespace", ""))
         if not _cat:
             continue
@@ -5498,12 +5536,13 @@ async def run_go_enrichment_analysis(
             description=_r.get("definition"),
             gene_count=_r["study_count"],
             pvalue=_r["pvalue"],
-            padj=_r.get("fdr", _r["pvalue"]),
+            padj=_r["fdr"],
             gene_ratio=f"{_r['study_count']}/{len(study_genes)}",
             bg_ratio=f"{_r['background_count']}/{len(background_genes)}",
             genes=_r.get("study_genes", []),
             regulation=regulation or "ALL",
         ))
+    dataset.dataset_metadata = {**(dataset.dataset_metadata or {}), "rows_without_padj": _n_without_padj}
     await db.commit()
 
     await history_service.log_activity(

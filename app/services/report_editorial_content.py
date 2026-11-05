@@ -26,7 +26,7 @@ from markupsafe import Markup, escape
 from app.services.cosmetics_taxonomy import normalize_pathway_id
 from app.services.cosmomics_grouping import clean_label
 from app.services.cosmomics_nova_svg import claim_color
-from app.services.omicskin_score import ALL_CLAIMS, BAND_LABELS, ClaimScore, omicskin_score
+from app.services.omicskin_score import ALL_CLAIMS, BAND_LABELS, ClaimScore, claim_score
 from app.services.report_editorial_svg import (
     clean_inline_svg,
     dose_ladder,
@@ -305,14 +305,15 @@ def claim_statement(cs: ClaimScore, test: str, control: str) -> str:
 
 
 def key_genes(
-    claim: dict, term_genes: dict[str, set[str]], degs: Sequence[dict], limit: int = 7
+    claim: dict, term_genes: dict[tuple[str, str], set[str]], degs: Sequence[dict], limit: int = 7
 ) -> list[tuple[str, float]]:
     """DEGs behind the claim's supporting terms, largest |log2 FC| first."""
     genes: set[str] = set()
     for sg in claim.get("subgroups") or []:
         for t in sg.get("terms") or []:
             if (t.get("effect") or 0) > 0:
-                genes |= {g.upper() for g in term_genes.get(normalize_pathway_id(t.get("id")), ())}
+                found = term_genes.get((normalize_pathway_id(t.get("id")), t.get("obs")), ())
+                genes |= {g.upper() for g in found}
     if not genes:
         return []
     picked: dict[str, tuple[str, float]] = {}
@@ -356,9 +357,7 @@ def dose_points(
     points = []
     for label, payload in dose_series or []:
         claim = next((c for c in payload.get("claims") or [] if c.get("name") == name), None)
-        value = (
-            omicskin_score(claim.get("coherence") or 0, claim.get("best_nl") or 0) if claim else 0
-        )
+        value = claim_score(claim) if claim else 0
         points.append((label, value))
     return points
 
@@ -395,7 +394,7 @@ class EditorialInputs:
     analysis_label: Optional[str]
     nova: dict[str, Any]
     scores: list[ClaimScore]
-    term_genes: dict[str, set[str]]
+    term_genes: dict[tuple[str, str], set[str]]
     figures: dict[str, Optional[str]]  # pca, volcano, dot_up, dot_down, heatmap (raw SVG)
     nova_light: str
     nova_dark: str

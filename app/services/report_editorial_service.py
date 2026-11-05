@@ -126,6 +126,8 @@ def hits_to_enrichment(hits: list[TermHit]) -> tuple[list[dict], list[dict]]:
     comparison has no analysis-linked ENRICHMENT dataset (rows stored on the DEG dataset)."""
     up, down = [], []
     for h in hits:
+        if h.p is None:  # no adjusted p-value: left out of the nova, left out of the plots
+            continue
         row = {
             "pathway_id": h.term_id,
             "pathway_name": h.label,

@@ -46,7 +46,7 @@ async def test_project_admin_reaches_the_worker():
     dataset.dataset_metadata = {"min_log2fc": 1.5}
     client = make_client(caller=owner, dataset=dataset, project=project, member=None)
 
-    runner = AsyncMock()
+    runner = AsyncMock(return_value=0)  # the rows left out for want of an adjusted p
     with patch("app.worker.tasks._auto_run_enrichment", new=runner):
         async with client as c:
             resp = await c.post(f"/api/v1/datasets/{dataset.id}/rerun-enrichment")

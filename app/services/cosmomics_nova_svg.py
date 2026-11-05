@@ -374,7 +374,7 @@ class _Nova:
         o.append(_arc(*band["other"], R, AGAINST, 2, 'stroke-dasharray="2 4"'))
 
         # centre disc
-        center = self.center[:8]
+        center = self.center if len(self.center) <= 8 else self.center[:7] + "…"
         o.append(f'<circle cx="{CX}" cy="{CY}" r="26" fill="{th["core_fill"]}"/>')
         o.append(
             _text(

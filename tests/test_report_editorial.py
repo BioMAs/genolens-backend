@@ -150,7 +150,7 @@ def _inputs(**overrides) -> EditorialInputs:
         for sg in claim["subgroups"][:2]:
             for t in sg["terms"]:
                 if t["effect"] > 0:
-                    term_genes[normalize_pathway_id(t["id"])] = {"UPG1", "UPG2", "DNG3", "UPG7"}
+                    term_genes[(normalize_pathway_id(t["id"]), t["obs"])] = {"UPG1", "UPG2", "DNG3", "UPG7"}
     params = {"species": "human", "fdr": 0.05, "min_log2fc": 0.585}
     figures = build_figures(
         degs, enr_up, enr_down, {"pca": pca, "vst": vst}, conditions, "AL-7", "Vehicle", params
@@ -296,7 +296,7 @@ def test_dose_block_only_with_a_dose_series():
     nova = json.loads(FIXTURE.read_text())
     weaker = json.loads(FIXTURE.read_text())
     for c in weaker["claims"]:
-        c["best_nl"] = c["best_nl"] / 3
+        c["best_nl"] = c["best_for_nl"] = c["best_nl"] / 3  # the score reads `best_for_nl`
     ctx = build_editorial_context(_inputs(dose_series=[("0.1 %", weaker), ("1 %", nova)]))
     page = render_html(ctx)
     assert "Dose progression" in page

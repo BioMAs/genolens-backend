@@ -66,6 +66,15 @@ def test_subgroup_labels_are_opt_in(nova):
     assert f">{best}<" in render_nova_svg(nova, "light", id_prefix="x", subgroup_labels=True)
 
 
+def test_a_long_condition_is_cut_with_an_ellipsis_not_mid_word():
+    """The nova names its condition after the numerator of the comparison, whatever its length:
+    the disc has room for eight characters and says when the name is longer."""
+    long_name = render_nova_svg({"claims": [], "unlinked": [], "condition": "Treatment_12"}, "light")
+    assert ">Treatme…<" in long_name
+    fits = render_nova_svg({"claims": [], "unlinked": [], "condition": "Treatmen"}, "light")
+    assert ">Treatmen<" in fits
+
+
 def test_empty_payload_renders_a_neutral_wheel():
     svg = render_nova_svg({"claims": [], "unlinked": []}, "light", id_prefix="e")
     ET.fromstring(svg)
@@ -136,7 +145,7 @@ def _client(with_module: bool):
 async def test_svg_endpoint_requires_the_cosmetics_module():
     client, dataset = _client(with_module=False)
     fetch = AsyncMock(return_value=[])
-    with patch("app.api.endpoints.cosmomics.fetch_term_hits", new=fetch):
+    with patch("app.services.cosmomics_nova.fetch_term_hits", new=fetch):
         async with client as c:
             resp = await c.get(
                 f"/api/v1/datasets/{dataset.id}/comparisons/A_vs_B/cosmomics-nova.svg"
@@ -156,7 +165,7 @@ async def test_svg_endpoint_returns_the_wheel(theme):
             "up",
         )
     ]
-    with patch("app.api.endpoints.cosmomics.fetch_term_hits", new=AsyncMock(return_value=hits)):
+    with patch("app.services.cosmomics_nova.fetch_term_hits", new=AsyncMock(return_value=hits)):
         async with client as c:
             resp = await c.get(
                 f"/api/v1/datasets/{dataset.id}/comparisons/P1_vs_control/cosmomics-nova.svg",

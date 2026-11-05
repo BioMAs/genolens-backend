@@ -1692,7 +1692,8 @@ class DataProcessorService:
     async def extract_enrichment_pathways_for_db(
         self,
         parquet_data: bytes,
-        comparisons: dict[str, dict[str, str]]
+        comparisons: dict[str, dict[str, str]],
+        report: Optional[dict[str, Any]] = None,
     ) -> dict[str, list[dict]]:
         """
         Extract enrichment pathways from Parquet file for database storage.
@@ -1711,6 +1712,10 @@ class DataProcessorService:
         Args:
             parquet_data: Parquet file as bytes
             comparisons: Dict of comparison names and their column mappings
+            report: When given, filled with what was read as adjusted p-value:
+                ``padj_column`` (the header actually read) and ``padj_unparsable`` (the rows whose
+                cell was empty or not a number, which are stored at 1.0). Left untouched when
+                the file has no usable adjusted p column.
 
         Returns:
             Dict[comparison_name, List[pathway_dict]]
@@ -1756,6 +1761,10 @@ class DataProcessorService:
             logger.warning(f"  - Pathway Name: {pathway_name_col}")
             logger.warning(f"  - Adjusted P-value: {padj_col}")
             return {}
+
+        if report is not None:
+            report["padj_column"] = padj_col
+            report["padj_unparsable"] = 0
 
         # For enrichment files, we might have:
         # 1. One comparison per file (most common)
@@ -1824,7 +1833,8 @@ class DataProcessorService:
                     bg_ratio_col,
                     genes_col,
                     count_col,
-                    category_col
+                    category_col,
+                    report,
                 )
                 
                 # Add regulation field to each pathway
@@ -1850,7 +1860,8 @@ class DataProcessorService:
                     bg_ratio_col,
                     genes_col,
                     count_col,
-                    category_col
+                    category_col,
+                    report,
                 )
                 
                 # Add default regulation for single comparison
@@ -1872,9 +1883,14 @@ class DataProcessorService:
         bg_ratio_col: str | None,
         genes_col: str | None,
         count_col: str | None,
-        category_col: str | None
+        category_col: str | None,
+        report: Optional[dict[str, Any]] = None,
     ) -> list[dict]:
-        """Extract pathway data from a DataFrame."""
+        """Extract pathway data from a DataFrame.
+
+        An adjusted p that is empty or not a number is stored as 1.0 (no evidence), and counted in
+        ``report["padj_unparsable"]`` when a report is given.
+        """
         pathways_list = []
 
         for _, row in df.iterrows():
@@ -1922,11 +1938,17 @@ class DataProcessorService:
                     p_val = 1.0
             
             p_adj = 1.0
+            readable = False
             if pd.notna(row.get(padj_col)):
-                 try:
+                try:
                     p_adj = float(row[padj_col])
-                 except (ValueError, TypeError):
-                    p_adj = 1.0
+                    readable = not pd.isna(p_adj)  # the text "nan" parses, to nothing usable
+                except (ValueError, TypeError):
+                    pass
+            if not readable:
+                p_adj = 1.0
+                if report is not None:
+                    report["padj_unparsable"] = report.get("padj_unparsable", 0) + 1
 
             cat = "General"
             if category_col and pd.notna(row.get(category_col)):

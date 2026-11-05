@@ -15,6 +15,7 @@ from app.worker.celery_app import celery_app
 from app.models.models import Dataset, DatasetStatus, DatasetType, DegGene, EnrichmentPathway, GeneSet, GeneSetDatabase
 from app.services.storage import storage_service
 from app.services.data_processor import data_processor, DEG_LOGFC_THRESHOLD, DEG_PADJ_THRESHOLD
+from app.services.enrichment_source import split_by_adjusted_p
 from app.services.go_service import GOService
 from app.services.external_integrations import geo_service
 from app.services.pipeline_inputs import INPUT_LABELS, prepare_pipeline_inputs
@@ -72,13 +73,18 @@ _NS_TO_CAT = {
 }
 
 
-async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str, min_log2fc: float = 1.0) -> None:
+async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str, min_log2fc: float = 1.0) -> int:
     """
     Automatically run enrichment (GO + ORA on KEGG/Reactome/Hallmark/…) for all
     comparisons in a DEG dataset, persisting results to EnrichmentPathway.
     Called after DEG genes are stored.
+
+    A row with no adjusted p-value (`fdr`) is not stored — the raw p-value is never stored in its
+    place. Returns how many rows were left out that way; the caller records it as the dataset's
+    `rows_without_padj`.
     """
     go_service = GOService()
+    rows_without_padj = 0
 
     from sqlalchemy import distinct as _distinct
     comp_result = await db.execute(
@@ -88,7 +94,7 @@ async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str, min_log2fc: 
 
     if not comparisons:
         logger.info(f"[WORKER] No comparisons for auto enrichment on dataset {dataset_id}")
-        return
+        return 0
 
     bg_result = await db.execute(select(DegGene).where(DegGene.dataset_id == dataset_id))
     all_deg_rows = bg_result.scalars().all()
@@ -154,6 +160,8 @@ async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str, min_log2fc: 
                     )
                     await db.commit()
 
+                    go_results, n_without = split_by_adjusted_p(go_results)
+                    rows_without_padj += n_without
                     go_records = []
                     for r in go_results:
                         cat = _NS_TO_CAT.get(r.get("namespace", ""))
@@ -168,7 +176,7 @@ async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str, min_log2fc: 
                             "description": r.get("definition"),
                             "gene_count": r["study_count"],
                             "pvalue": r["pvalue"],
-                            "padj": r.get("fdr", r["pvalue"]),
+                            "padj": r["fdr"],
                             "gene_ratio": f"{r['study_count']}/{len(study_genes)}",
                             "bg_ratio": f"{r['background_count']}/all_annotated",
                             "genes": r.get("study_genes", []),
@@ -209,6 +217,8 @@ async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str, min_log2fc: 
                     )
                     await db.commit()
 
+                    ora_results, n_without = split_by_adjusted_p(ora_results)
+                    rows_without_padj += n_without
                     ora_records = [
                         {
                             "dataset_id": dataset_id,
@@ -238,6 +248,13 @@ async def _auto_run_enrichment(db: "AsyncSession", dataset_id: str, min_log2fc: 
             await db.rollback()
             logger.warning(f"[WORKER] Auto enrichment failed for '{comp_name}': {e}")
             # Non-fatal: continue with other comparisons
+
+    if rows_without_padj:
+        logger.warning(
+            f"[WORKER] {rows_without_padj} enrichment rows without an adjusted p-value left out "
+            f"for dataset {dataset_id}"
+        )
+    return rows_without_padj
 
 
 # Keep backward-compatible alias
@@ -512,7 +529,9 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                         self.update_state(state="PROGRESS", meta={"step": "computing_go_enrichment"})
                         try:
                             _enr_min_log2fc = float(_meta_enr.get("min_log2fc", 1.0))
-                            await _auto_run_go_enrichment(db, dataset_id, min_log2fc=_enr_min_log2fc)
+                            metadata["rows_without_padj"] = await _auto_run_go_enrichment(
+                                db, dataset_id, min_log2fc=_enr_min_log2fc
+                            )
                         except Exception as e:
                             logger.warning(f"[WORKER] Auto GO enrichment step failed: {e}")
                             # Non-fatal: dataset still usable without pre-computed enrichment
@@ -521,10 +540,15 @@ def process_dataset_upload(self, dataset_id: str, raw_file_path: str, is_reproce
                 if metadata.get("enrichment_comparisons"):
                     self.update_state(state="PROGRESS", meta={"step": "storing_enrichment_pathways"})
                     try:
+                        # The header read as adjusted p, and the rows stored at 1.0 because their
+                        # cell could not be read, join the dataset's metadata (the nova states them).
+                        padj_report: dict = {}
                         enrichment_pathways_data = await data_processor.extract_enrichment_pathways_for_db(
                             parquet_data,
-                            {comp: {} for comp in metadata["enrichment_comparisons"]}
+                            {comp: {} for comp in metadata["enrichment_comparisons"]},
+                            report=padj_report,
                         )
+                        metadata.update(padj_report)
 
                         # Delete existing enrichment pathways for this dataset
                         try:

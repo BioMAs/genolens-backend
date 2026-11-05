@@ -8,13 +8,16 @@ cosmomics_pathway_nova.py; copied in tests/fixtures/ because CI only sees this r
 
 import json
 import math
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from scipy.stats import norm
 
+from app.models.models import Dataset, DatasetStatus, DatasetType, EnrichmentPathway
 from app.services.cosmomics_grouping import (
     clean_label,
     label_match_key,
@@ -29,10 +32,14 @@ from app.services.cosmomics_nova import (
     TermHit,
     _row_direction,
     build_nova,
+    compute_nova,
     condition_label,
+    fetch_term_hits,
     load_claim_subgroups,
+    resolve_nova_source,
     stouffer_p,
     subgroup_rows_from_referential,
+    term_gene_map,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cosmomics_nova_mock.json"
@@ -122,15 +129,189 @@ def test_no_pro_term_gives_balance_minus_one_and_zero_coherence():
     assert (claim["n_for"], claim["n_against"]) == (0, 1)
 
 
-def test_balanced_sub_group_counts_against():
-    """delta == 0 is "against" (n_against counts delta <= 0), balance and delta are 0."""
+def test_tie_subgroup_is_balanced_not_against():
+    """delta == 0 is neither for nor against: it is counted apart, as `n_balanced`."""
     nova = _one_claim(("GO:0000001", 1e-3, "up", "up"), ("GO:0000002", 1e-3, "down", "up"))
     claim = nova["claims"][0]
     sub = claim["subgroups"][0]
     assert sub["delta"] == pytest.approx(0.0)
     assert sub["balance"] == pytest.approx(0.0)
     assert claim["coherence"] == pytest.approx(0.5)
+    assert (claim["n_for"], claim["n_against"], claim["n_balanced"]) == (0, 0, 1)
+    assert claim["state"] == "both_ways"
+    # A tie supports nothing: no sub-group goes the expected way.
+    assert (claim["best_for_subgroup"], claim["best_for_nl"]) == (None, None)
+
+
+def test_every_subgroup_is_counted_once():
+    nova = _two_subgroups()
+    claim = nova["claims"][0]
+    assert (claim["n_for"], claim["n_against"], claim["n_balanced"]) == (1, 1, 0)
+    assert claim["n_for"] + claim["n_against"] + claim["n_balanced"] == len(claim["subgroups"])
+
+
+# ── Claim states, evidence for ──────────────────────────────────────────────
+
+
+def _two_subgroups() -> dict:
+    """Collagen goes the expected way (p = 1e-4), Barrier goes against it (p = 1e-9)."""
+    rows = [
+        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
+        SubgroupTerm("Firming", "Barrier", "GO:0000002", "Barrier", "up"),
+    ]
+    hits = [TermHit("GO:0000001", "Collagen", 1e-4, "up"), TermHit("GO:0000002", "Barrier", 1e-9, "down")]
+    return build_nova(hits, ClaimSubgroupMap(rows))
+
+
+def test_claim_with_evidence_for_only_is_for_only():
+    nova = _one_claim(("GO:0000001", 1e-4, "up", "up"), ("GO:0000002", 1e-3, "up", "up"))
+    claim = nova["claims"][0]
+    assert claim["state"] == "for_only"
+    assert claim["n_against"] == 0
+    assert nova["status"] == "ok"
+
+
+def test_claim_with_evidence_against_only_is_against_only():
+    claim = _one_claim(("GO:0000001", 1e-4, "down", "up"))["claims"][0]
+    assert claim["state"] == "against_only"
     assert (claim["n_for"], claim["n_against"]) == (0, 1)
+    assert (claim["best_for_subgroup"], claim["best_for_nl"]) == (None, None)
+
+
+def test_claim_with_evidence_both_ways_is_both_ways():
+    claim = _two_subgroups()["claims"][0]
+    assert claim["state"] == "both_ways"
+
+
+def test_best_supporting_subgroup_is_not_the_most_significant_one_when_that_one_is_against():
+    """`best_subgroup` stays the most significant sub-group whatever its direction (the fixture
+    pins it); `best_for_*` is the most significant one among those going the expected way."""
+    claim = _two_subgroups()["claims"][0]
+    assert claim["best_subgroup"] == "Barrier"
+    assert claim["best_nl"] == pytest.approx(9.0)
+    assert claim["best_for_subgroup"] == "Collagen"
+    assert claim["best_for_nl"] == pytest.approx(4.0)
+
+
+def test_best_supporting_subgroup_is_the_best_subgroup_when_it_goes_the_expected_way(reference):
+    _, nova = reference
+    for claim in nova["claims"]:
+        assert claim["best_for_subgroup"] == claim["best_subgroup"]
+        assert claim["best_for_nl"] == pytest.approx(claim["best_nl"])
+
+
+def test_claim_without_significant_term_is_not_evaluated():
+    rows = [
+        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
+        SubgroupTerm("Soothing", "TRP", "GO:0000002", "TRP", "down"),
+        SubgroupTerm("Healing", "Wound", "GO:0000003", "Wound", "up"),
+    ]
+    hits = [TermHit("GO:0000001", "Collagen", 1e-4, "up"), TermHit("GO:0000002", "TRP", 0.12, "down")]
+    nova = build_nova(hits, ClaimSubgroupMap(rows))
+    assert [c["name"] for c in nova["claims"]] == ["Firming"]
+    # Referential order; the claim that has a term below alpha is not in the list.
+    assert nova["not_evaluated"] == ["Soothing", "Healing"]
+
+
+def test_nothing_is_not_evaluated_when_the_referential_is_empty():
+    assert build_nova([], ClaimSubgroupMap([]))["not_evaluated"] == []
+
+
+# ── Terms: alpha, padj, directions ──────────────────────────────────────────
+
+
+def test_term_at_or_above_alpha_is_marked_and_counted():
+    """A stored term at padj = alpha is not significant: it is marked so and counted, and it
+    still weighs in the sums exactly as it did before the mark existed."""
+    rows = [
+        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
+        SubgroupTerm("Firming", "Collagen", "GO:0000002", "Fibre", "up"),
+    ]
+    hits = [TermHit("GO:0000001", "Collagen", 1e-4, "up"), TermHit("GO:0000002", "Fibre", 0.05, "up")]
+    nova = build_nova(hits, ClaimSubgroupMap(rows), alpha=0.05)
+    sub = nova["claims"][0]["subgroups"][0]
+    terms = {t["id"]: t for t in sub["terms"]}
+    assert terms["GO:0000001"]["significant"] is True
+    assert terms["GO:0000002"]["significant"] is False
+    assert sub["s_pro"] == pytest.approx(4.0 + -math.log10(0.05))
+    assert sub["s_anti"] == 0
+    assert nova["coverage"]["n_terms_not_significant"] == 1
+    assert nova["coverage"]["n_terms_significant"] == 1
+
+
+def test_term_just_below_alpha_is_significant():
+    nova = _one_claim(("GO:0000001", 0.0499, "up", "up"))
+    assert nova["claims"][0]["subgroups"][0]["terms"][0]["significant"] is True
+    assert nova["coverage"]["n_terms_not_significant"] == 0
+
+
+def test_reference_coverage_counts_the_stored_terms_at_or_above_alpha(reference):
+    fx, nova = reference
+    assert nova["coverage"]["n_terms_not_significant"] == 5
+    assert nova["coverage"]["n_terms_without_padj"] == 0
+    cov = nova["coverage"]
+    assert cov["n_terms"] == (
+        cov["n_terms_significant"] + cov["n_terms_not_significant"] + cov["n_terms_without_padj"]
+    )
+
+
+def test_term_without_padj_is_left_out_and_counted():
+    rows = [
+        SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up"),
+        SubgroupTerm("Firming", "Collagen", "GO:0000002", "Fibre", "up"),
+    ]
+    hits = [TermHit("GO:0000001", "Collagen", 1e-4, "up"), TermHit("GO:0000002", "Fibre", None, "up")]
+    nova = build_nova(hits, ClaimSubgroupMap(rows))
+    sub = nova["claims"][0]["subgroups"][0]
+    assert [t["id"] for t in sub["terms"]] == ["GO:0000001"]
+    assert sub["s_pro"] == pytest.approx(4.0)
+    cov = nova["coverage"]
+    assert (cov["n_terms"], cov["n_terms_without_padj"]) == (2, 1)
+    assert cov["n_terms_significant"] == 1
+    assert cov["n_terms_not_significant"] == 0
+
+
+def test_a_row_with_a_padj_wins_over_a_repeat_without_one():
+    rows = [SubgroupTerm("Firming", "Collagen", "GO:0000001", "Collagen", "up")]
+    hits = [TermHit("GO:0000001", "Collagen", None, "up"), TermHit("GO:0000001", "Collagen", 1.0, "up")]
+    nova = build_nova(hits, ClaimSubgroupMap(rows))
+    assert nova["coverage"]["n_terms_without_padj"] == 0
+
+
+def test_term_in_both_directions_is_flagged():
+    rows = [
+        SubgroupTerm("Firming", "Collagen", "GO:0030199", "Collagen fibril", "up"),
+        SubgroupTerm("Firming", "Collagen", "GO:0000002", "Fibre", "up"),
+    ]
+    mapping = ClaimSubgroupMap(rows)
+    hits = [
+        TermHit("GO:0030199", "Collagen fibril", 1e-5, "up", genes=("G1", "G2")),
+        TermHit("GO:0030199", "Collagen fibril", 1e-2, "down", genes=("G3",)),
+        TermHit("GO:0000002", "Fibre", 1e-4, "up", genes=("G4",)),
+    ]
+    sub = build_nova(hits, mapping)["claims"][0]["subgroups"][0]
+    by_id = {}
+    for t in sub["terms"]:
+        by_id.setdefault(t["id"], []).append(t)
+    assert [t["both_directions"] for t in by_id["GO:0030199"]] == [True, True]
+    assert [t["both_directions"] for t in by_id["GO:0000002"]] == [False]
+    assert sub["n_terms_both_directions"] == 1  # one term, however many entries it has
+
+    # The genes of each entry come from its own list only.
+    genes = term_gene_map(hits, mapping)
+    assert genes[("GO:0030199", "up")] == {"G1", "G2"}
+    assert genes[("GO:0030199", "down")] == {"G3"}
+    assert genes[("GO:0000002", "up")] == {"G4"}
+
+
+def test_unlinked_terms_carry_the_same_flags():
+    hits = [
+        TermHit("GO:0008380", "RNA splicing (GO:0008380)", 1e-4, "down"),
+        TermHit("GO:0008380", "RNA splicing (GO:0008380)", 1e-3, "up"),
+    ]
+    sub = build_nova(hits, ClaimSubgroupMap([]))["unlinked"][0]
+    assert all(t["both_directions"] and t["significant"] for t in sub["terms"])
+    assert sub["n_terms_both_directions"] == 1
 
 
 # ── Reference fixture ───────────────────────────────────────────────────────
@@ -315,10 +496,25 @@ def test_row_direction(regulation, name, expected):
 
 @pytest.mark.parametrize(
     "name,expected",
-    [("P1_vs_control", "P1"), ("P1_pos_3h_vs_P1_neg_3h", "Active"), ("", "Active")],
+    [
+        ("P1_vs_control", "P1"),
+        ("P1_pos_3h_vs_P1_neg_3h", "P1_pos_3h"),
+        ("Treatment A vs Control", "Treatment A"),
+        ("OnlyOneCondition", "OnlyOneCondition"),
+        ("", ""),
+    ],
 )
 def test_condition_label(name, expected):
     assert condition_label(name) == expected
+
+
+def test_condition_is_the_numerator():
+    """A numerator of any length is rendered as is; "Active" is never invented."""
+    numerator = "Treatment_12"
+    assert len(numerator) == 12
+    nova = build_nova([], ClaimSubgroupMap([]), contrast=f"{numerator}_vs_Control")
+    assert nova["condition"] == numerator
+    assert "Active" not in json.dumps(nova)
 
 
 # ── Referential (claim_subgroups.yaml) ──────────────────────────────────────
@@ -430,6 +626,198 @@ def test_label_helpers():
     assert label_match_key("REACTOME_CELL_CYCLE_MITOTIC") == label_match_key("Cell Cycle, Mitotic")
 
 
+# ── Data access and provenance ──────────────────────────────────────────────
+
+ANALYSIS_ID = "7f1d2c9e-0b6a-4a38-9d57-3c1d9c3f2a10"
+FIRMING = [SubgroupTerm("Firming", "Collagen", "GO:0030199", "Collagen fibril", "up")]
+
+
+def _dataset(
+    metadata: dict | None = None, *, type_=DatasetType.DEG, name: str = "A_vs_B"
+) -> MagicMock:
+    d = MagicMock(spec=Dataset)
+    d.id = uuid4()
+    d.project_id = uuid4()
+    d.name = name
+    d.type = type_
+    d.status = DatasetStatus.READY
+    d.dataset_metadata = metadata if metadata is not None else {}
+    return d
+
+
+def _row(pathway_id="GO:0030199", padj=1e-4, regulation="UP", pvalue=1e-5, comparison="A_vs_B"):
+    return SimpleNamespace(
+        pathway_id=pathway_id,
+        pathway_name="Collagen fibril",
+        category="GO:BP",
+        pvalue=pvalue,
+        padj=padj,
+        regulation=regulation,
+        comparison_name=comparison,
+        gene_count=3,
+        genes=["G1", "G2"],
+    )
+
+
+class _Db:
+    """The reads `compute_nova` makes, answered from plain data (one answer per entity)."""
+
+    def __init__(self, *, enrichment_datasets=(), analysis_params=None, rows=()):
+        self.enrichment_datasets = list(enrichment_datasets)
+        self.analysis_params = analysis_params
+        self.rows = list(rows)
+
+    async def execute(self, stmt, *args, **kwargs):
+        entity = stmt.column_descriptions[0]["entity"]
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = (
+            self.enrichment_datasets if entity is Dataset else []
+        )
+        result.all.return_value = self.rows if entity is EnrichmentPathway else []
+        return result
+
+    async def scalar(self, stmt, *args, **kwargs):
+        return self.analysis_params
+
+
+async def _nova_of(dataset, db, alpha=0.05, comparison="A_vs_B"):
+    with patch("app.services.cosmomics_nova.default_claim_subgroups") as mapping:
+        mapping.return_value = ClaimSubgroupMap(FIRMING, version="1")
+        nova, hits = await compute_nova(db, dataset, comparison, alpha)
+    return nova, hits
+
+
+async def test_no_directional_row_is_no_enrichment():
+    nova, hits = await _nova_of(_dataset(), _Db(rows=[]))
+    assert hits == []
+    assert nova["status"] == "no_enrichment"
+    assert nova["claims"] == []
+
+
+async def test_fetch_does_not_fall_back_to_the_raw_pvalue():
+    """A row with no adjusted p is a term without padj, not a term whose raw p stands in."""
+    db = _Db(rows=[_row(padj=None, pvalue=1e-9)])
+    source = await resolve_nova_source(db, _dataset(), "A_vs_B")
+    hits = await fetch_term_hits(db, source, "A_vs_B")
+    assert [h.p for h in hits] == [None]
+    nova, _ = await _nova_of(_dataset(), db)
+    assert nova["claims"] == []
+    assert nova["coverage"]["n_terms_without_padj"] == 1
+
+
+async def test_payload_carries_provenance():
+    dataset = _dataset({"analysis_id": ANALYSIS_ID})
+    enrichment = _dataset(
+        {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "source": "annodb"},
+        type_=DatasetType.ENRICHMENT,
+    )
+    params = {"enrichment_fdr": 0.1, "enrichment_databases": ["GO", "Reactome"]}
+    db = _Db(enrichment_datasets=[enrichment], analysis_params=params, rows=[_row()])
+    nova, _ = await _nova_of(dataset, db, alpha=0.05)
+
+    prov = nova["provenance"]
+    assert prov["dataset_id"] == str(dataset.id)
+    assert prov["comparison"] == "A_vs_B"
+    assert prov["enrichment_dataset_ids"] == [str(enrichment.id)]
+    assert prov["analysis_id"] == ANALYSIS_ID
+    assert prov["enrichment_fdr"] == 0.1
+    assert prov["enrichment_databases"] == ["GO", "Reactome"]
+    assert prov["referential_version"] == 1
+    assert prov["alpha"] == 0.05
+    assert prov["demo"] is False
+    assert prov["app_version"]
+    assert datetime.fromisoformat(prov["generated_at"]).utcoffset().total_seconds() == 0
+    # GenoLens's own enrichment: no table was read, and no data version was declared.
+    assert prov["padj_columns"] == []
+    assert prov["source_versions"] == []
+    assert nova["p_source"] == "padj (Benjamini–Hochberg, GenoLens enrichment)"
+    json.dumps(nova)  # the payload is what the route serves
+
+
+async def test_an_analysis_without_enrichment_fdr_ran_at_the_script_default():
+    dataset = _dataset({"analysis_id": ANALYSIS_ID})
+    enrichment = _dataset(
+        {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "source": "annodb"},
+        type_=DatasetType.ENRICHMENT,
+    )
+    db = _Db(enrichment_datasets=[enrichment], analysis_params={}, rows=[_row()])
+    nova, _ = await _nova_of(dataset, db)
+    assert nova["provenance"]["enrichment_fdr"] == 0.05
+    assert nova["provenance"]["enrichment_databases"] is None
+
+
+async def test_enrichment_stored_on_the_deg_dataset_names_no_enrichment_dataset():
+    dataset = _dataset()
+    nova, _ = await _nova_of(dataset, _Db(rows=[_row()]))
+    prov = nova["provenance"]
+    assert prov["enrichment_dataset_ids"] == []
+    assert prov["analysis_id"] is None
+    assert (prov["enrichment_fdr"], prov["enrichment_databases"]) == (None, None)
+
+
+async def test_uploaded_tables_state_the_padj_column_they_were_read_from():
+    dataset = _dataset({"source_version": "tables 2"})
+    enrichment = _dataset(
+        {"comparison_name": "A_vs_B", "padj_column": "qvalue"}, type_=DatasetType.ENRICHMENT
+    )
+    nova, _ = await _nova_of(dataset, _Db(enrichment_datasets=[enrichment], rows=[_row()]))
+    assert nova["provenance"]["padj_columns"] == ["qvalue"]
+    assert nova["p_source"] == "adjusted p from uploaded tables (column qvalue)"
+
+
+async def test_uploaded_tables_without_a_recorded_column_say_so():
+    enrichment = _dataset({"comparison_name": "A_vs_B"}, type_=DatasetType.ENRICHMENT)
+    nova, _ = await _nova_of(_dataset(), _Db(enrichment_datasets=[enrichment], rows=[_row()]))
+    assert nova["provenance"]["padj_columns"] == []
+    assert nova["p_source"] == "adjusted p from uploaded tables (column not recorded)"
+
+
+async def test_an_uploaded_table_does_not_take_the_analysis_enrichment_settings():
+    """The wizard's FDR describes the annoDB run, not a table somebody deposited."""
+    dataset = _dataset({"analysis_id": ANALYSIS_ID})
+    enrichment = _dataset(
+        {"analysis_id": ANALYSIS_ID, "comparison_name": "A_vs_B", "padj_column": "FDR"},
+        type_=DatasetType.ENRICHMENT,
+    )
+    db = _Db(enrichment_datasets=[enrichment], analysis_params={"enrichment_fdr": 0.2}, rows=[_row()])
+    nova, _ = await _nova_of(dataset, db)
+    assert nova["provenance"]["enrichment_fdr"] is None
+    assert nova["provenance"]["padj_columns"] == ["FDR"]
+
+
+async def test_demo_dataset_is_flagged():
+    nova, _ = await _nova_of(_dataset({"demo": True}), _Db(rows=[_row()]))
+    assert nova["provenance"]["demo"] is True
+    plain, _ = await _nova_of(_dataset(), _Db(rows=[_row()]))
+    assert plain["provenance"]["demo"] is False
+
+
+async def test_payload_carries_the_source_versions():
+    version = "pipe_scilicium v3.0.0"
+    dataset = _dataset({"source_version": version})
+    enrichment = _dataset(
+        {"comparison_name": "A_vs_B", "source_version": version}, type_=DatasetType.ENRICHMENT
+    )
+    nova, _ = await _nova_of(dataset, _Db(enrichment_datasets=[enrichment], rows=[_row()]))
+    assert nova["provenance"]["source_versions"] == [version]
+
+
+async def test_distinct_source_versions_are_all_listed_deg_first():
+    dataset = _dataset({"source_version": "tables 2"})
+    enrichment = _dataset(
+        {"comparison_name": "A_vs_B", "source_version": "tables 1"}, type_=DatasetType.ENRICHMENT
+    )
+    nova, _ = await _nova_of(dataset, _Db(enrichment_datasets=[enrichment], rows=[_row()]))
+    assert nova["provenance"]["source_versions"] == ["tables 2", "tables 1"]
+
+
+def test_provenance_without_a_source_still_states_what_the_nova_knows():
+    nova = build_nova([], ClaimSubgroupMap([], version="3"), alpha=0.01, contrast="A_vs_B")
+    prov = nova["provenance"]
+    assert (prov["comparison"], prov["alpha"], prov["referential_version"]) == ("A_vs_B", 0.01, 3)
+    assert prov["dataset_id"] is None
+
+
 # ── Endpoint ────────────────────────────────────────────────────────────────
 
 
@@ -461,7 +849,7 @@ async def test_endpoint_refuses_users_without_the_skin_claims_add_on(method, suf
     caller = _user(with_module=False)
     client, dataset = _client(caller, owner_id=caller.id)
     fetch = AsyncMock(return_value=[])
-    with patch("app.api.endpoints.cosmomics.fetch_term_hits", new=fetch):
+    with patch("app.services.cosmomics_nova.fetch_term_hits", new=fetch):
         async with client as c:
             resp = await c.request(
                 method, f"/api/v1/datasets/{dataset.id}/comparisons/A_vs_B/cosmomics-nova{suffix}"
@@ -474,7 +862,7 @@ async def test_endpoint_hides_another_tenants_dataset():
     caller = _user(with_module=True)
     client, dataset = _client(caller, owner_id=uuid4())
     fetch = AsyncMock(return_value=[])
-    with patch("app.api.endpoints.cosmomics.fetch_term_hits", new=fetch):
+    with patch("app.services.cosmomics_nova.fetch_term_hits", new=fetch):
         async with client as c:
             resp = await c.get(f"/api/v1/datasets/{dataset.id}/comparisons/A_vs_B/cosmomics-nova")
     assert resp.status_code == 404
@@ -493,7 +881,7 @@ async def test_endpoint_returns_the_nova_to_the_owner():
         ),
         TermHit("chromosome segregation (GO:0007059)", "chromosome segregation", 1e-4, "down"),
     ]
-    with patch("app.api.endpoints.cosmomics.fetch_term_hits", new=AsyncMock(return_value=hits)):
+    with patch("app.services.cosmomics_nova.fetch_term_hits", new=AsyncMock(return_value=hits)):
         async with client as c:
             resp = await c.get(
                 f"/api/v1/datasets/{dataset.id}/comparisons/P1_vs_control/cosmomics-nova",
@@ -517,3 +905,68 @@ async def test_endpoint_rejects_an_out_of_range_alpha():
             params={"alpha": 0.5},
         )
     assert resp.status_code == 422
+
+
+async def test_unknown_comparison_is_404():
+    caller = _user(with_module=True)
+    client, dataset = _client(caller, owner_id=caller.id)
+    dataset.dataset_metadata = {"comparison_name": "A_vs_B"}
+    fetch = AsyncMock(return_value=[])
+    with patch("app.services.cosmomics_nova.fetch_term_hits", new=fetch):
+        async with client as c:
+            resp = await c.get(f"/api/v1/datasets/{dataset.id}/comparisons/C_vs_D/cosmomics-nova")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "No comparison 'C_vs_D' in this dataset"
+    fetch.assert_not_awaited()
+
+
+async def test_a_comparison_the_dataset_lists_is_served():
+    caller = _user(with_module=True)
+    client, dataset = _client(caller, owner_id=caller.id)
+    dataset.dataset_metadata = {"comparisons": {"A_vs_B": {}, "C_vs_D": {}}}
+    async with client as c:
+        resp = await c.get(f"/api/v1/datasets/{dataset.id}/comparisons/C_vs_D/cosmomics-nova")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "no_enrichment"
+
+
+async def test_comparison_without_enrichment_is_no_enrichment():
+    """A dataset that records no comparison keeps the old path: no enrichment row, no 404."""
+    caller = _user(with_module=True)
+    client, dataset = _client(caller, owner_id=caller.id)
+    async with client as c:
+        resp = await c.get(f"/api/v1/datasets/{dataset.id}/comparisons/A_vs_B/cosmomics-nova")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "no_enrichment"
+    assert body["claims"] == []
+    assert body["provenance"]["dataset_id"] == str(dataset.id)
+
+
+async def test_the_deg_rows_tell_which_comparisons_a_dataset_has():
+    from app.models.models import DegGene
+    from tests.test_project_access_control import make_db
+
+    caller = _user(with_module=True)
+    client, dataset = _client(caller, owner_id=caller.id)
+    base = make_db(dataset=dataset, project=dataset.project, member=None)
+    plain_execute = base.execute.side_effect
+
+    def execute(stmt, *a, **k):
+        res = plain_execute(stmt, *a, **k)
+        if stmt.column_descriptions[0]["entity"] is DegGene:
+            res.scalars.return_value.all.return_value = ["A_vs_B"]
+        return res
+
+    from app.api.deps.supabase_deps import get_db
+    from app.main import app
+
+    base.execute = AsyncMock(side_effect=execute)
+
+    async def _db():
+        yield base
+
+    app.dependency_overrides[get_db] = _db
+    async with client as c:
+        resp = await c.get(f"/api/v1/datasets/{dataset.id}/comparisons/C_vs_D/cosmomics-nova")
+    assert resp.status_code == 404
