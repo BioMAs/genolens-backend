@@ -75,13 +75,18 @@ async def _async_generate(task, job_id: str, analysis_id: str) -> dict:
             from app.services.report_latex_service import report_latex_service
             from app.services.storage import storage_service
 
+            # The renderer lists the AI texts it prints; they are stored on the job with the PDF.
+            ai_texts: list[dict] = []
             pdf_bytes = await report_latex_service.render_pdf(
                 db,
                 UUID(analysis_id),
                 demo_watermark=await report_latex_service.is_demo_requester(
                     db, job.requested_by
                 ),
+                use_ai=job.use_ai,
+                ai_texts=ai_texts,
             )
+            job.ai_texts = ai_texts
 
             pdf_path = f"reports/{analysis_id}/{job_id}.pdf"
             await storage_service.upload_file(pdf_path, pdf_bytes, "application/pdf")
@@ -94,6 +99,7 @@ async def _async_generate(task, job_id: str, analysis_id: str) -> dict:
         except Exception as exc:
             logger.exception("Report generation failed for job %s", job_id)
             job.status = ReportJobStatus.FAILED
+            job.ai_texts = None  # no report was delivered: no AI text was
             job.error_message = str(exc)[:2000]
             await db.commit()
             return {"status": "failed", "error": str(exc)}
@@ -104,6 +110,8 @@ async def _run_comparison_job(job_id: str, render) -> dict:
 
     PENDING → RUNNING → `await render(db, job)` (PDF bytes) → stored under
     reports/comparisons/{dataset}/{job}.pdf → DONE; any error marks the job FAILED.
+    `render` records the AI texts the PDF prints in `job.ai_texts`; they are committed with the
+    DONE status, and dropped if the job fails.
     """
     from app.models.report_job import ReportJob, ReportJobStatus
 
@@ -131,6 +139,7 @@ async def _run_comparison_job(job_id: str, render) -> dict:
         except Exception as exc:
             logger.exception("Comparison report generation failed for job %s", job_id)
             job.status = ReportJobStatus.FAILED
+            job.ai_texts = None  # no report was delivered: no AI text was
             job.error_message = str(exc)[:2000]
             await db.commit()
             return {"status": "failed", "error": str(exc)}
@@ -150,7 +159,8 @@ def generate_comparison_report(self, job_id: str) -> dict:
 async def _render_latex(db, job) -> bytes:
     from app.services.report_latex_service import report_latex_service
 
-    return await report_latex_service.render_comparison_pdf(
+    ai_texts: list[dict] = []
+    pdf = await report_latex_service.render_comparison_pdf(
         db,
         job.dataset_id,
         job.comparison_name,
@@ -162,7 +172,10 @@ async def _render_latex(db, job) -> bytes:
         cover_info=job.cover_info,
         demo_watermark=await report_latex_service.is_demo_requester(db, job.requested_by),
         use_ai=job.use_ai,
+        ai_texts=ai_texts,
     )
+    job.ai_texts = ai_texts
+    return pdf
 
 
 async def _async_generate_comparison(task, job_id: str) -> dict:
@@ -186,7 +199,8 @@ async def _render_editorial(db, job) -> bytes:
     from app.services.report_editorial_service import report_editorial_service
     from app.services.report_latex_service import report_latex_service
 
-    return await report_editorial_service.render_comparison_pdf(
+    ai_texts: list[dict] = []
+    pdf = await report_editorial_service.render_comparison_pdf(
         db,
         job.dataset_id,
         job.comparison_name,
@@ -197,4 +211,7 @@ async def _render_editorial(db, job) -> bytes:
         # Requested through a service token: never the owner's saved branding (the PDF
         # goes to the pipeline's client, not to the internal account's own reports).
         use_branding=job.service_token_id is None,
+        ai_texts=ai_texts,
     )
+    job.ai_texts = ai_texts
+    return pdf

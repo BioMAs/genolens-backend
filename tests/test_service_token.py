@@ -25,7 +25,7 @@ import jwt
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select, text
+from sqlalchemy import event, func, select, text
 
 from app.models.models import (
     Dataset,
@@ -39,6 +39,7 @@ from app.models.models import (
     UserStatus,
 )
 from app.models.report_job import ReportJob, ReportJobStatus
+from app.models.service_token import ServiceToken
 
 API = "/api/v1"
 COMPARISON = "KO_vs_WT"
@@ -192,6 +193,54 @@ async def seed_dataset(sessions, owner: User) -> UUID:
         return dataset.id
 
 
+async def seed_job(
+    sessions,
+    dataset_id: UUID,
+    token_id: UUID | None,
+    *,
+    pdf_path: str = "report.pdf",
+    created_at: datetime | None = None,
+    status: ReportJobStatus = ReportJobStatus.DONE,
+    comparison_name: str = COMPARISON,
+    template: str = "editorial",
+) -> UUID:
+    """A report job of the comparison, requested through `token_id` (None: by a user)."""
+    async with sessions() as s:
+        dataset = await s.get(Dataset, dataset_id)
+        job = ReportJob(
+            id=uuid4(),
+            project_id=dataset.project_id,
+            dataset_id=dataset_id,
+            comparison_name=comparison_name,
+            template=template,
+            status=status,
+            pdf_path=pdf_path,
+            service_token_id=token_id,
+            requested_by=uuid4(),
+            created_at=created_at or datetime.now(timezone.utc),
+        )
+        s.add(job)
+        await s.commit()
+        return job.id
+
+
+def login(user: User) -> dict:
+    """The Authorization header of `user`'s own login (a JWT)."""
+    from app.core.config import settings
+
+    jwt_token = jwt.encode(
+        {
+            "sub": str(user.id),
+            "email": user.email,
+            "aud": "authenticated",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+        },
+        settings.SUPABASE_JWT_SECRET,
+        algorithm="HS256",
+    )
+    return bearer(jwt_token)
+
+
 async def jobs_of(sessions, dataset_id: UUID) -> list[ReportJob]:
     async with sessions() as s:
         rows = await s.execute(
@@ -278,6 +327,58 @@ async def test_service_token_is_stored_hashed(sessions):
     assert str(row["id"]).replace("-", "") in listing.replace("-", "")
     assert "pipeline" in listing and owner.email in listing
     assert token not in listing and row["token_sha256"] not in listing
+
+
+@pytest.mark.parametrize("role", [UserRole.ADMIN, UserRole.SCILICIUM_ADMIN])
+async def test_create_refuses_an_admin_owner(sessions, role):
+    """Least privilege: a token of an admin account would carry every admin right."""
+    admin = await seed_owner(sessions, role=role)
+
+    code, printed = await run_command(
+        sessions, "create", "--owner", admin.email, "--name", "pipeline"
+    )
+
+    assert code == 1, printed
+    assert "an admin account cannot own a service token" in printed
+    assert not TOKEN_RE.findall(printed)
+    async with sessions() as s:
+        assert await s.scalar(select(func.count()).select_from(ServiceToken)) == 0
+
+
+async def test_last_used_at_is_written_at_most_once_a_minute(client, sessions):
+    from app.api.deps import service_token as deps
+
+    owner = await seed_owner(sessions)
+    token_id, token = await make_token(sessions, owner)
+    updates = []
+
+    def count_updates(conn, cursor, statement, *_args):
+        if statement.lstrip().upper().startswith("UPDATE SERVICE_TOKENS"):
+            updates.append(statement)
+
+    async def last_used_at():
+        async with sessions() as s:
+            stored = (await s.get(ServiceToken, token_id)).last_used_at
+        return stored.replace(tzinfo=timezone.utc)  # SQLite reads the time back naive
+
+    start = datetime(2026, 11, 5, 9, 0, 0, tzinfo=timezone.utc)
+    clock = {"now": start}
+    event.listen(sessions.kw["bind"].sync_engine, "before_cursor_execute", count_updates)
+    with patch.object(deps, "_now", new=lambda: clock["now"]):
+        for seconds, expected_updates, expected_last_used in [
+            (0, 1, start),  # never used: written
+            (10, 1, start),  # ten seconds later: left alone
+            (59, 1, start),
+            (61, 2, start + timedelta(seconds=61)),  # past the minute: written again
+            (70, 2, start + timedelta(seconds=61)),
+        ]:
+            clock["now"] = start + timedelta(seconds=seconds)
+            resp = await client.post(
+                f"{API}/projects/", headers=bearer(token), json={"name": f"TST-{seconds}"}
+            )
+            assert resp.status_code == 201, resp.text
+            assert len(updates) == expected_updates, seconds
+            assert await last_used_at() == expected_last_used, seconds
 
 
 async def test_revoked_service_token_is_refused(client, sessions):
@@ -748,6 +849,157 @@ async def test_service_token_report_ignores_the_owner_branding(client, sessions)
     assert pdf.content == b"token.pdf"
 
 
+async def trigger(client, token, dataset_id) -> str:
+    resp = await client.post(
+        f"{API}/datasets/{dataset_id}/report", headers=bearer(token), params=EDITORIAL
+    )
+    assert resp.status_code == 202, resp.text
+    return resp.json()["job_id"]
+
+
+async def test_a_token_sees_only_its_own_jobs(client, sessions):
+    owner = await seed_owner(sessions)
+    a_id, token_a = await make_token(sessions, owner, name="a")
+    _, token_b = await make_token(sessions, owner, name="b")
+    dataset_id = await seed_dataset(sessions, owner)
+    job_a = await seed_job(sessions, dataset_id, a_id, pdf_path="a.pdf")
+    # A job of the owner in person, and one of a token that is gone: nobody's but their own.
+    await seed_job(sessions, dataset_id, None, pdf_path="owner.pdf")
+    await seed_job(sessions, dataset_id, uuid4(), pdf_path="other.pdf")
+
+    status_url = f"{API}/datasets/{dataset_id}/report/status"
+    download_url = f"{API}/datasets/{dataset_id}/report/download"
+    with patch(
+        "app.services.storage.storage_service.download_file",
+        new=AsyncMock(side_effect=lambda path: path.encode()),
+    ):
+        mine = await client.get(status_url, headers=bearer(token_a), params=EDITORIAL)
+        assert mine.status_code == 200, mine.text
+        assert mine.json()["id"] == str(job_a)
+        assert (
+            await client.get(download_url, headers=bearer(token_a), params=EDITORIAL)
+        ).content == b"a.pdf"
+
+        # B never gets A's job: not as the latest, nor by its id.
+        for params in (EDITORIAL, {**EDITORIAL, "job_id": str(job_a)}):
+            status = await client.get(status_url, headers=bearer(token_b), params=params)
+            assert status.status_code == 404, status.text
+            pdf = await client.get(download_url, headers=bearer(token_b), params=params)
+            assert pdf.status_code == 404, pdf.text
+
+
+async def test_a_token_never_reuses_another_tokens_job(client, sessions):
+    owner = await seed_owner(sessions)
+    a_id, token_a = await make_token(sessions, owner, name="a")
+    b_id, token_b = await make_token(sessions, owner, name="b")
+    dataset_id = await seed_dataset(sessions, owner)
+
+    job_a = await trigger(client, token_a, dataset_id)
+    job_b = await trigger(client, token_b, dataset_id)
+
+    assert job_a != job_b
+    assert await trigger(client, token_a, dataset_id) == job_a  # a token's own job is reused
+    assert await trigger(client, token_b, dataset_id) == job_b
+    owners = {str(j.id): j.service_token_id for j in await jobs_of(sessions, dataset_id)}
+    assert owners == {job_a: a_id, job_b: b_id}
+
+
+async def test_status_and_download_follow_the_job_id(client, sessions):
+    owner = await seed_owner(sessions)
+    token_id, token = await make_token(sessions, owner)
+    other_token_id, _ = await make_token(sessions, owner, name="other")
+    dataset_id = await seed_dataset(sessions, owner)
+    elsewhere_id = await seed_dataset(sessions, owner)
+    now = datetime.now(timezone.utc)
+    older = await seed_job(
+        sessions, dataset_id, token_id, pdf_path="older.pdf", created_at=now - timedelta(minutes=2)
+    )
+    newer = await seed_job(
+        sessions, dataset_id, token_id, pdf_path="newer.pdf", created_at=now - timedelta(minutes=1)
+    )
+    elsewhere = await seed_job(sessions, elsewhere_id, token_id, pdf_path="elsewhere.pdf")
+    another_comparison = await seed_job(
+        sessions, dataset_id, token_id, pdf_path="c2.pdf", comparison_name="OTHER_vs_WT"
+    )
+    another_format = await seed_job(
+        sessions, dataset_id, token_id, pdf_path="latex.pdf", template="latex"
+    )
+    failed = await seed_job(
+        sessions, dataset_id, token_id, pdf_path="failed.pdf", status=ReportJobStatus.FAILED
+    )
+    someone_elses = await seed_job(sessions, dataset_id, other_token_id, pdf_path="theirs.pdf")
+
+    status_url = f"{API}/datasets/{dataset_id}/report/status"
+    download_url = f"{API}/datasets/{dataset_id}/report/download"
+    with patch(
+        "app.services.storage.storage_service.download_file",
+        new=AsyncMock(side_effect=lambda path: path.encode()),
+    ):
+
+        async def ask(url, job_id=None):
+            params = {**EDITORIAL, **({"job_id": str(job_id)} if job_id else {})}
+            return await client.get(url, headers=bearer(token), params=params)
+
+        # No job id: the latest, as before.
+        assert (await ask(status_url)).json()["id"] == str(failed)
+        assert (await ask(download_url)).content == b"newer.pdf"
+
+        # A job id: that job, in both routes.
+        for job, name in ((older, b"older.pdf"), (newer, b"newer.pdf")):
+            status = await ask(status_url, job)
+            assert status.status_code == 200, status.text
+            assert status.json()["id"] == str(job)
+            pdf = await ask(download_url, job)
+            assert pdf.status_code == 200, pdf.text
+            assert pdf.content == name
+
+        # A job that is not this dataset's, comparison's, format's or caller's: 404, the route's message.
+        misses = {
+            "another dataset": elsewhere,
+            "another comparison": another_comparison,
+            "another format": another_format,
+            "another token": someone_elses,
+            "unknown": uuid4(),
+        }
+        for name, job in misses.items():
+            status = await ask(status_url, job)
+            assert status.status_code == 404, name
+            assert status.json()["detail"] == "No report job found for this comparison", name
+            pdf = await ask(download_url, job)
+            assert pdf.status_code == 404, name
+            assert pdf.json()["detail"] == "No completed report available", name
+
+        # A download is of a finished job only, whatever the id.
+        unfinished = await ask(download_url, failed)
+        assert unfinished.status_code == 404
+        assert unfinished.json()["detail"] == "No completed report available"
+
+        # A user keeps seeing every job of the comparison; the format filters when given.
+        user = login(owner)
+        with patch(
+            "app.core.supabase_auth.get_cached_user_role", new=AsyncMock(return_value="user")
+        ):
+            def as_user(**params):
+                return {"comparison_name": COMPARISON, **params}
+
+            by_token = await client.get(
+                status_url, headers=user, params=as_user(job_id=str(older))
+            )
+            assert by_token.status_code == 200, by_token.text
+            assert by_token.json()["id"] == str(older)
+            latex = await client.get(
+                status_url, headers=user, params=as_user(job_id=str(another_format))
+            )
+            assert latex.status_code == 200, latex.text
+            assert latex.json()["id"] == str(another_format)
+            wrong_format = await client.get(
+                status_url,
+                headers=user,
+                params=as_user(job_id=str(another_format), template="editorial"),
+            )
+            assert wrong_format.status_code == 404
+
+
 # ── JWT users ─────────────────────────────────────────────────────────────────
 
 
@@ -807,44 +1059,142 @@ async def test_jwt_users_are_unchanged(client, sessions):
 # ---------------------------------------------------------------------------
 
 def test_the_command_runs_on_an_engine_with_the_sql_echo_off(monkeypatch):
-    """SQLAlchemy's echo writes to standard output, where the token must be alone: the command opens its own
-    engine with the echo off and the parameters hidden, even with DEBUG on."""
+    """SQLAlchemy's echo writes to standard output, where the token must be alone: the command opens an engine of
+    its own (the app's echoes the SQL as DEBUG says), with the echo off."""
+    import asyncio
+
+    from app.db import session as app_db
+    from app.scripts import service_token as cli
+
+    seen = {}
+
+    async def fake_run(argv, *, session_factory, **_):
+        engine = session_factory.kw["bind"]
+        seen["own_engine"] = engine is not app_db.engine
+        seen["echo"] = engine.echo
+        return 0
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    assert asyncio.run(cli._main(["list"])) == 0
+    assert seen == {"own_engine": True, "echo": False}
+
+
+def test_the_app_engine_hides_sql_parameters_unless_asked():
+    """With DEBUG on, the echoed SQL would carry its bound parameters (user data, the sha256 a token lookup
+    binds): they stay out of the log unless SQL_ECHO_PARAMETERS asks for them. The settings are built here, so
+    the test does not depend on the environment it runs in."""
+    from app.core.config import Settings
+    from app.db.session import engine_options
+
+    def options(**fields):
+        return engine_options(
+            Settings(
+                _env_file=None,
+                SUPABASE_URL="https://placeholder.supabase.co",
+                SUPABASE_KEY="placeholder",
+                SUPABASE_JWT_SECRET="placeholder",
+                **fields,
+            )
+        )
+
+    assert Settings.model_fields["SQL_ECHO_PARAMETERS"].default is False
+    assert options(SQL_ECHO_PARAMETERS=False)["hide_parameters"] is True
+    assert options(SQL_ECHO_PARAMETERS=True)["hide_parameters"] is False
+    assert options(SQL_ECHO_PARAMETERS=False)["pool_pre_ping"] is True
+
+
+def test_the_cli_and_the_app_share_the_engine_options(monkeypatch):
+    """One list of engine options: what the app's engine is given, the command's engine is given too (an option
+    added later, such as an SSL setting, cannot reach one and miss the other)."""
+    import asyncio
+
+    from app.db import session as app_db
+    from app.scripts import service_token as cli
+
+    app_options = app_db.engine_options()
+    assert app_db.engine.sync_engine.hide_parameters == app_options["hide_parameters"]
+    assert app_db.engine.sync_engine.pool._pre_ping == app_options["pool_pre_ping"]
+
+    # Options that differ from the defaults everywhere: only the shared function can have set them
+    # (but for `hide_parameters`, which the command forces on: see the next test).
+    marked = {"hide_parameters": False, "pool_pre_ping": False, "pool_recycle": 1234}
+    monkeypatch.setattr(app_db, "engine_options", lambda *_: marked)
+    seen = {}
+
+    async def fake_run(argv, *, session_factory, **_):
+        engine = session_factory.kw["bind"].sync_engine
+        seen.update(
+            hide_parameters=engine.hide_parameters,
+            pool_pre_ping=engine.pool._pre_ping,
+            pool_recycle=engine.pool._recycle,
+        )
+        return 0
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    assert asyncio.run(cli._main(["list"])) == 0
+    assert seen == {**marked, "hide_parameters": True}
+
+
+def test_the_cli_never_echoes_sql_parameters_whatever_sql_echo_parameters_says(monkeypatch):
+    """R-F4: the sha256 a token lookup binds never reaches a message of the command. The app's
+    engine may show parameters when SQL_ECHO_PARAMETERS asks (development); the command's engine
+    hides them anyway: an error of its own would otherwise print them to the terminal."""
     import asyncio
 
     from app.core.config import settings
     from app.scripts import service_token as cli
 
+    monkeypatch.setattr(settings, "SQL_ECHO_PARAMETERS", True)
     monkeypatch.setattr(settings, "DEBUG", True)
     seen = {}
 
     async def fake_run(argv, *, session_factory, **_):
         engine = session_factory.kw["bind"]
-        seen["echo"] = engine.echo
         seen["hide_parameters"] = engine.sync_engine.hide_parameters
+        seen["echo"] = engine.echo
         return 0
 
     monkeypatch.setattr(cli, "run", fake_run)
     assert asyncio.run(cli._main(["list"])) == 0
-    assert seen == {"echo": False, "hide_parameters": True}
+    assert seen == {"hide_parameters": True, "echo": False}
 
 
-def test_the_app_engine_hides_sql_parameters_unless_asked():
-    """With DEBUG on, the echoed SQL would carry its bound parameters (user data, the sha256 a token lookup
-    binds): they stay out of the log unless SQL_ECHO_PARAMETERS asks for them."""
-    from app.core.config import settings
-    from app.db.session import engine
-
-    assert settings.SQL_ECHO_PARAMETERS is False
-    assert engine.sync_engine.hide_parameters is True
-
-
-def test_the_development_compose_passes_the_licence_to_every_service():
-    """Without the licence settings a local stack answers "no license configured" and refuses every upload."""
+def _compose(name: str) -> dict:
     from pathlib import Path
 
     import yaml
 
-    compose = yaml.safe_load((Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text())
+    return yaml.safe_load((Path(__file__).resolve().parents[1] / name).read_text())
+
+
+def test_the_development_compose_passes_the_licence_to_every_service():
+    """Without the licence settings a local stack answers "no license configured" and refuses every upload. The
+    file is public: each entry only forwards a variable of the operator's shell, never a value."""
     for service in ("api", "worker", "beat"):
-        names = {entry.split("=", 1)[0] for entry in compose["services"][service]["environment"]}
-        assert {"GENOLENS_LICENSE_KEY", "LICENSE_SECRET_KEY", "LICENSE_PRODUCT"} <= names, service
+        environment = _compose("docker-compose.yml")["services"][service]["environment"]
+        for entry in (
+            "GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY:-}",
+            "LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY:-}",
+            "LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}",
+        ):
+            assert entry in environment, (service, entry)
+
+
+def test_the_development_compose_forwards_the_sql_echo_choice():
+    """The documented opt-in (SQL_ECHO_PARAMETERS) must reach the containers, which do not read the host's .env."""
+    for service in ("api", "worker", "beat"):
+        environment = _compose("docker-compose.yml")["services"][service]["environment"]
+        assert "SQL_ECHO_PARAMETERS=${SQL_ECHO_PARAMETERS:-false}" in environment, service
+
+
+def test_production_compose_turns_debug_off():
+    """DEBUG only drives the SQL echo; on, production would write every statement to its logs."""
+    services = _compose("docker-compose.prod.yml")["services"]
+    production = {
+        name
+        for name, service in services.items()
+        if "ENVIRONMENT=production" in service.get("environment", [])
+    }
+    assert production == {"api", "worker", "beat", "r-worker"}
+    for name in production:
+        assert "DEBUG=false" in services[name]["environment"], name

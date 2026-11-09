@@ -12,6 +12,7 @@ import httpx
 from openai import APIConnectionError, AsyncOpenAI
 
 from app.core.config import settings
+from app.services.cosmomics_nova import ZERO_AGAINST_NOTE, claim_state_of, subgroup_side
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,34 @@ logger = logging.getLogger(__name__)
 # consume the max_tokens budget and (in streaming) leak into the prose. Templates
 # that don't support the flag simply ignore it.
 _NO_THINKING: Dict[str, Any] = {"chat_template_kwargs": {"enable_thinking": False}}
+
+# What the nova prompt carries at most: claims, sub-groups per side of a claim, sub-groups not
+# linked to a claim. What is cut is said in the prompt ("N of M claims").
+PROMPT_CLAIMS_LIMIT = 9
+PROMPT_SUBGROUPS_PER_SIDE = 3
+PROMPT_UNLINKED_LIMIT = 6
+
+CLAIM_STATE_TEXT = {
+    "for_only": "evidence for only, none against",
+    "against_only": "evidence against only, none for",
+    "both_ways": "evidence both for and against",
+}
+
+
+# What the term p-values are, in a fixed vocabulary, by `provenance.enrichment_source`. Only an
+# enrichment GenoLens ran itself is told to be a Benjamini–Hochberg adjustment; a deposited table
+# is told by its source (never by its column name, which is the user's text); anything else
+# (legacy rows, no enrichment, a payload with no provenance) is no more than an adjusted p-value.
+P_KIND_BY_SOURCE = {
+    "annodb": "a Benjamini–Hochberg adjusted p-value",
+    "uploaded": "an adjusted p-value read from uploaded tables",
+}
+P_KIND_UNSPECIFIED = "an adjusted p-value"
+
+
+def prompt_claims_sent(claims_total: int) -> int:
+    """How many of a nova's claims the AI prompt carries."""
+    return min(max(claims_total, 0), PROMPT_CLAIMS_LIMIT)
 
 
 class LocalAIInterpreter:
@@ -136,10 +165,9 @@ class LocalAIInterpreter:
         comparison_name: Optional[str] = None,
     ) -> str:
         """
-        Cosmetic-focused interpretation of a CosmOmics Pathway Nova
-        (output of cosmomics_nova.build_nova), in three English markdown sections —
-        claim-by-claim narrative, executive summary, regulatory note — grounded on the
-        pathways for / against each claim.
+        Reading of a CosmOmics Pathway Nova (output of cosmomics_nova.build_nova), in two English
+        markdown sections — a claim-by-claim reading and a summary — that say nothing beyond the
+        sub-groups for / against each claim that the prompt carries.
         """
         prompt = self._build_cosmomics_prompt(nova, comparison_name)
         return await self._complete_cosmetic_prompt(prompt)
@@ -173,7 +201,19 @@ class LocalAIInterpreter:
     def _build_cosmomics_prompt(
         self, nova: Dict[str, Any], comparison_name: Optional[str] = None
     ) -> str:
-        """Build the English cosmetic-persona prompt from a CosmOmics Pathway Nova."""
+        """Build the English prompt that has a CosmOmics Pathway Nova read, claim by claim.
+
+        It carries the data and asks for a reading of them and nothing else: no marketing
+        paragraph, no regulatory wording written by the model. What is cut to fit (claims beyond
+        `PROMPT_CLAIMS_LIMIT`, sub-groups beyond `PROMPT_SUBGROUPS_PER_SIDE` per side) is said in
+        the prompt, as "N of M".
+
+        What leaves for the hosted model is what the user agrees to before the first call: claim
+        names, sub-group names, directions, counts and p-values, and nothing else. So the prompt
+        carries no comparison name (it often holds the user's own condition or product names;
+        `comparison_name` is accepted so callers need not change, and is never used), no dataset
+        or analysis identifier, no column name of an uploaded table, no score and no setting.
+        """
 
         def p_text(nl: float) -> str:
             return f"p = {10 ** -nl:.1e}" if nl >= 3 else f"p = {10 ** -nl:.3f}"
@@ -182,57 +222,95 @@ class LocalAIInterpreter:
             arrow = "up" if s.get("obs") == "up" else "down"
             return f"{s['name']} ({arrow}, {p_text(s['nl'])})"
 
+        def count(n: int, noun: str) -> str:
+            return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+        all_claims = nova.get("claims", [])
+        shown_claims = all_claims[:PROMPT_CLAIMS_LIMIT]
         claim_lines = []
-        for c in nova.get("claims", [])[:9]:
+        for_only_shown = False
+        for c in shown_claims:
             subs = c.get("subgroups", [])
-            pro = [s for s in subs if s.get("delta", 0) > 0][:3]
-            con = [s for s in subs if s.get("delta", 0) <= 0][:3]
-            line = (
-                f"- {c['name']}: coherence {round(100 * c.get('coherence', 0))}% "
-                f"({c.get('n_for', 0)} pathways for, {c.get('n_against', 0)} against)"
-            )
+            pro = [s for s in subs if subgroup_side(s) == "for"][:PROMPT_SUBGROUPS_PER_SIDE]
+            con = [s for s in subs if subgroup_side(s) == "against"][:PROMPT_SUBGROUPS_PER_SIDE]
+            tied = [s for s in subs if subgroup_side(s) == "balanced"][:PROMPT_SUBGROUPS_PER_SIDE]
+            counts = f"{count(c.get('n_for', 0), 'sub-group')} for, {c.get('n_against', 0)} against"
+            if c.get("n_balanced"):
+                counts += f", {c['n_balanced']} balanced"
+            claim_state = claim_state_of(c)
+            if claim_state == "for_only":
+                for_only_shown = True
+            state = CLAIM_STATE_TEXT.get(claim_state)
+            if state:
+                counts += f"; {state}"
+            line = f"- {c['name']} ({counts})"
             if pro:
                 line += "; supporting: " + ", ".join(sub_text(s) for s in pro)
             if con:
                 line += "; contradicting: " + ", ".join(sub_text(s) for s in con)
+            if tied:
+                line += "; balanced: " + ", ".join(sub_text(s) for s in tied)
             claim_lines.append(line)
         claims_text = "\n".join(claim_lines) or (
             "- No cosmetic claim has a significant pathway in this comparison."
         )
-        unlinked_text = ", ".join(sub_text(s) for s in nova.get("unlinked", [])[:6]) or "none"
-        comp = f" for the comparison '{comparison_name}'" if comparison_name else ""
+        cut = (
+            f"; {len(shown_claims)} of {len(all_claims)} claims shown"
+            if len(all_claims) > len(shown_claims)
+            else ""
+        )
 
-        return f"""You are a senior cosmetic-science expert helping a R&D team turn \
-transcriptomic results into clear, marketing-ready skin-benefit insights{comp}.
+        unlinked = nova.get("unlinked", [])
+        unlinked_total = max(int(nova.get("unlinked_total") or 0), len(unlinked))
+        unlinked_shown = unlinked[:PROMPT_UNLINKED_LIMIT]
+        unlinked_text = ", ".join(sub_text(s) for s in unlinked_shown) or "none"
+        if unlinked_total > len(unlinked_shown) and unlinked_shown:
+            unlinked_text += f" ({len(unlinked_shown)} of {unlinked_total} sub-groups)"
 
-The data below comes from the CosmOmics Pathway Nova: the enriched pathways of this \
-comparison are mapped onto a curated catalogue of cosmetic claims. For each claim, a \
-pathway counts FOR the claim when its observed direction (up / down) matches the one the \
-claim expects, and AGAINST it otherwise. Coherence = share of the evidence that supports \
-the claim. p-values are adjusted (Benjamini-Hochberg) and combined per pathway.
+        # What the p-values are, in a fixed vocabulary read from the kind of enrichment, never from
+        # the payload's own wording (which may carry the column name of an uploaded table, the
+        # user's text, and does not leave).
+        kind = (nova.get("provenance") or {}).get("enrichment_source")
+        p_kind = P_KIND_BY_SOURCE.get(kind, P_KIND_UNSPECIFIED)
 
-CLAIMS (strongest supporting evidence first):
+        # The one ruled sentence, asked for only on the claims that have no contrary term at all
+        # (state for_only): a claim with 0 sub-groups against but a contrary term is not that.
+        zero_against = (
+            f' For a claim whose line says "{CLAIM_STATE_TEXT["for_only"]}", end its reading with '
+            f'this sentence, word for word: "{ZERO_AGAINST_NOTE}"'
+            if for_only_shown
+            else ""
+        )
+
+        return f"""You are a scientist helping an R&D team read transcriptomic results.
+
+The data below comes from the CosmOmics Pathway Nova: the enriched terms of this comparison are \
+mapped onto a curated catalogue of cosmetic claims and grouped into pathway sub-groups. A \
+sub-group counts FOR a claim when the direction in which its terms are observed (up / down) \
+matches the one the claim expects, and AGAINST it otherwise; a sub-group whose evidence for and \
+against cancels out is BALANCED. The p-value of a term is {p_kind}; the p shown for a \
+sub-group is a combined p-value of its terms (unsigned Stouffer), not an adjusted p-value.
+
+CLAIMS (strongest supporting evidence first; at most {PROMPT_SUBGROUPS_PER_SIDE} sub-groups per \
+side are listed{cut}):
 {claims_text}
 
-SIGNIFICANT PATHWAYS NOT LINKED TO ANY CLAIM: {unlinked_text}
+SIGNIFICANT SUB-GROUPS NOT LINKED TO ANY CLAIM: {unlinked_text}
 
-Write your answer in ENGLISH, in markdown, with EXACTLY these three sections:
+Write your answer in ENGLISH, in markdown, with EXACTLY these two sections:
 
-## Claim-by-claim narrative
-For each claim (strongest first), explain in 2-3 sentences the biological mechanism in \
-accessible skin-care language, how coherent the evidence is, and name the pathways that \
-contradict it, if any. Skip claims without supporting pathways.
+## Claim-by-claim reading
+For each claim listed above, in the order given, write 2-3 sentences: the sub-groups that \
+support it, and those that go against it or are balanced, with their direction and p-value as \
+given.{zero_against}
 
-## Executive summary
-One short, punchy marketing-oriented paragraph (4-6 sentences) describing the overall \
-effect of the tested product/ingredient on the skin.
+## Summary
+One short paragraph (3-5 sentences) that restates, claim by claim, how many sub-groups go for \
+and against it and which sub-groups lead.
 
-## Regulatory note
-A brief disclaimer. These are COSMETIC effects only, not medical or therapeutic claims. \
-Mention the contradicting evidence above. Use cautious, compliant wording (e.g. "helps \
-support", "appears to", "may contribute to") and avoid disease/treatment language.
-
-Be specific, rely only on the data provided, and never invent gene names or pathways."""
+Say nothing beyond the data provided above: no gene, pathway, mechanism or product that is not \
+named in it, and no wording of efficacy, benefit, proof, treatment or disease. Describe what \
+the data show ("is enriched", "goes in the direction of the claim"), never what a product does."""
 
     async def interpret_comparison_stream(
         self,

@@ -25,6 +25,7 @@ from app.core.service_tokens import SCOPE_REPORTS_EDITORIAL
 from app.models.models import Dataset, SelfServiceAnalysis, User
 from app.models.report_job import ReportJob, ReportJobStatus
 from app.schemas.report import (
+    AnalysisReportTriggerRequest,
     ComparisonReportTriggerRequest,
     ReportJobResponse,
     ReportTemplate,
@@ -67,13 +68,21 @@ async def trigger_report(
     analysis_id: UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    payload: Annotated[Optional[AnalysisReportTriggerRequest], Body()] = None,
 ):
-    """Trigger background SciLicium PDF report generation for an analysis."""
+    """Trigger background SciLicium PDF report generation for an analysis.
+
+    `use_ai` (default true) False gives a report without any AI text: no LLM call, no stored
+    interpretation read, no AI label.
+    """
+    use_ai = payload.use_ai if payload is not None else True
     analysis = await _get_analysis_or_404(analysis_id, db, current_user.id)
 
-    # Return existing in-progress job rather than spawning a duplicate
+    # Return existing in-progress job rather than spawning a duplicate — one made the same way:
+    # a flip of `use_ai` never hands back the job made with the other setting.
     stmt = select(ReportJob).where(
         ReportJob.analysis_id == analysis_id,
+        ReportJob.use_ai == use_ai,
         ReportJob.status.in_([ReportJobStatus.PENDING, ReportJobStatus.RUNNING]),
     )
     existing = (await db.execute(stmt)).scalar_one_or_none()
@@ -87,6 +96,7 @@ async def trigger_report(
         id=uuid4(),
         project_id=analysis.project_id,
         analysis_id=analysis_id,
+        use_ai=use_ai,
         requested_by=current_user.id,
         status=ReportJobStatus.PENDING,
     )
@@ -179,12 +189,18 @@ async def _get_dataset_or_404(dataset_id: UUID, db: AsyncSession, user_id: UUID)
     return dataset
 
 
+JOB_ID_DESCRIPTION = (
+    "A report job of this comparison, format and caller; without it, the latest one. "
+    "Any other job id gives 404."
+)
+
+
 def _visible_to(stmt, token_id: Optional[UUID]):
     """A user sees every job of the comparison; a service token only the jobs requested
-    through a service token (rendered without the owner's saved branding)."""
+    through that very token (rendered without the owner's saved branding)."""
     if token_id is None:
         return stmt
-    return stmt.where(ReportJob.service_token_id.is_not(None))
+    return stmt.where(ReportJob.service_token_id == token_id)
 
 
 @comparison_router.post(
@@ -228,8 +244,8 @@ async def trigger_comparison_report(
     # Return existing in-progress job rather than spawning a duplicate — but only
     # if it is *recent*. A job that has been PENDING/RUNNING for too long is stale
     # (e.g. the worker died) and must not block regeneration forever. Only a job made
-    # the same way is reused: same format, same `use_ai`, and requested through a service
-    # token (unbranded) or not.
+    # the same way is reused: same format, same `use_ai`, and requested by the same caller (a
+    # user, or one given service token: never another token's job).
     recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
     stmt = select(ReportJob).where(
         ReportJob.dataset_id == dataset_id,
@@ -241,7 +257,7 @@ async def trigger_comparison_report(
         (
             ReportJob.service_token_id.is_(None)
             if token_id is None
-            else ReportJob.service_token_id.is_not(None)
+            else ReportJob.service_token_id == token_id
         ),
     )
     stmt = stmt.order_by(desc(ReportJob.created_at)).limit(1)
@@ -321,8 +337,10 @@ async def comparison_report_status(
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
     comparison_name: Annotated[str, Query(...)],
     template: Annotated[Optional[ReportTemplate], Query()] = None,
+    job_id: Annotated[Optional[UUID], Query(description=JOB_ID_DESCRIPTION)] = None,
 ):
-    """Get the status of the latest report job for a comparison (of one format if given)."""
+    """Get the status of the latest report job for a comparison (of one format if given), or
+    of the job `job_id` when it is one of this comparison, format and caller."""
     await _get_dataset_or_404(dataset_id, db, current_user.id)
     stmt = select(ReportJob).where(
         ReportJob.dataset_id == dataset_id,
@@ -330,6 +348,8 @@ async def comparison_report_status(
     )
     if template:
         stmt = stmt.where(ReportJob.template == template)
+    if job_id is not None:
+        stmt = stmt.where(ReportJob.id == job_id)
     stmt = _visible_to(stmt, service_token_id(request))
     stmt = stmt.order_by(desc(ReportJob.created_at)).limit(1)
     job = (await db.execute(stmt)).scalar_one_or_none()
@@ -357,8 +377,10 @@ async def download_comparison_report(
     current_user: Annotated[CurrentUser, Depends(get_current_user)],
     comparison_name: Annotated[str, Query(...)],
     template: Annotated[Optional[ReportTemplate], Query()] = None,
+    job_id: Annotated[Optional[UUID], Query(description=JOB_ID_DESCRIPTION)] = None,
 ):
-    """Download the latest generated PDF report for a comparison (of one format if given)."""
+    """Download the latest generated PDF report for a comparison (of one format if given), or
+    that of the finished job `job_id` when it is one of this comparison, format and caller."""
     await _get_dataset_or_404(dataset_id, db, current_user.id)
     stmt = select(ReportJob).where(
         ReportJob.dataset_id == dataset_id,
@@ -367,6 +389,8 @@ async def download_comparison_report(
     )
     if template:
         stmt = stmt.where(ReportJob.template == template)
+    if job_id is not None:
+        stmt = stmt.where(ReportJob.id == job_id)
     stmt = _visible_to(stmt, service_token_id(request))
     stmt = stmt.order_by(desc(ReportJob.created_at)).limit(1)
     job = (await db.execute(stmt)).scalar_one_or_none()

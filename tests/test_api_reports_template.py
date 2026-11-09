@@ -181,6 +181,60 @@ async def test_status_reports_the_format():
     assert resp.json()["template"] == "editorial"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ai_texts",
+    [
+        None,
+        [],
+        [
+            {"kind": "nova", "model": "m-1", "generated_at": "2026-11-05T09:30:00+00:00"},
+            {"kind": "comparison", "model": "m-2", "generated_at": "2026-11-04T08:00:00+00:00"},
+        ],
+    ],
+)
+async def test_status_returns_ai_texts(ai_texts):
+    """The AI texts the report printed come back with the job (null: none recorded, [] : none)."""
+    from app.models.report_job import ReportJob, ReportJobStatus
+
+    now = datetime.now(timezone.utc)
+    job = ReportJob(
+        id=uuid4(),
+        project_id=TEST_PROJECT_ID,
+        dataset_id=DATASET_ID,
+        comparison_name="KO_vs_WT",
+        template="editorial",
+        status=ReportJobStatus.DONE,
+        requested_by=uuid4(),
+        pdf_path="p.pdf",
+        ai_texts=ai_texts,
+    )
+    job.created_at = job.updated_at = now
+    async with _client(_user(cosmetics=True), job=job) as c:
+        resp = await c.get(
+            f"{URL}/status", params={"comparison_name": "KO_vs_WT", "template": "editorial"}
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["ai_texts"]
+    if ai_texts is None:
+        assert body is None
+        return
+    assert [(t["kind"], t["model"]) for t in body] == [(t["kind"], t["model"]) for t in ai_texts]
+    assert [datetime.fromisoformat(t["generated_at"].replace("Z", "+00:00")) for t in body] == [
+        datetime.fromisoformat(t["generated_at"]) for t in ai_texts
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["status", "download"])
+async def test_a_job_id_must_be_a_uuid(route):
+    async with _client(_user(cosmetics=True)) as c:
+        resp = await c.get(
+            f"{URL}/{route}", params={"comparison_name": "KO_vs_WT", "job_id": "not-a-uuid"}
+        )
+    assert resp.status_code == 422
+
+
 def test_report_filename_is_sanitised():
     from app.api.endpoints.reports import report_filename
 

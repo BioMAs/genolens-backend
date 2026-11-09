@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from app.services.cosmomics_nova import ClaimSubgroupMap, SubgroupTerm, TermHit, build_nova
 from app.services.omicskin_score import (
     ALL_CLAIMS,
     BAND_LABELS,
@@ -74,6 +75,12 @@ def test_bands(score, band):
     assert BAND_LABELS[band]
 
 
+def test_the_lowest_band_is_called_weak_evidence_not_unsupported():
+    # A low score is a small amount of evidence, not a finding against the claim.
+    assert BAND_LABELS["not_supported"] == "Weak evidence"
+    assert "supported" not in BAND_LABELS["not_supported"].lower()
+
+
 def test_score_claims_matches_the_validated_report():
     nova = json.loads(FIXTURE.read_text())
     scores = score_claims(nova)
@@ -108,7 +115,7 @@ def test_claims_absent_from_the_nova_have_no_significant_evidence():
     unscored = [s for s in scores if not s.scored]
     assert sorted(s.name for s in unscored) == ["Anti-wrinkles", "Energising", "Healing"]
     assert all(s.band == "no_evidence" and s.score is None and s.claim is None for s in unscored)
-    assert all(s.label == "No significant evidence" for s in unscored)
+    assert all(s.label == "n.e." for s in unscored)  # not evaluated: no score, no band to name
     # Scored claims come first, highest score first.
     values = [s.score for s in scores if s.scored]
     assert values == sorted(values, reverse=True)
@@ -118,3 +125,48 @@ def test_claims_absent_from_the_nova_have_no_significant_evidence():
 def test_empty_nova_scores_nothing():
     scores = score_claims({"claims": []})
     assert [s.band for s in scores] == ["no_evidence"] * 9
+
+
+# ── The score reads the best sub-group that supports the claim ───────────────
+
+
+def _claim_with_a_contrary_best_subgroup() -> dict:
+    """The most significant sub-group (p = 1e-10) goes against the claim; the best one going the
+    expected way is at p = 1e-4. Coherence = 4 / (4 + 10)."""
+    rows = [
+        SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up"),
+        SubgroupTerm("Firming", "Group B", "GO:0000002", "Group B", "up"),
+    ]
+    hits = [
+        TermHit("GO:0000001", "Group A", 1e-4, "up"),
+        TermHit("GO:0000002", "Group B", 1e-10, "down"),
+    ]
+    return build_nova(hits, ClaimSubgroupMap(rows))
+
+
+def test_score_uses_the_best_supporting_subgroup():
+    nova = _claim_with_a_contrary_best_subgroup()
+    claim = nova["claims"][0]
+    assert claim["best_nl"] == pytest.approx(10.0)  # the strongest sub-group, against the claim
+    assert claim["best_for_nl"] == pytest.approx(4.0)
+    (scored,) = [s for s in score_claims(nova) if s.scored]
+    # 100 x 4/14 x min(1, 4 / 8): the supporting sub-group's strength, not the contrary one's (29).
+    assert scored.score == omicskin_score(claim["coherence"], 4.0) == 14
+    assert scored.score != omicskin_score(claim["coherence"], claim["best_nl"])
+
+
+def test_a_claim_without_a_supporting_subgroup_scores_zero():
+    rows = [SubgroupTerm("Firming", "Group A", "GO:0000001", "Group A", "up")]
+    nova = build_nova([TermHit("GO:0000001", "Group A", 1e-9, "down")], ClaimSubgroupMap(rows))
+    assert nova["claims"][0]["best_for_nl"] is None
+    (scored,) = [s for s in score_claims(nova) if s.scored]
+    assert scored.score == 0
+    assert scored.band == "not_supported"
+
+
+def test_a_payload_without_best_for_reads_the_supporting_subgroup_off_its_subgroups():
+    """The reference mock predates `best_for_nl`: the same figure comes from its sub-groups."""
+    nova = _claim_with_a_contrary_best_subgroup()
+    del nova["claims"][0]["best_for_nl"], nova["claims"][0]["best_for_subgroup"]
+    (scored,) = [s for s in score_claims(nova) if s.scored]
+    assert scored.score == 14

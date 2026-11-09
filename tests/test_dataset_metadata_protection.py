@@ -97,3 +97,58 @@ async def test_the_denylist_covers_what_ingestion_writes():
     metadata = await data_processor.get_file_metadata(tsv, ".tsv")
 
     assert set(metadata) <= _CLIENT_PROTECTED_METADATA_KEYS
+
+
+def test_the_provenance_the_nova_prints_cannot_be_forged_by_a_client():
+    """`source_version` is checked at upload; `padj_column`, `padj_unparsable`,
+    `rows_without_padj` and `padj_cutoff` are written by the worker. A PATCH writes none of them."""
+    forged = {
+        "source_version",
+        "padj_column",
+        "padj_unparsable",
+        "rows_without_padj",
+        "padj_cutoff",
+    }
+    assert forged <= _CLIENT_PROTECTED_METADATA_KEYS
+
+    merged = _merge_client_metadata(
+        {"source_version": "pipe_scilicium v3.0.0"}, {"source_version": "anything"}, DATASET_ID
+    )
+    assert merged == {"source_version": "pipe_scilicium v3.0.0"}
+
+
+def test_the_run_provenance_the_latex_report_prints_cannot_be_forged_by_a_client():
+    """The R scripts record the versions, the design of each comparison, the relaxed sample
+    thresholds, the anno.db file, the categories and the background: a PATCH writes none of them."""
+    forged = {
+        "software_versions",
+        "design_used",
+        "qc_relaxed",
+        "annodb_file",
+        "categories",
+        "background",
+    }
+    assert forged <= _CLIENT_PROTECTED_METADATA_KEYS
+    merged = _merge_client_metadata(
+        {"software_versions": {"R": "4.4.1"}, "annodb_file": "anno.db.human.gene_symbol.1.rds"},
+        {"software_versions": {"R": "9.9"}, "annodb_file": "other.rds", "note": "libre"},
+        DATASET_ID,
+    )
+    assert merged == {
+        "software_versions": {"R": "4.4.1"},
+        "annodb_file": "anno.db.human.gene_symbol.1.rds",
+        "note": "libre",
+    }
+
+
+def test_a_client_cannot_remove_the_demo_flag():
+    """A demo account owns its datasets: the flag that marks the nova and the exports it makes
+    must survive a PATCH."""
+    merged = _merge_client_metadata({"demo": True, "rows": 5}, {"demo": False}, DATASET_ID)
+    assert merged == {"demo": True, "rows": 5}
+    assert _merge_client_metadata({"demo": True}, {"demo": None}, DATASET_ID) == {"demo": True}
+
+
+def test_a_client_cannot_set_the_demo_flag():
+    assert _merge_client_metadata({"rows": 5}, {"demo": True}, DATASET_ID) == {"rows": 5}
+    assert "demo" in _CLIENT_PROTECTED_METADATA_KEYS

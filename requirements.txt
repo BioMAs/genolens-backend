@@ -21,6 +21,9 @@ passlib[bcrypt]==1.7.4
 
 # Task Queue
 celery==5.3.6
+# celery's transport: pinned because kombu 5.7.0 (2026-11-03) refuses redis-py 5.0.1, and an unpinned
+# build resolves it (the r-worker did not start). 5.6.2 is what the recette ran with.
+kombu==5.6.2
 redis==5.0.1
 
 # Data Processing

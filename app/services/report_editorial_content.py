@@ -25,8 +25,17 @@ from markupsafe import Markup, escape
 
 from app.services.cosmetics_taxonomy import normalize_pathway_id
 from app.services.cosmomics_grouping import clean_label
+from app.services.cosmomics_nova import (
+    DEFAULT_ALPHA,
+    ZERO_AGAINST_NOTE,
+    best_supporting_subgroup,
+    claim_state_of,
+    subgroup_side,
+)
 from app.services.cosmomics_nova_svg import claim_color
-from app.services.omicskin_score import ALL_CLAIMS, BAND_LABELS, ClaimScore, omicskin_score
+from app.services.omicskin_score import ALL_CLAIMS, BAND_LABELS, ClaimScore, claim_score
+from app.services.report_common import ai_label, ai_text_record
+from app.services.report_editorial_figures import volcano_sampling
 from app.services.report_editorial_svg import (
     clean_inline_svg,
     dose_ladder,
@@ -57,13 +66,20 @@ TERMS_PER_CLAIM_PAGE = 10
 RESERVATIONS_PER_PAGE = 2
 
 _NUMBER_WORDS = ["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
-_BAND_PHRASES = {  # (first clause, following clauses)
-    "strong": ("strongly supported", "strongly"),
-    "moderate": ("moderately supported", "moderately"),
-    "weak": ("weakly supported", "weakly"),
-    "not_supported": ("not supported", "not supported"),
-    "no_evidence": ("not evidenced", "not evidenced"),
+# What a claim's state says, for the verdict: the direction of the terms found for it. A claim
+# without a significant term is "not evaluated" (n.e.): it has no state of its own.
+_STATE_PHRASES = {
+    "for_only": "with evidence for the claim only",
+    "both_ways": "with evidence for and against",
+    "against_only": "with evidence against the claim only",
 }
+_LADDER_LABELS = {  # short band names of the verdict ladder
+    "strong": "STRONG",
+    "moderate": "MODERATE",
+    "weak": "WEAK",
+    "not_supported": "WEAK EVIDENCE",
+}
+NOT_EVALUATED = "n.e."
 
 
 # ---------------------------------------------------------------------------
@@ -270,49 +286,87 @@ def claim_title(name: str) -> str:
     return CLAIM_TITLES.get(name, name)
 
 
+def supporting_subgroup(claim: dict) -> Optional[tuple[str, float]]:
+    """The claim's most significant sub-group among those that go in the direction of the claim,
+    with its −log10 p; None when no sub-group does. Read from the payload's `best_for_subgroup`;
+    a payload that predates the field is searched."""
+    if "best_for_subgroup" in claim:
+        name = claim["best_for_subgroup"]
+        return (str(name), float(claim.get("best_for_nl") or 0.0)) if name else None
+    best = best_supporting_subgroup(claim.get("subgroups") or [])
+    return (str(best["name"]), float(best["nl"])) if best else None
+
+
+def state_of(claim: dict) -> str:
+    """for_only / both_ways / against_only (see `cosmomics_nova.claim_state_of`)."""
+    return claim_state_of(claim)
+
+
+def _n_balanced(claim: dict) -> int:
+    if claim.get("n_balanced") is not None:
+        return int(claim["n_balanced"])
+    return sum(1 for s in claim.get("subgroups") or [] if subgroup_side(s) == "balanced")
+
+
+def _sub_groups(n: int) -> str:
+    return f"{number_word(n)} sub-group{'s' if n != 1 else ''}"
+
+
 def claim_statement(cs: ClaimScore, test: str, control: str) -> str:
-    """Deterministic statement of a scored claim, built from its nova entry only."""
+    """Deterministic statement of a scored claim, built from its nova entry only.
+
+    A claim is "led by" its most significant sub-group among those that go in the direction of the
+    claim (`best_for_subgroup`), not by the most significant one whatever its direction; a claim
+    with no such sub-group says so."""
     c = cs.claim or {}
     subs = c.get("subgroups") or []
     n_for, n_against = int(c.get("n_for") or 0), int(c.get("n_against") or 0)
-    best = c.get("best_subgroup") or "—"
-    p = 10 ** -float(c.get("best_nl") or 0)
+    n_balanced = _n_balanced(c)
     coherence = round(100 * float(c.get("coherence") or 0))
     versus = f" in {test} versus {control}" if control else f" in {test}"
     n_sub = len(subs)
-    if n_sub == 1 and n_for == 1:
-        who = "The only pathway sub-group supports"
-    elif n_for == n_sub:
-        who = f"All {number_word(n_sub)} pathway sub-groups support"
+    lead = supporting_subgroup(c)
+    if lead is None:
+        s = f"No pathway sub-group supports the {cs.name} claim{versus}"
     else:
-        who = (
-            f"{number_word(n_for).capitalize()} of the {number_word(n_sub)} pathway "
-            f"sub-groups support{'s' if n_for == 1 else ''}"
-        )
-    s = (
-        f"{who} the {cs.name} claim{versus}, led by {best} (p = {_plain_p(p)}). "
-        f"{coherence} % of the evidence goes in the direction of the claim"
-    )
+        if n_sub == 1 and n_for == 1:
+            who = "The only pathway sub-group supports"
+        elif n_for == n_sub:
+            who = f"All {number_word(n_sub)} pathway sub-groups support"
+        else:
+            who = (
+                f"{number_word(n_for).capitalize()} of the {number_word(n_sub)} pathway "
+                f"sub-groups support{'s' if n_for == 1 else ''}"
+            )
+        s = f"{who} the {cs.name} claim{versus}, led by {lead[0]} (p = {_plain_p(10 ** -lead[1])})"
+    s += f". {coherence} % of the evidence goes in the direction of the claim"
     if n_against:
-        against = [x.get("name") for x in subs if (x.get("delta") or 0) <= 0][:2]
+        against = [x.get("name") for x in subs if subgroup_side(x) == "against"][:2]
         verb = "goes" if n_against == 1 else "go"
         s += (
-            f"; {number_word(n_against)} sub-group{'s' if n_against != 1 else ''} "
+            f"; {_sub_groups(n_against)} "
             f"({', '.join(str(a) for a in against)}{', …' if n_against > 2 else ''}) {verb} the "
             f"other way"
+        )
+    if n_balanced:
+        # A balanced sub-group (evidence for and against cancel) is neither for nor against.
+        s += (
+            f"; {_sub_groups(n_balanced)} {'is' if n_balanced == 1 else 'are'} balanced "
+            f"(evidence for and against cancel)"
         )
     return s + "."
 
 
 def key_genes(
-    claim: dict, term_genes: dict[str, set[str]], degs: Sequence[dict], limit: int = 7
+    claim: dict, term_genes: dict[tuple[str, str], set[str]], degs: Sequence[dict], limit: int = 7
 ) -> list[tuple[str, float]]:
     """DEGs behind the claim's supporting terms, largest |log2 FC| first."""
     genes: set[str] = set()
     for sg in claim.get("subgroups") or []:
         for t in sg.get("terms") or []:
             if (t.get("effect") or 0) > 0:
-                genes |= {g.upper() for g in term_genes.get(normalize_pathway_id(t.get("id")), ())}
+                found = term_genes.get((normalize_pathway_id(t.get("id")), t.get("obs")), ())
+                genes |= {g.upper() for g in found}
     if not genes:
         return []
     picked: dict[str, tuple[str, float]] = {}
@@ -344,6 +398,12 @@ def terms_rows(claim: dict, limit: int = TERMS_PER_CLAIM_PAGE) -> tuple[list[dic
                     "nl": float(t.get("nl") or 0),
                     "up": t.get("obs") == "up",
                     "pro": (t.get("effect") or 0) > 0,
+                    # Enriched in both lists: it has one entry per direction, one for and one
+                    # against, each marked.
+                    "both": bool(t.get("both_directions")),
+                    # Below alpha it still weighs in the sums; a payload without the flag is
+                    # read as significant.
+                    "significant": t.get("significant", True) is not False,
                 }
             )
     return rows, n
@@ -356,9 +416,7 @@ def dose_points(
     points = []
     for label, payload in dose_series or []:
         claim = next((c for c in payload.get("claims") or [] if c.get("name") == name), None)
-        value = (
-            omicskin_score(claim.get("coherence") or 0, claim.get("best_nl") or 0) if claim else 0
-        )
+        value = claim_score(claim) if claim else 0
         points.append((label, value))
     return points
 
@@ -395,14 +453,21 @@ class EditorialInputs:
     analysis_label: Optional[str]
     nova: dict[str, Any]
     scores: list[ClaimScore]
-    term_genes: dict[str, set[str]]
+    term_genes: dict[tuple[str, str], set[str]]
     figures: dict[str, Optional[str]]  # pca, volcano, dot_up, dot_down, heatmap (raw SVG)
     nova_light: str
     nova_dark: str
-    comparison_ai: Optional[str] = None  # text as stored / generated
+    # The AI texts: as stored / generated, with the model and the moment of generation the label
+    # names. `*_stale`: a stored text was left out because it was written from other data than
+    # these (the traceability page says so).
+    comparison_ai: Optional[str] = None
     comparison_ai_model: Optional[str] = None
+    comparison_ai_generated_at: Optional[datetime] = None
+    comparison_ai_stale: bool = False
     nova_ai: Optional[str] = None
     nova_ai_model: Optional[str] = None
+    nova_ai_generated_at: Optional[datetime] = None
+    nova_ai_stale: bool = False
     cover_info: dict[str, Any] = field(default_factory=dict)
     branding: Optional[dict[str, Any]] = None
     logo_data_uri: Optional[str] = None
@@ -414,31 +479,48 @@ class EditorialInputs:
     use_ai: bool = True
     illustrative: bool = False
     dose_series: Optional[list[tuple[str, dict]]] = None
+    # How the differentially expressed genes were called, as the DEG dataset records it: the method
+    # that decided the calls (`primary_method`: DESeq2, edgeR or limma) and the methods the
+    # analysis asked for (`de_method`: all, deseq2, edger or limma). None = not recorded.
+    de_primary_method: Optional[str] = None
+    de_method_run: Optional[str] = None
+    # The DEG dataset's metadata names the analysis that produced it, and that analysis cannot be
+    # found any more (deleted): the results are orphaned, not imported (the LaTeX report says the
+    # same, `report_latex_methods.not_described_tex`).
+    analysis_gone: bool = False
 
 
-def _reviewer_label(cover_info: dict[str, Any]) -> tuple[str, bool]:
-    reviewer = (cover_info or {}).get("checked_by")
-    if reviewer:
-        return f"AI-generated interpretation — reviewed by {reviewer}", True
-    return "AI-generated, not yet reviewed", False
+def nova_alpha(nova: dict) -> float:
+    """The significance threshold of the nova (a payload that predates the field: the default)."""
+    return float(nova.get("alpha") or DEFAULT_ALPHA)
 
 
-def _headline(scores: list[ClaimScore]) -> str:
+def _headline(scores: list[ClaimScore], no_enrichment: bool = False) -> str:
+    """The verdict, descriptive: how many claims have evidence for, against or both ways, and how
+    many were not evaluated. It does not say that a claim is supported."""
+    if not any(s.scored for s in scores):
+        if no_enrichment:
+            return "No enrichment result is stored for this comparison; no claim is evaluated."
+        return "No claim has a significant term in this comparison."
     counts: dict[str, int] = {}
     for s in scores:
-        counts[s.band] = counts.get(s.band, 0) + 1
-    if not any(s.scored for s in scores):
-        return "No claim shows significant evidence in this comparison."
+        if s.scored:
+            state = state_of(s.claim or {})
+            counts[state] = counts.get(state, 0) + 1
     parts = []
-    for band in ("strong", "moderate", "weak", "not_supported", "no_evidence"):
-        n = counts.get(band, 0)
+    for state in ("for_only", "both_ways", "against_only"):
+        n = counts.get(state, 0)
         if not n:
             continue
-        first, later = _BAND_PHRASES[band]
-        if not parts:
-            parts.append(f"{number_word(n).capitalize()} claim{'s' if n != 1 else ''} {first}")
-        else:
-            parts.append(f"{number_word(n)} {later}")
+        lead = (
+            f"{number_word(n).capitalize()} claim{'s' if n != 1 else ''}"
+            if not parts
+            else number_word(n)
+        )
+        parts.append(f"{lead} {_STATE_PHRASES[state]}")
+    n_ne = sum(1 for s in scores if not s.scored)
+    if n_ne:
+        parts.append(f"{number_word(n_ne)} not evaluated ({NOT_EVALUATED})")
     return ", ".join(parts) + "."
 
 
@@ -491,36 +573,225 @@ def analysis_thresholds(params: dict[str, Any]) -> tuple[Optional[float], Option
     return num("fdr", "fdr_threshold", "padj_cutoff"), num("min_log2fc")
 
 
+# ---------------------------------------------------------------------------
+# Methods: what is said about the enrichment and the calls comes from what the data record
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EnrichmentFacts:
+    """What the nova's provenance says about the enrichment behind the claims.
+
+    The kind comes from `provenance.enrichment_source` and from nothing else: not from the analysis
+    id, the enrichment dataset ids or the start of `p_source`. kind "genolens" (source "annodb"):
+    the over-representation GenoLens ran (hypergeometric test, Benjamini–Hochberg correction),
+    kept below `fdr` (None: the cut-off of the run was not recorded); `categories` are what the run
+    recorded about itself, else `databases` is the analysis's pick (an empty tuple: it picked none,
+    so all the categories ran; None: not known, the analysis is gone). kind "deposited" (source
+    "uploaded"): tables somebody uploaded, kept as deposited, whose adjusted p is the column(s)
+    read as such (`columns`, empty when not recorded); there is no cut-off and no database to
+    name. kind "legacy": rows stored by an earlier GenoLens enrichment (no enrichment dataset): its
+    test, correction, cut-off and databases are not recorded. kind "none": no enrichment result is
+    stored (source "none", or a payload whose status says so, whatever else it carries): nothing
+    more than that is said. kind "unknown": a payload without provenance, or whose provenance
+    names no source.
+    """
+
+    kind: str
+    columns: tuple[str, ...] = ()
+    fdr: Optional[float] = None
+    databases: Optional[tuple[str, ...]] = None
+    categories: Optional[tuple[str, ...]] = None
+
+
+_FACT_KIND_OF_SOURCE = {
+    "annodb": "genolens",
+    "uploaded": "deposited",
+    "legacy": "legacy",
+    "none": "none",
+}
+
+
+def enrichment_facts(nova: dict) -> EnrichmentFacts:
+    if nova.get("status") == "no_enrichment":
+        return EnrichmentFacts("none")
+    prov = nova.get("provenance")
+    if not isinstance(prov, dict):
+        return EnrichmentFacts("unknown")
+    kind = _FACT_KIND_OF_SOURCE.get(str(prov.get("enrichment_source")), "unknown")
+    if kind == "deposited":
+        return EnrichmentFacts("deposited", tuple(str(c) for c in prov.get("padj_columns") or []))
+    if kind != "genolens":
+        return EnrichmentFacts(kind)
+    fdr = prov.get("enrichment_fdr")
+    databases = prov.get("enrichment_databases")
+    categories = prov.get("enrichment_categories")
+    return EnrichmentFacts(
+        "genolens",
+        fdr=float(fdr) if isinstance(fdr, (int, float)) and not isinstance(fdr, bool) else None,
+        databases=tuple(str(d) for d in databases) if isinstance(databases, list) else None,
+        categories=(
+            tuple(str(c) for c in categories)
+            if isinstance(categories, list) and categories
+            else None
+        ),
+    )
+
+
+def _column_phrase(facts: EnrichmentFacts) -> str:
+    if not facts.columns:
+        return "column not recorded"
+    return f"{'columns' if len(facts.columns) > 1 else 'column'} {', '.join(facts.columns)}"
+
+
+def _cutoff_phrase(facts: EnrichmentFacts) -> str:
+    """The term cut-off the enrichment ran at: the recorded one, never a default."""
+    if facts.fdr is None:
+        return "the cut-off of the run (cut-off not recorded)"
+    return f"adjusted p < {facts.fdr:g}"
+
+
+def _databases_phrase(facts: EnrichmentFacts) -> str:
+    """What the enrichment GenoLens ran was run over: the categories the run recorded, else the
+    analysis's pick, "all categories" only for an analysis that is known and picked none, and
+    "not recorded" when nothing is known (a deleted analysis). Never a database that is not in the
+    list."""
+    if facts.categories:
+        return ", ".join(facts.categories)
+    if facts.databases:
+        return ", ".join(facts.databases)
+    if facts.databases is not None:
+        return "all categories of the annotation database"
+    return "not recorded"
+
+
+def enrichment_method(facts: EnrichmentFacts) -> str:
+    """One sentence on how the enrichment p-values were obtained (plain text)."""
+    if facts.kind == "genolens":
+        return (
+            "Over-representation analysis of the up- and down-regulated genes was run by GenoLens "
+            "(hypergeometric test, Benjamini–Hochberg correction)"
+        )
+    if facts.kind == "deposited":
+        return (
+            "The enrichment tables were deposited with the dataset; their adjusted p-value is "
+            f"read from {_column_phrase(facts)}, and the test that produced it is not described here"
+        )
+    if facts.kind == "legacy":
+        return (
+            "The enrichment results come from an earlier GenoLens method whose parameters (test, "
+            "correction, cut-off, databases) are not recorded"
+        )
+    if facts.kind == "none":
+        return "No enrichment result is stored for this comparison"
+    return (
+        "The enrichment results are those stored with the dataset; their test and correction "
+        "are not recorded"
+    )
+
+
+def enrichment_text(facts: EnrichmentFacts) -> str:
+    """The sentence above the enrichment figures (plain text)."""
+    if facts.kind == "genolens":
+        text = f"{enrichment_method(facts)}; terms kept at {_cutoff_phrase(facts)}. "
+        text += f"Databases: {_databases_phrase(facts)}. "
+    elif facts.kind == "deposited":
+        text = (
+            f"{enrichment_method(facts)}. The terms are listed as deposited: GenoLens applied "
+            f"no cut-off. "
+        )
+    elif facts.kind == "none":
+        return f"{enrichment_method(facts)}."  # no result, so no figure to explain
+    else:
+        text = f"{enrichment_method(facts)}. "
+    return text + "Dot size = number of genes, colour = significance."
+
+
+_DE_NAMES = {"deseq2": "DESeq2", "edger": "edgeR", "limma": "limma-voom"}
+
+
+def _de_name(method: str) -> str:
+    return _DE_NAMES.get(str(method).lower(), str(method))
+
+
+def _de_thresholds(params: dict[str, Any]) -> list[str]:
+    fdr, min_lfc = analysis_thresholds(params)
+    thr = []
+    if fdr is not None:
+        thr.append(f"adjusted p &lt; {fdr:g}")
+    if min_lfc is not None:
+        thr.append(f"|log<sub>2</sub> FC| ≥ {min_lfc:g}")
+    return thr
+
+
+def de_sentence(inp: EditorialInputs) -> Markup:
+    """How the differentially expressed genes were called, from what the DEG dataset records: the
+    method that decided the calls, and the others only when the analysis ran them. Imported
+    results name no method, and results whose analysis was deleted say so (`analysis_gone`)."""
+    primary = inp.de_primary_method
+    thr = _de_thresholds(inp.params)
+    cut = f" ({', '.join(thr)})" if thr else ""
+    if inp.analysis_gone:
+        # Whatever the dataset still records: the analysis is not there to describe, as in the
+        # LaTeX report.
+        s = (
+            "The analysis that produced these results is no longer available; its methods are "
+            "not described here."
+        )
+    elif primary:
+        name = _de_name(primary)
+        s = f"Differentially expressed genes were called with {escape(name)}{cut}"
+        if str(inp.de_method_run or "").lower() == "all":
+            others = [m for m in ("DESeq2", "edgeR", "limma-voom") if m != name]
+            s += (
+                f"; {' and '.join(others)} were run on the same counts to report how many "
+                f"methods support each call, and do not change the DEG list."
+            )
+        else:
+            s += "."
+    elif inp.has_analysis:
+        s = (
+            "Differentially expressed genes come from the analysis run in GenoLens; the method "
+            f"that decided the calls is not recorded for this comparison{cut}."
+        )
+    else:
+        s = (
+            "Differential expression results were imported with the dataset (imported results); "
+            "how they were produced is not described here."
+        )
+    return Markup(s)
+
+
+def _de_row(inp: EditorialInputs) -> str:
+    if inp.analysis_gone:
+        return "analysis no longer available (method not described)"
+    if inp.de_primary_method:
+        name = _de_name(inp.de_primary_method)
+        if str(inp.de_method_run or "").lower() == "all":
+            others = " and ".join(m for m in ("DESeq2", "edgeR", "limma-voom") if m != name)
+            return f"{name} (decides the calls); {others} (concordance)"
+        return f"{name} (decides the calls)"
+    if inp.has_analysis:
+        return "not recorded"
+    return "imported results (method not described)"
+
+
 def _design_text(inp: EditorialInputs, n_by_cond: dict[str, int]) -> str:
-    fdr, min_lfc = analysis_thresholds(inp.params)
     n_test, n_ctrl = n_by_cond.get(inp.test), n_by_cond.get(inp.control)
     who = f"{escape(inp.test)}{f' (n = {n_test})' if n_test else ''}"
     ref = f"{escape(inp.control)}{f' (n = {n_ctrl})' if n_ctrl else ''}"
     s = f"{who} was compared with {ref}" if inp.control else f"{who} was analysed"
     s += f" ({escape(inp.project_name)})." if inp.project_name else "."
-    if inp.has_analysis:
-        thr = []
-        if fdr is not None:
-            thr.append(f"adjusted p &lt; {fdr:g}")
-        if min_lfc is not None:
-            thr.append(f"|log<sub>2</sub> FC| ≥ {min_lfc:g}")
-        s += (
-            " Differentially expressed genes were called with DESeq2"
-            + (f" ({', '.join(thr)})" if thr else "")
-            + "; edgeR and limma-voom were run on the same counts to report how many methods"
-            " support each call."
-        )
-    else:
-        s += " Differential expression results were imported with the dataset."
-    s += (
-        " Over-representation analysis of the up- and down-regulated genes used a"
-        " hypergeometric test with Benjamini–Hochberg correction."
-    )
+    s += f" {de_sentence(inp)}"
+    s += f" {escape(enrichment_method(enrichment_facts(inp.nova)))}."
     return s
 
 
 def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, str]]:
     fdr, min_lfc = analysis_thresholds(inp.params)
+    facts = enrichment_facts(inp.nova)
+    prov = inp.nova.get("provenance") or {}
+    alpha = nova_alpha(inp.nova)
     rows: list[tuple[str, str]] = [("Analysis engine", f"GenoLens {inp.app_version}".strip())]
     if inp.analysis_label:
         rows.append(("Analysis", inp.analysis_label))
@@ -536,10 +807,7 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
     )
     if inp.params.get("species"):
         rows.append(("Organism", str(inp.params["species"])))
-    if inp.has_analysis:
-        rows.append(
-            ("Differential expression", "DESeq2 (calls); edgeR and limma-voom (concordance)")
-        )
+    rows.append(("Differential expression", _de_row(inp)))
     thr = []
     if fdr is not None:
         thr.append(f"adjusted p < {fdr:g}")
@@ -548,16 +816,16 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
     if inp.params.get("min_count") is not None:
         thr.append(f"min. {inp.params['min_count']} counts")
     if thr:
-        rows.append(("Thresholds", "; ".join(thr)))
-    dbs = inp.params.get("enrichment_databases")
-    if isinstance(dbs, (list, tuple)) and dbs:
-        dbs = ", ".join(str(d) for d in dbs)
-    rows.append(
-        (
-            "Enrichment",
-            "Over-representation analysis, hypergeometric test" + (f"; {dbs}" if dbs else ""),
-        )
-    )
+        rows.append(("DEG thresholds", "; ".join(thr)))
+    enrichment = enrichment_method(facts)
+    if facts.kind == "genolens":
+        enrichment += f"; terms kept at {_cutoff_phrase(facts)}"
+        rows.append(("Enrichment", enrichment))
+        rows.append(("Enrichment databases", _databases_phrase(facts)))
+    else:
+        rows.append(("Enrichment", enrichment))
+    sources = [str(v) for v in prov.get("source_versions") or []]
+    rows.append(("Data source version", ", ".join(sources) if sources else "not recorded"))
     rows.append(
         (
             "Claim referential",
@@ -568,53 +836,116 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
             ),
         )
     )
-    rows.append(("OmicSkin score", "100 × coherence × min(1, best sub-group −log10 p / 8)"))
+    rows.append(
+        (
+            "Significance threshold",
+            f"α = {alpha:g} (a term is significant when its adjusted p is below α)",
+        )
+    )
+    rows.append(
+        (
+            "OmicSkin score",
+            "100 × coherence × min(1, −log10 p of the most significant supporting sub-group / 8)",
+        )
+    )
     models = [m for m in (inp.comparison_ai_model, inp.nova_ai_model) if m]
     if models and inp.use_ai:
         rows.append(("Interpretation model", ", ".join(dict.fromkeys(models))))
+    if inp.use_ai:
+        # A stored text written from other data is left out, and the report says so.
+        for stale, name in (
+            (inp.nova_ai_stale and not inp.nova_ai, "Nova AI text"),
+            (inp.comparison_ai_stale and not inp.comparison_ai, "Comparison AI text"),
+        ):
+            if stale:
+                rows.append((name, "not included (generated on other data)"))
     rows.append(("Report generated", inp.generated_at.strftime("%d %B %Y, %H:%M UTC")))
     return rows
 
 
-METHOD_NOVA = (
-    "For each comparison, the over-representation results (Benjamini–Hochberg adjusted p-values, "
-    "computed separately on up- and down-regulated genes) are joined to the SciLicium claim "
-    "referential, a curated table that assigns ontology terms (Gene Ontology, Reactome, KEGG, "
-    "WikiPathways, STRING clusters) to nine cosmetic claims and groups them into pathway "
-    "sub-groups, each with the direction of regulation that supports the claim. A term counts "
-    "<i>for</i> a claim when its observed direction matches the expected one, and <i>against</i> "
-    "it otherwise. Within each sub-group the term p-values are combined with an unsigned Stouffer "
-    "test; the balance of evidence is (S<sub>pro</sub> − S<sub>anti</sub>) / (S<sub>pro</sub> + "
-    "S<sub>anti</sub>). The referential is versioned; the claim-to-pathway table itself is "
-    "SciLicium know-how and is not disclosed."
-)
-METHOD_SCORE = (
-    "OmicSkin = 100 × coherence × min(1, max<sub>sub-groups</sub>(−log<sub>10</sub> p) / 8), with "
-    "coherence = S<sub>pro</sub> / (S<sub>pro</sub> + S<sub>anti</sub>). Coherence is the share of "
-    "the evidence that goes in the direction of the claim; the second factor saturates once the "
-    "best sub-group reaches p = 10<sup>−8</sup>. Bands: ≥ 75 strong support, 50–74 moderate, "
-    "25–49 weak, &lt; 25 not supported. A claim with no term at adjusted p &lt; 0.05 receives no "
-    "score."
-)
+def method_nova(inp: EditorialInputs) -> Markup:
+    """How the nova is built, in terms of what this report's data are (HTML)."""
+    facts = enrichment_facts(inp.nova)
+    alpha = nova_alpha(inp.nova)
+    if facts.kind == "genolens":
+        p_values = (
+            "Benjamini–Hochberg adjusted p-values of the over-representation analysis run by "
+            "GenoLens, on up- and down-regulated genes separately"
+        )
+    elif facts.kind == "deposited":
+        p_values = f"adjusted p-values read from {_column_phrase(facts)} of the deposited tables"
+    elif facts.kind == "legacy":
+        p_values = (
+            "adjusted p-values stored by an earlier GenoLens enrichment method, whose parameters "
+            "are not recorded"
+        )
+    else:
+        p_values = "adjusted p-values as stored with the enrichment results"
+    return Markup(
+        f"For each comparison, the enrichment results ({escape(p_values)}) are joined to the "
+        f"SciLicium claim referential, a curated table that assigns ontology terms to "
+        f"{number_word(len(ALL_CLAIMS))} cosmetic claims and groups them into pathway "
+        "sub-groups, each with the expected direction of regulation. An enriched term counts "
+        "toward a claim when the curated referential links it to that claim — <i>for</i> it "
+        "when its observed direction matches the expected one, <i>against</i> otherwise; a term "
+        "enriched in both lists (↑↓) counts once each way. "
+        f"A term is significant when its adjusted p is below α (α = {alpha:g}); a claim with no "
+        "significant term is n.e. (not evaluated), and terms not significant at α still "
+        "contribute with their weight (marked n.s.). Within each sub-group the term p-values are "
+        "combined by an unsigned Stouffer test: terms are not weighted, their direction is "
+        "ignored, and they are treated as independent although they often share genes, so the "
+        "combined p is indicative, not a calibrated probability. Balance = (S<sub>pro</sub> − "
+        "S<sub>anti</sub>) / (S<sub>pro</sub> + S<sub>anti</sub>), S = Σ −log<sub>10</sub> p "
+        "of the terms for or against. The referential is versioned; its claim-to-pathway table "
+        "is SciLicium know-how and is not disclosed."
+    )
+
+
+def method_score(alpha: float) -> Markup:
+    return Markup(
+        "OmicSkin = 100 × coherence × min(1, s / 8), where coherence = S<sub>pro</sub> / "
+        "(S<sub>pro</sub> + S<sub>anti</sub>) is the share of the claim's evidence that goes in "
+        "its direction and s is the −log<sub>10</sub> p of its most significant sub-group among "
+        "those that go that way (S<sub>pro</sub> &gt; S<sub>anti</sub>); the factor saturates at "
+        "p = 10<sup>−8</sup>, and a claim with no such sub-group scores 0. Bands: ≥ 75 strong "
+        "support, 50–74 moderate, 25–49 weak, &lt; 25 weak evidence. A claim with no term at "
+        f"adjusted p &lt; α (α = {alpha:g}) is n.e. and has no score."
+    )
+
+
 METHOD_DOSE = " Scores are computed for each dose and checked for monotony across doses."
 SCOPE = (
-    "Transcriptomic evidence documents the mechanism of action at the gene-expression level in "
-    "the biological model tested; it does not by itself establish a clinical effect. Claims "
-    "marketed to consumers must rest on the whole substantiation file in accordance with "
-    "Regulation (EC) 1223/2009 and Regulation (EU) 655/2013."
+    "This report describes gene-expression changes and the pathways they enrich in the "
+    "biological model tested. It does not by itself establish a clinical effect: a claim made "
+    "to consumers needs its own supporting file (Regulation (EC) 1223/2009 and Regulation (EU) "
+    "655/2013)."
 )
 
 
-def _not_supported_reason(claim: dict) -> str:
-    """Why a scored claim stays below 25: weak evidence, or evidence going the other way."""
+def _weak_evidence_reason(claim: dict) -> str:
+    """Why a scored claim stays below 25: little evidence, or evidence going the other way."""
     coh = round(100 * float(claim.get("coherence") or 0))
+    lead = supporting_subgroup(claim)
+    if lead is None:
+        return f"No pathway sub-group goes in the direction of the claim (coherence {coh} %)."
     if coh >= 50:
-        best_p = _plain_p(10 ** -float(claim.get("best_nl") or 0))
         return (
             f"The evidence goes in the direction of the claim (coherence {coh} %) but stays "
-            f"weak: best sub-group p = {best_p}."
+            f"weak: most significant supporting sub-group p = {_plain_p(10 ** -lead[1])}."
         )
     return f"Most of the pathway evidence goes against the claim (coherence {coh} %)."
+
+
+def _not_evaluated_text(nova: dict) -> str:
+    """Why a claim of the referential is n.e. (not evaluated): no term of it is significant in the
+    enrichment results. Nothing is said of how many terms were stored: a deposited table is kept
+    as it was given, an enrichment GenoLens ran keeps only the terms under its cut-off."""
+    if nova.get("status") == "no_enrichment":
+        return "This comparison has no enrichment result, so no claim is evaluated."
+    return (
+        f"No term of this claim is significant at α (α = {nova_alpha(nova):g}); "
+        "the claim is not scored."
+    )
 
 
 def _claim_block(
@@ -630,7 +961,11 @@ def _claim_block(
     genes = key_genes(c, inp.term_genes, inp.degs)
     points = dose_points(cs.name, inp.dose_series) if inp.dose_series else []
     rows, n_terms = terms_rows(c)
+    if any(r["both"] or not r["significant"] for r in rows):
+        # The table's footnote takes the room of two rows (the page clips what overflows).
+        rows, n_terms = terms_rows(c, TERMS_PER_CLAIM_PAGE - 2)
     subs = c.get("subgroups") or []
+    lead = supporting_subgroup(c)
     if compact:
         bars = subgroup_bars(subs, 300, 20, 12, INK, "#EEF2F5", 9, limit=6)
         ring_svg = ring(cs.score or 0, fill, 110, 10, "#EEF2F5", INK)
@@ -652,17 +987,24 @@ def _claim_block(
         "statement": claim_statement(cs, inp.test, inp.control),
         "n_for": int(c.get("n_for") or 0),
         "n_against": int(c.get("n_against") or 0),
+        "n_balanced": _n_balanced(c),
         "coherence": round(100 * float(c.get("coherence") or 0)),
         "n_subgroups": len(subs),
         "bars": bars,
         "genes": gene_chips(genes) if genes else None,
         "dose": dose_svg,
         "dose_caption": _dose_caption(points) if points else None,
-        "best": c.get("best_subgroup") or "—",
-        "best_p": fmt_p_from_nl(c.get("best_nl") or 0),
+        # The most significant sub-group that goes in the direction of the claim; None without one.
+        "lead": {"name": lead[0], "p": fmt_p_from_nl(lead[1])} if lead else None,
         "terms": rows,
         "n_terms": n_terms,
         "terms_truncated": n_terms > len(rows),
+        # A claim with no contrary term at all (state for_only): no contrary term is not a
+        # confirmation. A claim whose sub-groups are all for it but that has a contrary term does
+        # not need the note.
+        "zero_against_note": ZERO_AGAINST_NOTE if state_of(c) == "for_only" else None,
+        "has_not_significant": any(not r["significant"] for r in rows),
+        "has_both": any(r["both"] for r in rows),
         "review": reviewer_text,
     }
 
@@ -679,13 +1021,15 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     branding = inp.branding or {}
     institute = branding.get("institute_name") or DEFAULT_INSTITUTE
     cover = inp.cover_info or {}
-    reviewer_label, reviewed = _reviewer_label(cover)
     checked_by = cover.get("checked_by")
     review_card = f"Report checked by {checked_by}." if checked_by else "Not yet reviewed."
     n_by_cond = _samples_by_condition(inp.qc_rows)
     n_test, n_ctrl = n_by_cond.get(inp.test, 0), n_by_cond.get(inp.control, 0)
     date_str = f"{inp.generated_at.day} {inp.generated_at.strftime('%B %Y')}"
     illustrative = " · Illustrative data" if inp.illustrative else ""
+    alpha = nova_alpha(inp.nova)
+    facts = enrichment_facts(inp.nova)
+    no_enrichment = inp.nova.get("status") == "no_enrichment"
 
     pages: list[dict[str, Any]] = []
 
@@ -697,13 +1041,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             "title": title,
             "title_size": 64 if len(title) <= 7 else 46 if len(title) <= 12 else 32,
             "subtitle": [
-                s
-                for s in (
-                    f"versus {inp.control}" if inp.control else "",
-                    inp.project_name,
-                    "whole-transcriptome evidence",
-                )
-                if s
+                s for s in (f"versus {inp.control}" if inp.control else "", inp.project_name) if s
             ],
             "strip": [
                 {"score": s.score, "name": s.name, "color": on_navy(claim_color(s.name)[0])}
@@ -719,7 +1057,9 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 if x
             )
             or inp.comparison_name,
-            "footer_right": f"Version 1.0 · {date_str}{illustrative}",
+            # The engine that produced the report, not a document version nobody maintains.
+            "footer_right": (f"GenoLens {inp.app_version} · " if inp.app_version else "")
+            + f"{date_str}{illustrative}",
         }
     )
 
@@ -731,20 +1071,30 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     if n_test and n_ctrl:
         lede += f" ({n_test} versus {n_ctrl} samples)"
     if n_evidence == 0:
-        evidence = f"none of the {len(ALL_CLAIMS)} cosmetic claims carries"
+        evidence = f"none of the {len(ALL_CLAIMS)} claims of the referential has"
     elif n_evidence == 1:
-        evidence = f"one of the {len(ALL_CLAIMS)} cosmetic claims carries"
+        evidence = f"one of the {len(ALL_CLAIMS)} claims of the referential has"
     else:
-        evidence = f"{number_word(n_evidence)} of the {len(ALL_CLAIMS)} cosmetic claims carry"
+        evidence = (
+            f"{number_word(n_evidence)} of the {len(ALL_CLAIMS)} claims of the referential have"
+        )
     lede += (
-        f" by whole-transcriptome sequencing. {thousands(n_deg)} genes are differentially "
-        f"expressed ({thousands(inp.n_up)} up, {thousands(inp.n_down)} down) and "
-        f"{evidence} significant pathway evidence."
+        f". {thousands(n_deg)} genes are differentially expressed "
+        f"({thousands(inp.n_up)} up, {thousands(inp.n_down)} down)"
     )
-    if strong:
-        names = [s.name.lower() for s in strong[:4]]
-        joined = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
-        lede += f" The response converges on {joined}."
+    if no_enrichment:
+        lede += "; no enrichment result is stored for this comparison."
+    else:
+        lede += f" and {evidence} a significant enriched term."
+    # By state: which claims have terms for them only, for and against, or against only.
+    for state, label in (
+        ("for_only", "Evidence for the claim only"),
+        ("both_ways", "Evidence for and against"),
+        ("against_only", "Evidence against the claim only"),
+    ):
+        names = [s.name for s in scored if state_of(s.claim or {}) == state]
+        if names:
+            lede += f" {label}: {', '.join(names)}."
     stats = [{"value": thousands(n_deg), "label": "differentially expressed genes", "color": None}]
     if n_test and n_ctrl:
         stats.append(
@@ -759,7 +1109,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     stats.append(
         {
             "value": f"{n_evidence} / {len(ALL_CLAIMS)}",
-            "label": "claims with significant evidence",
+            "label": f"claims evaluated ({NOT_EVALUATED} otherwise)",
             "color": None,
         }
     )
@@ -773,22 +1123,24 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 "name": s.name,
                 "score": s.score,
                 "scored": s.scored,
-                "band_short": BAND_LABELS[s.band].split()[0].upper() if s.scored else "NO EVIDENCE",
+                "band_short": _LADDER_LABELS[s.band] if s.scored else NOT_EVALUATED,
                 "color": claim_color(s.name)[0],
             }
         )
     n_unscored = sum(1 for s in scores if not s.scored)
     unscored_note = ""
-    if n_unscored:
-        unscored_note = f" {number_word(n_unscored).capitalize()} claim" + (
-            " has no term at adjusted p < 0.05 and receives no score."
-            if n_unscored == 1
-            else "s have no term at adjusted p < 0.05 and receive no score."
+    if n_unscored and not no_enrichment:
+        unscored_note = (
+            f" {number_word(n_unscored).capitalize()} claim"
+            + (" is" if n_unscored == 1 else "s are")
+            + f" not evaluated ({NOT_EVALUATED}): "
+            + ("none of its terms is" if n_unscored == 1 else "none of their terms is")
+            + f" significant at α (α = {alpha:g})."
         )
     pages.append(
         {
             "kind": "verdict",
-            "headline": _headline(scores),
+            "headline": _headline(scores, no_enrichment),
             "lede": lede,
             "stats": stats,
             "ladder": ladder,
@@ -796,8 +1148,10 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 f"OmicSkin score, {inp.test} vs {inp.control}" if inp.control else "OmicSkin score"
             ),
             "caption": (
-                "Score 0–100 = coherence × significance of the best pathway sub-group. "
-                "Bands: ≥ 75 strong · 50–74 moderate · 25–49 weak · < 25 not supported."
+                "Score 0–100 = coherence × significance of the most significant sub-group that "
+                "goes in the direction of the claim. Coherence = share of the claim's evidence "
+                "that goes in its direction. "
+                "Bands: ≥ 75 strong · 50–74 moderate · 25–49 weak · < 25 weak evidence."
                 + unscored_note
             ),
             "guide": [],  # filled once page numbers are known
@@ -806,14 +1160,19 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
 
     # 3. nova (+ optional AI reading page)
     nova_text = (inp.nova_ai or "").strip() if inp.use_ai else ""
+    nova_label = ai_label(inp.nova_ai_model or "", inp.nova_ai_generated_at)
     nova_inline = bool(nova_text) and len(nova_text) <= NOVA_READING_INLINE_CHARS
+    ai_texts: list[dict[str, Any]] = []
+    if nova_text:
+        ai_texts.append(ai_text_record("nova", inp.nova_ai_model, inp.nova_ai_generated_at))
     pages.append(
         {
             "kind": "nova",
             "svg": clean_inline_svg(inp.nova_light, "page-nova", "width:100%;height:auto"),
             "version": inp.referential_version,
+            "no_enrichment": no_enrichment,
             "ai_html": md_to_html(nova_text) if nova_inline else None,
-            "ai_label": reviewer_label,
+            "ai_label": nova_label,
             "unlinked_total": int(
                 inp.nova.get("unlinked_total") or len(inp.nova.get("unlinked") or [])
             ),
@@ -826,7 +1185,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 "kind": "nova_reading",
                 "ai_html": md_to_html(capped),
                 "truncated": truncated,
-                "ai_label": reviewer_label,
+                "ai_label": nova_label,
             }
         )
 
@@ -864,17 +1223,21 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                     strip.append(
                         {
                             "name": s.name,
-                            "title": f"Score {s.score} · not supported.",
-                            "text": _not_supported_reason(s.claim or {}),
+                            "title": f"Score {s.score} · {BAND_LABELS[s.band].lower()}.",
+                            "text": _weak_evidence_reason(s.claim or {}),
                         }
                     )
                 else:
                     strip.append(
                         {
                             "name": s.name,
-                            "title": "No significant evidence.",
-                            "text": "No term of this claim reaches adjusted p < 0.05 in "
-                            "this model; the claim is not scored.",
+                            "title": (
+                                f"{NOT_EVALUATED} — no enrichment result for this comparison."
+                                if no_enrichment
+                                else f"{NOT_EVALUATED} — no significant term for this claim in "
+                                "the enrichment results."
+                            ),
+                            "text": _not_evaluated_text(inp.nova),
                         }
                     )
         if chunk:
@@ -884,16 +1247,16 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 f" · with reservations"
             )
             headline = (
-                "Supported, but with pathways going the other way."
+                "Supported, but with sub-groups going the other way."
                 if any(b["n_against"] for b in blocks)
                 else "Moderately or weakly supported."
             )
         else:
-            kicker = "Claims without sufficient evidence"
+            kicker = "Claims with weak evidence or not evaluated"
             headline = (
-                "No claim reaches significance in this comparison."
+                "No claim is evaluated in this comparison."
                 if not scored
-                else "The remaining claims are not evidenced in this model."
+                else "The remaining claims have weak evidence or are not evaluated."
             )
         pages.append(
             {
@@ -954,6 +1317,8 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
         }
         for g in top_degs("UP", 10) + top_degs("DOWN", 10)
     ]
+    sampling = volcano_sampling(inp.degs)
+    n_drawn_degs = sum(1 for g in inp.degs if (g.get("regulation") or "").upper() in ("UP", "DOWN"))
     pages.append(
         {
             "kind": "science_deg",
@@ -962,7 +1327,15 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             "n_up": thousands(inp.n_up),
             "n_down": thousands(inp.n_down),
             "deg_rows": deg_rows,
-            "has_analysis": inp.has_analysis,
+            "de_text": de_sentence(inp),
+            # The volcano draws every up- and down-regulated gene and, past a budget of points, a
+            # sample of the others: its caption says so.
+            "volcano_note": (
+                f"All {thousands(n_drawn_degs)} differentially expressed genes are drawn; the "
+                f"others are a sample of {thousands(sampling[0])} of {thousands(sampling[1])} genes."
+                if sampling
+                else None
+            ),
         }
     )
 
@@ -986,7 +1359,8 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 "dot_down": figures.get("dot_down"),
                 "rows_up": enr_rows(inp.enr_up),
                 "rows_down": enr_rows(inp.enr_down),
-                "fdr": inp.params.get("enrichment_fdr") or 0.05,
+                # From the provenance of the enrichment, never from a constant.
+                "text": enrichment_text(facts),
             }
         )
 
@@ -1000,7 +1374,12 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
         capped, truncated = cap_text(
             cmp_text, COMPARISON_AI_WIDE_CHARS if wide else COMPARISON_AI_CHARS
         )
-        if not cmp_text:
+        if not cmp_text and inp.comparison_ai_stale:
+            notice = (
+                "The stored AI interpretation of this comparison was generated on other data "
+                "and is not included."
+            )
+        elif not cmp_text:
             notice = "No AI interpretation has been generated for this comparison."
         elif not english:
             notice = "No English AI interpretation is available for this comparison."
@@ -1013,11 +1392,16 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 "ai": True,
                 "ai_html": md_to_html(capped) if english else None,
                 "ai_notice": notice,
-                "ai_label": reviewer_label,
-                "ai_reviewed": reviewed,
+                "ai_label": ai_label(inp.comparison_ai_model or "", inp.comparison_ai_generated_at),
                 "truncated": truncated and english,
             }
         )
+        if cmp_text and english:
+            ai_texts.append(
+                ai_text_record(
+                    "comparison", inp.comparison_ai_model, inp.comparison_ai_generated_at
+                )
+            )
     last_science_page = len(pages)
 
     # 10. method + versions + contact
@@ -1038,11 +1422,13 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     pages.append(
         {
             "kind": "method",
-            "method_nova": Markup(METHOD_NOVA),
-            "method_score": Markup(METHOD_SCORE + (METHOD_DOSE if inp.dose_series else "")),
+            "method_nova": method_nova(inp),
+            "method_score": Markup(
+                str(method_score(alpha)) + (METHOD_DOSE if inp.dose_series else "")
+            ),
             "scope": (
-                "All AI-generated texts in this report are labelled as such and state whether "
-                "they were reviewed. " + SCOPE
+                "All AI-generated texts in this report are labelled with the model and the date "
+                "of their generation. " + SCOPE
                 if inp.use_ai
                 else SCOPE
             ),
@@ -1072,30 +1458,49 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
             f"Page {first_claim_page}" if single else f"Pages {first_claim_page}–{last_claim_page}"
         )
         verb = "gives" if single else "give"
-        if strong:
-            text = (
-                f"{span} {verb} one page per strongly supported claim — the score, a "
-                f"statement built from the data, the pathways and genes behind it — then "
-                f"the claims supported with reservations and those without evidence."
+        n_weak = sum(1 for s in strip_claims if s.scored)
+        reading = "the claims with weak evidence or not evaluated (n.e.)"
+        if strong or reserved:
+            lead = (
+                "one page per strongly supported claim — the score, a statement built from the "
+                "data, the pathways and genes behind it"
+                if strong
+                else "the claims supported with reservations — score, statement, pathways and genes"
             )
-        elif reserved:
-            text = (
-                f"{span} {verb} the claims supported with reservations — score, statement, "
-                f"pathways and genes — then those without evidence."
+            # What follows, by what is there: the claims with reservations (when the first pages
+            # were the strong ones), then those with weak evidence or not evaluated.
+            then = (["the claims supported with reservations"] if strong and reserved else []) + (
+                [reading] if strip_claims else []
             )
+            text = f"{span} {verb} {lead}" + (f" — then {' and '.join(then)}" if then else "") + "."
         else:
-            text = (
-                f"{span} {'lists' if single else 'list'} the {len(ALL_CLAIMS)} claims and "
-                f"why none of them is scored in this comparison."
-            )
-        guide.append(("How to read this dossier.", text))
+            lists = "lists" if single else "list"
+            if no_enrichment:
+                what = (
+                    f"the {len(ALL_CLAIMS)} claims and why none is evaluated: this comparison "
+                    "has no enrichment result"
+                )
+            elif n_weak and n_weak < len(strip_claims):
+                what = (
+                    "the claims with weak evidence (score below 25) and the claims not "
+                    f"evaluated ({NOT_EVALUATED})"
+                )
+            elif n_weak:
+                what = "the claims, all with weak evidence (score below 25)"
+            else:
+                what = (
+                    f"the {len(ALL_CLAIMS)} claims and why none of them is evaluated "
+                    f"({NOT_EVALUATED}): no term of theirs is significant"
+                )
+            text = f"{span} {lists} {what}."
+        guide.append(("How to read this review.", text))
     guide.append(
         (
             "Where the evidence comes from.",
             f"Pages {first_science_page}–{last_science_page} give the scientific results: "
             + (
                 "study design, differential expression, functional enrichment and the AI "
-                "interpretation, labelled with its review status."
+                "interpretation, labelled with its model and date."
                 if inp.use_ai
                 else "study design, differential expression and functional enrichment."
             ),
@@ -1119,6 +1524,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     return {
         "pages": pages,
         "total": total,
+        "ai_texts": ai_texts,  # the AI texts printed, as recorded on the report job
         "footer": footer,
         "title": f"OmicSkin PLUS — {inp.test}",
         "logo": inp.logo_data_uri,

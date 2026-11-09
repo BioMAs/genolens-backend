@@ -88,7 +88,8 @@ def _svg(fig) -> str:
 
 
 def _thin(mask: np.ndarray, keep: int, seed: int = 7) -> np.ndarray:
-    """Boolean mask keeping at most `keep` of the True entries (deterministic)."""
+    """Boolean mask keeping at most `keep` of the True entries (deterministic). A figure that
+    thins says so in its caption (`volcano_sampling`)."""
     idx = np.flatnonzero(mask)
     if len(idx) <= keep:
         return mask
@@ -96,6 +97,22 @@ def _thin(mask: np.ndarray, keep: int, seed: int = 7) -> np.ndarray:
     out = np.zeros_like(mask)
     out[chosen] = True
     return out
+
+
+def _sample_budget(n_significant: int) -> int:
+    """How many of the genes that are neither up- nor down-regulated the volcano draws."""
+    return max(MAX_POINTS - n_significant, 1000)
+
+
+def volcano_sampling(degs: Sequence[dict]) -> Optional[tuple[int, int]]:
+    """(drawn, total) of the genes that are neither up- nor down-regulated, when the volcano
+    draws only a sample of them; None when it draws every gene. The up- and down-regulated genes
+    are always all drawn."""
+    regulation = [(g.get("regulation") or "").upper() for g in degs]
+    n_significant = sum(r in ("UP", "DOWN") for r in regulation)
+    n_other = len(regulation) - n_significant
+    drawn = _sample_budget(n_significant)
+    return (drawn, n_other) if n_other > drawn else None
 
 
 def condition_colors(conditions: Sequence[str], test: str, control: str) -> dict[str, str]:
@@ -167,7 +184,7 @@ def volcano_svg(
     y = -np.log10(np.clip(padj, 1e-300, 1.0))
     reg = np.array([(g.get("regulation") or "").upper() for g in degs])
     up, dn = reg == "UP", reg == "DOWN"
-    ns = _thin(~(up | dn), max(MAX_POINTS - int(up.sum() + dn.sum()), 1000))
+    ns = _thin(~(up | dn), _sample_budget(int(up.sum() + dn.sum())))
     with plt.rc_context(_rc()):
         fig, ax = plt.subplots(figsize=(5.6, 4.2))
         ax.scatter(lfc[ns], y[ns], s=4, color=THEME["light"], alpha=0.7, lw=0)

@@ -4,33 +4,61 @@ CosmOmics Pathway Nova — which pathways support or contradict each cosmetic cl
 Successor of the Skin claims scoring (claim scores, Skin Stack). For one comparison it reads
 the over-representation results already stored in `enrichment_pathways`, joins them to the
 versioned claim referential `app/data/claims/claim_subgroups.yaml` (one row per claim × term,
-grouped into pathway sub-groups) and returns the payload drawn by the frontend nova.
+grouped into pathway sub-groups) and returns the payload drawn by the frontend nova. The payload
+also says what it was computed from (`provenance`, `p_source`, `coverage`).
 
 Definitions (reference: docs/reference/cosmomics/cosmomics_pathway_nova.py):
 
   term       nl = -log10(p). effect = +1 when the observed direction matches the direction the
              claim expects for that term ("pro"), -1 otherwise ("anti"), 0 when not linked.
+             `significant` is p < alpha; `both_directions` says the term is enriched in the up
+             list and in the down list (it then has one entry per direction).
   sub-group  p = unsigned Stouffer over its terms: z_i = Φ⁻¹(1 − p_i), Z = Σ z_i / √n,
              p = 1 − Φ(Z), bounded at 1e-300. S_pro / S_anti = Σ nl of its pro / anti terms,
              delta = S_pro − S_anti, balance = delta / (S_pro + S_anti) (0 when both are 0),
-             obs = "up" when Σ nl(up) ≥ Σ nl(down), else "down".
+             obs = "up" when Σ nl(up) ≥ Σ nl(down), else "down". A sub-group with delta = 0 is
+             balanced: it goes neither for nor against the claim.
   claim      S_pro / S_anti = sums over its sub-groups, importance = S_pro + S_anti,
              coherence = S_pro / importance, n_for = #sub-groups with delta > 0,
-             n_against = #sub-groups with delta ≤ 0. Claims are independent: one pathway may
-             sit in several claims. Only claims with at least one term at p < alpha are kept;
-             they are ordered by S_pro, strongest first.
+             n_against = #sub-groups with delta < 0, n_balanced = the others. `state` is
+             "for_only" (S_anti = 0), "against_only" (S_pro = 0) or "both_ways".
+             best_subgroup / best_nl: the most significant sub-group, whatever its direction;
+             best_for_subgroup / best_for_nl: the most significant one among those with
+             delta > 0 (None without one) — the figure the OmicSkin score is read from.
+             Claims are independent: one pathway may sit in several claims. Only claims with at
+             least one term at p < alpha are kept, ordered by S_pro, strongest first; the other
+             claims of the referential are listed in `not_evaluated`.
   not linked significant sub-groups (Stouffer p < alpha) attached to no claim.
 
-Choices made for the data GenoLens actually stores:
+What the p-values are, and what is stored (the payload's `provenance` and `p_source` say which):
 
-  * p is the Benjamini-Hochberg `padj` of each term, as in the Skin claims module (which also
-    filtered on padj); the raw `pvalue` is only used when a row carries no padj.
+  * p is the `padj` of each term. From an analysis run in GenoLens it is the Benjamini-Hochberg
+    figure of the annoDB over-representation, and only the terms below the cut-off the run was
+    given are stored (`provenance.enrichment_fdr`: 0.05 unless the wizard chose another, and
+    recorded as `padj_cutoff` on the ENRICHMENT dataset); the enrichment GenoLens runs on a DEG
+    upload stores its Benjamini-Hochberg terms at fdr <= 0.05. For tables uploaded to GenoLens it
+    is the column the parser read as adjusted p (`provenance.padj_columns`), and the tables are
+    stored as deposited, not filtered by anyone. A row without an adjusted p is never stored as if it
+    had one, and a term without a padj is left out of the nova and counted
+    (`coverage.n_terms_without_padj`).
+  * `provenance.enrichment_source` says what kind of enrichment the rows are, once, for every
+    reader (the p-value label, the poster header, the editorial and LaTeX methods, the AI prompt):
+    "annodb" (an ENRICHMENT dataset GenoLens registered, `source` "annodb"), "uploaded" (any other
+    ENRICHMENT dataset: tables somebody deposited), "legacy" (rows stored under the DEG dataset
+    by an earlier GenoLens method, no ENRICHMENT dataset) and "none" (no enrichment result is
+    stored: the cut-off, the databases and the columns are then not facts of any run and stay
+    empty). `provenance.enrichment_categories` is what the annoDB run recorded about itself (the
+    categories it enriched), None when it recorded none.
+  * `alpha` marks each term `significant` and keeps a claim only if one of its terms is. A stored
+    term at p >= alpha is not dropped: it weighs in the sums like any other and is counted in
+    `coverage.n_terms_not_significant`. Such terms are rare with GenoLens's own enrichment at its
+    defaults (`enrichment_fdr` = `alpha` = 0.05); they appear when the analysis kept terms above
+    `alpha`, and in uploaded tables.
   * The observed direction is the `regulation` of the row: enrichment is run separately on the
     up- and on the down-regulated genes. A term enriched in both lists yields two entries, one
     per direction, so it counts both for and against. Rows of the undirected "ALL" list are
-    ignored — they say nothing about direction.
-  * Producers only store significant terms (annoDB keeps p.adjust < 0.05), so evidence against a
-    claim and non-significant terms are rare by construction.
+    ignored — they say nothing about direction — so a comparison with none of the directional
+    rows has `status` "no_enrichment".
 """
 
 from __future__ import annotations
@@ -39,30 +67,39 @@ import logging
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Literal, Optional, Sequence
+from uuid import UUID
 
 import yaml  # type: ignore[import-untyped]
 from scipy.stats import norm
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Dataset, EnrichmentPathway
+from app.core.config import settings
+from app.models.models import Dataset, EnrichmentPathway, SelfServiceAnalysis
 from app.services.cosmetics_taxonomy import normalize_pathway_id
 from app.services.cosmomics_grouping import clean_label, label_match_key, subgroup_name
-from app.services.enrichment_source import resolve_pathway_dataset_id
+from app.services.enrichment_source import find_enrichment_dataset
 
 logger = logging.getLogger(__name__)
 
 Direction = Literal["up", "down"]
+Side = Literal["for", "against", "balanced"]
 
 P_FLOOR = 1e-300
 # Φ⁻¹(1 − p) diverges at p = 1; a padj of exactly 1 is treated as "no evidence at all".
 _P_CEIL = 1.0 - 1e-15
 
 DEFAULT_ALPHA = 0.05
+# The R enrichment script's own term cut-off: what an analysis ran at when no other was passed.
+DEFAULT_ENRICHMENT_FDR = 0.05
+# Sub-groups whose delta is within this of zero are balanced: float sums of equal evidence need
+# not cancel exactly.
+_TIE_EPS = 1e-9
 # `cosmetic_interpretations` holds one row per comparison, shared with the legacy Skin claims
 # narrative. The nova's rows carry this prefix in `model`, so a legacy text is never served as
 # a nova interpretation.
@@ -100,17 +137,48 @@ _WP_RE = re.compile(r"\((WP\d+)\)")
 
 @dataclass(frozen=True)
 class TermHit:
-    """One enriched term of the comparison, in one direction."""
+    """One enriched term of the comparison, in one direction. `p` None = no adjusted p-value."""
 
     term_id: str
     label: str
-    p: float
+    p: Optional[float]
     obs: Direction
     category: Optional[str] = None
     gene_count: Optional[int] = None
     # Genes of the enriched list that hit the term (EnrichmentPathway.genes); feeds the report's
     # "key genes" chips, never the nova statistics.
     genes: tuple[str, ...] = ()
+
+
+ENRICHMENT_SOURCES = ("annodb", "uploaded", "legacy", "none")
+
+
+@dataclass(frozen=True)
+class NovaSource:
+    """What the nova's enrichment rows came from: the facts `provenance` and `p_source` state.
+
+    `enrichment_source` is the kind of enrichment (`ENRICHMENT_SOURCES`). As read from the
+    database it is "annodb" or "uploaded" when an ENRICHMENT dataset exists and "none" when it does
+    not; `build_nova` settles it: no row at all is "none", and rows with no ENRICHMENT dataset are
+    "legacy" (the earlier GenoLens method stores them under the DEG dataset). `padj_columns` are
+    the headers the parser read as adjusted p of an uploaded table. `enrichment_databases` is the
+    analysis's own pick (an empty tuple: it picked none, so all the categories ran; None: not
+    known, e.g. the analysis was deleted) and `enrichment_categories` what the run recorded about
+    itself. All fields default to "unknown", so a nova built from hits alone still has a
+    provenance block.
+    """
+
+    dataset_id: Optional[str] = None
+    pathway_dataset_id: Optional[UUID] = None
+    enrichment_dataset_ids: tuple[str, ...] = ()
+    analysis_id: Optional[str] = None
+    enrichment_fdr: Optional[float] = None
+    enrichment_databases: Optional[tuple[str, ...]] = None
+    enrichment_categories: Optional[tuple[str, ...]] = None
+    enrichment_source: str = "none"
+    padj_columns: tuple[str, ...] = ()
+    source_versions: tuple[str, ...] = ()
+    demo: bool = False
 
 
 @dataclass(frozen=True)
@@ -280,6 +348,10 @@ def coherence_of(s_pro: float, s_anti: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _has_p(hit: TermHit) -> bool:
+    return hit.p is not None and not math.isnan(hit.p)
+
+
 @dataclass
 class _Term:
     id: str
@@ -287,6 +359,8 @@ class _Term:
     p: float
     effect: int
     obs: Direction
+    both_directions: bool = False
+    significant: bool = False
 
     @property
     def nl(self) -> float:
@@ -324,21 +398,167 @@ def _subgroup_payload(name: str, terms: list[_Term]) -> dict[str, Any]:
         "delta": s_pro - s_anti,
         "balance": balance_of(s_pro, s_anti),
         "obs": "up" if w_up >= w_down else "down",
+        # One term enriched in both lists has two entries; it is one term here.
+        "n_terms_both_directions": len({t.id for t in terms if t.both_directions}),
         "terms": [
-            {"id": t.id, "label": t.label, "nl": t.nl, "effect": t.effect, "obs": t.obs}
+            {
+                "id": t.id,
+                "label": t.label,
+                "nl": t.nl,
+                "effect": t.effect,
+                "obs": t.obs,
+                "both_directions": t.both_directions,
+                "significant": t.significant,
+            }
             for t in terms
         ],
     }
+
+
+def _term_key(hit: TermHit) -> str:
+    return normalize_pathway_id(hit.term_id) or hit.label
+
+
+def _significance_rank(hit: TermHit) -> float:
+    """Smaller is more significant; a row without an adjusted p ranks after any row with one."""
+    return clamp_p(hit.p) if _has_p(hit) else 2.0
 
 
 def _dedupe(hits: Iterable[TermHit]) -> list[TermHit]:
     """Keep the most significant row per (term, direction) — producers may repeat a term."""
     best: dict[tuple[str, str], TermHit] = {}
     for hit in hits:
-        key = (normalize_pathway_id(hit.term_id) or hit.label, hit.obs)
-        if key not in best or clamp_p(hit.p) < clamp_p(best[key].p):
+        key = (_term_key(hit), hit.obs)
+        if key not in best or _significance_rank(hit) < _significance_rank(best[key]):
             best[key] = hit
     return list(best.values())
+
+
+def subgroup_side(subgroup: dict[str, Any]) -> Side:
+    """Which side of its claim a sub-group of the payload stands on.
+
+    "for" when delta > 0, "against" when delta < 0, "balanced" when the evidence for and against
+    cancels (delta within `_TIE_EPS` of 0). The one rule behind `n_for` / `n_against` /
+    `n_balanced`, the wheel, the editorial sentences and the AI prompt: a balanced sub-group is
+    never presented as contrary.
+    """
+    delta = subgroup.get("delta") or 0.0
+    if delta > _TIE_EPS:
+        return "for"
+    if delta < -_TIE_EPS:
+        return "against"
+    return "balanced"
+
+
+def best_supporting_subgroup(subgroups: Iterable[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The most significant sub-group whose evidence goes the expected way (delta > 0), if any."""
+    supporting = [s for s in subgroups if subgroup_side(s) == "for"]
+    return min(supporting, key=lambda s: (-s["nl"], s["name"]), default=None)
+
+
+# Said wherever a claim has no contrary term at all (state "for_only"): on the wheel, on the
+# editorial pages and in what the AI is asked to write. The absence of a contrary term is not
+# evidence for; and it is said of the enrichment results, whatever their origin (an uploaded table
+# is not filtered, GenoLens's own enrichment is stored under its cut-off).
+ZERO_AGAINST_NOTE = (
+    "Only terms present in the enrichment results can count against a claim; "
+    "no contrary term is not a confirmation."
+)
+
+
+def claim_state(s_pro: float, s_anti: float) -> str:
+    """"for_only" without evidence against, "against_only" without evidence for, else "both_ways"."""
+    if s_anti == 0:
+        return "for_only"
+    if s_pro == 0:
+        return "against_only"
+    return "both_ways"
+
+
+def claim_state_of(claim: dict[str, Any]) -> str:
+    """The state of a payload claim: its `state`, or (a payload that predates the field) the one
+    its sums give."""
+    return claim.get("state") or claim_state(
+        float(claim.get("s_pro") or 0.0), float(claim.get("s_anti") or 0.0)
+    )
+
+
+def _referential_version(mapping: ClaimSubgroupMap) -> Optional[int]:
+    if mapping.version is None:
+        return None
+    try:
+        return int(mapping.version)
+    except ValueError:
+        return None
+
+
+# What the p-values are, by the kind of enrichment (`NovaSource.enrichment_source`). One function
+# for the payload's `p_source`, the poster header and the AI prompt's label, so they cannot differ.
+# P_SOURCE_UPLOADED is how the uploaded wording begins; nothing reads the kind from it any more.
+P_SOURCE_ANNODB = "padj (Benjamini–Hochberg, GenoLens enrichment)"
+P_SOURCE_UPLOADED = "adjusted p from uploaded tables"
+P_SOURCE_LEGACY = "adjusted p from an earlier GenoLens enrichment (test and correction not recorded)"
+P_SOURCE_NONE = "no enrichment result is stored"
+
+
+def p_source_of(kind: Optional[str], padj_columns: Iterable[str] = ()) -> Optional[str]:
+    """What the adjusted p-values are, in words, for an enrichment source; None for a kind that is
+    not one (a payload that predates the field: its own `p_source` stands)."""
+    if kind == "annodb":
+        return P_SOURCE_ANNODB
+    if kind == "uploaded":
+        columns = [str(c) for c in padj_columns or ()]
+        noun = "columns" if len(columns) > 1 else "column"
+        return f"{P_SOURCE_UPLOADED} ({noun} {', '.join(columns) or 'not recorded'})"
+    if kind == "legacy":
+        return P_SOURCE_LEGACY
+    if kind == "none":
+        return P_SOURCE_NONE
+    return None
+
+
+def _settled(source: NovaSource, has_rows: bool) -> NovaSource:
+    """The source with its kind settled by what was found: no enrichment row at all is "none"
+    (nothing is stored, so no cut-off, database or column is a fact of any run); rows with no
+    ENRICHMENT dataset behind them are "legacy"."""
+    if not has_rows:
+        return replace(
+            source,
+            enrichment_source="none",
+            enrichment_fdr=None,
+            enrichment_databases=None,
+            enrichment_categories=None,
+            padj_columns=(),
+        )
+    if source.enrichment_source == "none":
+        return replace(source, enrichment_source="legacy")
+    return source
+
+
+def _provenance(
+    source: NovaSource, comparison: str, alpha: float, referential_version: Optional[int]
+) -> dict[str, Any]:
+    return {
+        "dataset_id": source.dataset_id,
+        "comparison": comparison,
+        "enrichment_dataset_ids": list(source.enrichment_dataset_ids),
+        "analysis_id": source.analysis_id,
+        "enrichment_source": source.enrichment_source,
+        "enrichment_fdr": source.enrichment_fdr,
+        "enrichment_databases": (
+            list(source.enrichment_databases) if source.enrichment_databases is not None else None
+        ),
+        "enrichment_categories": (
+            list(source.enrichment_categories) if source.enrichment_categories is not None else None
+        ),
+        "padj_columns": list(source.padj_columns),
+        "source_versions": list(source.source_versions),
+        "referential_version": referential_version,
+        "alpha": alpha,
+        "app_version": settings.APP_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "demo": source.demo,
+    }
 
 
 def build_nova(
@@ -347,33 +567,59 @@ def build_nova(
     *,
     alpha: float = DEFAULT_ALPHA,
     contrast: str = "",
-    condition: str = "Active",
     unlinked_limit: int = UNLINKED_LIMIT,
+    source: Optional[NovaSource] = None,
 ) -> dict[str, Any]:
-    """Assemble the nova payload from the comparison's enriched terms. Pure function."""
+    """Assemble the nova payload from the comparison's enriched terms.
+
+    Pure but for `provenance.generated_at`, which is the clock. The condition shown on the
+    central disc is the numerator of `contrast`.
+    """
     unique_hits = _dedupe(hits)
+    source = _settled(source or NovaSource(), bool(unique_hits))
+    # (term, its adjusted p): a term without one is left out of everything but the counts.
+    scored = [(h, h.p) for h in unique_hits if h.p is not None and not math.isnan(h.p)]
+    n_without_padj = len(unique_hits) - len(scored)
+
+    # A term enriched in the up list and in the down list is flagged on both of its entries.
+    directions: dict[str, set[str]] = defaultdict(set)
+    for hit, _p in scored:
+        directions[_term_key(hit)].add(hit.obs)
+
     claim_groups: dict[str, dict[str, list[_Term]]] = defaultdict(lambda: defaultdict(list))
     unlinked_groups: dict[str, list[_Term]] = defaultdict(list)
     n_matched = 0
 
-    for hit in unique_hits:
+    for hit, p in scored:
         rows = mapping.lookup(hit)
         label = clean_label(hit.label) or hit.term_id
+        both = len(directions[_term_key(hit)]) > 1
+        significant = p < alpha
         if rows:
             n_matched += 1
         linked = [r for r in rows if r.claim is not None]
         for row in linked:
             effect = 1 if hit.obs == row.expected else -1
             claim_groups[row.claim][row.subgroup].append(  # type: ignore[index]
-                _Term(_display_id(row.term_id), row.label or label, hit.p, effect, hit.obs)
+                _Term(
+                    _display_id(row.term_id),
+                    row.label or label,
+                    p,
+                    effect,
+                    hit.obs,
+                    both,
+                    significant,
+                )
             )
         if not linked:
             name = rows[0].subgroup if rows else subgroup_name(label, hit.category)
-            unlinked_groups[name].append(_Term(_display_id(hit.term_id), label, hit.p, 0, hit.obs))
+            unlinked_groups[name].append(
+                _Term(_display_id(hit.term_id), label, p, 0, hit.obs, both, significant)
+            )
 
     claims: list[dict[str, Any]] = []
     for claim, groups in claim_groups.items():
-        if not any(t.p < alpha for terms in groups.values() for t in terms):
+        if not any(t.significant for terms in groups.values() for t in terms):
             continue
         subgroups = sorted(
             (_subgroup_payload(name, terms) for name, terms in groups.items()),
@@ -382,21 +628,34 @@ def build_nova(
         s_pro = sum(s["s_pro"] for s in subgroups)
         s_anti = sum(s["s_anti"] for s in subgroups)
         best = subgroups[0]
+        best_for = best_supporting_subgroup(subgroups)
+        sides = [subgroup_side(s) for s in subgroups]
+        n_for, n_against = sides.count("for"), sides.count("against")
         claims.append(
             {
                 "name": claim,
+                "state": claim_state(s_pro, s_anti),
                 "importance": s_pro + s_anti,
                 "s_pro": s_pro,
                 "s_anti": s_anti,
                 "coherence": coherence_of(s_pro, s_anti),
-                "n_for": sum(1 for s in subgroups if s["delta"] > 0),
-                "n_against": sum(1 for s in subgroups if s["delta"] <= 0),
+                "n_for": n_for,
+                "n_against": n_against,
+                "n_balanced": sides.count("balanced"),
                 "best_subgroup": best["name"],
                 "best_nl": best["nl"],
+                "best_for_subgroup": best_for["name"] if best_for else None,
+                "best_for_nl": best_for["nl"] if best_for else None,
                 "subgroups": subgroups,
             }
         )
     claims.sort(key=lambda c: (-c["s_pro"], c["name"]))
+
+    kept = {c["name"] for c in claims}
+    in_referential = {row.claim for row in mapping.rows if row.claim is not None}
+    not_evaluated = [
+        name for name in CLAIM_NAMES.values() if name in in_referential and name not in kept
+    ]
 
     sig_nl = nl_of(alpha)
     unlinked = sorted(
@@ -408,27 +667,32 @@ def build_nova(
         key=lambda s: (-s["nl"], s["name"]),
     )
 
+    n_significant = sum(1 for _hit, p in scored if p < alpha)
     return {
+        "status": "ok" if unique_hits else "no_enrichment",
         "contrast": contrast,
-        "condition": condition,
+        "condition": condition_label(contrast),
         "alpha": alpha,
-        "p_source": "padj (Benjamini-Hochberg, over-representation on up / down gene lists)",
+        "p_source": p_source_of(source.enrichment_source, source.padj_columns),
         "claims": claims,
+        "not_evaluated": not_evaluated,
         "unlinked": unlinked[:unlinked_limit],
         "unlinked_total": len(unlinked),
         "coverage": {
             "n_terms": len(unique_hits),
-            "n_terms_significant": sum(1 for h in unique_hits if h.p < alpha),
+            "n_terms_significant": n_significant,
+            "n_terms_not_significant": len(scored) - n_significant,
+            "n_terms_without_padj": n_without_padj,
             "n_terms_matched": n_matched,
         },
+        "provenance": _provenance(source, contrast, alpha, _referential_version(mapping)),
     }
 
 
-def condition_label(comparison_name: str, default: str = "Active", max_len: int = 8) -> str:
-    """Name for the central disc: the numerator of "A_vs_B" when short enough, else `default`."""
+def condition_label(comparison_name: str) -> str:
+    """Name for the central disc: the numerator of "A_vs_B", whatever its length."""
     numerator = re.split(r"[_\s]+vs[_\s]+", comparison_name or "", maxsplit=1, flags=re.I)[0]
-    numerator = numerator.strip()
-    return numerator if 0 < len(numerator) <= max_len else default
+    return numerator.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -451,16 +715,110 @@ def _row_direction(regulation: Optional[str], comparison_name: str) -> Optional[
     return None
 
 
-async def fetch_term_hits(
-    db: AsyncSession, deg_dataset: Dataset, comparison_name: str
-) -> list[TermHit]:
-    """The comparison's directional enrichment rows, read where the enrichment panel reads them.
+async def _analysis_params(db: AsyncSession, analysis_id: Any) -> Optional[dict]:
+    """The parameters the self-service analysis ran with, None when there is no such analysis."""
+    try:
+        key = UUID(str(analysis_id))
+    except ValueError:
+        return None
+    params = await db.scalar(select(SelfServiceAnalysis.params).where(SelfServiceAnalysis.id == key))
+    return params if isinstance(params, dict) else None
 
-    Uses the shared resolver (ENRICHMENT dataset of the same analysis when there is one, else
-    the DEG dataset) and an exact comparison-name match — never a prefix match, so
-    "A_vs_B" cannot pick up the rows of "A_vs_B_24h".
+
+def _enrichment_fdr(recorded: Any, params: Optional[dict]) -> Optional[float]:
+    """The term cut-off an annoDB enrichment ran at, None when it cannot be told.
+
+    The worker records the `--padj-cutoff` it passes to the script (`padj_cutoff` on the
+    ENRICHMENT dataset): that is the answer. A dataset that predates the record falls back on the
+    analysis parameters, which are only trustworthy when they ask for 0.05 (or for nothing): until
+    the cut-off was passed to the script (2026-09-29) it ran at 0.05 whatever the parameters
+    said, and since then it runs at what they say, so any other value may be either.
     """
-    source_id = await resolve_pathway_dataset_id(db, deg_dataset, comparison_name)
+    if isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+        return float(recorded)
+    if params is None:
+        return None
+    asked = params.get("enrichment_fdr")
+    if asked is None or asked == DEFAULT_ENRICHMENT_FDR:
+        return DEFAULT_ENRICHMENT_FDR
+    return None
+
+
+def _distinct(values: Iterable[Any]) -> tuple[str, ...]:
+    seen: dict[str, None] = {}
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            seen.setdefault(value.strip())
+    return tuple(seen)
+
+
+def _recorded_categories(raw: Any) -> Optional[tuple[str, ...]]:
+    """The categories an annoDB run recorded about itself; None for no record or a malformed one."""
+    if isinstance(raw, list) and raw and all(isinstance(c, str) and c.strip() for c in raw):
+        return tuple(c.strip() for c in raw)
+    return None
+
+
+async def resolve_nova_source(
+    db: AsyncSession, deg_dataset: Dataset, comparison_name: str
+) -> NovaSource:
+    """Where the comparison's enrichment rows are read, and what is known of how they were made.
+
+    The rows are read where the enrichment panel reads them: the ENRICHMENT dataset of the same
+    analysis when there is one, else the DEG dataset (the legacy Python enrichment stores its rows
+    there). An enrichment GenoLens ran itself (`source` "annodb") is described by the term cut-off
+    it ran at (`_enrichment_fdr`), the analysis's `enrichment_databases` pick and the categories the
+    run recorded; a deposited table by the column read as adjusted p. With no ENRICHMENT dataset
+    nothing says an enrichment ran, so the analysis's parameters are not read as if one had: the
+    kind is "none" here, which `build_nova` settles to "legacy" when rows exist under the DEG
+    dataset.
+    """
+    enrichment = await find_enrichment_dataset(db, deg_dataset, comparison_name)
+    deg_meta = deg_dataset.dataset_metadata or {}
+    enr_meta = (enrichment.dataset_metadata or {}) if enrichment is not None else {}
+    if enrichment is None:
+        kind = "none"
+    elif enr_meta.get("source") == "annodb":
+        kind = "annodb"
+    else:
+        kind = "uploaded"
+
+    analysis_id = deg_meta.get("analysis_id") or enr_meta.get("analysis_id")
+    fdr: Optional[float] = None
+    databases: Optional[tuple[str, ...]] = None
+    categories: Optional[tuple[str, ...]] = None
+    if kind == "annodb":
+        params = await _analysis_params(db, analysis_id) if analysis_id else None
+        fdr = _enrichment_fdr(enr_meta.get("padj_cutoff"), params)
+        if params is not None:
+            raw = params.get("enrichment_databases")
+            databases = tuple(d for d in raw if d) if isinstance(raw, list) else ()
+        categories = _recorded_categories(enr_meta.get("categories"))
+
+    return NovaSource(
+        dataset_id=str(deg_dataset.id),
+        pathway_dataset_id=enrichment.id if enrichment is not None else deg_dataset.id,
+        enrichment_dataset_ids=(str(enrichment.id),) if enrichment is not None else (),
+        analysis_id=str(analysis_id) if analysis_id else None,
+        enrichment_fdr=fdr,
+        enrichment_databases=databases,
+        enrichment_categories=categories,
+        enrichment_source=kind,
+        padj_columns=_distinct([enr_meta.get("padj_column")]) if kind == "uploaded" else (),
+        source_versions=_distinct([deg_meta.get("source_version"), enr_meta.get("source_version")]),
+        demo=bool(deg_meta.get("demo") or enr_meta.get("demo")),
+    )
+
+
+async def fetch_term_hits(
+    db: AsyncSession, source: NovaSource, comparison_name: str
+) -> list[TermHit]:
+    """The comparison's directional enrichment rows, read where `source` says they are.
+
+    An exact comparison-name match — never a prefix match, so "A_vs_B" cannot pick up the rows of
+    "A_vs_B_24h". A row with no adjusted p-value comes back with `p` None: the raw p-value is
+    never read in its place.
+    """
     names = [comparison_name] + [
         f"{comparison_name} {suffix}" for suffix in ("(up)", "(down)", "(UP)", "(DOWN)")
     ]
@@ -476,7 +834,7 @@ async def fetch_term_hits(
             EnrichmentPathway.gene_count,
             EnrichmentPathway.genes,
         ).where(
-            EnrichmentPathway.dataset_id == source_id,
+            EnrichmentPathway.dataset_id == source.pathway_dataset_id,
             EnrichmentPathway.comparison_name.in_(names),
         )
     )
@@ -485,12 +843,11 @@ async def fetch_term_hits(
         obs = _row_direction(row.regulation, row.comparison_name)
         if obs is None:
             continue
-        p = row.padj if row.padj is not None else row.pvalue
         hits.append(
             TermHit(
                 term_id=str(row.pathway_id),
                 label=str(row.pathway_name or row.pathway_id),
-                p=float(p) if p is not None else 1.0,
+                p=float(row.padj) if row.padj is not None else None,
                 obs=obs,
                 category=row.category,
                 gene_count=row.gene_count,
@@ -501,18 +858,17 @@ async def fetch_term_hits(
 
 
 def nova_from_hits(
-    hits: Iterable[TermHit], comparison_name: str, alpha: float = DEFAULT_ALPHA
+    hits: Iterable[TermHit],
+    comparison_name: str,
+    alpha: float = DEFAULT_ALPHA,
+    source: Optional[NovaSource] = None,
 ) -> dict[str, Any]:
     """The nova of one comparison from its enriched terms, joined to the default referential.
 
     Shared by the `cosmomics-nova` endpoints and the OmicSkin editorial report.
     """
     return build_nova(
-        hits,
-        default_claim_subgroups(),
-        alpha=alpha,
-        contrast=comparison_name,
-        condition=condition_label(comparison_name),
+        hits, default_claim_subgroups(), alpha=alpha, contrast=comparison_name, source=source
     )
 
 
@@ -520,20 +876,24 @@ async def compute_nova(
     db: AsyncSession, dataset: Dataset, comparison_name: str, alpha: float = DEFAULT_ALPHA
 ) -> tuple[dict[str, Any], list[TermHit]]:
     """The nova of one comparison as served by the API, plus the enriched terms behind it."""
-    hits = await fetch_term_hits(db, dataset, comparison_name)
-    return nova_from_hits(hits, comparison_name, alpha), hits
+    source = await resolve_nova_source(db, dataset, comparison_name)
+    hits = await fetch_term_hits(db, source, comparison_name)
+    return nova_from_hits(hits, comparison_name, alpha, source), hits
 
 
-def term_gene_map(hits: Iterable[TermHit], mapping: ClaimSubgroupMap) -> dict[str, set[str]]:
-    """Genes per referential term (normalised id), joined exactly as `build_nova` joins terms.
+def term_gene_map(
+    hits: Iterable[TermHit], mapping: ClaimSubgroupMap
+) -> dict[tuple[str, str], set[str]]:
+    """Genes per referential term and direction, joined exactly as `build_nova` joins terms.
 
-    Keys match `normalize_pathway_id(term["id"])` for the terms of the nova payload, so a
-    report can list the genes behind a claim without re-reading the referential.
+    Keys are `(normalize_pathway_id(term["id"]), term["obs"])` for the terms of the nova payload:
+    a term enriched in both lists has two entries, and each takes the genes of its own list only.
+    A report can list the genes behind a claim without re-reading the referential.
     """
-    genes: dict[str, set[str]] = defaultdict(set)
+    genes: dict[tuple[str, str], set[str]] = defaultdict(set)
     for hit in hits:
-        if not hit.genes:
+        if not hit.genes or not _has_p(hit):
             continue
         for row in mapping.lookup(hit):
-            genes[normalize_pathway_id(row.term_id)].update(hit.genes)
+            genes[(normalize_pathway_id(row.term_id), hit.obs)].update(hit.genes)
     return dict(genes)

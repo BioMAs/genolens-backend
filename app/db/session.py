@@ -3,17 +3,25 @@ Database session management using SQLAlchemy.
 """
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from app.core.config import settings
+from app.core.config import Settings, settings
+
+
+def engine_options(config: Settings = settings) -> dict:
+    """The options every engine of the application is built with: the app's, and the service-token command's."""
+    return {
+        # The echoed SQL keeps its parameters out of the log (user data, the sha256 a service-token lookup binds)
+        # unless SQL_ECHO_PARAMETERS asks for them.
+        "hide_parameters": not config.SQL_ECHO_PARAMETERS,
+        "pool_pre_ping": True,
+    }
+
 
 # Create Async Engine
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DEBUG,
-    # The echoed SQL keeps its parameters out of the log (user data, the sha256 a service-token lookup binds)
-    # unless SQL_ECHO_PARAMETERS asks for them.
-    hide_parameters=not settings.SQL_ECHO_PARAMETERS,
     future=True,
-    pool_pre_ping=True,
+    **engine_options(),
 )
 
 # Create Async Session Factory

@@ -49,6 +49,7 @@ services:
       - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY:-}
       - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY:-}
       - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
+      - SQL_ECHO_PARAMETERS=${SQL_ECHO_PARAMETERS:-false}
       - LOCAL_STORAGE_PATH=/app/data
       # Remote LLM inference (Modal + vLLM, Gemma 4). Set these in backend/.env.
       - LLM_BASE_URL=${LLM_BASE_URL}
@@ -86,6 +87,7 @@ services:
       - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY:-}
       - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY:-}
       - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
+      - SQL_ECHO_PARAMETERS=${SQL_ECHO_PARAMETERS:-false}
       - LOCAL_STORAGE_PATH=/app/data
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_API_KEY=${LLM_API_KEY}
@@ -121,6 +123,7 @@ services:
       - GENOLENS_LICENSE_KEY=${GENOLENS_LICENSE_KEY:-}
       - LICENSE_SECRET_KEY=${LICENSE_SECRET_KEY:-}
       - LICENSE_PRODUCT=${LICENSE_PRODUCT:-genolens}
+      - SQL_ECHO_PARAMETERS=${SQL_ECHO_PARAMETERS:-false}
       - LOCAL_STORAGE_PATH=/app/data
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_API_KEY=${LLM_API_KEY}

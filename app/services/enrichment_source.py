@@ -17,13 +17,14 @@ cannot drift apart again.
 """
 
 import logging
-from typing import Any, Optional, Sequence
+import math
+from typing import Any, Iterable, Optional, Sequence
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.models import Dataset, DatasetStatus, DatasetType
+from app.models.models import Dataset, DatasetStatus, DatasetType, DegGene
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,43 @@ def deg_comparison_names(deg_dataset: Dataset) -> list[str]:
 
     seen = set()
     return [n for n in names if not (n in seen or seen.add(n))]
+
+
+async def recorded_comparison_names(db: AsyncSession, dataset: Dataset) -> set[str]:
+    """
+    The comparisons a dataset records, empty when it records none.
+
+    First what its metadata declares (`deg_comparison_names`), then — for a dataset whose metadata
+    names none — the comparisons of its DEG rows. A caller can refuse a comparison absent from a
+    non-empty answer; an empty answer says nothing, since a dataset with no DEG rows and no
+    metadata is not one whose comparisons are known.
+    """
+    names = set(deg_comparison_names(dataset))
+    if names:
+        return names
+    result = await db.execute(
+        select(DegGene.comparison_name).where(DegGene.dataset_id == dataset.id).distinct()
+    )
+    return {name for name in result.scalars().all() if name}
+
+
+def split_by_adjusted_p(rows: Iterable[dict]) -> tuple[list[dict], int]:
+    """
+    (rows that carry an adjusted p-value `fdr`, number of rows that do not).
+
+    An enrichment row is stored with the adjusted p it was given. One without — the producer
+    sent none, or NaN — is left out and counted: the raw p-value is never stored in its place,
+    because the nova and every report read `padj` as the Benjamini-Hochberg figure.
+    """
+    kept: list[dict] = []
+    n_without = 0
+    for row in rows:
+        fdr = row.get("fdr")
+        if fdr is None or (isinstance(fdr, float) and math.isnan(fdr)):
+            n_without += 1
+        else:
+            kept.append(row)
+    return kept, n_without
 
 
 def match_enrichment_for_deg(

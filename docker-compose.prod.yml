@@ -46,6 +46,8 @@ services:
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
       - ENVIRONMENT=production
+      # DEBUG only turns the SQL echo on (every statement in the logs): off in production, in every service.
+      - DEBUG=false
       - LOCAL_STORAGE_PATH=/app/data
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_API_KEY=${LLM_API_KEY}
@@ -110,6 +112,7 @@ services:
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
       - ENVIRONMENT=production
+      - DEBUG=false
       - LOCAL_STORAGE_PATH=/app/data
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_API_KEY=${LLM_API_KEY}
@@ -162,6 +165,7 @@ services:
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
       - ENVIRONMENT=production
+      - DEBUG=false
       - LOCAL_STORAGE_PATH=/app/data
       - LLM_BASE_URL=${LLM_BASE_URL}
       - LLM_API_KEY=${LLM_API_KEY}
@@ -206,6 +210,7 @@ services:
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
       - ENVIRONMENT=production
+      - DEBUG=false
       - LOCAL_STORAGE_PATH=/app/data
       - R_SCRIPTS_PATH=/app/r_scripts
       - ANNO_DB_PATH=/app/anno_db

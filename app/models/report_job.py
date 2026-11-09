@@ -51,6 +51,9 @@ class ReportJob(Base, TimestampMixin):
     use_ai: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=true()
     )
+    # The AI texts the report really printed, [{kind, model, generated_at}] (None: not recorded,
+    # []: none printed). Written by the worker with the PDF.
+    ai_texts: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     # The service token the job was requested through (None: a user). Such a job is rendered
     # without the owner's saved branding and cover data. No foreign key, like `requested_by`.
     service_token_id: Mapped[Optional[UUID]] = mapped_column(nullable=True)

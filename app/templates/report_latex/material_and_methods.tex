@@ -1,24 +1,146 @@
-
+\JINJABLOCK{set m = jj_methods}
+\JINJABLOCK{set enr = m.enrichment}
 \subsection{Input Data}
-The analysis was performed on the provided gene-level count matrix. Samples below the minimum sequencing depth or number of detected genes set for the analysis were excluded. Genes with very low expression were then removed: a gene was kept when it reached the minimum count set for the analysis (10 by default) in at least as many samples as the smallest compared condition contains, the rule of edgeR's \textit{filterByExpr} (Chen et al., 2016); above ten samples per condition the requirement is relaxed to $10 + 0.7\,(n - 10)$ samples. A gene expressed in a single condition is therefore retained, whereas a gene detected in fewer samples than any condition holds is not. When a fixed number of samples was set for the analysis instead, that number applies.
+\JINJABLOCK{if m.imported}
+The count matrix behind the results, and the filtering of its samples and genes, are not described here.
+\JINJABLOCK{else}
+The analysis was performed on the provided gene-level count matrix.
+\JINJABLOCK{if m.qc.min_reads is not none and m.qc.min_genes is not none}
+A sample was kept when it had at least \JINJAVAR{m.qc.min_reads|fmt_g} total counts and at least \JINJAVAR{m.qc.min_genes|fmt_g} genes with a count above zero.
+\JINJABLOCK{else}
+The minimum sequencing depth and the minimum number of detected genes required of a sample are not recorded for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{if m.qc.removed_sample_ids is none}
+The samples excluded are not recorded.
+\JINJABLOCK{elif m.qc.removed_sample_ids}
+\JINJABLOCK{set n_removed = m.qc.removed_sample_ids|length}
+\JINJAVAR{n_removed} \JINJAVAR{'sample was' if n_removed == 1 else 'samples were'} excluded: \JINJAVAR{m.qc.removed_sample_ids|map('tex_escape')|join(', ')}.
+\JINJABLOCK{else}
+No sample was excluded.
+\JINJABLOCK{endif}
+\JINJABLOCK{if m.qc.relaxed}
+Fewer than two samples passed these thresholds, so they were relaxed: the two samples with the largest library sizes were kept.
+\JINJABLOCK{endif}
+\JINJABLOCK{if m.min_count is not none}
+Genes with very low expression were then removed: a gene was kept when its raw counts (before any normalisation) reached \JINJAVAR{m.min_count|fmt_g} in \JINJABLOCK{if m.min_reps is not none}at least \JINJAVAR{m.min_reps|fmt_g} samples\JINJABLOCK{else}a number of samples that is not recorded\JINJABLOCK{endif}\JINJABLOCK{if m.min_reps_mode == 'auto'} (the number of samples of the smallest compared group; above ten samples per group the requirement is reduced to $10 + 0.7 (n - 10)$)\JINJABLOCK{endif}.
+\JINJABLOCK{else}
+The filter that removes genes with very low expression is not recorded for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{endif}
 
 \subsection{Differential Gene Expression Analysis}
+\JINJABLOCK{if m.imported}
 
-Differentially expressed genes (DEGs) were called with \textbf{DESeq2} (Love et al., 2014), which fits a negative binomial generalised linear model with shrinkage of the dispersion estimates and tests each gene with a Wald test. P-values were corrected for multiple testing using the Benjamini-Hochberg (BH) False Discovery Rate. A gene was classified as a DEG if (i) its DESeq2 adjusted p-value was below the FDR threshold set for the analysis (0.05 by default), and (ii) its absolute DESeq2 log$_2$ fold-change (maximum-likelihood estimate, unshrunken) was at or above the fold-change threshold set for the analysis (log$_2$(1.5) by default).
+\JINJABLOCK{if m.analysis_gone}
+The analysis that produced these results is no longer available; its methods are not described here.
+\JINJABLOCK{else}
+The differential analysis was not run in GenoLens; its methods are not described here.
+\JINJABLOCK{endif}
+The calls (up- and down-regulated genes), the log$_2$ fold-changes and the adjusted \textit{p}-values are shown as they \JINJAVAR{'are stored' if m.analysis_gone else 'were imported'} with the dataset; the statistical model and the versions of the software that produced them are not reported.
+\JINJABLOCK{else}
 
-To show how robust each call is, two complementary frameworks were applied to the same counts and reported alongside DESeq2, without changing the DEG list:
+\JINJABLOCK{if m.primary_method == 'DESeq2'}
+Differentially expressed genes (DEGs) were called with \textbf{DESeq2} (Love et al., 2014), which fits a negative binomial generalised linear model with shrinkage of the dispersion estimates and tests each gene with a Wald test. Its log$_2$ fold-changes are maximum-likelihood estimates (unshrunken).
+\JINJABLOCK{elif m.primary_method == 'edgeR'}
+Differentially expressed genes (DEGs) were called with \textbf{edgeR} (Robinson et al., 2010), which fits a negative binomial model on TMM-normalised counts and performs quasi-likelihood F-tests to account for overdispersion.
+\JINJABLOCK{elif m.primary_method == 'limma'}
+Differentially expressed genes (DEGs) were called with \textbf{limma-voom} (Ritchie et al., 2015), which models log-transformed data with precision weights derived from the mean--variance trend and employs empirical Bayes shrinkage of variance estimates.
+\JINJABLOCK{elif m.primary_by_comparison}
+The method that decided the differentially expressed gene (DEG) calls \JINJAVAR{'differs between the comparisons' if m.primary_differs else 'is not recorded for every comparison'}:
+\JINJABLOCK{for name, method in m.primary_by_comparison}
+\JINJABLOCK{if name}\JINJAVAR{name|tex_escape}, \JINJABLOCK{endif}\JINJAVAR{method}\JINJAVAR{'; ' if not loop.last else '.'}
+\JINJABLOCK{endfor}
+\JINJABLOCK{else}
+The method that decided the differentially expressed gene (DEG) calls is not recorded for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{if m.ahead_methods}
+\JINJAVAR{m.ahead_methods|join(' and ')} gave no result, so \JINJAVAR{m.primary_method|method_name} decided the calls.
+\JINJABLOCK{endif}
+\JINJABLOCK{if m.primary_method or m.primary_by_comparison}
+P-values were corrected for multiple testing using the Benjamini-Hochberg (BH) False Discovery Rate.
+\JINJABLOCK{if m.fdr is not none and m.min_log2fc is not none}
+A gene was classified as a DEG if (i) its adjusted \textit{p}-value was below \JINJAVAR{m.fdr|fmt_g} and (ii) the absolute value of its log$_2$ fold-change was at or above \JINJAVAR{m.min_log2fc|fmt_g}.
+\JINJABLOCK{else}
+The thresholds on the adjusted \textit{p}-value and on the log$_2$ fold-change that define a DEG are not recorded for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{endif}
+
+\JINJABLOCK{if m.other_methods}
+\JINJAVAR{m.other_methods|join(' and ')} were also run on the same counts; they do not decide the calls and are not reported here:
 
 \begin{enumerate}
+\JINJABLOCK{for other in m.other_methods}
+\JINJABLOCK{if other == 'DESeq2'}
+  \item \textbf{DESeq2} (Love et al., 2014): fits a negative binomial generalised linear model with shrinkage of the dispersion estimates and tests each gene with a Wald test.
+\JINJABLOCK{elif other == 'edgeR'}
   \item \textbf{edgeR} (Robinson et al., 2010): fits a negative binomial model on TMM-normalised counts and performs quasi-likelihood F-tests to account for overdispersion.
+\JINJABLOCK{else}
   \item \textbf{limma-voom} (Ritchie et al., 2015): models log-transformed data with precision weights derived from the mean--variance trend and employs empirical Bayes shrinkage of variance estimates.
+\JINJABLOCK{endif}
+\JINJABLOCK{endfor}
 \end{enumerate}
 
-For each gene, the number of methods in which it is significant is reported. A combined p-value (Stouffer's Z-score method) is also provided for information only: it assumes independent tests, whereas the three methods analyse the same counts and give strongly correlated p-values, so the combination overstates significance and is not used to call DEGs.
+\JINJABLOCK{endif}
+\JINJABLOCK{if m.design_used|length == 1}
+\JINJABLOCK{for name, design in m.design_used.items()}
+The model design was \JINJAVAR{design|tex_escape}.
+\JINJABLOCK{endfor}
+\JINJABLOCK{elif m.design_used}
+The model design was fitted per comparison:
+\JINJABLOCK{for name, design in m.design_used.items()}
+\JINJAVAR{name|tex_escape}, \JINJAVAR{design|tex_escape}\JINJAVAR{'; ' if not loop.last else '.'}
+\JINJABLOCK{endfor}
+\JINJABLOCK{else}
+The design used is not recorded for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{if m.versions}
+Software versions, as observed when the analysis ran: \JINJABLOCK{for name, version in m.versions.items()}\JINJAVAR{name} \JINJAVAR{version|tex_escape}\JINJAVAR{', ' if not loop.last else ''}\JINJABLOCK{endfor}.
+\JINJABLOCK{else}
+The versions of R and of the packages used are not recorded for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{endif}
 
 \subsection{Functional Enrichment Analysis}
+\JINJABLOCK{if enr.kind in ['annodb', 'mixed']}
 
-Functional enrichment analysis was performed using an over-representation analysis (ORA) approach against the local annotation database. Analyses were conducted separately for up-regulated and down-regulated DEG sets.
+Functional enrichment analysis was performed by over-representation analysis (ORA) against the annotation database \JINJABLOCK{if enr.annodb_file}(file \texttt{\JINJAVAR{enr.annodb_file|tex_escape}})\JINJABLOCK{else}(file not recorded)\JINJABLOCK{endif}, separately for the up-regulated and for the down-regulated DEGs.
+\JINJABLOCK{if enr.categories}
+The categories tested were \JINJAVAR{enr.categories|map('tex_escape')|join(', ')}.
+\JINJABLOCK{else}
+No selection of categories was made: the test was run over all categories of the annotation database.
+\JINJABLOCK{endif}
 
-\textbf{Over-representation analysis (ORA)} tested whether DEGs were significantly over-represented in curated biological term sets using hypergeometric tests against multiple databases: Gene Ontology (GO --- Biological Process, Molecular Function, Cellular Component), KEGG pathways, Reactome pathways, WikiPathways, and MSigDB gene set collections (Hallmark, C2, C5, C6, C7).
+\textbf{Over-representation analysis (ORA)} tested whether DEGs were over-represented in each term with a hypergeometric test; within each category, \textit{p}-values were adjusted by the Benjamini-Hochberg (BH) procedure.
+\JINJABLOCK{if enr.fdr is not none}
+A term was reported when at least three DEGs were annotated to it, its raw \textit{p}-value was below 0.05 and its adjusted \textit{p}-value was below \JINJAVAR{enr.fdr|fmt_g}.
+\JINJABLOCK{else}
+A term was reported when at least three DEGs were annotated to it, its raw \textit{p}-value was below 0.05 and its adjusted \textit{p}-value was below a cut-off that is not recorded for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{if enr.background}
+The background was the set of \JINJAVAR{enr.background|tex_escape}.
+\JINJABLOCK{else}
+The background set is not recorded for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{endif}
+\JINJABLOCK{if enr.kind in ['stored', 'mixed']}
 
-Only results with Benjamini-Hochberg adjusted p-value $\leq$ 0.05 are reported. In dotplots, dot size reflects the gene ratio (proportion of DEGs annotated to that term) and dot colour represents statistical significance ($-\log_{10}$ adjusted p-value).
+\JINJABLOCK{if enr.kind == 'mixed'}
+For some comparisons the enrichment results are those stored with the dataset instead; the test and the correction that produced them are not described here.
+\JINJABLOCK{else}
+The enrichment results are those stored with the dataset; the test and the correction that produced them are not described here.
+\JINJABLOCK{endif}
+\JINJABLOCK{endif}
+\JINJABLOCK{if enr.kind == 'none'}
+
+\JINJABLOCK{if m.imported}
+\JINJAVAR{'Enrichment results are not included in this report: the analysis that produced these results is no longer available.' if m.analysis_gone else 'Enrichment results of imported data are not included in this report.'}
+\JINJABLOCK{else}
+No enrichment result is stored for the comparisons of this report.
+\JINJABLOCK{if not enr.requested}
+No annotation database was selected for this analysis.
+\JINJABLOCK{endif}
+\JINJABLOCK{endif}
+\JINJABLOCK{else}
+
+In dotplots, dot size is the number of genes of the term found among the DEGs and dot colour is the significance ($-\log_{10}$ adjusted \textit{p}-value); the terms with the smallest adjusted \textit{p}-value are shown (at most \JINJAVAR{m.dotplot_terms}).
+\JINJABLOCK{endif}

@@ -18,7 +18,9 @@ from app.api.endpoints.analyses import AnalysisParams
 from app.worker.tasks import (
     _build_pipeline_command,
     build_functional_enrichment_cmd,
+    enrichment_dataset_metadata,
     enrichment_requested,
+    read_enrichment_run_meta,
 )
 
 
@@ -71,6 +73,71 @@ def test_default_is_the_cutoff_the_script_always_used():
 def test_out_of_range_cutoff_is_rejected(bad):
     with pytest.raises(ValidationError):
         AnalysisParams(enrichment_fdr=bad)
+
+
+def test_the_enrichment_dataset_records_the_cutoff_the_script_was_given():
+    """The nova prints this value as the enrichment FDR: it is the flag, not the wizard's field."""
+    for params in ({"enrichment_fdr": 0.01}, {"enrichment_fdr": 0.2}, {}):
+        meta = enrichment_dataset_metadata("an-1", "A_vs_B", params)
+        assert meta["padj_cutoff"] == float(_flag(_cmd(params), "--padj-cutoff"))
+    assert enrichment_dataset_metadata("an-1", "A_vs_B", {})["padj_cutoff"] == 0.05
+
+
+def test_the_enrichment_dataset_keeps_the_metadata_the_pipeline_matches_it_on():
+    meta = enrichment_dataset_metadata("an-1", "A_vs_B", {"enrichment_fdr": 0.01})
+    assert meta == {
+        "analysis_id": "an-1",
+        "comparison_name": "A_vs_B",
+        "source": "annodb",
+        "padj_cutoff": 0.01,
+    }
+
+
+# ── what the script records about its own run ─────────────────────────────────────
+
+RUN_META = {
+    "annodb_file": "anno.db.human.gene_symbol.20260324.rds",
+    "categories": ["GO_BP", "kegg_pathway"],
+    "background": "genes annotated to at least one term of the category tested",
+}
+
+
+def test_the_meta_out_flag_is_passed_only_when_asked():
+    asked = build_functional_enrichment_cmd(
+        Path("/app/r_scripts/functional_enrichment.R"), Path("/tmp/deg.csv"), "/app/anno_db",
+        "A_vs_B", Path("/tmp/out.csv"), {}, meta_out=Path("/tmp/enrichment_meta.json"),
+    )
+    assert _flag(asked, "--meta-out") == "/tmp/enrichment_meta.json"
+    assert "--meta-out" not in _cmd({})
+    # The flag is one the script defines: optparse rejects an unknown one and the run fails.
+    assert _flags(asked) <= _r_options("functional_enrichment.R")
+
+
+def test_the_enrichment_dataset_records_the_file_the_categories_and_the_background():
+    meta = enrichment_dataset_metadata("an-1", "A_vs_B", {"enrichment_fdr": 0.01}, RUN_META)
+    assert meta == {
+        "analysis_id": "an-1",
+        "comparison_name": "A_vs_B",
+        "source": "annodb",
+        "padj_cutoff": 0.01,
+        **RUN_META,
+    }
+
+
+def test_what_the_script_wrote_is_read_back_whatever_it_wrote(tmp_path):
+    ok = tmp_path / "meta.json"
+    ok.write_text('{"annodb_file": "a.rds", "categories": ["GO_BP"], "background": "b", "stranger": 1}')
+    assert read_enrichment_run_meta(ok) == {
+        "annodb_file": "a.rds", "categories": ["GO_BP"], "background": "b",
+    }
+    # Nothing, garbage or a wrong type: no record, never an error and never a made-up value.
+    assert read_enrichment_run_meta(tmp_path / "missing.json") == {}
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert read_enrichment_run_meta(bad) == {}
+    wrong = tmp_path / "wrong.json"
+    wrong.write_text('{"annodb_file": 3, "categories": "GO_BP", "background": ["x"]}')
+    assert read_enrichment_run_meta(wrong) == {}
 
 
 # ── the database pick ─────────────────────────────────────────────────────────────

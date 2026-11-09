@@ -7,12 +7,14 @@ Port of the reference generator docs/omicskin-report-editorial/cosmomics_pathway
 
   * one sector per claim, width ∝ importance (Σ −log10 p of its terms), hatched part = share of
     the evidence against the claim; a grey sector for significant sub-groups linked to no claim;
-  * one bubble per pathway sub-group: distance to the centre = Stouffer −log10 p, colour =
-    balance for → against, size = |Δ pro − anti|; small dots = the individual ontology terms.
+  * one bubble per pathway sub-group: distance to the centre = Stouffer −log10 p (unsigned),
+    colour = balance for → against (a balanced sub-group is grey, outside the hatched part), size
+    = |Δ pro − anti|; small dots = the individual ontology terms.
 
 Only what the payload carries is drawn — claim names, sub-group names and term dots — so the
-claim referential never leaves the server. Output is deterministic (seeded jitter) and every
-`id` is prefixed, so several novas can be inlined in one HTML document.
+claim referential never leaves the server, and no dot stands for anything but a term or a
+sub-group. A demo payload (`provenance.demo`) is marked DEMO. Output is deterministic (seeded
+jitter) and every `id` is prefixed, so several novas can be inlined in one HTML document.
 """
 
 from __future__ import annotations
@@ -22,6 +24,13 @@ import uuid
 from typing import Any, Literal, Optional
 
 import numpy as np
+
+from app.services.cosmomics_nova import (
+    ZERO_AGAINST_NOTE,
+    claim_state_of,
+    p_source_of,
+    subgroup_side,
+)
 
 Theme = Literal["light", "dark"]
 
@@ -170,10 +179,21 @@ def _bsize(d: float) -> float:
     return 3.2 + 1.9 * math.sqrt(abs(d))
 
 
+AXIS_TITLE = "−log10 combined p (Stouffer, unsigned)"
+
+
+def _plural(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
 def _sector_note(claim: dict[str, Any]) -> str:
+    """"3 sub-groups for · 0 against": both counts are always written, a zero included."""
     n_for, n_against = int(claim.get("n_for") or 0), int(claim.get("n_against") or 0)
-    noun = "pathway" if n_for == 1 else "pathways"
-    return f"{n_for} {noun} for" + (f" · {n_against} against" if n_against else "")
+    n_balanced = claim.get("n_balanced")
+    if n_balanced is None:  # a payload that predates the field
+        n_balanced = sum(1 for s in claim.get("subgroups") or [] if subgroup_side(s) == "balanced")
+    note = f"{_plural(n_for, 'sub-group')} for · {n_against} against"
+    return note + (f" · {int(n_balanced)} balanced" if n_balanced else "")
 
 
 class _Nova:
@@ -187,6 +207,7 @@ class _Nova:
         center_label: str,
         alpha: float,
         subgroup_labels: bool = False,
+        demo_mark: bool = True,
     ):
         self.th = THEMES[theme]
         self.subgroup_labels = subgroup_labels
@@ -204,6 +225,8 @@ class _Nova:
         )
         self.other = list(payload.get("unlinked") or [])
         self.other_total = int(payload.get("unlinked_total") or len(self.other))
+        self.no_enrichment = payload.get("status") == "no_enrichment"
+        self.demo = demo_mark and bool((payload.get("provenance") or {}).get("demo"))
         self.sig_nl = -math.log10(alpha)
         values = [c.get("best_nl") or 0 for c in self.claims] or [
             s.get("nl") or 0 for s in self.other
@@ -276,22 +299,6 @@ class _Nova:
                 o.append(_wedge(s1, s2, R, f"url(#{self.p}-hatch)", 0.9))
         o.append(_wedge(*band["other"], R, AGAINST, 0.07))
 
-        # dust: the non-significant background of each sector
-        for key in names + ["other"]:
-            t1, t2 = band[key][0], band[key][-1]
-            n = int(9 * (t2 - t1))
-            col = claim_color(key)[1] if key != "other" else AGAINST
-            for _ in range(n):
-                rr = 30 + (self.rad(1.3) - 30) * rng.random() ** 0.7 + rng.normal(0, 6)
-                o.append(
-                    _dot(
-                        *_pt(abs(rr), rng.uniform(t1, t2)),
-                        0.7,
-                        col,
-                        0.3 if key != "other" else 0.16,
-                    )
-                )
-
         # significance rings
         rt = self.rad(self.sig_nl)
         o.append(
@@ -340,8 +347,10 @@ class _Nova:
             else:
                 s0, s1, s2 = band[key]
                 subs = by_name[key].get("subgroups") or []
-                con = [s for s in subs if (s.get("delta") or 0) <= 0]
-                items = place([s for s in subs if (s.get("delta") or 0) > 0], s0, s1)
+                con = [s for s in subs if subgroup_side(s) == "against"]
+                # A balanced sub-group is neither for nor against: it sits with the plain arc,
+                # grey, never in the hatched one.
+                items = place([s for s in subs if subgroup_side(s) != "against"], s0, s1)
                 items += place(con, s1, s2) if s2 - s1 > 3 else place(con, s0, s2)
             best = by_name[key].get("best_subgroup") if key != "other" else None
             for s, a in items:
@@ -374,25 +383,28 @@ class _Nova:
         o.append(_arc(*band["other"], R, AGAINST, 2, 'stroke-dasharray="2 4"'))
 
         # centre disc
-        center = self.center[:8]
+        center = self.center if len(self.center) <= 8 else self.center[:7] + "…"
         o.append(f'<circle cx="{CX}" cy="{CY}" r="26" fill="{th["core_fill"]}"/>')
-        o.append(
-            _text(
-                CX, CY + 5, center, 13 if len(center) <= 6 else 11, th["core_text"], "middle", 700
-            )
-        )
-        if not self.claims:
+        if center:  # the disc names the condition it was given, never an invented one
             o.append(
                 _text(
                     CX,
-                    CY + R + 44,
-                    "No claim with significant evidence",
-                    18,
-                    th["dim"],
+                    CY + 5,
+                    center,
+                    13 if len(center) <= 6 else 11,
+                    th["core_text"],
                     "middle",
-                    600,
-                    self.halo(),
+                    700,
                 )
+            )
+        if not self.claims:
+            message = (
+                "No enrichment result for this comparison"
+                if self.no_enrichment
+                else "No claim with significant evidence"
+            )
+            o.append(
+                _text(CX, CY + R + 44, message, 18, th["dim"], "middle", 600, self.halo())
             )
 
         # claim labels outside the wheel
@@ -454,7 +466,7 @@ class _Nova:
             o += lab(
                 ang["other"],
                 "Not linked to a claim",
-                f"{self.other_total} pathways",
+                _plural(self.other_total, "sub-group"),
                 AGAINST_TEXT,
                 AGAINST_TEXT,
             )
@@ -511,6 +523,25 @@ class _Nova:
             )
         return o
 
+    def annotations(self) -> list[str]:
+        """What the wheel says about itself: the title of its radial axis, and the DEMO mark of a
+        demo payload (drawn last, over the wheel)."""
+        th = self.th
+        o: list[str] = []
+        if self.claims or self.other:
+            o.append(_text(20, 944, f"Radius: {AXIS_TITLE}", 12.5, th["muted"], weight=500))
+        if any(claim_state_of(c) == "for_only" for c in self.claims):
+            first, second = ZERO_AGAINST_NOTE.split("; ")
+            o.append(_text(20, 960, first + ";", 11, th["dim"]))
+            o.append(_text(20, 974, second, 11, th["dim"]))
+        if self.demo:
+            o.append(
+                f'<text x="{CX}" y="{CY + 70}" text-anchor="middle" font-family="{FONT}" '
+                f'font-size="200" font-weight="700" letter-spacing="10" fill="{th["coral"]}" '
+                f'fill-opacity=".16" transform="rotate(-32 {CX} {CY})">DEMO</text>'
+            )
+        return o
+
     def blocks(self, y0: float) -> list[str]:
         """Claim cards under the wheel (full poster only)."""
         th = self.th
@@ -532,9 +563,14 @@ class _Nova:
             ]
             subs = sorted(c.get("subgroups") or [], key=lambda s: -(s.get("nl") or 0))[:3]
             for j, s in enumerate(subs):
-                sup = (s.get("delta") or 0) > 0
+                # Only a sub-group that goes against the claim is greyed out: a balanced one is
+                # neutral, in the ink of the page.
+                side = subgroup_side(s)
                 up = s.get("obs") == "up"
-                arrow_col = (th["green"] if up else th["coral"]) if sup else AGAINST_TEXT
+                if side == "for":
+                    arrow_col = th["green"] if up else th["coral"]
+                else:
+                    arrow_col = th["muted"] if side == "balanced" else AGAINST_TEXT
                 o += [
                     _text(x, y + 62 + 18 * j, "↑" if up else "↓", 13, arrow_col, weight=600),
                     _text(
@@ -542,7 +578,7 @@ class _Nova:
                         y + 62 + 18 * j,
                         s.get("name") or "",
                         12,
-                        th["ink"] if sup else AGAINST_TEXT,
+                        AGAINST_TEXT if side == "against" else th["ink"],
                     ),
                 ]
         return o
@@ -554,7 +590,7 @@ class _Nova:
             _dot(56, y - 5, 6, th["green"], 1),
             _dot(70, y - 5, 6, "#C9D1D9", 1),
             _dot(84, y - 5, 6, th["coral"], 1),
-            _text(96, y, "Sub-group: terms for → against the claim", 13, ink),
+            _text(96, y, "Sub-group: for → balanced → against", 13, ink),
             _dot(380, y - 5, 2.2, th["green"], 1),
             _dot(388, y - 5, 2.2, th["coral"], 1),
             _text(398, y, "Individual ontology term", 13, ink),
@@ -570,6 +606,7 @@ class _Nova:
             f'<path d="M262,{y2} L280,{y2 - 14} A22,22 0 0 1 284,{y2 - 1} Z" fill="#158394" '
             f'opacity=".5"/>',
             _text(288, y2, "Sector width = claim importance (Σ −log10 p of its terms)", 13, ink),
+            _text(690, y2, "Coherence = share of evidence for", 13, ink),
         ]
         return o
 
@@ -583,21 +620,24 @@ def render_nova_svg(
     title: Optional[str] = None,
     logo_data_uri: Optional[str] = None,
     subgroup_labels: bool = False,
+    demo_mark: bool = True,
 ) -> str:
     """SVG of the nova for a `build_nova` payload (the reference mock JSON is accepted too).
 
     wheel_only=True: the wheel and its labels on a transparent background (viewBox cropped as
     in the report). wheel_only=False: the full poster — header, wheel, claim cards, legend.
     subgroup_labels=True also names the best sub-group of each claim and the ones against it.
+    A demo payload (`provenance.demo`) is marked DEMO unless demo_mark is False (a page that
+    carries its own mark over the picture).
     """
     if theme not in THEMES:
         raise ValueError(f"Unknown nova theme {theme!r}")
     prefix = id_prefix or f"nova-{uuid.uuid4().hex[:8]}"
     alpha = float(payload.get("alpha") or 0.05)
-    label = center_label or str(payload.get("condition") or "Active")
-    nova = _Nova(payload, theme, prefix, label, alpha, subgroup_labels)
+    label = center_label or str(payload.get("condition") or "")
+    nova = _Nova(payload, theme, prefix, label, alpha, subgroup_labels, demo_mark)
     th = THEMES[theme]
-    wheel = nova.draw()
+    wheel = nova.draw() + nova.annotations()
 
     if wheel_only:
         head = (
@@ -607,7 +647,7 @@ def render_nova_svg(
         return "\n".join([head, nova.defs(), *wheel, "</svg>"])
 
     n_rows = math.ceil(min(len(nova.claims), 9) / 3)
-    height = 1030 + 140 * n_rows
+    height = 1056 + 140 * n_rows  # the cards start under the wheel's footnotes
     wordmark = "#0B2A3E" if theme == "light" else "#F2F6FA"
     subtitle = title or f"Pathway nova · {payload.get('contrast') or ''}".rstrip(" ·")
     o = [
@@ -620,6 +660,18 @@ def render_nova_svg(
         f'<tspan fill="{th["green"]}">Omics</tspan></text>',
         _text(50, 104, subtitle, 16, th["muted"]),
     ]
+    # What the p-values are, and where significance starts: read from the kind of enrichment
+    # (`provenance.enrichment_source`), the payload's own `p_source` only for a payload that
+    # predates it. With no enrichment result the header says that and nothing else: there is no
+    # p-value, hence no threshold, to state.
+    kind = (payload.get("provenance") or {}).get("enrichment_source")
+    if kind == "none" or payload.get("status") == "no_enrichment":
+        o.append(_text(50, 126, "No enrichment result is stored for this comparison", 12, th["dim"]))
+    else:
+        p_source = p_source_of(kind, (payload.get("provenance") or {}).get("padj_columns") or [])
+        p_source = p_source or payload.get("p_source")
+        if p_source:
+            o.append(_text(50, 126, f"{p_source} · α = {alpha:g}", 12, th["dim"]))
     if logo_data_uri:
         lw = 170
         lh = lw * 190 / 1024
@@ -628,5 +680,5 @@ def render_nova_svg(
             f'<image x="{950 - lw}" y="{72 - lh + 4:.1f}" width="{lw}" height="{lh:.1f}" '
             f'href="{logo_data_uri}"/>',
         ]
-    o += wheel + nova.blocks(990) + nova.legend(height - 46) + ["</svg>"]
+    o += wheel + nova.blocks(1016) + nova.legend(height - 46) + ["</svg>"]
     return "\n".join(o)

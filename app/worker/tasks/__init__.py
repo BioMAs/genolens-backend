@@ -35,6 +35,9 @@ _analysis_cancelled = _legacy_mod._analysis_cancelled  # noqa: F401
 _auto_run_enrichment = _legacy_mod._auto_run_enrichment  # noqa: F401
 build_functional_enrichment_cmd = _legacy_mod.build_functional_enrichment_cmd  # noqa: F401
 enrichment_requested = _legacy_mod.enrichment_requested  # noqa: F401
+enrichment_dataset_metadata = _legacy_mod.enrichment_dataset_metadata  # noqa: F401
+enrichment_padj_cutoff = _legacy_mod.enrichment_padj_cutoff  # noqa: F401
+read_enrichment_run_meta = _legacy_mod.read_enrichment_run_meta  # noqa: F401
 deg_dataset_metadata = _legacy_mod.deg_dataset_metadata  # noqa: F401
 
 # ── Periodic tasks ────────────────────────────────────────────────────────────

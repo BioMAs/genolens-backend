@@ -15,6 +15,7 @@ from typing import Iterable, Optional, Sequence
 
 from markupsafe import Markup, escape
 
+from app.services.cosmomics_nova import subgroup_side
 from app.services.cosmomics_nova_svg import balance_color
 
 INK = "#1B2733"
@@ -104,8 +105,9 @@ def subgroup_bars(
     font_size: float = 10,
     limit: Optional[int] = None,
 ) -> Markup:
-    """One row per sub-group: name (greyed when it goes against the claim), a bar of its
-    significance (−log10 p, Stouffer, capped at `maxnl`) coloured by its balance, and 10⁻ⁿ."""
+    """One row per sub-group: name (greyed only when it goes against the claim — a balanced
+    sub-group is not contrary), a bar of its significance (−log10 p, unsigned Stouffer, capped at
+    `maxnl`) coloured by its balance, and 10⁻ⁿ."""
     subs = sorted(subgroups, key=lambda s: -(s.get("nl") or 0))
     if limit:
         subs = subs[:limit]
@@ -119,7 +121,7 @@ def subgroup_bars(
         bl = (w - lw - 40) * min(nl, maxnl) / maxnl
         col = balance_color(sg.get("balance") or 0)
         name = escape(_ellipsis(str(sg.get("name") or ""), max_chars))
-        opacity = 1 if (sg.get("delta") or 0) > 0 else 0.55
+        opacity = 0.55 if subgroup_side(sg) == "against" else 1
         o.append(
             f'<text x="0" y="{y + row * 0.68:.1f}" font-family="Inter" font-size="{font_size}" '
             f'fill="{ink}" opacity="{opacity}">{name}</text>'
