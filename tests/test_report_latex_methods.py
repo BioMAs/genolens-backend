@@ -726,7 +726,7 @@ def test_compile_fails_on_a_nonzero_return_code_even_when_a_pdf_is_there(tmp_pat
     (tmp_path / "report.pdf").write_bytes(b"%PDF-stale")
     failed = MagicMock(returncode=1, stdout="! Undefined control sequence.", stderr="")
     with patch.object(rl.subprocess, "run", return_value=failed):
-        with pytest.raises(RuntimeError, match="pdflatex failed"):
+        with pytest.raises(rl.LatexCompileError, match="could not be compiled"):
             svc.compile_pdf(MINIMAL % "text", str(tmp_path))
 
 
