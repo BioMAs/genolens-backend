@@ -498,6 +498,15 @@ def _leaders(svg):
     return [e for e in ET.fromstring(svg).iter(f"{SVG}line") if e.get("stroke-width") == "0.8"]
 
 
+def test_a_reference_label_is_hashable():
+    """The label is a frozen value: its lines are a tuple, not a list."""
+    one = nova_svg._reference_label(10.0, "Claim", "1 sub-group for · 0 against", "#000", "#111")
+    two = nova_svg._reference_label(200.0, "Claim", "1 sub-group for · 0 against", "#000", "#111")
+    assert isinstance(one.notes, tuple) and isinstance(two.notes, tuple)
+    assert len({one, two, one}) == 2
+    assert len(two.notes) == 2  # broken in two where the note would spill over the wheel
+
+
 def test_claim_labels_never_overlap_each_other_or_the_wheel():
     payload = _nine_claims()
     total = sum(NINE_WEIGHTS)
@@ -783,10 +792,17 @@ def test_the_push_rule_gives_the_frontend_placement_from_the_same_boxes():
 
 # What the backend's own wheel comes to for that payload: (reference top, final box, leader line).
 # The sector order, the mid angles, the reference tops and the title widths agree with the
-# frontend's; the boxes do not, for one reason: the backend's note always reads "N sub-group(s) for
-# · 0 against". Where that spills over the wheel (Claims 2, 4 to 9) the label breaks it in two and
-# stands 58 px tall, not 42, and Claims 4 and 5 move their right edge to x 250 (the frontend keeps
-# 315 and 258). The pushes follow from the taller boxes; the rule itself is tested above.
+# frontend's; the boxes do not, and the notes are why. The notes differ in three ways:
+#  - the backend's note always reads "N sub-group(s) for · 0 against", the frontend's figure leaves
+#    out "· 0 against". This is the difference of this payload: where the longer note spills over
+#    the wheel (Claims 2, 4 to 9) the label breaks it in two and stands 58 px tall, not 42, and
+#    Claims 4 and 5 move their right edge to x 250 (the frontend keeps 315 and 258). The pushes
+#    follow from the taller boxes; the rule itself is tested above;
+#  - the frontend's "Not linked to a claim" note gains "· N drawn" when the payload holds more
+#    unlinked sub-groups than the sector draws, so its label breaks in two and stands 16 px
+#    differently from the backend's, which gives the count only;
+#  - a claim without `n_balanced` (a payload that predates the field) has its balanced
+#    sub-groups counted by the backend, and none by the frontend.
 NINE_BACKEND = [
     (179.00, (380.00, 179.00, 620.00, 221.00), None),
     (565.50, (750.00, 780.49, 990.00, 838.49), (835.19, 578.26, 835.19, 780.49)),

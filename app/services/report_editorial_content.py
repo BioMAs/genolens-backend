@@ -62,6 +62,13 @@ NOVA_READING_PAGE_CHARS = 6500
 COMPARISON_AI_CHARS = 3200
 COMPARISON_AI_WIDE_CHARS = 6000
 
+# The frame of the nova wheel grows with its labels (cosmomics_nova_svg). Shown at a width alone it
+# would grow taller and push what follows it off the fixed A4 page, the inline AI reading first.
+# The height is capped at the reference one (85 % of the width: 190 mm on the nova page, 205 mm on
+# the cover); a crowded wheel is fitted by "meet" and centred in the box, so it scales down instead.
+WHEEL_STYLE_PAGE = "width:100%;height:auto;max-height:161.5mm"
+WHEEL_STYLE_COVER = "width:100%;height:auto;max-height:174.25mm"
+
 TERMS_PER_CLAIM_PAGE = 10
 RESERVATIONS_PER_PAGE = 2
 
@@ -1057,7 +1064,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 {"score": s.score, "name": s.name, "color": on_navy(claim_color(s.name)[0])}
                 for s in scored[:6]
             ],
-            "nova": clean_inline_svg(inp.nova_dark, "cover-nova", "width:100%;height:auto"),
+            "nova": clean_inline_svg(inp.nova_dark, "cover-nova", WHEEL_STYLE_COVER),
             "footer_left": " · ".join(
                 x
                 for x in (
@@ -1178,7 +1185,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     pages.append(
         {
             "kind": "nova",
-            "svg": clean_inline_svg(inp.nova_light, "page-nova", "width:100%;height:auto"),
+            "svg": clean_inline_svg(inp.nova_light, "page-nova", WHEEL_STYLE_PAGE),
             "version": inp.referential_version,
             "no_enrichment": no_enrichment,
             "ai_html": md_to_html(nova_text) if nova_inline else None,

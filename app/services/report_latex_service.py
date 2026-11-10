@@ -94,7 +94,10 @@ _GREEK_LOWER = {
     "α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta", "ε": "varepsilon", "ζ": "zeta",
     "η": "eta", "θ": "theta", "ι": "iota", "κ": "kappa", "λ": "lambda", "μ": "mu", "ν": "nu",
     "ξ": "xi", "π": "pi", "ρ": "rho", "ς": "varsigma", "σ": "sigma", "τ": "tau",
-    "υ": "upsilon", "φ": "phi", "χ": "chi", "ψ": "psi", "ω": "omega",
+    "υ": "upsilon", "φ": "varphi", "χ": "chi", "ψ": "psi", "ω": "omega",
+    # The other forms of phi, epsilon and theta are characters of their own: φ (U+03C6) is the
+    # loopy phi that \varphi draws, ϕ (U+03D5) the straight one of \phi.
+    "ϕ": "phi", "ϵ": "epsilon", "ϑ": "vartheta",
 }
 _GREEK_UPPER = {
     "Γ": "Gamma", "Δ": "Delta", "Θ": "Theta", "Λ": "Lambda", "Ξ": "Xi", "Π": "Pi",
@@ -108,11 +111,17 @@ _GREEK_LATIN_LOOKALIKE = {
 # Every non-ASCII character that is written as a command. The values are pure ASCII and are not
 # escaped again: they are applied after the LaTeX specials are.
 UNICODE_TO_LATEX: dict[str, str] = {
-    # Quotes, dashes, spaces.
-    "’": "'", "‘": "'", "“": "``", "”": "''",
-    "–": "--", "—": "---", "…": r"\ldots{}",
-    "\u00a0": " ", "\u202f": " ", "\u2009": " ", "\u2010": "-", "\u2011": "-",
-    "−": "-",
+    # Quotes, dashes, spaces. Quotes and dashes are commands, not the ASCII that TeX reads as
+    # ligatures ("''" is a closing double quote, "--" an en dash): next to one another the ASCII
+    # forms print other characters, in another order, and a left single quote would print as
+    # a right one.
+    "’": r"\textquoteright{}", "‘": r"\textquoteleft{}",
+    "“": r"\textquotedblleft{}", "”": r"\textquotedblright{}",
+    "–": r"\textendash{}", "—": r"\textemdash{}", "−": _math("-"), "…": r"\ldots{}",
+    "‒": r"\textendash{}", "―": r"\textemdash{}",
+    "„": r"\quotedblbase{}", "‚": r"\quotesinglbase{}",
+    "‹": r"\guilsinglleft{}", "›": r"\guilsinglright{}",
+    "\u00a0": " ", "\u202f": " ", "\u2009": " ", "\u2010": "{-}", "\u2011": "{-}",
     # Invisible format characters (zero-width space and joiners, direction marks, word joiner,
     # byte order mark): nothing to print, and no reason to put a "?" in the text.
     **{chr(c): "" for c in (0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2060, 0xFEFF)},
@@ -120,6 +129,7 @@ UNICODE_TO_LATEX: dict[str, str] = {
     "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl",
     # Units and signs.
     "°": r"\textdegree{}", "×": r"\texttimes{}", "‰": r"\textperthousand{}",
+    "™": r"\texttrademark{}", "€": r"\texteuro{}", "†": r"\textdagger{}", "‡": r"\textdaggerdbl{}",
     "²": r"\textsuperscript{2}", "³": r"\textsuperscript{3}", "½": r"\textonehalf{}",
     "⁺": r"\textsuperscript{+}", "⁻": r"\textsuperscript{\ensuremath{-}}",
     **{
@@ -136,6 +146,8 @@ UNICODE_TO_LATEX: dict[str, str] = {
     "′": _math("'"), "″": _math("''"), "ħ": _math(r"\hbar"),
     **{ch: _math("\\" + name) for ch, name in {**_GREEK_LOWER, **_GREEK_UPPER}.items()},
     "ο": _math("o"),
+    # Romanian letters with a comma below, which the fonts have as an accent only.
+    **{ch: rf"\textcommabelow{{{latin}}}" for ch, latin in zip("ȘșȚț", "SsTt")},
     **{ch: _math(rf"\mathrm{{{latin}}}") for ch, latin in _GREEK_LATIN_LOOKALIKE.items()},
 }
 
@@ -155,10 +167,20 @@ def _printable(ch: str) -> bool:
     return 0xA0 <= code <= 0x17F and ch not in _NOT_IN_THE_FONT
 
 
-# In the report fonts "?`" and "!`" are ligatures for the inverted marks, so a "?" (a replacement
-# one included) or a "!" right before an opening quote (which is two backticks) would print
-# "¿" or "¡" and eat a backtick.
-_INVERTED_MARK_LIGATURE = re.compile(r"([?!])(?=`)")
+# TeX forms ligatures between a character and the next one, a character that a command prints
+# included. In the report fonts "?`" and "!`" are the inverted marks, "``" an opening double
+# quote and "''" a closing one. So a "?" (a replacement one included) or a "!" right before a
+# typed backtick or a left single quote would print "¿" or "¡" and eat the quote, and a typed
+# "`" before a left single quote or a typed "'" before a right one would print a double quote.
+# An empty group between the two keeps them apart. The typed ASCII quotes among themselves
+# keep their TeX meaning.
+_LIGATURE_BREAK = re.compile(
+    r"([?!])(?=`|\\textquoteleft\{\})|(?<=`)(?=\\textquoteleft\{\})|(?<=')(?=\\textquoteright\{\})"
+)
+
+
+def _break_ligatures(text: str) -> str:
+    return _LIGATURE_BREAK.sub(lambda m: (m.group(1) or "") + "{}", text)
 
 
 def latex_safe_unicode(text: str, field: str = "") -> str:
@@ -185,7 +207,7 @@ def latex_safe_unicode(text: str, field: str = "") -> str:
             sum(replaced.values()),
             ", ".join(f"U+{ord(ch):04X}" for ch in replaced),
         )
-    return _INVERTED_MARK_LIGATURE.sub(r"\1{}", "".join(out))
+    return _break_ligatures("".join(out))
 
 
 def plaintext_to_latex(text, field: str = "") -> str:
@@ -646,9 +668,8 @@ class LatexCompileError(RuntimeError):
 
 
 class LatexTimeoutError(LatexCompileError):
-    """A pdflatex pass, or the Ghostscript pass, ran past its time limit. The message names the
-    step and nothing else: the command and the paths (`subprocess.TimeoutExpired` prints them)
-    stay in the worker log."""
+    """A pdflatex pass ran past its time limit. The message names the step and nothing else: the
+    command and the paths (`subprocess.TimeoutExpired` prints them) stay in the worker log."""
 
     def __init__(self, step: str):
         RuntimeError.__init__(
@@ -657,6 +678,7 @@ class LatexTimeoutError(LatexCompileError):
             "the details are in the worker log.",
         )
         self.step = step
+        self.pass_no = None  # a `LatexCompileError` has one; a timeout is named by its step
 
     def __reduce__(self):
         return (type(self), (self.step,))
@@ -1255,10 +1277,14 @@ class ReportLatexService:
                                 f"-sOutputFile={out}", str(pdf_path)],
                                capture_output=True, text=True, timeout=300)
             except subprocess.TimeoutExpired as exc:
-                logger.error(
-                    "Ghostscript timed out after %s s embedding the fonts of the report", exc.timeout
+                # Best-effort: the report is complete without the normalised fonts. What
+                # Ghostscript had written when it was stopped is not, and is not returned.
+                out.unlink(missing_ok=True)
+                logger.warning(
+                    "Ghostscript timed out after %s s embedding the fonts of the report; "
+                    "the PDF is kept as pdflatex wrote it", exc.timeout
                 )
-                raise LatexTimeoutError("Ghostscript") from exc
+                return pdf_path.read_bytes()
             if out.exists():
                 return out.read_bytes()
         return pdf_path.read_bytes()

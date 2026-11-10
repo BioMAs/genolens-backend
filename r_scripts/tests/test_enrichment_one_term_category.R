@@ -60,7 +60,10 @@ deg <- data.frame(
 
 # A category's background is the genes annotated to its own terms, so a one-term
 # category can never reach significance (p = 1). The cutoffs are opened so that
-# every term with at least one DEG is reported and its gene list can be read.
+# every term with at least one DEG is reported and its gene list can be read:
+# 1.1 and not 1, because the script keeps a term only when its p-value and its
+# adjusted p-value are strictly below the cutoff (`<`), and a p-value of 1 is
+# not below 1.
 deg_path <- file.path(work, "deg.csv")
 out_path <- file.path(work, "enrichment.csv")
 write.csv(deg, deg_path, row.names = FALSE, na = "NA")

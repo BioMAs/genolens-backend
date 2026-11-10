@@ -4,6 +4,7 @@ Unit tests for the SciLicium LaTeX report renderer (no pdflatex compilation).
 import copy
 import logging
 import pickle
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -75,16 +76,57 @@ def test_the_printable_set():
     assert rl._printable("é") and rl._printable("Ł")
 
 
+@pytest.mark.parametrize(
+    "char, command",
+    [
+        ("™", r"\texttrademark{}"), ("€", r"\texteuro{}"),
+        ("„", r"\quotedblbase{}"), ("‚", r"\quotesinglbase{}"),
+        ("‹", r"\guilsinglleft{}"), ("›", r"\guilsinglright{}"),
+        ("‒", r"\textendash{}"), ("―", r"\textemdash{}"),
+        ("†", r"\textdagger{}"), ("‡", r"\textdaggerdbl{}"),
+        ("Ș", r"\textcommabelow{S}"), ("ș", r"\textcommabelow{s}"),
+        ("Ț", r"\textcommabelow{T}"), ("ț", r"\textcommabelow{t}"),
+        # The two forms of phi, epsilon and theta are two characters in Unicode and in TeX alike.
+        ("φ", r"\ensuremath{\varphi}"), ("ϕ", r"\ensuremath{\phi}"),
+        ("ε", r"\ensuremath{\varepsilon}"), ("ϵ", r"\ensuremath{\epsilon}"),
+        ("θ", r"\ensuremath{\theta}"), ("ϑ", r"\ensuremath{\vartheta}"),
+    ],
+)
+def test_the_characters_that_have_a_text_command_are_not_replaced_by_a_question_mark(
+    char, command, caplog
+):
+    with caplog.at_level(logging.WARNING, logger=rl.logger.name):
+        assert rl.tex_escape(f"a{char}b") == f"a{command}b"
+    assert caplog.records == []
+
+
 def test_every_table_entry_is_a_pure_ascii_command():
     for char, command in rl.UNICODE_TO_LATEX.items():
         assert all(ord(c) < 0x80 for c in command), char
         assert rl.latex_safe_unicode(char) == command
 
 
-def test_the_punctuation_the_conclusion_always_mapped_is_unchanged():
+def test_the_punctuation_of_a_text_maps_to_commands():
     assert rl.plaintext_to_latex("it’s “fine” – a—b… 5 × 3 − 1 20°\u00a0C\u202fx") == (
-        "it's ``fine'' -- a---b\\ldots{} 5 \\texttimes{} 3 - 1 20\\textdegree{} C x"
+        r"it\textquoteright{}s \textquotedblleft{}fine\textquotedblright{} \textendash{} "
+        r"a\textemdash{}b\ldots{} 5 \texttimes{} 3 \ensuremath{-} 1 20\textdegree{} C x"
     )
+
+
+def test_adjacent_quotes_and_dashes_never_form_an_ascii_ligature():
+    # As ASCII, "''" is a closing double quote and "--" an en dash for TeX: "’”" would print as
+    # "”’", a left single quote as a right one, and two minus signs as one dash.
+    assert rl.tex_escape("“it is ‘ok’” ‘a’ ’’") == (
+        r"\textquotedblleft{}it is \textquoteleft{}ok\textquoteright{}\textquotedblright{} "
+        r"\textquoteleft{}a\textquoteright{} \textquoteright{}\textquoteright{}"
+    )
+    assert rl.tex_escape("5−−3 1‐‐2 1‑‑2") == r"5\ensuremath{-}\ensuremath{-}3 1{-}{-}2 1{-}{-}2"
+    assert rl.tex_escape("a-–b a–-b a—-b") == (
+        r"a-\textendash{}b a\textendash{}-b a\textemdash{}-b"
+    )
+    for ch in "’‘“”–—−\u2010\u2011":
+        assert "''" not in rl.latex_safe_unicode(ch * 2) and "``" not in rl.latex_safe_unicode(ch * 2)
+        assert "--" not in rl.latex_safe_unicode(ch * 2)
 
 
 def test_plaintext_to_latex_keeps_its_paragraphs_and_maps_symbols():
@@ -111,7 +153,7 @@ def test_superscript_digits_print_in_full():
 
 def test_a_decomposed_accent_is_one_printable_letter(caplog):
     with caplog.at_level(logging.WARNING, logger=rl.logger.name):
-        assert rl.tex_escape("cafe\u0301 Ame\u0301lie") == "caf\u00e9 Am\u00e9lie"
+        assert rl.tex_escape("cafe\u0301 cre\u0300me") == "caf\u00e9 cr\u00e8me"
     assert caplog.records == []
 
 
@@ -132,10 +174,25 @@ def test_pdf_ligatures_print_as_their_letters(caplog):
 
 def test_a_mark_before_an_opening_quote_never_forms_an_inverted_mark():
     # In the T1 fonts "?`" is a ligature for an inverted question mark, "!`" for an inverted
-    # exclamation mark: an empty group keeps them apart, and the quotes keep their output.
-    assert rl.tex_escape("really?“yes” and wow!“no”") == "really?{}``yes'' and wow!{}``no''"
-    assert rl.tex_escape("a 🙂“x”") == "a ?{}``x''"
-    assert rl.tex_escape("really? “yes” and a`b?") == "really? ``yes'' and a`b?"
+    # exclamation mark: an empty group keeps them apart. The curly left quotes are commands that
+    # print the same character, so they are guarded as well; the typed ASCII quotes keep their
+    # TeX meaning.
+    assert rl.tex_escape("really?‘yes’ and wow!‘no’") == (
+        r"really?{}\textquoteleft{}yes\textquoteright{} and wow!{}\textquoteleft{}no\textquoteright{}"
+    )
+    assert rl.tex_escape("really?“yes” and wow!“no”") == (
+        r"really?\textquotedblleft{}yes\textquotedblright{} and wow!\textquotedblleft{}no"
+        r"\textquotedblright{}"
+    )
+    assert rl.tex_escape("a 🙂‘x’") == r"a ?{}\textquoteleft{}x\textquoteright{}"
+    assert rl.tex_escape("really?`yes' and wow!`no'") == "really?{}`yes' and wow!{}`no'"
+    assert rl.tex_escape("really? ‘yes’ and a`b?") == (
+        r"really? \textquoteleft{}yes\textquoteright{} and a`b?"
+    )
+    # A typed quote right before the curly one of the same kind would be one double quote.
+    assert rl.tex_escape("a`‘b ``a'' x'’") == (
+        r"a`{}\textquoteleft{}b ``a'' x'{}\textquoteright{}"
+    )
 
 
 def test_the_sanitizer_survives_a_lone_surrogate_and_a_nul(caplog):
@@ -253,7 +310,9 @@ def test_every_escaped_symbol_compiles(tmp_path):
     probe = "\n\n".join([" ".join(rl.UNICODE_TO_LATEX), kept, ascii_printable, refused])
     # The text of an AI box does not go through `plaintext_to_latex`: tab, CR and the control
     # characters `splitlines` takes for line ends reach `tex_escape` as they are.
-    raw = "a\tb\rc\nd \x0b \x0c \x85 \u2028 q?\u201cx\u201d r!\u201cy\u201d"
+    raw = (
+        "a\tb\rc\nd \x0b \x0c \x85 \u2028 q?\u201cx\u201d r!\u201cy\u201d q?\u2018x\u2019 r!\u2018y\u2019"
+    )
     data = {k: "" for k in MAIN_TEMPLATE_KEYS}
     data["jj_conclusion"] = (
         rl.plaintext_to_latex(probe, field="conclusion") + "\n\n" + rl.tex_escape(raw, field="ai_text")
@@ -272,15 +331,15 @@ def test_a_report_with_symbols_in_every_kind_of_text_compiles(tmp_path):
         project=SimpleNamespace(name="Proj α ≤ 5 µM"),
         comparison_name="TNF-α vs ctrl",
         comparisons=[_comparison(
-            test="TNF-α ≥ 2", control="ctrl µ β", n_up=1, n_down=0,
+            test="TNF-α ≥ 2 “x” ‘y’ – −1", control="ctrl µ β", n_up=1, n_down=0,
             degs=[{"gene_name": "IL6 β", "log_fc": 2.0, "pvalue": 1e-5, "padj": 1e-4, "regulation": "UP"}],
             enr_up=[{"pathway_name": "response to TGF-β (≥ 2 genes) → ↑", "category": "GO:BP",
                      "pvalue": 1e-5, "padj": 1e-3}],
-            ai_interpretation="IL‑6 ↑ (p ≤ 10⁻⁶), log₂FC ≈ 1.5 ± 0.2; “quoted”? “yes” 🙂",
+            ai_interpretation="IL‑6 ↑ (p ≤ 10⁻⁶), log₂FC ≈ 1.5 ± 0.2; “quoted”? “yes” ‘no’ — 🙂",
             ai_model="org/model-α", ai_generated_at=datetime(2026, 11, 5, tzinfo=timezone.utc),
         )],
         qc_rows=[{"sample": "s1 α", "library_size": 1234567, "detected_genes": 12000, "condition": "β ≤ 2"}],
-        conclusion="Δ ≥ 2 → done",
+        conclusion="Δ ≥ 2 → done ‘x’ “y” − –",
         materials_methods="Methods: µM, 20 °C, α = 0.05",
         cover_info={"project_name": "Cover α ≤ β", "prepared_by": "µ"},
         branding={"institute_name": "Lab α"},
@@ -300,15 +359,39 @@ def _pdf_text(pdf: bytes, tmp_path) -> str:
     return out.stdout.decode("utf-8", errors="replace")
 
 
+def _printed(conclusion: str, tmp_path) -> str:
+    """The text of the conclusion as the PDF prints it, without its spaces (Ghostscript drops the
+    ones next to a quote), between two markers."""
+    data = {k: "" for k in MAIN_TEMPLATE_KEYS}
+    data["jj_conclusion"] = rl.plaintext_to_latex(f"QQQ {conclusion} ZZZ")
+    tex = rl.report_latex_service.env.get_template(rl.MAIN_TEMPLATE).render(**data)
+    text = _pdf_text(rl.report_latex_service.compile_pdf(tex, str(tmp_path)), tmp_path)
+    return re.search(r"QQQ(.*?)ZZZ", "".join(text.split()), re.S).group(1)
+
+
 @needs_pdflatex
 @pytest.mark.skipif(shutil.which("gs") is None, reason="Ghostscript is not installed")
 def test_a_mark_before_an_opening_quote_prints_as_typed(tmp_path):
-    data = {k: "" for k in MAIN_TEMPLATE_KEYS}
-    data["jj_conclusion"] = rl.plaintext_to_latex("Really?“yes” and wow!“no” and 🙂“x”")
-    tex = rl.report_latex_service.env.get_template(rl.MAIN_TEMPLATE).render(**data)
-    text = _pdf_text(rl.report_latex_service.compile_pdf(tex, str(tmp_path)), tmp_path)
-    assert "Really?“yes” and wow!“no” and ?“x”" in text
-    assert "¿" not in text and "¡" not in text
+    typed = "Really?“yes” and wow!“no” and ?“x” and wow!‘no’ and ?‘x’ and 🙂‘y’"
+    assert _printed(typed, tmp_path) == "".join(typed.replace("🙂", "?").split())
+
+
+@needs_pdflatex
+@pytest.mark.skipif(shutil.which("gs") is None, reason="Ghostscript is not installed")
+@pytest.mark.parametrize(
+    "typed, printed",
+    [
+        ("“x ‘y’” ‘a’ ‘b’ “a”“b” ’’ ‘‘ d’Alembert x’‘y", None),
+        ("5−−3 a-–b a–-b a—-b a−-b", None),
+        ("1‐‐2 1‑‑2", "1--2 1--2"),  # two hyphens, not an en dash
+        ("typed ``a'' and a`‘b and a'’b", "typed “a” and a‘‘b and a’’b"),
+    ],
+    ids=["quotes", "dashes", "hyphens", "typed-ascii-next-to-curly"],
+)
+def test_quotes_and_dashes_print_as_typed(typed, printed, tmp_path):
+    """Nested and adjacent quotes keep their kind and their order, and a minus sign, a hyphen
+    and a dash stay what they are: no ASCII ligature forms."""
+    assert _printed(typed, tmp_path) == "".join((printed or typed).split())
 
 
 @needs_pdflatex
@@ -377,29 +460,36 @@ def test_a_pdflatex_timeout_is_a_short_error_without_the_command(tmp_path, caplo
     assert "timed out after 600" in caplog.text and "partial log" in caplog.text
 
 
-def test_a_ghostscript_timeout_is_a_short_error_without_the_command_or_the_path(tmp_path, caplog):
-    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.5")
+def test_a_ghostscript_timeout_keeps_the_pdf_pdflatex_wrote_and_warns(tmp_path, caplog):
+    """Embedding the fonts is best-effort: the report is complete without it, so the plain PDF is
+    returned (and a half-written output of Ghostscript is not), the same as when Ghostscript
+    leaves no output."""
+    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.5 plain")
 
     def run(command, **kwargs):
         if command[0] == "pdflatex":
             return MagicMock(returncode=0, stdout="", stderr="")
+        (tmp_path / "report_embedded.pdf").write_bytes(b"%PDF-1.5 half writ")
         raise subprocess.TimeoutExpired(command, 300)
 
     with patch.object(rl.shutil, "which", return_value="/usr/bin/gs"):
         with patch.object(rl.subprocess, "run", side_effect=run):
-            with caplog.at_level(logging.ERROR, logger=rl.logger.name):
-                with pytest.raises(rl.LatexTimeoutError) as caught:
-                    rl.report_latex_service.compile_pdf(_minimal("x"), str(tmp_path))
-    message = str(caught.value)
-    assert message == (
-        "The LaTeX report took too long to compile (Ghostscript); the details are in the worker log."
-    )
-    assert "-sOutputFile" not in message and "report_embedded" not in message
-    assert str(tmp_path) not in message and "report.tex" not in message
-    assert "Ghostscript timed out after 300" in caplog.text
+            with caplog.at_level(logging.WARNING, logger=rl.logger.name):
+                pdf = rl.report_latex_service.compile_pdf(_minimal("x"), str(tmp_path))
+    assert pdf == b"%PDF-1.5 plain"
+    warning = next(r for r in caplog.records if "Ghostscript timed out after 300" in r.getMessage())
+    assert warning.levelno == logging.WARNING
+    # The warning names no path and no command.
+    assert str(tmp_path) not in warning.getMessage() and "-sOutputFile" not in warning.getMessage()
 
 
-@pytest.mark.parametrize("make", [lambda: rl.LatexCompileError(2), lambda: rl.LatexTimeoutError("Ghostscript")])
+def test_a_timeout_is_a_compile_error_without_a_pass_number():
+    error = rl.LatexTimeoutError("pdflatex pass 1")
+    assert isinstance(error, rl.LatexCompileError) and error.pass_no is None
+    assert rl.LatexCompileError(2).pass_no == 2
+
+
+@pytest.mark.parametrize("make", [lambda: rl.LatexCompileError(2), lambda: rl.LatexTimeoutError("pdflatex pass 2")])
 def test_the_compile_errors_survive_pickle_and_copy(make):
     error = make()
     for clone in (pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)):

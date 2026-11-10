@@ -219,7 +219,7 @@ class _Label:
     y: float  # baseline of the title
     anchor: str
     title: str
-    notes: list[str]  # one line, or two when the note would spill over the wheel
+    notes: tuple[str, ...]  # one line, or two when the note would spill over the wheel
     title_fill: str
     note_fill: str
     box: Box  # what the text covers: 12 px per title character, 6.3 per note character
@@ -238,12 +238,12 @@ def _reference_label(
         x = 990 - w
     if anchor == "end" and x - w < 10:
         x = 10 + w
-    notes, note_w = [note], len(note) * 6.3
+    notes, note_w = (note,), len(note) * 6.3
     if anchor != "middle" and " · " in note:
         edge = (CX + R + 6) if anchor == "start" else (CX - R - 6)
         if (anchor == "start" and x < edge) or (anchor == "end" and x > edge):
             # the second line would spill over the wheel: break it in two
-            notes = note.split(" · ")
+            notes = tuple(note.split(" · "))
             note_w = max(len(line) for line in notes) * 6.3
             x = max(edge, x) if anchor == "start" else min(edge, x)
             widest = max(title_w, note_w)

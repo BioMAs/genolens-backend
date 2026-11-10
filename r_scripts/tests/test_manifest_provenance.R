@@ -125,8 +125,9 @@ check("relaxed sample thresholds are recorded",
 # -----------------------------------------------------------------------------
 
 genes <- sprintf("GENE%02d", 1:40)
-# Terms of different sizes: with equally sized gene sets the script's apply() call returns a
-# matrix, which is not what this test is about.
+# Terms of different sizes, as real gene sets are. (The script's apply() call used to return a
+# matrix for equally sized sets; it no longer does, and test_enrichment_one_term_category.R
+# is the test of that case.)
 term_matrix <- function(sizes, start, terms) {
   rows <- unlist(Map(function(n, from) seq(from, length.out = n), sizes, start))
   sparseMatrix(i = rows, j = rep(seq_along(sizes), sizes), x = 1, dims = c(40, length(sizes)),
