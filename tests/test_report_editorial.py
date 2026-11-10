@@ -1336,6 +1336,39 @@ def test_methods_of_a_comparison_with_no_enrichment_say_only_that_none_is_stored
             assert phrase not in text.lower(), (where, phrase)
 
 
+def test_no_enrichment_method_page_states_only_what_is_stored():
+    """With no enrichment result there is nothing to join, score or combine: the method paragraph
+    says what is, and the parameters table lists neither the threshold nor the score formula."""
+    ctx = _context(_no_enrichment(enrichment_source="none"), enr_up=[], enr_down=[])
+    method = next(p for p in ctx["pages"] if p["kind"] == "method")
+    text = _text(method["method_nova"])
+    assert "No enrichment result is stored" in text
+    assert "no claim is evaluated" in text
+    for phrase in ("joined", "Stouffer", "α ="):
+        assert phrase not in text, phrase
+    # The referential's sentence stays: versioned, and its table is not disclosed.
+    assert "The referential is versioned" in text and "is not disclosed" in text
+    names = [k for k, _v in method["versions"]]
+    assert "Significance threshold" not in names and "OmicSkin score" not in names
+    assert not any("α" in f"{k} {v}" for k, v in method["versions"])
+    # The other rows are still there.
+    assert {"Claim referential", "Enrichment", "Data source version"} <= set(names)
+
+
+def test_the_other_kinds_keep_their_method_paragraph_and_score_rows():
+    for provenance in (
+        {},
+        dict(enrichment_source="uploaded", padj_columns=["qvalue"], enrichment_fdr=None),
+        dict(enrichment_source="legacy", analysis_id=None, enrichment_dataset_ids=[]),
+        dict(enrichment_source="mystery"),
+    ):
+        method = next(p for p in _context(_honest_nova(**provenance))["pages"] if p["kind"] == "method")
+        text = _text(method["method_nova"])
+        assert "are joined to the SciLicium claim referential" in text and "Stouffer" in text
+        names = [k for k, _v in method["versions"]]
+        assert "Significance threshold" in names and "OmicSkin score" in names
+
+
 def test_methods_of_a_deleted_analysis_do_not_print_all_categories():
     """The analysis is gone: its pick, its cut-off and its categories are not known (R-F1)."""
     nova = _honest_nova(enrichment_fdr=None, enrichment_databases=None, enrichment_categories=None)

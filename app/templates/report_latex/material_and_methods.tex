@@ -106,8 +106,10 @@ The versions of R and of the packages used are not recorded for this analysis.
 Functional enrichment analysis was performed by over-representation analysis (ORA) against the annotation database \JINJABLOCK{if enr.annodb_file}(file \texttt{\JINJAVAR{enr.annodb_file|tex_escape}})\JINJABLOCK{else}(file not recorded)\JINJABLOCK{endif}, separately for the up-regulated and for the down-regulated DEGs.
 \JINJABLOCK{if enr.categories}
 The categories tested were \JINJAVAR{enr.categories|map('tex_escape')|join(', ')}.
-\JINJABLOCK{else}
+\JINJABLOCK{elif enr.categories_known}
 No selection of categories was made: the test was run over all categories of the annotation database.
+\JINJABLOCK{else}
+The categories tested were not recorded for this result.
 \JINJABLOCK{endif}
 
 \textbf{Over-representation analysis (ORA)} tested whether DEGs were over-represented in each term with a hypergeometric test; within each category, \textit{p}-values were adjusted by the Benjamini-Hochberg (BH) procedure.

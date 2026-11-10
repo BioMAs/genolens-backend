@@ -836,18 +836,21 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
             ),
         )
     )
-    rows.append(
-        (
-            "Significance threshold",
-            f"α = {alpha:g} (a term is significant when its adjusted p is below α)",
+    if facts.kind != "none":
+        # With no enrichment result no term is tested against α and no claim is scored.
+        rows.append(
+            (
+                "Significance threshold",
+                f"α = {alpha:g} (a term is significant when its adjusted p is below α)",
+            )
         )
-    )
-    rows.append(
-        (
-            "OmicSkin score",
-            "100 × coherence × min(1, −log10 p of the most significant supporting sub-group / 8)",
+        rows.append(
+            (
+                "OmicSkin score",
+                "100 × coherence × min(1, −log10 p of the most significant supporting "
+                "sub-group / 8)",
+            )
         )
-    )
     models = [m for m in (inp.comparison_ai_model, inp.nova_ai_model) if m]
     if models and inp.use_ai:
         rows.append(("Interpretation model", ", ".join(dict.fromkeys(models))))
@@ -866,6 +869,13 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
 def method_nova(inp: EditorialInputs) -> Markup:
     """How the nova is built, in terms of what this report's data are (HTML)."""
     facts = enrichment_facts(inp.nova)
+    if facts.kind == "none":
+        # Nothing was joined, scored or combined: the paragraph says what is, and no more.
+        return Markup(
+            "No enrichment result is stored for this comparison, so no term is linked to the "
+            "SciLicium claim referential and no claim is evaluated. The referential is "
+            "versioned; its claim-to-pathway table is SciLicium know-how and is not disclosed."
+        )
     alpha = nova_alpha(inp.nova)
     if facts.kind == "genolens":
         p_values = (
