@@ -1433,8 +1433,11 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
         {
             "kind": "method",
             "method_nova": method_nova(inp),
-            "method_score": Markup(
-                str(method_score(alpha)) + (METHOD_DOSE if inp.dose_series else "")
+            # None when nothing was scored (no enrichment result): the page has no such section.
+            "method_score": (
+                None
+                if facts.kind == "none"
+                else Markup(str(method_score(alpha)) + (METHOD_DOSE if inp.dose_series else ""))
             ),
             "scope": (
                 "All AI-generated texts in this report are labelled with the model and the date "

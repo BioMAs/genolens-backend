@@ -1355,6 +1355,26 @@ def test_no_enrichment_method_page_states_only_what_is_stored():
     assert {"Claim referential", "Enrichment", "Data source version"} <= set(names)
 
 
+def _method_page_html(nova, **overrides) -> str:
+    """The method page of the editorial HTML (from its opening tag to the next page or the end)."""
+    html = render_html(_context(nova, **overrides))
+    return html.split('data-kind="method"', 1)[1].split('<div class="page"', 1)[0]
+
+
+def test_no_enrichment_method_page_has_no_score_section():
+    """Nothing was scored: the page has no "OmicSkin score" section and no alpha anywhere."""
+    page = _method_page_html(_no_enrichment(enrichment_source="none"), enr_up=[], enr_down=[])
+    assert "CosmOmics Pathway Nova" in page and "No enrichment result is stored" in page
+    assert "OmicSkin score" not in page
+    assert "α =" not in page
+    # Nor is the dose sentence of the score kept on a page that scores nothing.
+    assert "checked for monotony" not in page
+    # A nova with a result keeps the section, its formula and its alpha.
+    page = _method_page_html(_honest_nova())
+    assert "<h3>OmicSkin score</h3>" in page
+    assert "OmicSkin = 100 × coherence" in page and "α = " in page
+
+
 def test_the_other_kinds_keep_their_method_paragraph_and_score_rows():
     for provenance in (
         {},

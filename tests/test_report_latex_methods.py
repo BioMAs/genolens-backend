@@ -291,6 +291,20 @@ def test_no_pick_means_all_categories():
     assert "were not recorded" not in text
 
 
+def test_an_explicit_empty_pick_is_not_said_to_be_all_categories():
+    """An explicit empty pick is not the absence of a pick: with no categories recorded, what was
+    tested is not known, so the text does not say "all categories"."""
+    ctx = rm.methods_context(
+        {"enrichment_databases": []}, {}, {}, [_drop(ENR_META, "categories")]
+    )
+    assert ctx["enrichment"]["categories_known"] is False
+    text = _text(ctx)
+    assert "were not recorded" in text
+    assert "all categories" not in text
+    # A recorded list still wins over the pick.
+    assert _ctx(params_enrichment_databases=[])["enrichment"]["categories_known"] is True
+
+
 def test_recorded_categories_are_listed_whatever_the_params():
     for params in (None, {}, PARAMS):
         ctx = rm.methods_context(params, {}, {}, [ENR_META])

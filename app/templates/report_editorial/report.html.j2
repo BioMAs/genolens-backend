@@ -265,7 +265,7 @@
   <div class="kicker">Method and traceability</div>
   <h2>How the score is built, and every version behind it</h2>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:8mm;font-size:8.2pt">
-    <div><h3>CosmOmics Pathway Nova</h3><p style="margin-top:0">{{ p.method_nova }}</p><h3>OmicSkin score</h3><p style="margin-top:0">{{ p.method_score }}</p>
+    <div><h3>CosmOmics Pathway Nova</h3><p style="margin-top:0">{{ p.method_nova }}</p>{% if p.method_score %}<h3>OmicSkin score</h3><p style="margin-top:0">{{ p.method_score }}</p>{% endif %}
       <h3>Scientific review and scope</h3><p style="margin-top:0">{{ p.scope }}</p></div>
     <div><h3>Versions</h3><table>{% for k, v in p.versions %}<tr><td style="width:32mm;color:{{ C.grey }}">{{ k }}</td><td>{{ v }}</td></tr>{% endfor %}</table>
       {%- if p.signoff %}
