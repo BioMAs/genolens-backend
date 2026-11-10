@@ -254,6 +254,16 @@ def _reference_label(
     return _Label(angle, x, y, anchor, title, notes, title_fill, note_fill, box)
 
 
+def _touch(a: Box, b: Box) -> bool:
+    """Two boxes overlap, or touch."""
+    return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+
+def _footnote_box(y: float, text: str, size: float) -> Box:
+    """What a footnote line covers, from x 20: 0.56 em per character, ascent to descent."""
+    return (20, y - size, 20 + len(text) * size * 0.56, y + 0.3 * size)
+
+
 def _disc_half_height(x0: float, x1: float) -> float:
     """Half the height of the disc of radius R + 4 over the column of [x0, x1] nearest to the centre
     (0 when the span lies wholly beyond the disc's width)."""
@@ -277,9 +287,7 @@ def _resolve_label_overlaps(boxes: list[Box]) -> list[Box]:
     for x0, y0, x1, y1 in boxes:
         away = 1 if (y0 + y1) / 2 >= CY else -1
         for _ in range(MAX_PUSHES):
-            hit = next(
-                (q for q in placed if not (x1 < q[0] or x0 > q[2] or y1 < q[1] or y0 > q[3])), None
-            )
+            hit = next((q for q in placed if _touch((x0, y0, x1, y1), q)), None)
             if hit is not None:
                 edge = hit[3] if away > 0 else hit[1]
             else:
@@ -321,6 +329,10 @@ class _Nova:
         # leader line (None when it stands in its reference place).
         self.label_boxes: list[Box] = []
         self.label_leaders: list[Optional[tuple[float, float, float, float]]] = []
+        # Filled by `annotations()`: where the footnotes stand, and how far they were moved down
+        # to clear the labels (0 when none reached them).
+        self.footnote_boxes: list[Box] = []
+        self.footnote_shift = 0.0
         self.rng = np.random.default_rng(11)  # same jitter for every theme / render
         self.claims = sorted(
             (
@@ -608,10 +620,12 @@ class _Nova:
         return o
 
     def frame(self) -> tuple[int, int, int, int]:
-        """The wheel's crop (x0, y0, x1, y1): the reference crop, grown to hold every label box and
-        leader line with an 8 px margin. Read after `draw()`."""
+        """The wheel's crop (x0, y0, x1, y1): the reference crop, grown to hold every label box,
+        leader line and moved footnote with an 8 px margin (footnotes that stand in their reference
+        place are inside the crop already). Read after `draw()` and `annotations()`."""
         x0, y0, x1, y1 = _CROP_X, _CROP_Y, _CROP_X + _CROP_W, _CROP_Y + _CROP_H
-        points = [(b[0], b[1]) for b in self.label_boxes] + [(b[2], b[3]) for b in self.label_boxes]
+        boxes = self.label_boxes + (self.footnote_boxes if self.footnote_shift else [])
+        points = [(b[0], b[1]) for b in boxes] + [(b[2], b[3]) for b in boxes]
         for leader in self.label_leaders:
             if leader:
                 points += [leader[:2], leader[2:]]
@@ -620,17 +634,35 @@ class _Nova:
             x1, y1 = max(x1, math.ceil(x + FRAME_MARGIN)), max(y1, math.ceil(y + FRAME_MARGIN))
         return x0, y0, x1, y1
 
+    def _footnote_shift(self, notes: list[Box]) -> float:
+        """How far the footnotes move down to clear the labels: 0 when no label box reaches them,
+        else under the lowest label box in their columns, with the frame's 8 px margin."""
+        if not any(_touch(note, label) for note in notes for label in self.label_boxes):
+            return 0.0
+        left, top = min(n[0] for n in notes), min(n[1] for n in notes)
+        right = max(n[2] for n in notes)
+        in_columns = [b for b in self.label_boxes if b[0] <= right and b[2] >= left and b[3] >= top]
+        return max(b[3] for b in in_columns) + FRAME_MARGIN - top
+
     def annotations(self) -> list[str]:
-        """What the wheel says about itself: the title of its radial axis, and the DEMO mark of a
-        demo payload (drawn last, over the wheel)."""
+        """What the wheel says about itself: the title of its radial axis and the note on claims
+        with no contrary term (at the bottom left, where the reference puts them; moved down under
+        the labels when these reach them), and the DEMO mark of a demo payload (drawn last, over
+        the wheel). Read after `draw()`."""
         th = self.th
         o: list[str] = []
+        notes: list[tuple[str, float, float, str, int]] = []  # text, baseline, size, fill, weight
         if self.claims or self.other:
-            o.append(_text(20, 944, f"Radius: {AXIS_TITLE}", 12.5, th["muted"], weight=500))
+            notes.append((f"Radius: {AXIS_TITLE}", 944, 12.5, th["muted"], 500))
         if any(claim_state_of(c) == "for_only" for c in self.claims):
             first, second = ZERO_AGAINST_NOTE.split("; ")
-            o.append(_text(20, 960, first + ";", 11, th["dim"]))
-            o.append(_text(20, 974, second, 11, th["dim"]))
+            notes.append((first + ";", 960, 11, th["dim"], 400))
+            notes.append((second, 974, 11, th["dim"], 400))
+        shift = self._footnote_shift([_footnote_box(y, t, size) for t, y, size, _, _ in notes])
+        self.footnote_shift = shift
+        self.footnote_boxes = [_footnote_box(y + shift, t, size) for t, y, size, _, _ in notes]
+        for text, y, size, fill, weight in notes:
+            o.append(_text(20, y + shift, text, size, fill, weight=weight))
         if self.demo:
             o.append(
                 f'<text x="{CX}" y="{CY + 70}" text-anchor="middle" font-family="{FONT}" '
