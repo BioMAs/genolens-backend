@@ -9,7 +9,10 @@ Port of the reference generator docs/omicskin-report-editorial/cosmomics_pathway
     the evidence against the claim; a grey sector for significant sub-groups linked to no claim;
   * one bubble per pathway sub-group: distance to the centre = Stouffer −log10 p (unsigned),
     colour = balance for → against (a balanced sub-group is grey, outside the hatched part), size
-    = |Δ pro − anti|; small dots = the individual ontology terms.
+    = |Δ pro − anti|; small dots = the individual ontology terms;
+  * the claim labels stand outside the wheel, kept apart from one another and off the wheel by the
+    app's own rule; a label pushed far from its sector is tied back to it by a thin line, and the
+    frame grows to hold every label.
 
 Only what the payload carries is drawn — claim names, sub-group names and term dots — so the
 claim referential never leaves the server, and no dot stands for anything but a term or a
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 import numpy as np
@@ -100,6 +104,15 @@ W = 1000
 CX, CY, R = 500, 555, 330
 # Wheel only: the reference crop (nova_wheel.py), around the wheel and its claim labels.
 WHEEL_VIEWBOX = "0 130 1000 850"
+_CROP_X, _CROP_Y, _CROP_W, _CROP_H = (int(v) for v in WHEEL_VIEWBOX.split())
+
+# A claim label's box: (x0, y0, x1, y1). The labels follow the app's rule (novaLayout.ts), so the
+# wheel drawn here and the one drawn in the app agree.
+Box = tuple[float, float, float, float]
+LABEL_CLEARANCE = 4.0  # px a label keeps from the wheel (R + 4) and from the labels before it
+MAX_PUSHES = 40  # pushes before a label is left where the last one put it
+LEADER_MIN_SHIFT = 12.0  # a label that moved further than this (px, vertically) gets a leader line
+FRAME_MARGIN = 8  # px the frame keeps around every label box
 
 
 def _djb2(value: str) -> int:
@@ -196,6 +209,96 @@ def _sector_note(claim: dict[str, Any]) -> str:
     return note + (f" · {int(n_balanced)} balanced" if n_balanced else "")
 
 
+@dataclass(frozen=True)
+class _Label:
+    """A claim label where the reference puts it, before it is kept off its neighbours and the
+    wheel."""
+
+    angle: float  # mid angle of its sector
+    x: float
+    y: float  # baseline of the title
+    anchor: str
+    title: str
+    notes: list[str]  # one line, or two when the note would spill over the wheel
+    title_fill: str
+    note_fill: str
+    box: Box  # what the text covers: 12 px per title character, 6.3 per note character
+
+
+def _reference_label(
+    angle: float, title: str, note: str, title_fill: str, note_fill: str
+) -> _Label:
+    x, y = _pt(R + 24, angle)
+    ca, sa = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+    anchor = "middle" if abs(ca) < 0.3 else ("start" if ca > 0 else "end")
+    y += 8 if sa > 0.3 else (-2 if sa < -0.3 else 6)
+    title_w = len(title) * 12.0
+    w = max(title_w, len(note) * 6.3)
+    if anchor == "start" and x + w > 990:
+        x = 990 - w
+    if anchor == "end" and x - w < 10:
+        x = 10 + w
+    notes, note_w = [note], len(note) * 6.3
+    if anchor != "middle" and " · " in note:
+        edge = (CX + R + 6) if anchor == "start" else (CX - R - 6)
+        if (anchor == "start" and x < edge) or (anchor == "end" and x > edge):
+            # the second line would spill over the wheel: break it in two
+            notes = note.split(" · ")
+            note_w = max(len(line) for line in notes) * 6.3
+            x = max(edge, x) if anchor == "start" else min(edge, x)
+            widest = max(title_w, note_w)
+            x = min(x, 990 - widest) if anchor == "start" else max(x, 10 + widest)
+    width = max(title_w, note_w)
+    x0 = x if anchor == "start" else x - width if anchor == "end" else x - width / 2
+    box = (x0, y - 20, x0 + width, y + 18 + 16 * (len(notes) - 1) + 4)
+    return _Label(angle, x, y, anchor, title, notes, title_fill, note_fill, box)
+
+
+def _disc_half_height(x0: float, x1: float) -> float:
+    """Half the height of the disc of radius R + 4 over the column of [x0, x1] nearest to the centre
+    (0 when the span lies wholly beyond the disc's width)."""
+    radius = R + LABEL_CLEARANCE
+    dx = max(x0 - CX, 0, CX - x1)
+    return math.sqrt(radius * radius - dx * dx) if dx < radius else 0.0
+
+
+def _resolve_label_overlaps(boxes: list[Box]) -> list[Box]:
+    """Where each label ends up once narrow sectors cannot stack theirs on one another, and a long
+    name squeezed in by the frame's edge cannot sit over the wheel.
+
+    A label that hits an earlier one (touching counts), or the disc of radius R + 4 around the
+    centre (tangent does not), is pushed vertically, away from the centre, by the height of the
+    overlap + 4 px, until it is free: 40 pushes at most, after which it stays where the last one
+    left it, possibly still touching something. An earlier label is dealt with before the disc. The
+    disc's overlap is measured on the label's column nearest the centre, so the label ends 4 px past
+    the end of that chord. A label that hits nothing keeps its reference position.
+    """
+    placed: list[Box] = []
+    for x0, y0, x1, y1 in boxes:
+        away = 1 if (y0 + y1) / 2 >= CY else -1
+        for _ in range(MAX_PUSHES):
+            hit = next(
+                (q for q in placed if not (x1 < q[0] or x0 > q[2] or y1 < q[1] or y0 > q[3])), None
+            )
+            if hit is not None:
+                edge = hit[3] if away > 0 else hit[1]
+            else:
+                half = _disc_half_height(x0, x1)
+                if half == 0 or y1 <= CY - half or y0 >= CY + half:
+                    break
+                edge = CY + away * half
+            shift = edge - y0 + LABEL_CLEARANCE if away > 0 else edge - y1 - LABEL_CLEARANCE
+            y0, y1 = y0 + shift, y1 + shift
+        placed.append((x0, y0, x1, y1))
+    return placed
+
+
+def _leader_line(angle: float, box: Box) -> tuple[float, float, float, float]:
+    """From the rim of the wheel (R + 6, on the sector's mid angle) to the nearest box point."""
+    x1, y1 = _pt(R + 6, angle)
+    return x1, y1, min(max(x1, box[0]), box[2]), min(max(y1, box[1]), box[3])
+
+
 class _Nova:
     """One drawing of the nova. Mirrors the reference `nova()` step by step."""
 
@@ -214,6 +317,10 @@ class _Nova:
         self.theme = theme
         self.p = prefix
         self.center = center_label
+        # Filled by `draw()`: where each claim label (then "Not linked to a claim") ends up, and its
+        # leader line (None when it stands in its reference place).
+        self.label_boxes: list[Box] = []
+        self.label_leaders: list[Optional[tuple[float, float, float, float]]] = []
         self.rng = np.random.default_rng(11)  # same jitter for every theme / render
         self.claims = sorted(
             (
@@ -386,17 +493,10 @@ class _Nova:
         center = self.center if len(self.center) <= 8 else self.center[:7] + "…"
         o.append(f'<circle cx="{CX}" cy="{CY}" r="26" fill="{th["core_fill"]}"/>')
         if center:  # the disc names the condition it was given, never an invented one
-            o.append(
-                _text(
-                    CX,
-                    CY + 5,
-                    center,
-                    13 if len(center) <= 6 else 11,
-                    th["core_text"],
-                    "middle",
-                    700,
-                )
-            )
+            size = 13 if len(center) <= 6 else 11
+            name = _text(CX, CY + 5, center, size, th["core_text"], "middle", 700)
+            # the text is the cut name; the title (a tooltip) carries the whole one
+            o.append(f"<g><title>{_esc(self.center)}</title>{name}</g>")
         if not self.claims:
             message = (
                 "No enrichment result for this comparison"
@@ -407,69 +507,52 @@ class _Nova:
                 _text(CX, CY + R + 44, message, 18, th["dim"], "middle", 600, self.halo())
             )
 
-        # claim labels outside the wheel
-        boxes: list[tuple[float, float, float, float]] = []
-
-        def lab(angle, l1, l2, c1, c2, r_label=R + 24):
-            x, y = _pt(r_label, angle)
-            ca, sa = math.cos(math.radians(angle)), math.sin(math.radians(angle))
-            anchor = "middle" if abs(ca) < 0.3 else ("start" if ca > 0 else "end")
-            y += 8 if sa > 0.3 else (-2 if sa < -0.3 else 6)
-            w = max(len(l1) * 12.0, len(l2) * 6.3)
-            if anchor == "start" and x + w > 990:
-                x = 990 - w
-            if anchor == "end" and x - w < 10:
-                x = 10 + w
-            x0 = x if anchor == "start" else x - w if anchor == "end" else x - w / 2
-
-            def hits_label(y_):
-                b = (x0, y_ - 20, x0 + w, y_ + 22)
-                return any(not (b[2] < q[0] or b[0] > q[2] or b[3] < q[1] or b[1] > q[3])
-                           for q in boxes)
-
-            # Narrow neighbouring sectors put their labels on top of each other: step this
-            # one away from the wheel (down at the bottom and sides, up at the top).
-            step = -26 if sa < -0.3 else 26
-            for _ in range(3):
-                if not hits_label(y):
-                    break
-                y += step
-            boxes.append((x0, y - 20, x0 + w, y + 22))
-            lines2 = [l2]
-            if anchor != "middle" and " · " in l2:
-                edge = (CX + R + 6) if anchor == "start" else (CX - R - 6)
-                if (anchor == "start" and x < edge) or (anchor == "end" and x > edge):
-                    lines2 = l2.split(" · ")
-                    w2 = max(len(line) for line in lines2) * 6.3
-                    x = max(edge, x) if anchor == "start" else min(edge, x)
-                    x = (
-                        min(x, 990 - max(len(l1) * 12.0, w2))
-                        if anchor == "start"
-                        else max(x, 10 + max(len(l1) * 12.0, w2))
-                    )
-            out = [_text(x, y, l1, 21, c1, anchor, 600, self.halo())]
-            out += [
-                _text(x, y + 18 + 16 * j, line, 12.5, c2, anchor, 500, self.halo())
-                for j, line in enumerate(lines2)
-            ]
-            return out
-
-        for name in names:
-            o += lab(
+        # claim labels outside the wheel, each where the reference puts it, then kept apart from the
+        # labels before it and off the wheel; one that had to travel is tied back to its sector by a
+        # thin leader line, drawn under the labels
+        labels = [
+            _reference_label(
                 ang[name],
                 name,
                 _sector_note(by_name[name]),
                 self.claim_text_color(name),
                 th["muted"],
             )
+            for name in names
+        ]
         if self.other or self.claims:
-            o += lab(
-                ang["other"],
-                "Not linked to a claim",
-                _plural(self.other_total, "sub-group"),
-                AGAINST_TEXT,
-                AGAINST_TEXT,
+            labels.append(
+                _reference_label(
+                    ang["other"],
+                    "Not linked to a claim",
+                    _plural(self.other_total, "sub-group"),
+                    AGAINST_TEXT,
+                    AGAINST_TEXT,
+                )
             )
+        self.label_boxes = _resolve_label_overlaps([label.box for label in labels])
+        self.label_leaders = []
+        for label, box in zip(labels, self.label_boxes):
+            travelled = abs(box[1] - label.box[1])
+            self.label_leaders.append(
+                _leader_line(label.angle, box) if travelled > LEADER_MIN_SHIFT else None
+            )
+        for label, leader in zip(labels, self.label_leaders):
+            if leader:
+                x1, y1, x2, y2 = leader
+                o.append(
+                    f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+                    f'stroke="{label.title_fill}" stroke-width="0.8" opacity="0.6"/>'
+                )
+        halo = self.halo()
+        for label, box in zip(labels, self.label_boxes):
+            y = label.y + box[1] - label.box[1]  # the text moves with its box
+            o.append(_text(label.x, y, label.title, 21, label.title_fill, label.anchor, 600, halo))
+            for j, line in enumerate(label.notes):
+                note_y = y + 18 + 16 * j
+                o.append(
+                    _text(label.x, note_y, line, 12.5, label.note_fill, label.anchor, 500, halo)
+                )
 
         # key sub-group labels (best of each claim + sub-groups against), without overlap.
         # Off by default: the validated reference computes them but never draws them.
@@ -479,6 +562,7 @@ class _Nova:
         def tw(s, size):
             return len(s) * size * 0.56
 
+        boxes = list(self.label_boxes)
         for x, y, sz, _a, _n in todo:
             boxes.append((x - sz - 3, y - sz - 3, x + sz + 3, y + sz + 3))
         boxes.append((CX - 30, CY - 30, CX + 30, CY + 30))
@@ -522,6 +606,19 @@ class _Nova:
                 )
             )
         return o
+
+    def frame(self) -> tuple[int, int, int, int]:
+        """The wheel's crop (x0, y0, x1, y1): the reference crop, grown to hold every label box and
+        leader line with an 8 px margin. Read after `draw()`."""
+        x0, y0, x1, y1 = _CROP_X, _CROP_Y, _CROP_X + _CROP_W, _CROP_Y + _CROP_H
+        points = [(b[0], b[1]) for b in self.label_boxes] + [(b[2], b[3]) for b in self.label_boxes]
+        for leader in self.label_leaders:
+            if leader:
+                points += [leader[:2], leader[2:]]
+        for x, y in points:
+            x0, y0 = min(x0, math.floor(x - FRAME_MARGIN)), min(y0, math.floor(y - FRAME_MARGIN))
+            x1, y1 = max(x1, math.ceil(x + FRAME_MARGIN)), max(y1, math.ceil(y + FRAME_MARGIN))
+        return x0, y0, x1, y1
 
     def annotations(self) -> list[str]:
         """What the wheel says about itself: the title of its radial axis, and the DEMO mark of a
@@ -625,7 +722,9 @@ def render_nova_svg(
     """SVG of the nova for a `build_nova` payload (the reference mock JSON is accepted too).
 
     wheel_only=True: the wheel and its labels on a transparent background (viewBox cropped as
-    in the report). wheel_only=False: the full poster — header, wheel, claim cards, legend.
+    in the report, and grown to hold every label: they are kept off one another and off the wheel,
+    and a label that travelled far from its sector is tied back to it by a thin line).
+    wheel_only=False: the full poster — header, wheel, claim cards, legend.
     subgroup_labels=True also names the best sub-group of each claim and the ones against it.
     A demo payload (`provenance.demo`) is marked DEMO unless demo_mark is False (a page that
     carries its own mark over the picture).
@@ -639,15 +738,21 @@ def render_nova_svg(
     th = THEMES[theme]
     wheel = nova.draw() + nova.annotations()
 
+    x0, y0, x1, y1 = nova.frame()
     if wheel_only:
         head = (
-            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{WHEEL_VIEWBOX}" '
-            f'width="1000" height="850">'
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{x0} {y0} {x1 - x0} {y1 - y0}" '
+            f'width="{x1 - x0}" height="{y1 - y0}">'
         )
         return "\n".join([head, nova.defs(), *wheel, "</svg>"])
 
     n_rows = math.ceil(min(len(nova.claims), 9) / 3)
-    height = 1056 + 140 * n_rows  # the cards start under the wheel's footnotes
+    # Labels pushed past the crop make room: above it (the header stays, the wheel and what follows
+    # move down) and below it (the cards start under the labels, not under the footnotes). The
+    # poster is as much taller; it keeps its width.
+    above_crop = _CROP_Y - y0
+    below_crop = y1 - (_CROP_Y + _CROP_H)
+    height = 1056 + 140 * n_rows + above_crop + below_crop
     wordmark = "#0B2A3E" if theme == "light" else "#F2F6FA"
     subtitle = title or f"Pathway nova · {payload.get('contrast') or ''}".rstrip(" ·")
     o = [
@@ -680,5 +785,7 @@ def render_nova_svg(
             f'<image x="{950 - lw}" y="{72 - lh + 4:.1f}" width="{lw}" height="{lh:.1f}" '
             f'href="{logo_data_uri}"/>',
         ]
-    o += wheel + nova.blocks(1016) + nova.legend(height - 46) + ["</svg>"]
+    if above_crop:
+        wheel = [f'<g transform="translate(0 {above_crop})">', *wheel, "</g>"]
+    o += wheel + nova.blocks(1016 + above_crop + below_crop) + nova.legend(height - 46) + ["</svg>"]
     return "\n".join(o)

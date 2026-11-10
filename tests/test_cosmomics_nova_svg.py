@@ -3,6 +3,7 @@ Server-side SVG of the CosmOmics Pathway Nova (`render_nova_svg`) and its endpoi
 """
 
 import json
+import math
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.services import cosmomics_nova_svg as nova_svg
 from app.services.cosmomics_nova import TermHit
 from app.services.cosmomics_nova_svg import balance_color, claim_color, render_nova_svg
 
@@ -373,3 +375,377 @@ def test_the_header_of_a_comparison_with_no_enrichment_says_only_that_none_is_st
         header = _header(payload)
         assert header == "No enrichment result is stored for this comparison"
         assert "Benjamini" not in header and "α" not in header
+
+
+# ── D6: the labels keep apart from each other and off the wheel, inside the frame ──────────────
+
+SVG = "{http://www.w3.org/2000/svg}"
+DISC = nova_svg.R + 4  # the wheel and a 4 px margin: no label comes closer
+
+
+def _pathway(name, nl, s_pro, s_anti):
+    return {
+        "name": name,
+        "nl": nl,
+        "s_pro": s_pro,
+        "s_anti": s_anti,
+        "delta": s_pro - s_anti,
+        "balance": (s_pro - s_anti) / (s_pro + s_anti),
+        "obs": "up",
+        "terms": [
+            {"id": f"GO:{name}", "label": f"Term of {name}", "nl": nl, "effect": 1, "obs": "up"}
+        ],
+    }
+
+
+def _wheel_payload(names, weights):
+    """One claim per name, sector width ∝ weight (80 % for the claim), three unlinked groups."""
+    claims = []
+    for n, (name, weight) in enumerate(zip(names, weights), start=1):
+        s_pro = 0.8 * weight
+        nl = 3 + n % 3
+        claims.append(
+            {
+                "name": name,
+                "importance": weight,
+                "s_pro": s_pro,
+                "s_anti": weight - s_pro,
+                "coherence": 0.8,
+                "n_for": 1,
+                "n_against": 0,
+                "best_nl": nl,
+                "best_subgroup": f"Pathway {n}",
+                "subgroups": [_pathway(f"Pathway {n}", nl, s_pro, weight - s_pro)],
+            }
+        )
+    return {
+        "contrast": "Group_A vs Group_B",
+        "condition": "Group_A",
+        "alpha": 0.05,
+        "claims": claims,
+        "unlinked": [
+            _pathway("Unlinked 1", 4, 5, 1),
+            _pathway("Unlinked 2", 3, 4, 1),
+            _pathway("Unlinked 3", 2.5, 3, 1),
+        ],
+        "unlinked_total": 3,
+    }
+
+
+# Three broad claims, then six narrow neighbours of under 4 % of the weight each, 20 characters per
+# name: their labels are far wider than their sectors and crowd the left of the wheel.
+NINE_WEIGHTS = [30, 25, 20, 2.9, 2.8, 2.7, 2.6, 2.5, 2.4]
+
+
+def _nine_claims():
+    return _wheel_payload([f"Claim {n} long name xx" for n in range(1, 10)], NINE_WEIGHTS)
+
+
+def _three_broad_claims():
+    return _wheel_payload(["Claim 1", "Claim 2", "Claim 3"], [30, 25, 20])
+
+
+def _label_boxes(payload):
+    wheel = nova_svg._Nova(payload, "light", "t", "", 0.05)
+    wheel.draw()
+    return wheel.label_boxes
+
+
+def _distance_to_centre(box):
+    x0, y0, x1, y1 = box
+    return math.hypot(
+        max(x0 - nova_svg.CX, 0, nova_svg.CX - x1), max(y0 - nova_svg.CY, 0, nova_svg.CY - y1)
+    )
+
+
+def _apart(a, b):
+    return a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3]
+
+
+def _viewbox(svg):
+    return [float(v) for v in ET.fromstring(svg).get("viewBox").split()]
+
+
+def _label_texts(svg):
+    """(text, x, y, anchor) of every claim label line, in drawing order (21 px titles, 12.5 notes)."""
+    return [
+        (t.text, float(t.get("x")), float(t.get("y")), t.get("text-anchor"))
+        for t in ET.fromstring(svg).iter(f"{SVG}text")
+        if t.get("font-size") in ("21", "12.5") and not t.text.startswith("Radius")
+    ]
+
+
+def _leaders(svg):
+    return [e for e in ET.fromstring(svg).iter(f"{SVG}line") if e.get("stroke-width") == "0.8"]
+
+
+def test_claim_labels_never_overlap_each_other_or_the_wheel():
+    payload = _nine_claims()
+    total = sum(NINE_WEIGHTS)
+    assert sum(1 for w in NINE_WEIGHTS if w / total < 0.04) == 6
+    assert all(len(c["name"]) == 20 for c in payload["claims"])
+
+    boxes = _label_boxes(payload)
+    assert len(boxes) == 10  # nine claims and the "not linked" sector
+    for i, box in enumerate(boxes):
+        assert _distance_to_centre(box) >= DISC - 1e-9
+        for other in boxes[i + 1 :]:
+            assert _apart(box, other)
+
+    for wheel_only in (True, False):
+        x0, y0, width, height = _viewbox(
+            render_nova_svg(payload, "light", id_prefix="x", wheel_only=wheel_only)
+        )
+        for bx0, by0, bx1, by1 in boxes:
+            # inside the frame, with the 8 px margin the frame keeps around every label
+            assert x0 <= bx0 - 8 and bx1 + 8 <= x0 + width
+            assert y0 <= by0 - 8 and by1 + 8 <= y0 + height
+
+
+def test_a_label_that_stands_free_keeps_its_reference_place():
+    """Three broad claims leave their labels clear of each other and of the wheel: they stay exactly
+    where the wheel drew them before labels were pushed apart (positions read off the code as it
+    stood, before the change). Only "Not linked to a claim" stood over the wheel."""
+    svg = render_nova_svg(_three_broad_claims(), "light", id_prefix="x")
+    where_they_were = [
+        ("Claim 1", 500.0, 199.0, "middle"),
+        ("1 sub-group for · 0 against", 500.0, 217.0, "middle"),
+        ("Claim 2", 836.0, 728.5, "start"),
+        ("1 sub-group for", 836.0, 746.5, "start"),
+        ("0 against", 836.0, 762.5, "start"),
+        ("Claim 3", 164.0, 854.2, "end"),
+        ("1 sub-group for", 164.0, 872.2, "end"),
+        ("0 against", 164.0, 888.2, "end"),
+    ]
+    texts = _label_texts(svg)
+    for (text, x, y, anchor), got in zip(where_they_were, texts):
+        assert (got[0], got[3]) == (text, anchor)
+        assert (got[1], got[2]) == pytest.approx((x, y), abs=0.5)
+    assert [t[0] for t in texts[8:]] == ["Not linked to a claim", "3 sub-groups"]
+    # None of these three moved: the one leader line is that of "Not linked to a claim", which
+    # stood over the grey sector (top at 505) and now ends above it.
+    assert len(_leaders(svg)) == 1
+    boxes = _label_boxes(_three_broad_claims())
+    assert all(_distance_to_centre(box) >= DISC - 1e-9 for box in boxes)
+    assert boxes[3][1] == pytest.approx(274.67, abs=0.5)
+
+
+def test_the_centre_names_the_condition_in_a_title():
+    svg = render_nova_svg(
+        {"claims": [], "unlinked": [], "condition": "Treatment_C"}, "light", id_prefix="c"
+    )
+    root = ET.fromstring(svg)
+    assert [t.text for t in root.iter(f"{SVG}title")] == ["Treatment_C"]
+    assert ">Treatme…<" in svg
+    # The disc's text is the cut name alone: the full one lives in the title, nowhere else.
+    assert "Treatment_C" not in [t.text for t in root.iter(f"{SVG}text")]
+    # The rule is unchanged: whole up to 8 characters, 13 px up to 6 and 11 px above.
+    for name, shown, size in (
+        ("Sample", "Sample", "13"),
+        ("Sample_1", "Sample_1", "11"),
+        ("Treatment", "Treatme…", "11"),
+    ):
+        one = ET.fromstring(
+            render_nova_svg({"claims": [], "unlinked": [], "condition": name}, "light")
+        )
+        centre = [t for t in one.iter(f"{SVG}text") if t.get("font-weight") == "700"]
+        assert [(t.text, t.get("font-size")) for t in centre] == [(shown, size)]
+        assert [t.text for t in one.iter(f"{SVG}title")] == [name]
+    # The title is escaped.
+    odd = render_nova_svg({"claims": [], "unlinked": []}, "light", center_label='A&B<c>"d"_long')
+    assert "<title>A&amp;B&lt;c&gt;&quot;d&quot;_long</title>" in odd
+    assert [t.text for t in ET.fromstring(odd).iter(f"{SVG}title")] == ['A&B<c>"d"_long']
+    # A wheel with no name draws the disc and neither text nor title.
+    bare = render_nova_svg({"claims": [], "unlinked": [], "condition": ""}, "light", id_prefix="b")
+    assert 'r="26"' in bare and "<title" not in bare and 'font-weight="700"' not in bare
+
+
+def test_the_frame_grows_to_hold_every_label_and_the_cards_follow():
+    # Labels that stand inside the crop leave it as the reference drew it.
+    free = _three_broad_claims()
+    wheel = render_nova_svg(free, "light", id_prefix="x")
+    poster = render_nova_svg(free, "light", id_prefix="x", wheel_only=False)
+    assert _viewbox(wheel) == [0, 130, 1000, 850]
+    assert _viewbox(poster) == [0, 0, 1000, 1196]
+
+    # Narrow neighbours stack their labels below the crop: the frame follows, 8 px past the last.
+    crowded = _nine_claims()
+    bottom = max(box[3] for box in _label_boxes(crowded))
+    assert bottom > 980
+    svg = render_nova_svg(crowded, "light", id_prefix="x")
+    height = math.ceil(bottom + 8) - 130
+    assert _viewbox(svg) == [0, 130, 1000, height]
+    root = ET.fromstring(svg)
+    assert (root.get("width"), root.get("height")) == ("1000", str(height))  # still 1 px per unit
+
+    # Full view: the poster is as much taller; the claim cards and the legend start under the
+    # labels.
+    extra = math.ceil(bottom + 8) - 980
+    full = render_nova_svg(crowded, "light", id_prefix="x", wheel_only=False)
+    assert _viewbox(full) == [0, 0, 1000, 1056 + 140 * 3 + extra]
+    first_card = float(re.search(r'<rect x="36" y="([\d.]+)"', full).group(1))
+    assert first_card == 1016 + extra - 18
+    assert first_card > bottom + 8
+
+
+def test_labels_pushed_above_the_crop_move_the_wheel_down_in_the_poster_not_the_header():
+    # Twelve claims of about the same weight: the labels crowd the top right and rise past the crop.
+    claims = _wheel_payload(
+        [f"Claim {n} long name xx" for n in range(1, 13)], [10 - 0.01 * i for i in range(12)]
+    )
+    boxes = _label_boxes(claims)
+    top, bottom = min(box[1] for box in boxes), max(box[3] for box in boxes)
+    assert top < 130
+    above, below = 130 - math.floor(top - 8), math.ceil(bottom + 8) - 980
+    assert (above, below) == (45, 44)
+
+    wheel = render_nova_svg(claims, "light", id_prefix="x")
+    assert _viewbox(wheel) == [0, 130 - above, 1000, 850 + above + below]
+
+    poster = render_nova_svg(claims, "light", id_prefix="x", wheel_only=False)
+    assert _viewbox(poster) == [0, 0, 1000, 1056 + 140 * 3 + above + below]
+    # The wheel and what follows move down; the header does not.
+    assert f'<g transform="translate(0 {above})">' in poster
+    assert poster.index('y="72"') < poster.index("<g transform")
+    assert top + above - 8 >= 130  # the highest label clears the header band
+    first_card = float(re.search(r'<rect x="36" y="([\d.]+)"', poster).group(1))
+    assert first_card == 1016 + above + below - 18 > bottom + above + 8
+    # A wheel whose labels stay inside the crop is drawn without the extra group.
+    assert "<g transform" not in render_nova_svg(_three_broad_claims(), "light", wheel_only=False)
+
+
+def test_a_label_pushed_far_from_its_sector_is_tied_to_it_by_a_leader_line():
+    svg = render_nova_svg(_three_broad_claims(), "light", id_prefix="x")
+    (line,) = _leaders(svg)  # "Not linked to a claim" is the only label that had to move
+    assert line.get("stroke") == "#7D8B9C" and line.get("opacity") == "0.6"
+    assert line.get("marker-start") is None and line.get("marker-end") is None
+    x1, y1, x2, y2 = (float(line.get(k)) for k in ("x1", "y1", "x2", "y2"))
+    # It starts on the rim, 6 px out (the sector's mid angle), and ends on the nearest box point.
+    assert math.hypot(x1 - nova_svg.CX, y1 - nova_svg.CY) == pytest.approx(nova_svg.R + 6, abs=0.1)
+    box = _label_boxes(_three_broad_claims())[3]
+    assert (x2, y2) == pytest.approx(
+        (min(max(x1, box[0]), box[2]), min(max(y1, box[1]), box[3])), abs=0.1
+    )
+    # Drawn under the labels, so their halo keeps the text readable.
+    assert svg.index('stroke-width="0.8"') < svg.index('font-size="21"')
+    # A leader carries its label's title colour: a claim's own, "Not linked to a claim" in grey.
+    crowded = render_nova_svg(_nine_claims(), "light", id_prefix="x")
+    titles = [e for e in ET.fromstring(crowded).iter(f"{SVG}text") if e.get("font-size") == "21"]
+    leaders = _leaders(crowded)
+    moved = [
+        title
+        for title, box, ref in zip(titles, _label_boxes(_nine_claims()), NINE_BACKEND)
+        if abs(box[1] - ref[0]) > 12
+    ]
+    assert [e.get("stroke") for e in leaders] == [t.get("fill") for t in moved]
+
+
+def test_a_label_is_pushed_off_the_wheel_by_the_overlap_plus_four():
+    half = math.sqrt(DISC**2 - 50**2)  # half the disc's height over the box's nearest column
+    below = (nova_svg.CX + 50, nova_svg.CY + 10, nova_svg.CX + 150, nova_svg.CY + 50)
+    above = (nova_svg.CX + 50, nova_svg.CY - 50, nova_svg.CX + 150, nova_svg.CY - 10)
+    pushed_below, pushed_above = nova_svg._resolve_label_overlaps([below, above])
+    assert pushed_below[1] == pytest.approx(nova_svg.CY + half + 4, abs=1e-9)
+    assert pushed_above[3] == pytest.approx(nova_svg.CY - half - 4, abs=1e-9)
+    assert pushed_below[3] - pushed_below[1] == 40 and pushed_above[3] - pushed_above[1] == 40
+    assert pushed_below[0::2] == below[0::2] and pushed_above[0::2] == above[0::2]  # vertical only
+
+
+def test_an_earlier_label_is_dealt_with_before_the_wheel():
+    """`first` ends 2 px inside the chord of the disc over `second`'s column: `second` hits both.
+    Past `first` + 4 px it is clear of the disc (top = chord end + 2), so a second push never
+    happens. Had the disc come first, `second` would stop at the chord end + 4."""
+    cx, cy = nova_svg.CX, nova_svg.CY
+    half = math.sqrt(DISC**2 - 300**2)
+    first = (cx + 340, cy + 100, cx + 460, cy + half - 2)
+    second = (cx + 300, cy + 120, cx + 420, cy + 160)
+    placed_first, placed_second = nova_svg._resolve_label_overlaps([first, second])
+    assert placed_first == first
+    assert placed_second[1] == pytest.approx(cy + half + 2, abs=1e-9)  # = first's bottom + 4
+    assert placed_second[3] == pytest.approx(cy + half + 42, abs=1e-9)
+    assert _apart(placed_first, placed_second) and _distance_to_centre(placed_second) >= DISC
+
+
+def test_a_label_that_touches_nothing_stays_put_the_tangent_to_the_wheel_included():
+    cx, cy = nova_svg.CX, nova_svg.CY
+    tangent = (cx - 60, cy - DISC - 42, cx + 60, cy - DISC)
+    far = (cx + DISC + 10, cy - 20, cx + DISC + 130, cy + 20)
+    assert nova_svg._resolve_label_overlaps([tangent, far]) == [tangent, far]
+
+
+def test_a_label_gives_up_after_forty_pushes():
+    """A stack of 45 boxes in the way: the label stays where its fortieth push left it (still
+    touching the 41st box) instead of looping."""
+    stack = [(0.0, 600.0 + 12 * i, 100.0, 610.0 + 12 * i) for i in range(45)]
+    label = (0.0, 600.0, 100.0, 640.0)
+    *_, placed = nova_svg._resolve_label_overlaps([*stack, label])
+    assert placed[1] == 614 + 12 * 39
+    assert not _apart(placed, stack[40])
+
+
+# The frontend's pinned placement of the nine-claim payload (frontend commit aa6adef,
+# novaLayout.test.ts): (sector mid angle, reference top, box x0, box x1, final top, leader line
+# (x1, y1, x2, y2) or None). Its boxes are 42 px tall: its notes never carry "· 0 against", so no
+# label breaks in two lines.
+FRONTEND_NINE = [
+    (-90.00, 179.00, 380.00, 620.00, 179.00, None),
+    (3.97, 565.50, 750.00, 990.00, 780.49, (835.19, 578.26, 835.19, 780.49)),
+    (81.22, 892.85, 434.05, 674.05, 892.85, None),
+    (121.51, 844.80, 74.99, 314.99, 844.80, None),
+    (133.04, 801.73, 18.39, 258.39, 801.73, None),
+    (144.24, 749.89, 10.00, 250.00, 890.80, (227.35, 751.37, 227.35, 890.80)),
+    (155.10, 692.05, 10.00, 250.00, 936.80, (195.23, 696.47, 195.23, 936.80)),
+    (165.63, 628.87, 10.00, 250.00, 982.80, (174.52, 638.40, 174.52, 982.80)),
+    (175.82, 566.79, 10.00, 250.00, 1028.80, (164.89, 579.48, 164.89, 1028.80)),
+    (198.83, 418.71, 10.00, 262.00, 274.67, (181.99, 446.52, 181.99, 316.67)),
+]
+
+
+def test_the_push_rule_gives_the_frontend_placement_from_the_same_boxes():
+    """Same rule on the frontend's own boxes: same final boxes, same leader lines (0.5 px)."""
+    boxes = [(x0, ref, x1, ref + 42) for _, ref, x0, x1, _, _ in FRONTEND_NINE]
+    placed = nova_svg._resolve_label_overlaps(boxes)
+    for (mid, ref, x0, x1, top, leader), box in zip(FRONTEND_NINE, placed):
+        assert box == pytest.approx((x0, top, x1, top + 42), abs=0.5)
+        assert (abs(box[1] - ref) > 12) == (leader is not None)
+        if leader:
+            assert nova_svg._leader_line(mid, box) == pytest.approx(leader, abs=0.5)
+
+
+# What the backend's own wheel comes to for that payload: (reference top, final box, leader line).
+# The sector order, the mid angles, the reference tops and the title widths agree with the
+# frontend's; the boxes do not, for one reason: the backend's note always reads "N sub-group(s) for
+# · 0 against". Where that spills over the wheel (Claims 2, 4 to 9) the label breaks it in two and
+# stands 58 px tall, not 42, and Claims 4 and 5 move their right edge to x 250 (the frontend keeps
+# 315 and 258). The pushes follow from the taller boxes; the rule itself is tested above.
+NINE_BACKEND = [
+    (179.00, (380.00, 179.00, 620.00, 221.00), None),
+    (565.50, (750.00, 780.49, 990.00, 838.49), (835.19, 578.26, 835.19, 780.49)),
+    (892.85, (434.05, 892.85, 674.05, 934.85), None),
+    (844.80, (10.00, 844.80, 250.00, 902.80), None),
+    (801.73, (10.00, 906.80, 250.00, 964.80), (270.67, 800.57, 250.00, 906.80)),
+    (749.89, (10.00, 780.49, 250.00, 838.49), (227.35, 751.37, 227.35, 780.49)),
+    (692.05, (10.00, 968.80, 250.00, 1026.80), (195.23, 696.47, 195.23, 968.80)),
+    (628.87, (10.00, 1030.80, 250.00, 1088.80), (174.52, 638.40, 174.52, 1030.80)),
+    (566.79, (10.00, 1092.80, 250.00, 1150.80), (164.89, 579.48, 164.89, 1092.80)),
+    (418.71, (10.00, 274.67, 262.00, 316.67), (181.99, 446.52, 181.99, 316.67)),
+]
+
+
+def test_the_nine_claim_wheel_is_pinned():
+    wheel = nova_svg._Nova(_nine_claims(), "light", "t", "", 0.05)
+    svg_lines = wheel.draw()
+    assert len(wheel.label_boxes) == len(wheel.label_leaders) == len(NINE_BACKEND) == 10
+    for (ref, box, leader), got, got_leader in zip(
+        NINE_BACKEND, wheel.label_boxes, wheel.label_leaders
+    ):
+        assert got == pytest.approx(box, abs=0.5)
+        assert (abs(got[1] - ref) > 12) == (leader is not None) == (got_leader is not None)
+        if leader:
+            assert got_leader == pytest.approx(leader, abs=0.5)
+    assert sum(1 for line in svg_lines if line.startswith("<line ")) == 7
+    # The text moved with its box: the title stands 20 px under its top.
+    texts = _label_texts("<svg xmlns='http://www.w3.org/2000/svg'>" + "".join(svg_lines) + "</svg>")
+    titles = [t for t in texts if t[0].startswith(("Claim", "Not linked"))]
+    for title, box in zip(titles, wheel.label_boxes):
+        assert title[2] == pytest.approx(box[1] + 20, abs=0.06)
