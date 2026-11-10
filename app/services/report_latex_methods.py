@@ -137,7 +137,8 @@ def _enrichment(metas: list[dict], params: Optional[dict]) -> dict[str, Any]:
 
     kind "annodb": GenoLens ran the over-representation analysis; "stored": rows deposited with
     the dataset (their test is not described); "mixed": both, for different comparisons; "none":
-    no enrichment dataset for the comparisons of the report.
+    no enrichment dataset for the comparisons of the report. `categories_known` tells whether what
+    was tested is known: the categories are listed, or the analysis is known and made no pick.
     """
     annodb = [m for m in metas if m.get("source") == "annodb"]
     kind = "none" if not metas else "annodb" if len(annodb) == len(metas) else (
@@ -162,6 +163,11 @@ def _enrichment(metas: list[dict], params: Optional[dict]) -> dict[str, Any]:
         # An older result did not record them: the categories the analysis asked for.
         picked = _strings(asked) if isinstance(asked, list) else None
         categories = picked or []
+    # "All the categories" is only a fact where the analysis is known and made no pick: the worker
+    # passes `--databases` for a non-empty pick alone, so without one R ran every category. With no
+    # params (imported results), or an explicit empty pick (which is not the absence of one), and
+    # no record, which categories were tested is not known.
+    categories_known = bool(categories) or (params is not None and asked != [])
     files = _distinct(m.get("annodb_file") for m in annodb if isinstance(m.get("annodb_file"), str))
     backgrounds = _distinct(
         m.get("background") for m in annodb if isinstance(m.get("background"), str)
@@ -170,6 +176,7 @@ def _enrichment(metas: list[dict], params: Optional[dict]) -> dict[str, Any]:
         "kind": kind,
         "fdr": fdr,
         "categories": categories or None,
+        "categories_known": categories_known,
         "annodb_file": ", ".join(files) or None,
         "background": backgrounds[0] if len(backgrounds) == 1 else None,
         # An explicit empty pick ("0 databases selected") runs no enrichment at all.

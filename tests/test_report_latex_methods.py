@@ -272,6 +272,48 @@ def test_no_robust_and_no_fixed_database_list():
         assert name not in picked
 
 
+def test_unrecorded_categories_are_said_unrecorded():
+    """Imported results carry no analysis params: that R ran every category is not known."""
+    ctx = rm.methods_context(None, {}, {}, [_drop(ENR_META, "categories")])
+    assert ctx["enrichment"]["categories_known"] is False
+    text = _text(ctx)
+    assert "were not recorded" in text
+    assert "all categories" not in text
+
+
+def test_no_pick_means_all_categories():
+    """The worker passes `--databases` only for a non-empty pick: with the params of the analysis
+    and no pick, R ran all the categories, even when the result did not record them."""
+    ctx = rm.methods_context({}, {}, {}, [_drop(ENR_META, "categories")])
+    assert ctx["enrichment"]["categories_known"] is True
+    text = _text(ctx)
+    assert "all categories" in text
+    assert "were not recorded" not in text
+
+
+def test_an_explicit_empty_pick_is_not_said_to_be_all_categories():
+    """An explicit empty pick is not the absence of a pick: with no categories recorded, what was
+    tested is not known, so the text does not say "all categories"."""
+    ctx = rm.methods_context(
+        {"enrichment_databases": []}, {}, {}, [_drop(ENR_META, "categories")]
+    )
+    assert ctx["enrichment"]["categories_known"] is False
+    text = _text(ctx)
+    assert "were not recorded" in text
+    assert "all categories" not in text
+    # A recorded list still wins over the pick.
+    assert _ctx(params_enrichment_databases=[])["enrichment"]["categories_known"] is True
+
+
+def test_recorded_categories_are_listed_whatever_the_params():
+    for params in (None, {}, PARAMS):
+        ctx = rm.methods_context(params, {}, {}, [ENR_META])
+        assert ctx["enrichment"]["categories_known"] is True
+        text = _text(ctx)
+        assert r"The categories tested were GO\_BP, kegg\_pathway." in text
+        assert "all categories" not in text and "were not recorded" not in text
+
+
 def test_enrichment_is_described_as_it_was_run():
     text = _text(_ctx())
     assert "hypergeometric" in text and "Benjamini" in text
@@ -726,7 +768,7 @@ def test_compile_fails_on_a_nonzero_return_code_even_when_a_pdf_is_there(tmp_pat
     (tmp_path / "report.pdf").write_bytes(b"%PDF-stale")
     failed = MagicMock(returncode=1, stdout="! Undefined control sequence.", stderr="")
     with patch.object(rl.subprocess, "run", return_value=failed):
-        with pytest.raises(RuntimeError, match="pdflatex failed"):
+        with pytest.raises(rl.LatexCompileError, match="could not be compiled"):
             svc.compile_pdf(MINIMAL % "text", str(tmp_path))
 
 

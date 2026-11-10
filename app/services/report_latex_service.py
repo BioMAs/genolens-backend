@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -60,7 +61,10 @@ GO_CATEGORIES = ["GO:BP", "GO:MF", "GO:CC"]
 # LaTeX-escaping + formatting helpers (ported from fill_latex_template.py)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def tex_escape(text) -> str:
+def tex_escape(text, field: str = "") -> str:
+    """`text` as LaTeX text: the LaTeX specials escaped, then every non-ASCII character mapped to
+    a command or, when pdflatex cannot print it, to "?" (`latex_safe_unicode`). `field` only
+    names where the text comes from in the warning that records a replacement."""
     if text is None:
         return ""
     text = str(text)
@@ -70,7 +74,7 @@ def tex_escape(text) -> str:
         '\\': r'\textbackslash{}', '<': r'\textless{}', '>': r'\textgreater{}',
     }
     regex = re.compile('|'.join(re.escape(k) for k in sorted(conv, key=lambda i: -len(i))))
-    return regex.sub(lambda m: conv[m.group()], text)
+    return latex_safe_unicode(regex.sub(lambda m: conv[m.group()], text), field)
 
 
 def tex_escape_address(text) -> str:
@@ -79,22 +83,141 @@ def tex_escape_address(text) -> str:
     return r'\\'.join(tex_escape(line) for line in str(text).split('\\\\'))
 
 
-# Common Unicode punctuation that pdflatex can choke on, mapped to LaTeX-safe ASCII.
-_UNICODE_PUNCT = {
-    "’": "'", "‘": "'", "“": "``", "”": "''",
-    "–": "--", "—": "---", "…": r"\ldots{}",
-    " ": " ", " ": " ", "°": r"\textdegree{}",
-    "×": r"\texttimes{}", "−": "-",
+def _math(command: str) -> str:
+    """A mathematical symbol, which prints in the text and in a formula alike."""
+    return rf"\ensuremath{{{command}}}"
+
+
+# Greek letters. The capitals that look like a Latin letter have no command of their own in
+# LaTeX: they print as that letter, upright.
+_GREEK_LOWER = {
+    "α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta", "ε": "varepsilon", "ζ": "zeta",
+    "η": "eta", "θ": "theta", "ι": "iota", "κ": "kappa", "λ": "lambda", "μ": "mu", "ν": "nu",
+    "ξ": "xi", "π": "pi", "ρ": "rho", "ς": "varsigma", "σ": "sigma", "τ": "tau",
+    "υ": "upsilon", "φ": "varphi", "χ": "chi", "ψ": "psi", "ω": "omega",
+    # The other forms of phi, epsilon and theta are characters of their own: φ (U+03C6) is the
+    # loopy phi that \varphi draws, ϕ (U+03D5) the straight one of \phi.
+    "ϕ": "phi", "ϵ": "epsilon", "ϑ": "vartheta",
+}
+_GREEK_UPPER = {
+    "Γ": "Gamma", "Δ": "Delta", "Θ": "Theta", "Λ": "Lambda", "Ξ": "Xi", "Π": "Pi",
+    "Σ": "Sigma", "Υ": "Upsilon", "Φ": "Phi", "Ψ": "Psi", "Ω": "Omega",
+}
+_GREEK_LATIN_LOOKALIKE = {
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M",
+    "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Χ": "X",
 }
 
+# Every non-ASCII character that is written as a command. The values are pure ASCII and are not
+# escaped again: they are applied after the LaTeX specials are.
+UNICODE_TO_LATEX: dict[str, str] = {
+    # Quotes, dashes, spaces. Quotes and dashes are commands, not the ASCII that TeX reads as
+    # ligatures ("''" is a closing double quote, "--" an en dash): next to one another the ASCII
+    # forms print other characters, in another order, and a left single quote would print as
+    # a right one.
+    "’": r"\textquoteright{}", "‘": r"\textquoteleft{}",
+    "“": r"\textquotedblleft{}", "”": r"\textquotedblright{}",
+    "–": r"\textendash{}", "—": r"\textemdash{}", "−": _math("-"), "…": r"\ldots{}",
+    "‒": r"\textendash{}", "―": r"\textemdash{}",
+    "„": r"\quotedblbase{}", "‚": r"\quotesinglbase{}",
+    "‹": r"\guilsinglleft{}", "›": r"\guilsinglright{}",
+    "\u00a0": " ", "\u202f": " ", "\u2009": " ", "\u2010": "{-}", "\u2011": "{-}",
+    # Invisible format characters (zero-width space and joiners, direction marks, word joiner,
+    # byte order mark): nothing to print, and no reason to put a "?" in the text.
+    **{chr(c): "" for c in (0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2060, 0xFEFF)},
+    # Ligatures that a PDF copied into a text leaves behind.
+    "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl",
+    # Units and signs.
+    "°": r"\textdegree{}", "×": r"\texttimes{}", "‰": r"\textperthousand{}",
+    "™": r"\texttrademark{}", "€": r"\texteuro{}", "†": r"\textdagger{}", "‡": r"\textdaggerdbl{}",
+    "²": r"\textsuperscript{2}", "³": r"\textsuperscript{3}", "½": r"\textonehalf{}",
+    "⁺": r"\textsuperscript{+}", "⁻": r"\textsuperscript{\ensuremath{-}}",
+    **{
+        chr(c): rf"\textsuperscript{{{digit}}}"
+        for c, digit in zip((0x2070, *range(0x2074, 0x207A)), "0456789")
+    },
+    **{chr(0x2080 + n): rf"\textsubscript{{{n}}}" for n in range(10)},
+    # Mathematics.
+    "≤": _math(r"\leq"), "≥": _math(r"\geq"), "±": _math(r"\pm"), "≈": _math(r"\approx"),
+    "≠": _math(r"\neq"), "∼": _math(r"\sim"), "∞": _math(r"\infty"), "∆": _math(r"\Delta"),
+    "→": _math(r"\rightarrow"), "←": _math(r"\leftarrow"), "↑": _math(r"\uparrow"),
+    "↓": _math(r"\downarrow"), "↔": _math(r"\leftrightarrow"),
+    "µ": _math(r"\mu"), "·": _math(r"\cdot"), "•": _math(r"\bullet"),
+    "′": _math("'"), "″": _math("''"), "ħ": _math(r"\hbar"),
+    **{ch: _math("\\" + name) for ch, name in {**_GREEK_LOWER, **_GREEK_UPPER}.items()},
+    "ο": _math("o"),
+    # Romanian letters with a comma below, which the fonts have as an accent only.
+    **{ch: rf"\textcommabelow{{{latin}}}" for ch, latin in zip("ȘșȚț", "SsTt")},
+    **{ch: _math(rf"\mathrm{{{latin}}}") for ch, latin in _GREEK_LATIN_LOOKALIKE.items()},
+}
 
-def plaintext_to_latex(text) -> str:
+# Characters of U+00A0 to U+017F that the fonts of the report (T1 encoding) do not have: pdflatex
+# stops on them whatever the input encoding. The one with a command (ħ) is in the table above.
+_NOT_IN_THE_FONT = frozenset("ĦħĸĿŀŉŦŧſ")
+
+
+def _printable(ch: str) -> bool:
+    """True when pdflatex prints `ch` as it is, and so when `latex_safe_unicode` leaves it alone
+    (a character of `UNICODE_TO_LATEX` is replaced first, whatever this says): the printable
+    ASCII, the tab and the line ends, and the Latin letters, signs and accents of U+00A0 to
+    U+017F that the fonts have. A control character, DEL included, stops pdflatex too."""
+    code = ord(ch)
+    if code < 0x80:
+        return 0x20 <= code < 0x7F or ch in "\t\n\r"
+    return 0xA0 <= code <= 0x17F and ch not in _NOT_IN_THE_FONT
+
+
+# TeX forms ligatures between a character and the next one, a character that a command prints
+# included. In the report fonts "?`" and "!`" are the inverted marks, "``" an opening double
+# quote and "''" a closing one. So a "?" (a replacement one included) or a "!" right before a
+# typed backtick or a left single quote would print "¿" or "¡" and eat the quote, and a typed
+# "`" before a left single quote or a typed "'" before a right one would print a double quote.
+# An empty group between the two keeps them apart. The typed ASCII quotes among themselves
+# keep their TeX meaning.
+_LIGATURE_BREAK = re.compile(
+    r"([?!])(?=`|\\textquoteleft\{\})|(?<=`)(?=\\textquoteleft\{\})|(?<=')(?=\\textquoteright\{\})"
+)
+
+
+def _break_ligatures(text: str) -> str:
+    return _LIGATURE_BREAK.sub(lambda m: (m.group(1) or "") + "{}", text)
+
+
+def latex_safe_unicode(text: str, field: str = "") -> str:
+    """`text` (the LaTeX specials already escaped) with each character pdflatex would stop on
+    made safe: a character of `UNICODE_TO_LATEX` becomes its command, any other that is not
+    `_printable` becomes "?" and the report is produced. The text is composed (NFC) first, so an
+    accent typed as a letter and a combining mark is one printable letter. The replacements are
+    one warning that names the code points and `field`, never the text."""
+    out = []
+    replaced: dict[str, int] = {}
+    for ch in unicodedata.normalize("NFC", text):
+        command = UNICODE_TO_LATEX.get(ch)
+        if command is not None:
+            out.append(command)
+        elif _printable(ch):
+            out.append(ch)
+        else:
+            out.append("?")
+            replaced[ch] = replaced.get(ch, 0) + 1
+    if replaced:
+        logger.warning(
+            "Report text %s: %d character(s) pdflatex cannot print replaced by '?' (%s)",
+            repr(field) if field else "(field not named)",
+            sum(replaced.values()),
+            ", ".join(f"U+{ord(ch):04X}" for ch in replaced),
+        )
+    return _break_ligatures("".join(out))
+
+
+def plaintext_to_latex(text, field: str = "") -> str:
     """Convert user-entered prose into LaTeX-safe markup.
 
     User-provided conclusion / Material & Methods are plain text, not LaTeX, so
     every special character must be escaped (e.g. a literal '#' or '&' otherwise
     aborts pdflatex). Blank lines become paragraph breaks; single newlines are
-    treated as soft wraps (joined with spaces).
+    treated as soft wraps (joined with spaces). `field` names the text in the warning
+    about a character that could not be printed (`tex_escape`).
     """
     if not text:
         return ""
@@ -104,12 +227,7 @@ def plaintext_to_latex(text) -> str:
         line = " ".join(seg.strip() for seg in para.splitlines() if seg.strip())
         if not line:
             continue
-        # Escape LaTeX specials first, then map Unicode punctuation to LaTeX
-        # commands (tex_escape leaves these Unicode chars untouched).
-        escaped = tex_escape(line)
-        for uni, repl in _UNICODE_PUNCT.items():
-            escaped = escaped.replace(uni, repl)
-        out.append(escaped)
+        out.append(tex_escape(line, field))
     return "\n\n".join(out)
 
 
@@ -123,7 +241,7 @@ def sanitize_condition_name(condition) -> str:
 
 
 def format_condition_display(condition, label) -> str:
-    return f"{tex_escape(sanitize_condition_name(condition))} ({label})"
+    return f"{tex_escape(sanitize_condition_name(condition), field='condition name')} ({label})"
 
 
 def format_number(number, decimals=2) -> str:
@@ -296,7 +414,8 @@ def generate_qc_table(qc_rows: list[dict], title: str) -> str:
         return r"\textit{QC data not available}"
     lines = [
         r"\begin{longtable}{L{4cm}S[table-format=4.2]S[table-format=6]L{4cm}}",
-        f"\\caption{{Quality Control Statistics --- {tex_escape(title)}}} \\\\",
+        f"\\caption{{Quality Control Statistics --- {tex_escape(title, field='project_name')}}} "
+        r"\\",
         r"\toprule",
         r"\rowcolor{white}\multicolumn{1}{L{4cm}}{Sample} &",
         r"  \multicolumn{1}{L{3cm}}{Library size} &",
@@ -312,9 +431,11 @@ def generate_qc_table(qc_rows: list[dict], title: str) -> str:
         r"\hline\endfoot\hline\endlastfoot",
     ]
     for r in qc_rows:
+        sample = tex_escape(str(r["sample"]), field="sample name")
+        condition = tex_escape(r.get("condition", "Unknown"), field="condition name")
         lines.append(
-            f"{tex_escape(str(r['sample']))} & {format_millions(r['library_size'])} "
-            f"& {r['detected_genes']} & {tex_escape(r.get('condition', 'Unknown'))} \\\\"
+            f"{sample} & {format_millions(r['library_size'])} "
+            f"& {r['detected_genes']} & {condition} \\\\"
         )
     lines.append(r"\end{longtable}")
     return "\n".join(lines)
@@ -339,7 +460,7 @@ def generate_deg_table(degs: list[dict], max_rows: int = 15) -> str:
         r"\hline\endfoot\hline\endlastfoot",
     ]
     for d in rows:
-        gene = tex_escape(d.get("gene_name") or d.get("gene_id") or "")
+        gene = tex_escape(d.get("gene_name") or d.get("gene_id") or "", field="gene name")
         lines.append(
             f"{gene} & {format_number(d.get('log_fc'))} & {_fmt_p(d.get('pvalue'))} "
             f"& {_fmt_p(d.get('padj'))} & {tex_escape(d.get('regulation') or '')} \\\\"
@@ -369,8 +490,9 @@ def generate_enrichment_table(pathways: list[dict], label: str, max_terms: int =
             name = name[:77] + "..."
         cat = t.get("category") or ""
         display = f"{name} [{cat}]" if cat else name
+        term = tex_escape(display, field="enrichment term")
         lines.append(
-            f"{{\\small {tex_escape(display)}}} & {_fmt_p(t.get('pvalue'))} & {_fmt_p(t.get('padj'))} \\\\"
+            f"{{\\small {term}}} & {_fmt_p(t.get('pvalue'))} & {_fmt_p(t.get('padj'))} \\\\"
         )
     lines.append(r"\end{longtable}")
     return "\n".join(lines)
@@ -383,13 +505,13 @@ def generate_enrichment_table(pathways: list[dict], label: str, max_terms: int =
 def _ai_box(text: str, model: Optional[str] = None, generated_at: Optional[datetime] = None) -> str:
     """The AI comparison text in its box, titled with the label every AI text carries: its model
     and the date it was generated."""
-    label = tex_escape(ai_label(model or "", generated_at))
+    label = tex_escape(ai_label(model or "", generated_at), field="ai_label")
     return (
         r"\subsubsection{Biological Summary (AI)}" "\n"
         r"\begin{tcolorbox}[enhanced,breakable,colback=sciliciumgreen!5,"
         r"colframe=sciliciumgreen,boxrule=0.8pt,arc=1mm,"
         rf"title={{\textbf{{{label}}}}},fonttitle=\bfseries,coltitle=white]" "\n"
-        f"{tex_escape(text)}" "\n"
+        f"{tex_escape(text, field='ai_text')}" "\n"
         r"\end{tcolorbox}" "\n"
     )
 
@@ -523,6 +645,43 @@ def undefined_references(log: str) -> list[str]:
     if not names and "There were undefined references" in log:
         return ["?"]
     return names
+
+
+class LatexCompileError(RuntimeError):
+    """pdflatex could not compile the report.
+
+    The worker stores `str(exc)` as the error of the job and the API returns it, so the message
+    is short and carries nothing of the pdflatex log (server paths, the text of the report). The
+    end of the log goes to the worker log (`logger.error`).
+    """
+
+    def __init__(self, pass_no: int):
+        super().__init__(
+            f"The LaTeX report could not be compiled (pdflatex pass {pass_no}); "
+            "the details are in the worker log."
+        )
+        self.pass_no = pass_no
+
+    def __reduce__(self):
+        # `Exception.args` holds the message: rebuild from the pass number instead.
+        return (type(self), (self.pass_no,))
+
+
+class LatexTimeoutError(LatexCompileError):
+    """A pdflatex pass ran past its time limit. The message names the step and nothing else: the
+    command and the paths (`subprocess.TimeoutExpired` prints them) stay in the worker log."""
+
+    def __init__(self, step: str):
+        RuntimeError.__init__(
+            self,
+            f"The LaTeX report took too long to compile ({step}); "
+            "the details are in the worker log.",
+        )
+        self.step = step
+        self.pass_no = None  # a `LatexCompileError` has one; a timeout is named by its step
+
+    def __reduce__(self):
+        return (type(self), (self.step,))
 
 
 class ReportLatexService:
@@ -945,6 +1104,8 @@ class ReportLatexService:
         params = data["params"]
         species = str(params.get("species", "human"))
         proj_name = getattr(project, "name", "") or getattr(analysis, "name", "")
+        # Escaped once: the name is printed in the title, the results and the cover.
+        proj_title = tex_escape(proj_name, field="project_name")
 
         # Subtitle + report number: comparison-scoped when a comparison is set,
         # otherwise the legacy analysis-scoped values.
@@ -961,21 +1122,23 @@ class ReportLatexService:
         branding = data.get("branding") or {}
         default_address = r"35 bd du portugal\\35\,200 Rennes, France"
         institute_name = (
-            tex_escape(branding["institute_name"]) if branding.get("institute_name")
+            tex_escape(branding["institute_name"], field="branding.institute_name")
+            if branding.get("institute_name")
             else tex_escape("SciLicium")
         )
         institute_address = (
-            tex_escape(branding["institute_address"]) if branding.get("institute_address")
+            tex_escape(branding["institute_address"], field="branding.institute_address")
+            if branding.get("institute_address")
             else default_address
         )
         # User-provided M&M / conclusion are plain prose → LaTeX-escape them.
         # (Empty → fall back to the default LaTeX M&M template / no conclusion.)
         mm_raw = data.get("materials_methods")
-        mm = plaintext_to_latex(mm_raw) if mm_raw else None
-        conclusion = plaintext_to_latex(data.get("conclusion"))
+        mm = plaintext_to_latex(mm_raw, field="materials_methods") if mm_raw else None
+        conclusion = plaintext_to_latex(data.get("conclusion"), field="conclusion")
 
         # Results section: title + QC + PCA + per-comparison
-        results = [f"\\section{{Results: {tex_escape(proj_name)}}}"]
+        results = [f"\\section{{Results: {proj_title}}}"]
         results.append(r"\subsection{Quality Control}")
         results.append(EXPLANATORY["qc"])
         results.append(generate_qc_table(data["qc_rows"], proj_name))
@@ -994,13 +1157,13 @@ class ReportLatexService:
 
         def _cv(key: str, default: str = "") -> str:
             val = cover.get(key)
-            return tex_escape(val) if val else default
+            return tex_escape(val, field=f"cover.{key}") if val else default
 
         first_page_type = data.get("first_page_type") or "detailed"
         last_page_type = data.get("last_page_type") or "color"
 
         template_vars = {
-            "jj_file_title": tex_escape(f"GenoLens Report - {proj_name}"),
+            "jj_file_title": f"GenoLens Report - {proj_title}",
             "jj_report_title": tex_escape("Transcriptomics Analysis Report"),
             "jj_report_subtitle": tex_escape(report_subtitle),
             "jj_report_version": "1.0",
@@ -1024,7 +1187,7 @@ class ReportLatexService:
             "jj_test_site_contact": _cv("test_site_contact"),
             "jj_test_site_email": _cv("test_site_email"),
             "jj_test_site_address": _cv("test_site_address"),
-            "jj_report_project": _cv("project_name", tex_escape(proj_name)),
+            "jj_report_project": _cv("project_name") or proj_title,
             "jj_report_prepared_by": _cv("prepared_by"),
             "jj_report_checked_by": _cv("checked_by"),
             "jj_report_approved_by": _cv("approved_by"),
@@ -1063,24 +1226,41 @@ class ReportLatexService:
         shutil.copy(TEMPLATE_DIR / MM_TEMPLATE, Path(work_dir) / MM_TEMPLATE)
 
         tex_path = Path(work_dir) / "report.tex"
-        tex_path.write_text(tex_str)
+        tex_path.write_text(tex_str, encoding="utf-8")
         env = {**os.environ, "TEXINPUTS": f"{work_dir}//:"}
         log_path = Path(work_dir) / "report.log"
 
-        def _tail(proc) -> str:
-            return log_path.read_text(errors="replace")[-2000:] if log_path.exists() else proc.stdout[-2000:]
+        def _tail(stdout: str = "") -> str:
+            return log_path.read_text(errors="replace")[-2000:] if log_path.exists() else stdout[-2000:]
 
         for pass_no in (1, 2):
-            proc = subprocess.run(
-                ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "report.tex"],
-                cwd=work_dir, env=env, capture_output=True, text=True, timeout=600,
-            )
+            # pdflatex prints the text it sets in 8-bit font encoding (an accent in an overfull
+            # box warning): decoding strictly would fail a report that compiled.
+            try:
+                proc = subprocess.run(
+                    ["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "report.tex"],
+                    cwd=work_dir, env=env, capture_output=True, text=True, timeout=600,
+                    encoding="utf-8", errors="replace",
+                )
+            except subprocess.TimeoutExpired as exc:
+                logger.error(
+                    "pdflatex timed out after %s s (pass %d); end of the log:\n%s",
+                    exc.timeout, pass_no, _tail(),
+                )
+                raise LatexTimeoutError(f"pdflatex pass {pass_no}") from exc
             # A failed pass is a failed report, even when an earlier pass left a PDF behind.
             if proc.returncode != 0:
-                raise RuntimeError(f"pdflatex failed (pass {pass_no}, exit {proc.returncode}):\n{_tail(proc)}")
+                logger.error(
+                    "pdflatex failed (pass %d, exit %d); end of the log:\n%s",
+                    pass_no, proc.returncode, _tail(proc.stdout),
+                )
+                raise LatexCompileError(pass_no)
         pdf_path = Path(work_dir) / "report.pdf"
         if not pdf_path.exists():
-            raise RuntimeError(f"pdflatex failed:\n{_tail(proc)}")
+            logger.error(
+                "pdflatex left no PDF (pass %d); end of the log:\n%s", pass_no, _tail(proc.stdout)
+            )
+            raise LatexCompileError(pass_no)
         # After the second pass every reference resolves; one that does not prints as "??".
         undefined = undefined_references(log_path.read_text(errors="replace") if log_path.exists() else "")
         if undefined:
@@ -1091,12 +1271,29 @@ class ReportLatexService:
         out = Path(work_dir) / "report_embedded.pdf"
         gs = shutil.which("gs")
         if gs:
-            r = subprocess.run([gs, "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite",
-                                "-dEmbedAllFonts=true", "-dSubsetFonts=false",
-                                f"-sOutputFile={out}", str(pdf_path)],
-                               capture_output=True, text=True, timeout=300)
-            if out.exists():
+            try:
+                result = subprocess.run([gs, "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite",
+                                         "-dEmbedAllFonts=true", "-dSubsetFonts=false",
+                                         f"-sOutputFile={out}", str(pdf_path)],
+                                        capture_output=True, text=True, timeout=300)
+            except subprocess.TimeoutExpired as exc:
+                # Best-effort: the report is complete without the normalised fonts. What
+                # Ghostscript had written when it was stopped is not, and is not returned.
+                out.unlink(missing_ok=True)
+                logger.warning(
+                    "Ghostscript timed out after %s s embedding the fonts of the report; "
+                    "the PDF is kept as pdflatex wrote it", exc.timeout
+                )
+                return pdf_path.read_bytes()
+            if result.returncode == 0 and out.exists() and out.stat().st_size > 0:
                 return out.read_bytes()
+            # A Ghostscript that failed or was killed can leave a truncated file: never return it.
+            if out.exists():
+                out.unlink(missing_ok=True)
+                logger.warning(
+                    "Ghostscript exited with code %s embedding the fonts of the report; "
+                    "the PDF is kept as pdflatex wrote it", result.returncode
+                )
         return pdf_path.read_bytes()
 
     async def render_pdf(self, db: AsyncSession, analysis_id: UUID, generate_ai: bool = False,

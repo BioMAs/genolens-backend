@@ -405,6 +405,21 @@ def test_cover_and_nova_page_describe_the_content():
     assert "Version 1.0" not in text and "GenoLens 1.0.0" in text
 
 
+def test_the_wheel_height_is_capped_so_a_grown_frame_cannot_push_the_page():
+    """The frame of the wheel grows with its labels. A width-only rule would make the picture
+    taller and push what follows it off the fixed A4 page (the inline AI reading first): the
+    displayed height is capped at the reference one, 85 % of the width (190 mm on the nova page,
+    205 mm on the cover), and a crowded wheel scales down inside the box instead."""
+    pages = {p["kind"]: p for p in _context()["pages"]}
+    for kind, key, cap in (("nova", "svg", "161.5mm"), ("cover", "nova", "174.25mm")):
+        root = str(pages[kind][key]).split(">", 1)[0]
+        assert f"width:100%;height:auto;max-height:{cap}" in root, kind
+        # Fitted by "meet" (the default when the attribute is absent), centred in the box.
+        assert "preserveAspectRatio" not in root or "meet" in root, kind
+    assert 190 * 0.85 == 161.5 and 205 * 0.85 == 174.25  # the reference ratio of the frame
+    assert render_html(_context()).count("max-height:161.5mm") == 1
+
+
 def test_scope_does_not_promise_a_dossier():
     scope = next(p["scope"] for p in _context()["pages"] if p["kind"] == "method")
     assert "does not by itself establish a clinical effect" in scope
@@ -1213,6 +1228,26 @@ async def test_pdf_is_produced(tmp_path, context, html):
     assert overflow == [], f"content clipped on pages {overflow}"
 
 
+@pytest.mark.skipif(not chromium_available(), reason="Playwright Chromium is not installed")
+async def test_a_crowded_wheel_keeps_the_inline_ai_reading_on_the_nova_page(tmp_path):
+    """Nine claims make the frame of the wheel grow; the page must still hold the wheel, its
+    legend, the inline AI reading and the footer without clipping anything."""
+    from tests.test_cosmomics_nova_svg import _nine_claims
+
+    nine = _nine_claims()
+    inp = _inputs(
+        nova_light=render_nova_svg(nine, "light", id_prefix="nova-light", center_label="AL-7"),
+        nova_dark=render_nova_svg(nine, "dark", id_prefix="nova-dark", center_label="AL-7"),
+    )
+    ctx = build_editorial_context(inp)
+    nova_page = next(p for p in ctx["pages"] if p["kind"] == "nova")
+    assert nova_page["ai_html"], "the fixture's AI reading is short enough to stand on the page"
+    frame = re.search(r'viewBox="([^"]+)"', inp.nova_light).group(1).split()
+    assert float(frame[3]) > 850, "the frame did grow: this is the crowded case"
+    _pdf, overflow = await html_to_pdf(render_html(ctx), str(tmp_path))
+    assert overflow == [], f"content clipped on pages {overflow}"
+
+
 # ── Worker lifecycle ────────────────────────────────────────────────────────
 
 
@@ -1334,6 +1369,64 @@ def test_methods_of_a_comparison_with_no_enrichment_say_only_that_none_is_stored
     for where, text in {**texts, "page": page}.items():
         for phrase in RUN_CLAIMS:
             assert phrase not in text.lower(), (where, phrase)
+
+
+def test_no_enrichment_method_page_states_only_what_is_stored():
+    """With no enrichment result there is nothing to join, score or combine: the method paragraph
+    says what is, and the parameters table lists neither the threshold nor the score formula."""
+    ctx = _context(_no_enrichment(enrichment_source="none"), enr_up=[], enr_down=[])
+    method = next(p for p in ctx["pages"] if p["kind"] == "method")
+    text = _text(method["method_nova"])
+    assert "No enrichment result is stored" in text
+    assert "no claim is evaluated" in text
+    for phrase in ("joined", "Stouffer", "α ="):
+        assert phrase not in text, phrase
+    # The referential's sentence stays: versioned, and its table is not disclosed.
+    assert "The referential is versioned" in text and "is not disclosed" in text
+    names = [k for k, _v in method["versions"]]
+    assert "Significance threshold" not in names and "OmicSkin score" not in names
+    assert not any("α" in f"{k} {v}" for k, v in method["versions"])
+    # The other rows are still there.
+    assert {"Claim referential", "Enrichment", "Data source version"} <= set(names)
+
+
+def _method_page_html(nova, **overrides) -> str:
+    """The method page of the editorial HTML (from its opening tag to the next page or the end)."""
+    html = render_html(_context(nova, **overrides))
+    return html.split('data-kind="method"', 1)[1].split('<div class="page"', 1)[0]
+
+
+def test_no_enrichment_method_page_has_no_score_section():
+    """Nothing was scored: the page has no "OmicSkin score" section and no alpha anywhere."""
+    page = _method_page_html(_no_enrichment(enrichment_source="none"), enr_up=[], enr_down=[])
+    assert "CosmOmics Pathway Nova" in page and "No enrichment result is stored" in page
+    assert "OmicSkin score" not in page
+    # The heading does not promise a score either.
+    assert "<h2>How the nova is built, and every version behind it</h2>" in page
+    assert "How the score is built" not in page
+    assert "α =" not in page
+    # Nor is the dose sentence of the score kept on a page that scores nothing.
+    assert "checked for monotony" not in page
+    # A nova with a result keeps the section, its formula and its alpha.
+    page = _method_page_html(_honest_nova())
+    assert "<h2>How the score is built, and every version behind it</h2>" in page
+    assert "<h3>OmicSkin score</h3>" in page
+    assert "OmicSkin = 100 × coherence" in page and "α = " in page
+
+
+def test_the_other_kinds_keep_their_method_paragraph_and_score_rows():
+    for provenance in (
+        {},
+        dict(enrichment_source="uploaded", padj_columns=["qvalue"], enrichment_fdr=None),
+        dict(enrichment_source="legacy", analysis_id=None, enrichment_dataset_ids=[]),
+        dict(enrichment_source="mystery"),
+    ):
+        method = next(p for p in _context(_honest_nova(**provenance))["pages"] if p["kind"] == "method")
+        assert method["method_score"] is not None
+        text = _text(method["method_nova"])
+        assert "are joined to the SciLicium claim referential" in text and "Stouffer" in text
+        names = [k for k, _v in method["versions"]]
+        assert "Significance threshold" in names and "OmicSkin score" in names
 
 
 def test_methods_of_a_deleted_analysis_do_not_print_all_categories():

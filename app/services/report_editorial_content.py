@@ -62,6 +62,13 @@ NOVA_READING_PAGE_CHARS = 6500
 COMPARISON_AI_CHARS = 3200
 COMPARISON_AI_WIDE_CHARS = 6000
 
+# The frame of the nova wheel grows with its labels (cosmomics_nova_svg). Shown at a width alone it
+# would grow taller and push what follows it off the fixed A4 page, the inline AI reading first.
+# The height is capped at the reference one (85 % of the width: 190 mm on the nova page, 205 mm on
+# the cover); a crowded wheel is fitted by "meet" and centred in the box, so it scales down instead.
+WHEEL_STYLE_PAGE = "width:100%;height:auto;max-height:161.5mm"
+WHEEL_STYLE_COVER = "width:100%;height:auto;max-height:174.25mm"
+
 TERMS_PER_CLAIM_PAGE = 10
 RESERVATIONS_PER_PAGE = 2
 
@@ -836,18 +843,21 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
             ),
         )
     )
-    rows.append(
-        (
-            "Significance threshold",
-            f"α = {alpha:g} (a term is significant when its adjusted p is below α)",
+    if facts.kind != "none":
+        # With no enrichment result no term is tested against α and no claim is scored.
+        rows.append(
+            (
+                "Significance threshold",
+                f"α = {alpha:g} (a term is significant when its adjusted p is below α)",
+            )
         )
-    )
-    rows.append(
-        (
-            "OmicSkin score",
-            "100 × coherence × min(1, −log10 p of the most significant supporting sub-group / 8)",
+        rows.append(
+            (
+                "OmicSkin score",
+                "100 × coherence × min(1, −log10 p of the most significant supporting "
+                "sub-group / 8)",
+            )
         )
-    )
     models = [m for m in (inp.comparison_ai_model, inp.nova_ai_model) if m]
     if models and inp.use_ai:
         rows.append(("Interpretation model", ", ".join(dict.fromkeys(models))))
@@ -866,6 +876,13 @@ def _versions(inp: EditorialInputs, version: Optional[str]) -> list[tuple[str, s
 def method_nova(inp: EditorialInputs) -> Markup:
     """How the nova is built, in terms of what this report's data are (HTML)."""
     facts = enrichment_facts(inp.nova)
+    if facts.kind == "none":
+        # Nothing was joined, scored or combined: the paragraph says what is, and no more.
+        return Markup(
+            "No enrichment result is stored for this comparison, so no term is linked to the "
+            "SciLicium claim referential and no claim is evaluated. The referential is "
+            "versioned; its claim-to-pathway table is SciLicium know-how and is not disclosed."
+        )
     alpha = nova_alpha(inp.nova)
     if facts.kind == "genolens":
         p_values = (
@@ -1047,7 +1064,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
                 {"score": s.score, "name": s.name, "color": on_navy(claim_color(s.name)[0])}
                 for s in scored[:6]
             ],
-            "nova": clean_inline_svg(inp.nova_dark, "cover-nova", "width:100%;height:auto"),
+            "nova": clean_inline_svg(inp.nova_dark, "cover-nova", WHEEL_STYLE_COVER),
             "footer_left": " · ".join(
                 x
                 for x in (
@@ -1168,7 +1185,7 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
     pages.append(
         {
             "kind": "nova",
-            "svg": clean_inline_svg(inp.nova_light, "page-nova", "width:100%;height:auto"),
+            "svg": clean_inline_svg(inp.nova_light, "page-nova", WHEEL_STYLE_PAGE),
             "version": inp.referential_version,
             "no_enrichment": no_enrichment,
             "ai_html": md_to_html(nova_text) if nova_inline else None,
@@ -1423,8 +1440,11 @@ def build_editorial_context(inp: EditorialInputs) -> dict[str, Any]:
         {
             "kind": "method",
             "method_nova": method_nova(inp),
-            "method_score": Markup(
-                str(method_score(alpha)) + (METHOD_DOSE if inp.dose_series else "")
+            # None when nothing was scored (no enrichment result): the page has no such section.
+            "method_score": (
+                None
+                if facts.kind == "none"
+                else Markup(str(method_score(alpha)) + (METHOD_DOSE if inp.dose_series else ""))
             ),
             "scope": (
                 "All AI-generated texts in this report are labelled with the model and the date "

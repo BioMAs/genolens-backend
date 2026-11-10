@@ -93,7 +93,11 @@ fa.function <- function(group.ids, anno.db.m, all.ids = NULL, group.name = "gene
     r.IDs <- lapply(colnames(anno.db.m), function(x) NULL)
     names(r.IDs) <- colnames(anno.db.m)
   } else {
-    r.IDs <- apply(anno.db.m[R.IDs, , drop = FALSE], 2, function(x) unique(R.IDs[which(x > 0)]))
+    # simplify = FALSE keeps one gene vector per term (a list named by the terms): apply()
+    # would otherwise fold equal-length results (a one-term category, or terms with the same
+    # number of hits) into a matrix, and the genes / r columns below would lose their rows.
+    r.IDs <- apply(anno.db.m[R.IDs, , drop = FALSE], 2, function(x) unique(R.IDs[which(x > 0)]),
+                   simplify = FALSE)
   }
 
   df <- data.frame(term = colnames(anno.db.m), stringsAsFactors = FALSE)
