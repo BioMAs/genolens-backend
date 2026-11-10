@@ -1272,10 +1272,10 @@ class ReportLatexService:
         gs = shutil.which("gs")
         if gs:
             try:
-                subprocess.run([gs, "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite",
-                                "-dEmbedAllFonts=true", "-dSubsetFonts=false",
-                                f"-sOutputFile={out}", str(pdf_path)],
-                               capture_output=True, text=True, timeout=300)
+                result = subprocess.run([gs, "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pdfwrite",
+                                         "-dEmbedAllFonts=true", "-dSubsetFonts=false",
+                                         f"-sOutputFile={out}", str(pdf_path)],
+                                        capture_output=True, text=True, timeout=300)
             except subprocess.TimeoutExpired as exc:
                 # Best-effort: the report is complete without the normalised fonts. What
                 # Ghostscript had written when it was stopped is not, and is not returned.
@@ -1285,8 +1285,15 @@ class ReportLatexService:
                     "the PDF is kept as pdflatex wrote it", exc.timeout
                 )
                 return pdf_path.read_bytes()
-            if out.exists():
+            if result.returncode == 0 and out.exists() and out.stat().st_size > 0:
                 return out.read_bytes()
+            # A Ghostscript that failed or was killed can leave a truncated file: never return it.
+            if out.exists():
+                out.unlink(missing_ok=True)
+                logger.warning(
+                    "Ghostscript exited with code %s embedding the fonts of the report; "
+                    "the PDF is kept as pdflatex wrote it", result.returncode
+                )
         return pdf_path.read_bytes()
 
     async def render_pdf(self, db: AsyncSession, analysis_id: UUID, generate_ai: bool = False,

@@ -381,7 +381,7 @@ def test_a_mark_before_an_opening_quote_prints_as_typed(tmp_path):
 @pytest.mark.parametrize(
     "typed, printed",
     [
-        ("“x ‘y’” ‘a’ ‘b’ “a”“b” ’’ ‘‘ d’Alembert x’‘y", None),
+        ("“x ‘y’” ‘a’ ‘b’ “a”“b” ’’ ‘‘ l’eau x’‘y", None),
         ("5−−3 a-–b a–-b a—-b a−-b", None),
         ("1‐‐2 1‑‑2", "1--2 1--2"),  # two hyphens, not an en dash
         ("typed ``a'' and a`‘b and a'’b", "typed “a” and a‘‘b and a’’b"),
@@ -481,6 +481,27 @@ def test_a_ghostscript_timeout_keeps_the_pdf_pdflatex_wrote_and_warns(tmp_path, 
     assert warning.levelno == logging.WARNING
     # The warning names no path and no command.
     assert str(tmp_path) not in warning.getMessage() and "-sOutputFile" not in warning.getMessage()
+
+
+@pytest.mark.parametrize("returncode", [1, -9])
+def test_a_failed_ghostscript_never_returns_what_it_left_behind(tmp_path, caplog, returncode):
+    """A Ghostscript that fails or is killed (-9: the worker's memory limit) can leave a truncated
+    file: the plain PDF pdflatex wrote is returned instead, with a warning."""
+    (tmp_path / "report.pdf").write_bytes(b"%PDF-1.5 plain")
+
+    def run(command, **kwargs):
+        if command[0] == "pdflatex":
+            return MagicMock(returncode=0, stdout="", stderr="")
+        (tmp_path / "report_embedded.pdf").write_bytes(b"%PDF-1.5 trunc")
+        return MagicMock(returncode=returncode, stdout="", stderr="")
+
+    with patch.object(rl.shutil, "which", return_value="/usr/bin/gs"):
+        with patch.object(rl.subprocess, "run", side_effect=run):
+            with caplog.at_level(logging.WARNING, logger=rl.logger.name):
+                pdf = rl.report_latex_service.compile_pdf(_minimal("x"), str(tmp_path))
+    assert pdf == b"%PDF-1.5 plain"
+    assert not (tmp_path / "report_embedded.pdf").exists()
+    assert any(f"exited with code {returncode}" in r.getMessage() for r in caplog.records)
 
 
 def test_a_timeout_is_a_compile_error_without_a_pass_number():
