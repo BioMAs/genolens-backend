@@ -1,14 +1,17 @@
 """Password hashing and policy of the local authentication (no database, no network)."""
 
 import unicodedata
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import bcrypt
 import pytest
 from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 
 from app.auth import passwords
 from app.auth.passwords import (
+    DUMMY_BCRYPT_HASH,
     DUMMY_HASH,
     PasswordCheck,
     PasswordPolicyError,
@@ -78,6 +81,104 @@ def test_oversized_password_still_pays_for_the_bcrypt_check(monkeypatch):
     spy.assert_called_once()
 
 
+ARGON2_HASH = hash_password("Right-passphrase-2026")
+BCRYPT_72_BYTES = bcrypt.hashpw(b"x" * 72, bcrypt.gensalt(4, prefix=b"2a")).decode()
+
+
+class _CountingHasher:
+    """Stands in for `passwords._hasher`, counting the argon2 verifications that really ran.
+
+    A verification counts once the hash has been computed, whether it matched or not; a call that
+    is refused up front (a malformed hash) does no work and does not count.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.verifications = 0
+
+    def verify(self, stored, password):
+        try:
+            result = self._real.verify(stored, password)
+        except VerifyMismatchError:
+            self.verifications += 1
+            raise
+        self.verifications += 1
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.fixture
+def verifications(monkeypatch):
+    """Counts of the argon2 verifications and the bcrypt checks that really ran, real or dummy."""
+    hasher = _CountingHasher(passwords._hasher)
+    bcrypt_checks = []
+    real_checkpw = bcrypt.checkpw
+
+    def counting_checkpw(raw, stored):
+        result = real_checkpw(raw, stored)  # a call that raises did no work: not counted
+        bcrypt_checks.append(result)
+        return result
+
+    monkeypatch.setattr(passwords, "_hasher", hasher)
+    monkeypatch.setattr(passwords.bcrypt, "checkpw", counting_checkpw)
+    return SimpleNamespace(argon2=lambda: hasher.verifications, bcrypt=lambda: len(bcrypt_checks))
+
+
+def test_dummy_bcrypt_hash_has_the_cost_of_inherited_hashes():
+    assert DUMMY_BCRYPT_HASH.startswith("$2a$10$")
+    assert len(DUMMY_BCRYPT_HASH) == 60
+    assert not bcrypt.checkpw(b"anything", DUMMY_BCRYPT_HASH.encode())
+
+
+@pytest.mark.parametrize(
+    "password,stored",
+    [
+        ("wrong", None),
+        ("wrong", ""),
+        ("wrong", "not-a-hash"),
+        ("wrong", "$scrypt$ln=16,r=8,p=1$c2FsdA$aGFzaA"),
+        ("wrong", "$argon2id$v=19$m=65536,t=3,p=4$garbage"),
+        ("wrong", "$2a$10$short"),
+        ("wrong", "$2a$99$" + "a" * 53),
+        ("wrong", ARGON2_HASH),
+        ("wrong", LEGACY),
+        ("x" * 200, LEGACY),
+        ("x" * 72 + "y", BCRYPT_72_BYTES),
+    ],
+    ids=[
+        "no-hash",
+        "empty-hash",
+        "unrecognised-format",
+        "other-scheme",
+        "malformed-argon2",
+        "malformed-bcrypt",
+        "bcrypt-invalid-salt",
+        "argon2-mismatch",
+        "bcrypt-mismatch",
+        "bcrypt-over-72-bytes",
+        "bcrypt-72-byte-prefix-match",
+    ],
+)
+def test_every_rejection_costs_one_argon2_and_one_bcrypt_check(password, stored, verifications):
+    # Whatever the reason, a refusal takes the same work, so the time of the answer does not
+    # tell an unknown account from an inherited bcrypt hash from an argon2 hash. The checks are
+    # counted, not timed: wall-clock assertions would be flaky.
+    assert verify_password(password, stored) == PasswordCheck(False, None)
+    assert verifications.argon2() == 1
+    assert verifications.bcrypt() == 1
+
+
+def test_successful_logins_do_no_dummy_work(verifications):
+    assert verify_password("Right-passphrase-2026", ARGON2_HASH) == PasswordCheck(True, None)
+    assert (verifications.argon2(), verifications.bcrypt()) == (1, 0)
+
+    check = verify_password("Café-été-2026!", LEGACY)
+    assert check.ok and check.upgraded_hash.startswith("$argon2id$")
+    assert (verifications.argon2(), verifications.bcrypt()) == (1, 1)
+
+
 def test_password_is_not_unicode_normalised():
     nfc = unicodedata.normalize("NFC", "Café-été-2026!")
     nfd = unicodedata.normalize("NFD", "Café-été-2026!")
@@ -119,7 +220,12 @@ def test_missing_hash_is_verified_against_the_dummy_hash(monkeypatch):
     [
         ("short", "too_short"),
         ("x" * 129, "too_long"),
-        ("unbelievable", "too_common"),  # 12 characters, in the embedded 10k list
+        ("unbelievable", "too_common"),  # 12 characters, in the embedded 10k list as it is
+        ("password1234", "too_common"),  # "password" once the trailing digits are removed
+        ("qwertyuiop12", "too_common"),
+        ("iloveyou12345", "too_common"),
+        ("Password1234!!", "too_common"),  # case, trailing digits and punctuation
+        ("monkey 2026 !! ", "too_common"),  # trailing whitespace too
         ("me@example.test", "same_as_email"),
     ],
 )
@@ -131,6 +237,30 @@ def test_policy(pw, code):
 
 def test_policy_accepts_long_passphrase():
     validate_new_password("correct horse battery staple", "me@example.test")
+
+
+@pytest.mark.parametrize(
+    "pw",
+    [
+        "correct horse battery staple 2026!",  # trailing characters removed: still not listed
+        "passwordx1234",  # "passwordx" is not a common password
+        "1password1234",  # only trailing characters are removed
+        "123456789012",  # nothing but digits: see the next test
+    ],
+)
+def test_policy_does_not_refuse_what_the_list_does_not_cover(pw):
+    validate_new_password(pw, "me@example.test")
+
+
+def test_policy_all_digit_password_is_judged_on_its_full_string_only():
+    # Removing the trailing non-letters of "123456789012" leaves nothing, and an empty string is
+    # never looked up: the full string is the only check left, and it is not in the 10k list.
+    # So a 12-digit password passes (no composition rule, per NIST 800-63B); a listed digit string
+    # is still refused as it stands.
+    validate_new_password("123456789012", "me@example.test")
+    assert "123456" in passwords._common_passwords()
+    assert passwords._strip_trailing_non_letters("123456789012") == ""
+    assert passwords._strip_trailing_non_letters("Pass-word 12 !") == "Pass-word"
 
 
 def test_policy_length_bounds_are_inclusive():
