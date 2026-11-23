@@ -26,17 +26,28 @@ production an empty setting is an error, because a key that changed at each rest
 silently lock every user with a second factor out of their account.
 
 Recovery codes: `XXXXX-XXXXX`, ten symbols of the Crockford base-32 alphabet (no `I`, `L`, `O` or
-`U`, so nothing can be misread when copied from paper), 50 bits of `secrets` randomness. Only
-their SHA-256 is stored; a typed code is normalised first, so case, spaces and hyphens do not
-matter.
+`U`, so nothing can be misread when copied from paper), 50 bits of `secrets` randomness. A typed
+code is normalised first, so case, spaces and hyphens do not matter.
+
+Fifty bits are too few for a bare hash: whoever holds a copy of the database could try 2**50
+codes against it offline. What is stored is therefore an HMAC-SHA256 of the normalised code, keyed
+from `AUTH_ENCRYPTION_KEYS`, so that a copy of the table alone is worthless. The HMAC key of an
+encryption key is derived, never the Fernet key itself: SHA-256 over the fixed label
+`genolens-recovery-code-v1` followed by the raw 32 bytes of the key (the label keeps this use of
+the key apart from every other). `hash_recovery_code` uses the first key; `recovery_code_matches`
+tries every configured key, so a rotation (new key first, old one kept) leaves the stored hashes
+valid until the old key is dropped. Dropping a key makes the hashes made under it stop matching:
+the owners of such codes have to regenerate them, exactly as for the encrypted secrets.
 """
 
+import base64
 import hashlib
 import hmac
 import logging
 import re
 import secrets
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Optional
 
@@ -55,6 +66,8 @@ TOTP_DIGITS = 6
 TOTP_PERIOD = 30  # seconds per step
 _TOTP_WINDOW = (-1, 0, 1)  # steps tried around the current one
 _TOTP_CODE = re.compile(r"[0-9]{6}")  # ASCII digits only: `\d` and `str.isdigit` take more
+
+_RECOVERY_KEY_LABEL = b"genolens-recovery-code-v1"  # domain separation: see the module docstring
 
 _BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
 _SECRET_LENGTH = 32  # 32 characters x 5 bits = 160 bits
@@ -105,8 +118,9 @@ def verify_totp(
     of the matching steps still unused is returned: the caller stores it, and a later replay of
     that code then finds every step it can match at or below `last_used_step`.
 
-    `now` defaults to the current time; a naive `now` is read as UTC. A `secret` that is not
-    valid base32 raises: that is corrupted data, not a wrong code.
+    `now` defaults to the current time; a naive `now` is read as UTC. A `secret` that is empty or
+    not valid base32 (corrupted, or decrypted with the wrong key) is refused like a wrong code,
+    after an error is logged; the log names no secret, not even a fragment of it.
     """
     if not isinstance(code, str):
         return None
@@ -121,6 +135,16 @@ def verify_totp(
     current = int(now.timestamp()) // TOTP_PERIOD
 
     totp = _totp(secret)
+    try:
+        usable = bool(totp.byte_secret())  # binascii.Error is a ValueError; None is a TypeError
+    except (ValueError, TypeError):
+        usable = False
+    if not usable:
+        logger.error(
+            "TOTP verification refused: the stored secret is empty or not valid base32 "
+            "(corrupted, or decrypted with the wrong key)"
+        )
+        return None
     typed = code.encode("ascii")
     accepted: Optional[int] = None
     for step in (current + offset for offset in _TOTP_WINDOW):  # ascending: last match is highest
@@ -134,21 +158,32 @@ def verify_totp(
 # Encryption of the secret at rest
 # --------------------------------------------------------------------------------------------
 
-_cipher: Optional[MultiFernet] = None
+
+@dataclass(frozen=True)
+class _Keyring:
+    """What `AUTH_ENCRYPTION_KEYS` yields: the cipher, and the HMAC key of each key, same order."""
+
+    cipher: MultiFernet
+    recovery_keys: tuple[bytes, ...]
+
+
+_keyring_cache: Optional[_Keyring] = None
 _lock = threading.Lock()
 
 
-def _parse_key(entry: str, position: int) -> Fernet:
+def _parse_key(entry: str, position: int) -> tuple[Fernet, bytes]:
     """One configured key. The error names the position, never the value: it ends up in logs."""
     try:
-        return Fernet(entry)
+        fernet = Fernet(entry)  # checks that it is 32 bytes of url-safe base64
+        raw = base64.urlsafe_b64decode(entry)
     except (ValueError, TypeError) as exc:
         raise RuntimeError(
             f"{_SETTING} entry {position} is not a Fernet key (32 bytes, url-safe base64)"
         ) from exc
+    return fernet, hashlib.sha256(_RECOVERY_KEY_LABEL + raw).digest()
 
 
-def _load() -> MultiFernet:
+def _load() -> _Keyring:
     entries = [entry.strip() for entry in settings.AUTH_ENCRYPTION_KEYS.split(",")]
     entries = [entry for entry in entries if entry]
 
@@ -156,38 +191,50 @@ def _load() -> MultiFernet:
         if settings.is_production:
             raise RuntimeError(f"{_SETTING} is required in production")
         logger.warning(
-            "%s is empty: using an ephemeral encryption key. Every second-factor secret this "
-            "process stores becomes unreadable when it restarts; set the setting for anything "
-            "but local development.",
+            "%s is empty: using an ephemeral encryption key. Every second-factor secret and "
+            "recovery-code hash this process stores becomes unreadable when it restarts; set "
+            "the setting for anything but local development.",
             _SETTING,
         )
-        return MultiFernet([Fernet(Fernet.generate_key())])
+        entries = [generate_encryption_key()]
 
     fernets: list[Fernet] = []
+    recovery_keys: list[bytes] = []
     listed: set[str] = set()
     for position, entry in enumerate(entries, start=1):
-        fernet = _parse_key(entry, position)  # every entry is checked, even a repeated one
+        fernet, recovery_key = _parse_key(entry, position)  # a repeated entry is checked too
         if entry not in listed:  # the same key twice is listed once
             listed.add(entry)
             fernets.append(fernet)
-    return MultiFernet(fernets)
+            recovery_keys.append(recovery_key)
+    return _Keyring(cipher=MultiFernet(fernets), recovery_keys=tuple(recovery_keys))
+
+
+def _keyring() -> _Keyring:
+    global _keyring_cache
+    if _keyring_cache is None:
+        with _lock:
+            if _keyring_cache is None:  # another thread may have loaded them while this one waited
+                _keyring_cache = _load()
+    return _keyring_cache
 
 
 def load_cipher() -> MultiFernet:
-    """The configured keys, first one encrypting. Loaded once; `reset_encryption_cache` forgets."""
-    global _cipher
-    if _cipher is None:
-        with _lock:
-            if _cipher is None:  # another thread may have loaded them while this one waited
-                _cipher = _load()
-    return _cipher
+    """
+    The configured keys, first one encrypting. Loaded once; `reset_encryption_cache` forgets.
+
+    Calling it at start-up (the lifespan does) makes a deployment without `AUTH_ENCRYPTION_KEYS`
+    in production fail then, not at the first use. It reads the very keys the recovery-code
+    hashes are keyed from, so it vouches for both.
+    """
+    return _keyring().cipher
 
 
 def reset_encryption_cache() -> None:
     """Forget the loaded keys, so the next call reads the setting again (tests)."""
-    global _cipher
+    global _keyring_cache
     with _lock:
-        _cipher = None
+        _keyring_cache = None
 
 
 def generate_encryption_key() -> str:
@@ -250,6 +297,41 @@ def normalize_recovery_code(code: str) -> str:
     return re.sub(r"[\s-]", "", code).upper()
 
 
+def _recovery_mac(key: bytes, code: str) -> str:
+    return hmac.new(key, normalize_recovery_code(code).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def hash_recovery_code(code: str) -> str:
-    """SHA-256 (hex) of the normalised code: the only form in which it is stored."""
-    return hashlib.sha256(normalize_recovery_code(code).encode("utf-8")).hexdigest()
+    """
+    HMAC-SHA256 (hex, 64 characters) of the normalised code, under the first configured key: the
+    only form in which a recovery code is stored. The same code under the same keys always gives
+    the same hash; under another key, another one. Needs `AUTH_ENCRYPTION_KEYS` like the
+    encryption does (`RuntimeError` in production without it).
+    """
+    return _recovery_mac(_keyring().recovery_keys[0], code)
+
+
+def recovery_code_matches(code: str, stored_hash: str) -> bool:
+    """
+    Whether `stored_hash` is the hash of `code` under any configured key (so that a hash made
+    before a rotation still matches). `code` is normalised first.
+
+    Never raises on junk: something that is not a string, text that cannot be encoded, an empty
+    code, a malformed hash are all just `False`. Every key is tried and compared with
+    `hmac.compare_digest` whatever matches. A missing configuration is not junk, and raises the
+    `RuntimeError` of the encryption.
+    """
+    keys = _keyring().recovery_keys
+    if not isinstance(code, str) or not isinstance(stored_hash, str):
+        return False
+    try:
+        stored = stored_hash.encode("utf-8")
+        if not normalize_recovery_code(code):
+            return False
+        macs = [_recovery_mac(key, code).encode("ascii") for key in keys]
+    except UnicodeEncodeError:  # a lone surrogate, say: not something a keyboard produces
+        return False
+    matched = False
+    for mac in macs:
+        matched |= hmac.compare_digest(mac, stored)
+    return matched

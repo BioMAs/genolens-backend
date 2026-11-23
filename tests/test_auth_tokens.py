@@ -25,6 +25,7 @@ from app.auth.keys import (
     load_signing_keys,
     reset_key_cache,
 )
+from app.auth.mfa import generate_encryption_key, load_cipher, reset_encryption_cache
 from app.auth.tokens import (
     ACCESS_TOKEN_TTL,
     AUDIENCE,
@@ -40,10 +41,12 @@ from app.core.config import settings
 
 @pytest.fixture(autouse=True)
 def _clean_key_cache():
-    """No key (ephemeral or not) leaks from one test to the next."""
+    """No key (ephemeral or not) leaks from one test to the next: signing or encryption."""
     reset_key_cache()
+    reset_encryption_cache()
     yield
     reset_key_cache()
+    reset_encryption_cache()
 
 
 def _claims(**overrides):
@@ -400,13 +403,59 @@ async def test_startup_fails_fast_in_production_without_keys(
 
 
 @pytest.mark.asyncio
-async def test_startup_loads_keys_when_local_auth_is_on(monkeypatch, quiet_lifespan, local_keys):
+@pytest.mark.parametrize(
+    "mode, enabled",
+    [("local", False), ("supabase", True), ("local", True)],
+)
+async def test_startup_fails_fast_in_production_without_encryption_keys(
+    monkeypatch, quiet_lifespan, local_keys, mode, enabled
+):
+    """Signing keys are there; the encryption keys (second-factor secrets, recovery-code hashes)
+    are not: the application must not start, rather than fail at the first enrolment."""
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "AUTH_ENCRYPTION_KEYS", "")
+    monkeypatch.setattr(settings, "AUTH_MODE", mode)
+    monkeypatch.setattr(settings, "AUTH_LOCAL_ENABLED", enabled)
+    with pytest.raises(RuntimeError, match="AUTH_ENCRYPTION_KEYS is required in production"):
+        async with app_main.lifespan(app_main.app):
+            pytest.fail("the application must not start")
+
+
+@pytest.mark.asyncio
+async def test_startup_fails_fast_on_a_malformed_encryption_key(
+    monkeypatch, quiet_lifespan, local_keys
+):
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
     monkeypatch.setattr(settings, "AUTH_MODE", "local")
-    spy = MagicMock(wraps=load_signing_keys)
-    monkeypatch.setattr(app_main, "load_signing_keys", spy)
+    monkeypatch.setattr(settings, "AUTH_ENCRYPTION_KEYS", f"{generate_encryption_key()},nope")
+    with pytest.raises(RuntimeError, match="AUTH_ENCRYPTION_KEYS entry 2"):
+        async with app_main.lifespan(app_main.app):
+            pytest.fail("the application must not start")
+
+
+@pytest.mark.asyncio
+async def test_startup_in_production_with_both_sets_of_keys(
+    monkeypatch, quiet_lifespan, local_keys, enc_keys
+):
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "AUTH_MODE", "local")
     async with app_main.lifespan(app_main.app):
         pass
-    spy.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_startup_loads_keys_when_local_auth_is_on(
+    monkeypatch, quiet_lifespan, local_keys, enc_keys
+):
+    monkeypatch.setattr(settings, "AUTH_MODE", "local")
+    signing_spy = MagicMock(wraps=load_signing_keys)
+    cipher_spy = MagicMock(wraps=load_cipher)
+    monkeypatch.setattr(app_main, "load_signing_keys", signing_spy)
+    monkeypatch.setattr(app_main, "load_cipher", cipher_spy)
+    async with app_main.lifespan(app_main.app):
+        pass
+    signing_spy.assert_called_once_with()
+    cipher_spy.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -416,8 +465,12 @@ async def test_startup_is_unchanged_with_the_default_settings(monkeypatch, quiet
     monkeypatch.setattr(settings, "AUTH_JWT_PRIVATE_KEYS", "")
     monkeypatch.setattr(settings, "AUTH_MODE", "supabase")
     monkeypatch.setattr(settings, "AUTH_LOCAL_ENABLED", False)
+    monkeypatch.setattr(settings, "AUTH_ENCRYPTION_KEYS", "")
     spy = MagicMock()
+    cipher_spy = MagicMock()
     monkeypatch.setattr(app_main, "load_signing_keys", spy)
+    monkeypatch.setattr(app_main, "load_cipher", cipher_spy)
     async with app_main.lifespan(app_main.app):
         pass
     spy.assert_not_called()
+    cipher_spy.assert_not_called()

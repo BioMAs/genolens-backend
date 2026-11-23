@@ -7,6 +7,7 @@ Keys and secrets are generated here, never committed. Nothing hosted is called.
 
 import base64
 import hashlib
+import hmac
 import logging
 import re
 from datetime import UTC, datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from app.auth.mfa import (
     new_totp_secret,
     normalize_recovery_code,
     provisioning_uri,
+    recovery_code_matches,
     reset_encryption_cache,
     verify_totp,
 )
@@ -49,6 +51,12 @@ def _fresh_cipher_cache():
 
 def _code_for_step(secret: str, step: int) -> str:
     return pyotp.TOTP(secret).generate_otp(step)
+
+
+def _use_keys(monkeypatch, *keys: str) -> None:
+    """Make `keys` the whole of `AUTH_ENCRYPTION_KEYS` (first one primary), as a restart would."""
+    monkeypatch.setattr(settings, "AUTH_ENCRYPTION_KEYS", ",".join(keys))
+    reset_encryption_cache()
 
 
 # --------------------------------------------------------------------------------------------
@@ -251,10 +259,39 @@ def test_when_several_steps_match_the_highest_unused_one_is_returned(monkeypatch
     assert verify_totp(s, "424242", STEP0 + 1, now=T0) is None
 
 
-def test_a_corrupt_secret_is_an_error_not_a_refusal():
-    # A secret that is not base32 is a data problem; it must not read as "wrong code".
-    with pytest.raises(ValueError):  # binascii.Error
-        verify_totp("not base32 !", "123456", None, now=T0)
+@pytest.mark.parametrize(
+    "corrupt",
+    ["not base32 !", "", "====", "0189" * 8, "secret-of-corrupt-row-1", None, 123456789],
+)
+def test_a_corrupt_secret_is_refused_and_logged_without_its_value(corrupt, caplog):
+    """Corrupt data (or a secret decrypted with the wrong key) reads as "no", never as a crash;
+    the error log is there for the operator, and does not repeat the secret."""
+    with caplog.at_level(logging.ERROR, logger="app.auth.mfa"):
+        assert verify_totp(corrupt, "123456", None, now=T0) is None
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    text = errors[0].getMessage()
+    assert "secret" in text and "base32" in text
+    if corrupt:
+        assert str(corrupt) not in text
+        assert errors[0].exc_info is None  # no traceback either: it would quote the value
+
+
+def test_a_sound_secret_logs_no_error(caplog):
+    s = new_totp_secret()
+    with caplog.at_level(logging.ERROR, logger="app.auth.mfa"):
+        assert verify_totp(s, _code_for_step(s, STEP0), None, now=T0) == STEP0
+        good = {_code_for_step(s, STEP0 + offset) for offset in (-1, 0, 1)}
+        wrong = next(f"{n:06d}" for n in range(1_000_000) if f"{n:06d}" not in good)
+        assert verify_totp(s, wrong, None, now=T0) is None  # a wrong code is no error
+    assert not caplog.records
+
+
+def test_a_lowercase_base32_secret_is_sound():
+    """Some apps and users hand secrets back in lower case: base32 is read case-insensitively."""
+    s = new_totp_secret()
+    code = _code_for_step(s, STEP0)
+    assert verify_totp(s.lower(), code, None, now=T0) == STEP0
 
 
 # --------------------------------------------------------------------------------------------
@@ -321,19 +358,197 @@ def test_normalize_recovery_code(typed, expected):
     assert normalize_recovery_code(typed) == expected
 
 
-def test_hash_recovery_code_is_sha256_hex_of_the_normalized_code():
-    expected = hashlib.sha256(b"ABCDEFGHJK").hexdigest()
+# --------------------------------------------------------------------------------------------
+# Recovery code hashes: HMAC-SHA256 keyed from AUTH_ENCRYPTION_KEYS
+# --------------------------------------------------------------------------------------------
+
+
+def _expected_hash(key: str, normalized: str) -> str:
+    """The documented construction, written out independently of the implementation."""
+    mac_key = hashlib.sha256(b"genolens-recovery-code-v1" + base64.urlsafe_b64decode(key)).digest()
+    return hmac.new(mac_key, normalized.encode(), hashlib.sha256).hexdigest()
+
+
+def test_hash_is_the_hmac_sha256_of_the_normalized_code_under_the_derived_first_key(enc_keys):
+    k1, _k2 = enc_keys
+    expected = _expected_hash(k1, "ABCDEFGHJK")
     assert hash_recovery_code("abcde-fghjk") == expected
     assert hash_recovery_code("ABCDE FGHJK") == expected
     assert re.fullmatch(r"[0-9a-f]{64}", expected)
     assert hash_recovery_code("ABCDE-FGHJL") != expected
 
 
-def test_hashes_of_distinct_codes_are_distinct_and_never_the_code():
+def test_hash_of_a_dump_cannot_be_reproduced_without_the_key(enc_keys):
+    """What a copy of the table holds is not the SHA-256 of the code: guessing the 2**50 codes
+    and hashing them plainly finds nothing; the key is needed."""
+    k1, _k2 = enc_keys
+    code = generate_recovery_codes(1)[0]
+    stored = hash_recovery_code(code)
+    plain = hashlib.sha256(normalize_recovery_code(code).encode()).hexdigest()
+    assert stored != plain
+    # Nor is it a MAC under something an attacker could derive without the key.
+    raw = base64.urlsafe_b64decode(k1)
+    for naive_key in (b"", raw, k1.encode(), b"genolens-recovery-code-v1"):
+        naive = hmac.new(naive_key, normalize_recovery_code(code).encode(), hashlib.sha256)
+        assert stored != naive.hexdigest()
+    assert not recovery_code_matches(code, plain)
+
+
+def test_same_code_under_the_same_keys_gives_the_same_hash(enc_keys, monkeypatch):
+    code = "ABCDE-FGHJK"
+    first = hash_recovery_code(code)
+    assert hash_recovery_code(code) == first
+    reset_encryption_cache()  # a restart: same setting, same keys, same hash
+    assert hash_recovery_code(code) == first
+
+
+def test_another_key_gives_another_hash(enc_keys, monkeypatch):
+    k1, k2 = enc_keys
+    code = "ABCDE-FGHJK"
+    _use_keys(monkeypatch, k1)
+    under_k1 = hash_recovery_code(code)
+    _use_keys(monkeypatch, k2)
+    under_k2 = hash_recovery_code(code)
+    assert under_k1 != under_k2
+    # Only the first key counts for a new hash, whatever follows it.
+    _use_keys(monkeypatch, k1, k2)
+    assert hash_recovery_code(code) == under_k1
+    _use_keys(monkeypatch, k2, k1)
+    assert hash_recovery_code(code) == under_k2
+
+
+def test_hashes_of_distinct_codes_are_distinct_and_never_the_code(enc_keys):
     codes = generate_recovery_codes()
     hashes = [hash_recovery_code(c) for c in codes]
     assert len(set(hashes)) == len(codes)
     assert not set(hashes) & set(codes)
+
+
+def test_recovery_code_matches_however_it_is_typed(enc_keys):
+    code = generate_recovery_codes(1)[0]
+    stored = hash_recovery_code(code)
+    plain = code.replace("-", "")
+    typed = (code, code.lower(), plain, plain.lower(), f"{plain[:5]} {plain[5:]}", f" {code}\n")
+    assert all(recovery_code_matches(t, stored) for t in typed)
+
+
+def test_recovery_code_does_not_match_another_code_or_another_hash(enc_keys):
+    first, second = generate_recovery_codes(2)
+    assert not recovery_code_matches(first, hash_recovery_code(second))
+    assert not recovery_code_matches(first, hash_recovery_code(first)[:-1])
+    assert not recovery_code_matches(first, hash_recovery_code(first) + "0")
+    assert not recovery_code_matches(first, f" {hash_recovery_code(first)}")
+
+
+def test_recovery_hash_follows_a_key_rotation(enc_keys, monkeypatch):
+    k1, k2 = enc_keys
+    code = "ABCDE-FGHJK"
+
+    # A hash stored when k2 was the only key...
+    _use_keys(monkeypatch, k2)
+    old_hash = hash_recovery_code(code)
+    assert recovery_code_matches(code, old_hash)
+
+    # ...still matches once k1 is the primary key and k2 the previous one...
+    _use_keys(monkeypatch, k1, k2)
+    assert recovery_code_matches(code, old_hash)
+    assert not recovery_code_matches("ABCDE-FGHJL", old_hash)
+
+    # ...while a new hash is made under k1: it matches, it differs from the old one, and it is
+    # what k1 alone gives.
+    new_hash = hash_recovery_code(code)
+    assert new_hash != old_hash
+    assert new_hash == _expected_hash(k1, "ABCDEFGHJK")
+    assert recovery_code_matches(code, new_hash)
+
+    # Once k2 is dropped, what it alone protected stops matching, quietly (False, no exception).
+    _use_keys(monkeypatch, k1)
+    assert not recovery_code_matches(code, old_hash)
+    assert recovery_code_matches(code, new_hash)
+
+    # A key that was never configured matches nothing.
+    _use_keys(monkeypatch, generate_encryption_key())
+    assert not recovery_code_matches(code, old_hash)
+    assert not recovery_code_matches(code, new_hash)
+
+
+def test_every_configured_key_is_compared_whatever_matches(enc_keys, monkeypatch):
+    """No early exit: how long the answer takes does not say under which key a hash was made."""
+    k1, k2 = enc_keys
+    third = generate_encryption_key()
+    _use_keys(monkeypatch, k1, k2, third)
+    stored = hash_recovery_code("ABCDE-FGHJK")  # the first key: the first comparison would match
+    calls = []
+    real = mfa.hmac.compare_digest
+
+    def spy(a, b):
+        calls.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(mfa.hmac, "compare_digest", spy)
+    assert recovery_code_matches("ABCDE-FGHJK", stored)
+    assert len(calls) == 3
+    calls.clear()
+    assert not recovery_code_matches("ABCDE-FGHJL", stored)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    "junk_code",
+    ["", " ", "-", " - ", "\n\t", None, 12345, b"ABCDE-FGHJK", ["ABCDE-FGHJK"], "\ud800", "é" * 40],
+)
+def test_junk_code_never_raises_and_never_matches(enc_keys, junk_code):
+    stored = hash_recovery_code("ABCDE-FGHJK")
+    assert recovery_code_matches(junk_code, stored) is False
+    assert recovery_code_matches(junk_code, "") is False
+    assert recovery_code_matches(junk_code, hash_recovery_code("")) is False
+
+
+@pytest.mark.parametrize(
+    "junk_hash",
+    ["", " ", "not hex", "0" * 64, "é" * 64, "\ud800", None, 12345, b"abc", ["abc"], "A" * 65],
+)
+def test_junk_hash_never_raises_and_never_matches(enc_keys, junk_hash):
+    assert recovery_code_matches("ABCDE-FGHJK", junk_hash) is False
+
+
+def test_the_empty_code_matches_nothing_not_even_its_own_hash(enc_keys):
+    assert recovery_code_matches("", hash_recovery_code("")) is False
+    assert recovery_code_matches(" - ", hash_recovery_code("")) is False
+
+
+def test_recovery_hashes_share_the_encryption_key_policy(monkeypatch, caplog):
+    # Outside production, no key: one ephemeral key, one warning for encryption and hashes alike.
+    monkeypatch.setattr(settings, "ENVIRONMENT", "development")
+    monkeypatch.setattr(settings, "AUTH_ENCRYPTION_KEYS", "")
+    with caplog.at_level(logging.WARNING, logger="app.auth.mfa"):
+        stored = hash_recovery_code("ABCDE-FGHJK")
+        assert recovery_code_matches("abcde-fghjk", stored)
+        assert decrypt_secret(encrypt_secret("ABC")) == "ABC"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "recovery-code" in warnings[0].getMessage()
+    # A new process has a new key: the old hash is just a hash that does not match.
+    reset_encryption_cache()
+    assert not recovery_code_matches("ABCDE-FGHJK", stored)
+
+    # In production, no key is an error, for hashing as for encrypting.
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    reset_encryption_cache()
+    with pytest.raises(RuntimeError, match="AUTH_ENCRYPTION_KEYS is required in production"):
+        hash_recovery_code("ABCDE-FGHJK")
+    with pytest.raises(RuntimeError, match="AUTH_ENCRYPTION_KEYS is required in production"):
+        recovery_code_matches("ABCDE-FGHJK", stored)
+
+
+def test_a_bad_key_breaks_recovery_hashing_like_encryption_and_names_only_its_position(
+    monkeypatch,
+):
+    bad = "definitely-not-a-key"
+    monkeypatch.setattr(settings, "AUTH_ENCRYPTION_KEYS", bad)
+    with pytest.raises(RuntimeError, match="entry 1") as caught:
+        hash_recovery_code("ABCDE-FGHJK")
+    assert bad not in str(caught.value)
 
 
 # --------------------------------------------------------------------------------------------
