@@ -18,6 +18,12 @@ alembic==1.13.1
 pyjwt==2.8.0
 cryptography==42.0.0
 passlib[bcrypt]==1.7.4
+# Self-hosted authentication: argon2id hashing, bcrypt for the hashes inherited from Supabase, TOTP.
+# bcrypt is pinned because passlib 1.7.4 cannot read the version of bcrypt >= 4.1 (it only logs it)
+# and bcrypt 5 refuses passwords over 72 bytes inside passlib's own self-test.
+argon2-cffi==23.1.0
+bcrypt==4.2.1
+pyotp==2.9.0
 
 # Task Queue
 celery==5.3.6
