@@ -8,7 +8,9 @@ helpers, fake mailer, ...); keep it free of anything specific to a single test f
 Everything runs against an in-memory SQLite database. Nothing hosted is called.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import uuid4
 
 import pytest
@@ -117,3 +119,74 @@ def enc_keys(monkeypatch):
         yield k1, k2
     finally:
         reset_encryption_cache()
+
+
+@dataclass(frozen=True)
+class CapturedEmail:
+    """One message as `send_email` handed it to the SMTP library: decoded, and never sent."""
+
+    to: str
+    subject: str
+    text: str
+    html: str
+
+
+class SmtpCapture:
+    """What `smtp_capture` yields: the messages that would have gone out, oldest first.
+
+    Set `fail_with` to an exception and every later send raises it, like an unreachable server.
+    """
+
+    def __init__(self) -> None:
+        self.messages: list[CapturedEmail] = []
+        self.fail_with: Optional[Exception] = None
+
+    @property
+    def last(self) -> CapturedEmail:
+        assert self.messages, "no e-mail was sent"
+        return self.messages[-1]
+
+    @property
+    def last_text(self) -> str:
+        return self.last.text
+
+    async def send(self, message, **_smtp_options) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+        # Serialise as the SMTP library would: a message that cannot be sent fails here too.
+        message.as_bytes()
+        bodies = {
+            part.get_content_subtype(): part.get_payload(decode=True).decode("utf-8")
+            for part in message.get_payload()
+        }
+        self.messages.append(
+            CapturedEmail(
+                to=message["To"],
+                subject=message["Subject"],
+                text=bodies["plain"],
+                html=bodies["html"],
+            )
+        )
+
+
+@pytest.fixture
+def smtp_capture(monkeypatch):
+    """Capture every e-mail `send_email` sends, instead of reaching an SMTP server.
+
+    Replaces `aiosmtplib.send` and sets placeholder SMTP settings (`@example.test`, no real host)
+    so that the module counts as configured: a `required=True` send is captured, not refused. A
+    test of the unconfigured case sets `settings.SMTP_HOST` back to None itself. Nothing leaves
+    the process.
+    """
+    from app.core.config import settings
+
+    for name, value in (
+        ("SMTP_HOST", "smtp.example.test"),
+        ("SMTP_USER", "mailer"),
+        ("SMTP_PASSWORD", "placeholder"),
+        ("EMAIL_FROM_ADDRESS", "no-reply@example.test"),
+    ):
+        monkeypatch.setattr(settings, name, value)
+    capture = SmtpCapture()
+    monkeypatch.setattr("app.services.email_service.aiosmtplib.send", capture.send)
+    return capture
