@@ -2,7 +2,7 @@
 Application configuration using Pydantic Settings.
 Loads configuration from environment variables.
 """
-from typing import Optional
+from typing import Literal, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
@@ -61,6 +61,45 @@ class Settings(BaseSettings):
     SUPABASE_STORAGE_BUCKET: str = Field(
         default="genolens-data",
         description="Supabase storage bucket name"
+    )
+
+    # Self-hosted authentication (replaces the hosted identity provider; see app/auth/)
+    AUTH_MODE: Literal["supabase", "local"] = Field(
+        default="supabase",
+        description="Which identity provider authenticates requests: the hosted one (supabase) or this "
+        "service (local)",
+    )
+    AUTH_LOCAL_ENABLED: bool = Field(
+        default=False,
+        description="Serve the local sign-in endpoints and accept local tokens, whatever AUTH_MODE says "
+        "(migration window: both providers answer)",
+    )
+    AUTH_ISSUER: str = Field(
+        default="http://localhost:8001",
+        description="`iss` of the access tokens this service issues; checked when they come back",
+    )
+    AUTH_JWT_PRIVATE_KEYS: str = Field(
+        default="",
+        description="ES256 signing keys: PKCS#8 PEM, base64-encoded, comma-separated. The first one signs, "
+        "all of them verify (rotation). Empty: an ephemeral key outside production, an error in production",
+    )
+    AUTH_ENCRYPTION_KEYS: str = Field(
+        default="",
+        description="Fernet keys that encrypt secrets at rest (TOTP seeds), comma-separated; the first one "
+        "encrypts, all of them decrypt",
+    )
+    AUTH_COOKIE_DOMAIN: Optional[str] = Field(
+        default=None,
+        description="Domain of the refresh-token cookie (None: the API host only)",
+    )
+    AUTH_COOKIE_SECURE: bool = Field(
+        default=True,
+        description="Send the refresh-token cookie over HTTPS only (turn off for plain-HTTP local development)",
+    )
+    SUPABASE_DB_URL: Optional[str] = Field(
+        default=None,
+        description="Connection URL of the hosted database the legacy accounts are imported from "
+        "(migration scripts only)",
     )
 
     # LLM inference (Modal + vLLM, OpenAI-compatible endpoint serving Gemma 4)

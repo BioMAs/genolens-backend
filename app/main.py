@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from slowapi.errors import RateLimitExceeded
 
+from app.auth.keys import load_signing_keys
 from app.core.config import settings
 from app.core.supabase_auth import close_supabase_http_client
 from app.db.session import close_db
@@ -33,6 +34,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"🌐 CORS Origins: {settings.CORS_ORIGINS}")
     logger.info(f"📊 Database: Connected")
     logger.info(f"🔄 Celery: Worker configured")
+
+    # Self-hosted authentication: read the signing keys now, so that a production deployment
+    # without them fails at start-up instead of at the first sign-in. Nothing changes while
+    # the hosted provider is the only one in charge (AUTH_MODE=supabase, AUTH_LOCAL_ENABLED off).
+    if settings.AUTH_MODE == "local" or settings.AUTH_LOCAL_ENABLED:
+        keys = load_signing_keys()
+        logger.info(f"🔑 Local authentication: {len(keys)} signing key(s) loaded")
 
     yield
 

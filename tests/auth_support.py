@@ -11,6 +11,7 @@ Everything runs against an in-memory SQLite database. Nothing hosted is called.
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import pytest
 import pytest_asyncio
 
 from app.models.models import Project, ProjectMember, SubscriptionPlan, User, UserRole, UserStatus
@@ -73,3 +74,25 @@ async def seed_user(sessions, **fields) -> User:
         s.add(user)
         await s.commit()
         return user
+
+
+@pytest.fixture
+def local_keys(monkeypatch):
+    """Two freshly generated signing keys (the first signs, the second is "the previous one").
+
+    Sets `AUTH_JWT_PRIVATE_KEYS` and drops the key cache before and after the test, so that no
+    key outlives it. Keys are generated here, never read from the environment or from a file.
+    """
+    from app.auth.keys import generate_private_key_b64, reset_key_cache
+    from app.core.config import settings
+
+    reset_key_cache()
+    monkeypatch.setattr(
+        settings,
+        "AUTH_JWT_PRIVATE_KEYS",
+        ",".join(generate_private_key_b64() for _ in range(2)),
+    )
+    try:
+        yield
+    finally:
+        reset_key_cache()
