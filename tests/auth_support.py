@@ -96,3 +96,24 @@ def local_keys(monkeypatch):
         yield
     finally:
         reset_key_cache()
+
+
+@pytest.fixture
+def enc_keys(monkeypatch):
+    """Two freshly generated Fernet keys, `(k1, k2)`; the first encrypts, both decrypt.
+
+    Sets `AUTH_ENCRYPTION_KEYS` and drops the cipher cache before and after the test, so that no
+    key outlives it. A test that needs another combination (a rotation, say) sets the setting
+    itself and calls `reset_encryption_cache()`. Keys are generated here, never read from the
+    environment or from a file.
+    """
+    from app.auth.mfa import generate_encryption_key, reset_encryption_cache
+    from app.core.config import settings
+
+    k1, k2 = generate_encryption_key(), generate_encryption_key()
+    reset_encryption_cache()
+    monkeypatch.setattr(settings, "AUTH_ENCRYPTION_KEYS", f"{k1},{k2}")
+    try:
+        yield k1, k2
+    finally:
+        reset_encryption_cache()
