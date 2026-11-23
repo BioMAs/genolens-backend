@@ -6,6 +6,7 @@ from typing import Optional
 from uuid import UUID, uuid4
 from datetime import datetime
 from sqlalchemy import String, ForeignKey, JSON, Enum as SQLEnum, Text, Index, Float, Integer, DateTime
+from sqlalchemy import BigInteger
 from sqlalchemy import func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy import text as sa_text
@@ -795,6 +796,50 @@ class User(Base, TimestampMixin):
         Integer, nullable=False, default=0, server_default=sa_text("0"),
         comment="Extra analyses granted by an admin for the current period. "
                 "Reset with the monthly counter (never for demo accounts).",
+    )
+
+    # ── Local authentication (app/models/auth.py holds the tables around these) ──
+    #
+    # All of it is NULL on an account that has never signed in locally, i.e. every account
+    # that still authenticates through Supabase until it is migrated (`auth_migrated_at`).
+    #
+    # argon2id, or the bcrypt hash inherited from Supabase (`$2a$...`) until the next login
+    # rewrites it. NULL: no local password yet, so a local login is refused whatever is typed.
+    password_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    email_verified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="A local login requires it."
+    )
+    password_changed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="Protects the Supabase resync: a hash is never overwritten when this is "
+                "later than auth_migrated_at."
+    )
+    # TOTP secrets are Fernet-encrypted, never stored in clear. `mfa_pending_secret_enc` is the
+    # secret of an enrolment not yet confirmed with a first valid code.
+    mfa_totp_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    mfa_pending_secret_enc: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    mfa_enabled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="MFA is active when not NULL."
+    )
+    mfa_last_used_step: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True,
+        comment="Last accepted TOTP time step; a code at or below it is a replay."
+    )
+    # Brute-force lock: consecutive failures, and the end of the lock they triggered.
+    failed_login_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    locked_until: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    auth_migrated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+        comment="When this account moved from Supabase Auth to local authentication."
     )
 
     def __repr__(self) -> str:

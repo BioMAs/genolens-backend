@@ -23,6 +23,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 from datetime import datetime
 
+# Shared fixtures of the local-auth tests (auth_db, seed_user, NOW, ...).
+pytest_plugins = ["tests.auth_support"]
+
 # ─────────────────────────────────────────────
 # Constant test IDs (deterministic for fixtures)
 # ─────────────────────────────────────────────

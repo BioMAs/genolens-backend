@@ -17,6 +17,7 @@ from app.models.report_job import ReportJob  # noqa - Register for migrations
 from app.models.intersection_enrichment_job import IntersectionEnrichmentJob  # noqa - Register for migrations
 from app.models.gsea_job import GSEAJob  # noqa - Register for migrations
 from app.models.service_token import ServiceToken  # noqa - Register for migrations
+from app.models.auth import AuthSession, AuthOneTimeToken, AuthRecoveryCode, AuthEvent  # noqa - Register for migrations
 from app.core.config import settings
 
 # this is the Alembic Config object, which provides
