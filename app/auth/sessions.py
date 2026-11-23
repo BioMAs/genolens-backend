@@ -38,6 +38,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.clock import aware_utc, now_utc
 from app.auth.tokens import hash_token, issue_access_token, new_opaque_token
 from app.models.auth import AuthSession
 from app.models.models import User
@@ -87,26 +88,11 @@ class RefreshRejected(Exception):
         self.reason = reason
 
 
-def _now(now: Optional[datetime]) -> datetime:
-    """The instant to work at, as an aware UTC datetime (a naive one is taken as UTC)."""
-    if now is None:
-        return datetime.now(UTC)
-    return _aware_utc(now)
-
-
-def _aware_utc(moment: datetime) -> datetime:
-    """SQLite hands back the naive UTC wall clock of what was stored, Postgres an aware value:
-    normalise both so that they compare with `now`."""
-    if moment.tzinfo is None:
-        return moment.replace(tzinfo=UTC)
-    return moment.astimezone(UTC)
-
-
 def _is_live(session: AuthSession, now: datetime) -> bool:
     return (
         session.revoked_at is None
-        and now < _aware_utc(session.idle_expires_at)
-        and now < _aware_utc(session.expires_at)
+        and now < aware_utc(session.idle_expires_at)
+        and now < aware_utc(session.expires_at)
     )
 
 
@@ -123,7 +109,7 @@ async def create_session(
     `amr` records how the user proved who they are (`["pwd"]`, `["pwd", "otp"]`, ...); every access
     token of the session carries it. Also records `user.last_login_at`. Flushes, does not commit.
     """
-    now = _now(now)
+    now = now_utc(now)
     session_id = uuid4()
     refresh_token = new_opaque_token()
     expires_at = now + ABSOLUTE_TTL
@@ -185,7 +171,7 @@ async def rotate_refresh(
     client's new refresh token. Because of that, the caller commits right after this returns and
     does nothing slow in between.
     """
-    now = _now(now)
+    now = now_utc(now)
     presented = hash_token(raw_refresh)
 
     session = (
@@ -218,7 +204,7 @@ async def rotate_refresh(
         session.refresh_token_hash = hash_token(refresh_token)
         session.rotated_at = now
         session.last_used_at = now
-        session.idle_expires_at = min(now + IDLE_TTL, _aware_utc(session.expires_at))
+        session.idle_expires_at = min(now + IDLE_TTL, aware_utc(session.expires_at))
         await db.flush()
         return RefreshOutcome(
             session_id=session.id,
@@ -231,7 +217,7 @@ async def rotate_refresh(
     # The presented token is the previous one. A session with a previous hash always has a
     # rotated_at; if it is missing anyway, fail closed (outside the grace window).
     rotated_at = session.rotated_at
-    if rotated_at is not None and now - _aware_utc(rotated_at) <= REFRESH_GRACE:
+    if rotated_at is not None and now - aware_utc(rotated_at) <= REFRESH_GRACE:
         return RefreshOutcome(
             session_id=session.id,
             access_token=issue_access_token(
@@ -288,7 +274,7 @@ async def get_session_user(
     session being live: not revoked, `now < idle_expires_at` and `now < expires_at`. Read-only: it
     does not slide the inactivity window.
     """
-    now = _now(now)
+    now = now_utc(now)
     row = (
         await db.execute(
             select(User, AuthSession)

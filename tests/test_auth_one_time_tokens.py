@@ -32,7 +32,7 @@ from app.auth.one_time_tokens import (
     count_recent_tokens,
     issue_token,
     peek_token,
-    record_failed_attempt,
+    reserve_attempt,
 )
 from app.auth.tokens import hash_token
 from app.models.auth import AuthEvent, AuthEventType, AuthOneTimeToken, OneTimeTokenPurpose
@@ -411,90 +411,227 @@ async def test_peek_sees_what_another_transaction_committed_not_what_it_loaded(a
             await peek_token(slow, raw, CHALLENGE, now=NOW)
 
 
-# --------------------------------------------------------------------------- failed attempts
+# --------------------------------------------------------------------------- reserve_attempt
+
+
+async def _attempts(auth_db, raw) -> tuple[int, bool]:
+    """What is stored for a token: how many attempts are taken, and whether it is spent."""
+    row = await _row(auth_db, raw)
+    return row.attempts, row.used_at is not None
 
 
 async def test_challenge_attempts_exhaust_after_five(auth_db):
     user = await seed_user(auth_db)
     async with auth_db() as db:
         raw = await issue_token(db, user.id, CHALLENGE, now=NOW)
-        tok = await peek_token(db, raw, CHALLENGE, now=NOW)
-        assert [await record_failed_attempt(db, tok) for _ in range(5)] == [4, 3, 2, 1, 0]
-        with pytest.raises(InvalidOneTimeToken):
-            await peek_token(db, raw, CHALLENGE)
         await db.commit()
-    row = await _row(auth_db, raw)
-    assert row.attempts == 5
-    assert row.used_at is not None
+
+        left = []
+        for _ in range(5):
+            token = await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+            left.append(MAX_CHALLENGE_ATTEMPTS - token.attempts)
+            await db.commit()  # what the login flow does before it looks at the code
+        assert left == [4, 3, 2, 1, 0]
+
+        for _ in range(2):
+            with pytest.raises(InvalidOneTimeToken) as excinfo:
+                await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+            assert excinfo.value.reason == "exhausted"
+    # The refused ones counted nothing; the token is not spent, it just cannot be tried again.
+    assert await _attempts(auth_db, raw) == (5, False)
 
 
-async def test_the_token_stays_usable_until_the_last_attempt_is_spent(auth_db):
-    user = await seed_user(auth_db)
-    async with auth_db() as db:
-        raw = await issue_token(db, user.id, CHALLENGE, now=NOW)
-        tok = await peek_token(db, raw, CHALLENGE, now=NOW)
-        for _ in range(MAX_CHALLENGE_ATTEMPTS - 1):
-            assert await record_failed_attempt(db, tok, now=NOW) > 0
-            assert tok.used_at is None
-            await peek_token(db, raw, CHALLENGE, now=NOW)  # still alive
-        assert await record_failed_attempt(db, tok, now=NOW + timedelta(seconds=7)) == 0
-        assert _aware(tok.used_at) == NOW + timedelta(seconds=7)  # the object the caller holds
-        assert tok.attempts == MAX_CHALLENGE_ATTEMPTS
-
-
-async def test_once_exhausted_further_failures_change_nothing(auth_db):
-    user = await seed_user(auth_db)
-    async with auth_db() as db:
-        raw = await issue_token(db, user.id, CHALLENGE, now=NOW)
-        tok = await peek_token(db, raw, CHALLENGE, now=NOW)
-        for _ in range(MAX_CHALLENGE_ATTEMPTS):
-            await record_failed_attempt(db, tok, now=NOW)
-        closed_at = tok.used_at
-        assert [await record_failed_attempt(db, tok, now=NOW + timedelta(minutes=1))] == [0]
-        assert tok.attempts == MAX_CHALLENGE_ATTEMPTS  # the counter does not run on
-        assert tok.used_at == closed_at
-        with pytest.raises(InvalidOneTimeToken):
-            await consume_token(db, raw, CHALLENGE, now=NOW)  # not even with the right code
-
-
-async def test_a_failure_against_a_token_just_consumed_elsewhere_has_no_attempts_left(auth_db):
-    # The legitimate code was accepted in another request an instant earlier: this wrong guess has
-    # nothing to count against, and must not reopen or alter the spent token.
+async def test_a_correct_code_on_the_fifth_reservation_still_consumes(auth_db):
     user = await seed_user(auth_db)
     raw = await _issue(auth_db, user.id, CHALLENGE)
-    async with auth_db() as slow, auth_db() as fast:
-        tok = await peek_token(slow, raw, CHALLENGE, now=NOW)
-        await consume_token(fast, raw, CHALLENGE, now=NOW + timedelta(seconds=1))
-        await fast.commit()
-        assert await record_failed_attempt(slow, tok, now=NOW + timedelta(seconds=2)) == 0
-        await slow.commit()
-    row = await _row(auth_db, raw)
-    assert row.attempts == 0
-    assert _aware(row.used_at) == NOW + timedelta(seconds=1)
+    async with auth_db() as db:
+        for _ in range(MAX_CHALLENGE_ATTEMPTS):
+            token = await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+            await db.commit()
+        assert token.attempts == MAX_CHALLENGE_ATTEMPTS  # the last attempt, and the right code
+        done = await consume_token(db, raw, CHALLENGE, now=NOW)
+        await db.commit()
+        assert done.user_id == user.id and done.used_at is not None
+
+        # Once consumed, nothing can reserve on it any more, and it says why.
+        with pytest.raises(InvalidOneTimeToken) as excinfo:
+            await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+        assert excinfo.value.reason == "used"
+    assert await _attempts(auth_db, raw) == (5, True)
 
 
-async def test_attempts_are_counted_in_sql_not_from_the_object_in_hand(auth_db):
-    # Two requests hold the same challenge (attempts == 0 in both objects). Each failure must
-    # count against the stored value: 3 failures in one, then 1 in the other leaves 1, not 4.
+async def test_reserve_counts_the_attempt_before_the_code_is_checked(auth_db):
+    # The returned token already includes this attempt, and nothing is spent: it is the caller's
+    # `consume_token` that closes the challenge.
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+    async with auth_db() as db:
+        token = await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+        assert token.attempts == 1
+        assert token.used_at is None
+        assert token.user_id == user.id and token.purpose is CHALLENGE
+        await db.commit()
+    assert await _attempts(auth_db, raw) == (1, False)
+
+
+async def test_a_reserved_attempt_is_not_handed_back_by_the_callers_rollback(auth_db):
+    # The login flow commits the reservation, then answers a wrong code with a 401 whose request
+    # rolls back: the attempt must stay spent.
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+    async with auth_db() as db:
+        await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+        await db.commit()
+        await db.rollback()
+    assert await _attempts(auth_db, raw) == (1, False)
+
+
+async def test_reserve_does_not_commit(auth_db):
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+    async with auth_db() as db:
+        await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+        await db.rollback()  # nobody committed: the attempt was never taken
+    assert await _attempts(auth_db, raw) == (0, False)
+
+
+async def test_reserve_refuses_what_peek_and_consume_refuse_and_writes_nothing(auth_db):
+    user = await seed_user(auth_db)
+    live = await _issue(auth_db, user.id, CHALLENGE)
+    used = await _issue(auth_db, user.id, OneTimeTokenPurpose.MFA_ENROLL)
+    await _consume(auth_db, used, OneTimeTokenPurpose.MFA_ENROLL)
+    spent = await _issue(auth_db, user.id, RESET)
+    async with auth_db() as db:
+        for _ in range(MAX_CHALLENGE_ATTEMPTS):
+            await reserve_attempt(db, live, CHALLENGE, now=NOW)
+        await db.commit()
+
+    cases = {
+        "unknown": (hash_token("nobody"), CHALLENGE, NOW),
+        "wrong_purpose": (spent, CHALLENGE, NOW),
+        "expired": (spent, RESET, NOW + TOKEN_TTL[RESET]),
+        "used": (used, OneTimeTokenPurpose.MFA_ENROLL, NOW),
+        "exhausted": (live, CHALLENGE, NOW),
+    }
+    messages = set()
+    async with auth_db() as db:
+        for expected, (raw, purpose, now) in cases.items():
+            with pytest.raises(InvalidOneTimeToken) as excinfo:
+                await reserve_attempt(db, raw, purpose, now=now)
+            assert excinfo.value.reason == expected
+            messages.add(str(excinfo.value))
+            for secret in (raw, hash_token(raw)):
+                assert secret not in str(excinfo.value) and secret not in repr(excinfo.value)
+        await db.commit()
+    assert len(messages) == 1  # the same words whatever the cause
+    # Not one of the refusals touched a counter or spent a token.
+    assert await _attempts(auth_db, spent) == (0, False)
+    assert await _attempts(auth_db, used) == (0, True)
+    assert await _attempts(auth_db, live) == (5, False)
+
+
+async def test_a_wrong_purpose_does_not_burn_an_attempt(auth_db):
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+    async with auth_db() as db:
+        for _ in range(3):
+            with pytest.raises(InvalidOneTimeToken) as excinfo:
+                await reserve_attempt(db, raw, OneTimeTokenPurpose.MFA_ENROLL, now=NOW)
+            assert excinfo.value.reason == "wrong_purpose"
+        assert (await reserve_attempt(db, raw, CHALLENGE, now=NOW)).attempts == 1
+
+
+async def test_an_expired_challenge_cannot_be_reserved_on_at_its_last_instant(auth_db):
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+    ttl = TOKEN_TTL[CHALLENGE]
+    async with auth_db() as db:
+        assert (
+            await reserve_attempt(db, raw, CHALLENGE, now=NOW + ttl - timedelta(seconds=1))
+        ).attempts == 1
+        with pytest.raises(InvalidOneTimeToken) as excinfo:
+            await reserve_attempt(db, raw, CHALLENGE, now=NOW + ttl)
+        assert excinfo.value.reason == "expired"
+
+
+async def test_unknown_and_malformed_challenges_cannot_be_reserved_on(auth_db):
+    await seed_user(auth_db)
+    async with auth_db() as db:
+        for raw in ("", "not-a-token", "A" * 5000, "\ud800 lone surrogate"):
+            with pytest.raises(InvalidOneTimeToken) as excinfo:
+                await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+            assert excinfo.value.reason == "unknown"
+
+
+async def test_attempts_are_handed_out_one_by_one_when_many_arrive_before_any_check(auth_db):
+    # The case the counter exists for. Seven guesses are made against one challenge, and none of
+    # them has been verified (so no failure has been recorded anywhere) when the next one starts.
+    # Counting failures after the check would let all seven through; reserving first lets five.
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+
+    outcomes = []
+    async with auth_db() as db:
+        for _ in range(7):
+            try:
+                token = await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+                outcomes.append(token.attempts)
+            except InvalidOneTimeToken as exc:
+                outcomes.append(exc.reason)
+        await db.commit()
+    assert outcomes == [1, 2, 3, 4, 5, "exhausted", "exhausted"]
+    assert await _attempts(auth_db, raw) == (5, False)
+
+
+async def test_of_many_concurrent_reservations_exactly_five_succeed(auth_db):
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+
+    async def attempt():
+        async with auth_db() as db:
+            try:
+                await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+            except InvalidOneTimeToken as exc:
+                return exc.reason
+            await db.commit()
+            return "reserved"
+
+    results = await asyncio.gather(*(attempt() for _ in range(7)))
+    assert sorted(results) == ["exhausted"] * 2 + ["reserved"] * 5
+    assert await _attempts(auth_db, raw) == (5, False)
+
+
+async def test_reservations_count_against_the_stored_value_whichever_session_makes_them(auth_db):
     user = await seed_user(auth_db)
     raw = await _issue(auth_db, user.id, CHALLENGE)
     async with auth_db() as a, auth_db() as b:
-        tok_a = await peek_token(a, raw, CHALLENGE, now=NOW)
-        tok_b = await peek_token(b, raw, CHALLENGE, now=NOW)
-        assert tok_a.attempts == tok_b.attempts == 0
-
-        assert [await record_failed_attempt(a, tok_a, now=NOW) for _ in range(3)] == [4, 3, 2]
+        held = await peek_token(b, raw, CHALLENGE, now=NOW)  # b's copy says attempts == 0
+        assert held.attempts == 0
+        for expected in (1, 2, 3):
+            assert (await reserve_attempt(a, raw, CHALLENGE, now=NOW)).attempts == expected
         await a.commit()
-        assert await record_failed_attempt(b, tok_b, now=NOW) == 1
+        # b reserves against what is stored, and its held object follows.
+        assert (await reserve_attempt(b, raw, CHALLENGE, now=NOW)).attempts == 4
+        assert held.attempts == 4
         await b.commit()
-    assert (await _row(auth_db, raw)).attempts == 4
+    assert await _attempts(auth_db, raw) == (4, False)
 
 
-async def test_failed_attempt_is_one_atomic_increment_statement(auth_db, monkeypatch):
+async def test_peek_counts_no_attempt(auth_db):
     user = await seed_user(auth_db)
     raw = await _issue(auth_db, user.id, CHALLENGE)
     async with auth_db() as db:
-        tok = await peek_token(db, raw, CHALLENGE, now=NOW)
+        for _ in range(10):
+            await peek_token(db, raw, CHALLENGE, now=NOW)
+        assert (await reserve_attempt(db, raw, CHALLENGE, now=NOW)).attempts == 1
+
+
+async def test_reserve_is_one_conditional_increment_statement(auth_db, monkeypatch):
+    # The bound is in the statement: one UPDATE that increments in SQL and only matches a token
+    # that is unused, unexpired, of the right purpose and below the maximum.
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+    async with auth_db() as db:
         seen = []
         real_execute = db.execute
 
@@ -503,47 +640,61 @@ async def test_failed_attempt_is_one_atomic_increment_statement(auth_db, monkeyp
             return await real_execute(statement, *args, **kwargs)
 
         monkeypatch.setattr(db, "execute", spy)
-        await record_failed_attempt(db, tok, now=NOW)
+        await reserve_attempt(db, raw, CHALLENGE, now=NOW)
 
     updates = [s for s in seen if str(s).lstrip().startswith("UPDATE")]
     assert len(updates) == 1
     sql = str(updates[0].compile(dialect=postgresql.dialect()))
-    assert "attempts=(auth_one_time_tokens.attempts + " in sql
-    assert "auth_one_time_tokens.used_at IS NULL" in sql
-    # The instant written into `used_at` is declared as timestamptz: asyncpg, unlike SQLite,
-    # refuses an aware datetime for a plain timestamp, which only a real Postgres would reveal.
+    assert "UPDATE auth_one_time_tokens SET attempts=(auth_one_time_tokens.attempts + " in sql
+    for clause in (
+        "auth_one_time_tokens.token_hash =",
+        "auth_one_time_tokens.purpose =",
+        "auth_one_time_tokens.used_at IS NULL",
+        "auth_one_time_tokens.expires_at >",
+        "auth_one_time_tokens.attempts <",
+    ):
+        assert clause in sql
+    # The instant is declared as timestamptz: asyncpg, unlike SQLite, refuses an aware datetime for
+    # a plain timestamp, which only a real Postgres would reveal.
     strict = str(updates[0].compile(dialect=asyncpg.dialect()))
-    assert re.search(r"THEN \$\d+::TIMESTAMP WITH TIME ZONE", strict)
+    assert re.search(r"expires_at > \$\d+::TIMESTAMP WITH TIME ZONE", strict)
 
 
-async def test_failed_attempts_are_not_shared_between_tokens(auth_db):
+async def test_reserved_attempts_are_not_shared_between_tokens(auth_db):
     user = await seed_user(auth_db)
     first = await _issue(auth_db, user.id, CHALLENGE)
     async with auth_db() as db:
-        tok = await peek_token(db, first, CHALLENGE, now=NOW)
         for _ in range(MAX_CHALLENGE_ATTEMPTS):
-            await record_failed_attempt(db, tok, now=NOW)
+            await reserve_attempt(db, first, CHALLENGE, now=NOW)
         # A new challenge starts from zero (the account-level counter is the caller's business).
         second = await issue_token(db, user.id, CHALLENGE, now=NOW)
-        fresh = await peek_token(db, second, CHALLENGE, now=NOW)
-        assert fresh.attempts == 0
-        assert await record_failed_attempt(db, fresh, now=NOW) == MAX_CHALLENGE_ATTEMPTS - 1
+        with pytest.raises(InvalidOneTimeToken) as excinfo:
+            await reserve_attempt(db, first, CHALLENGE, now=NOW)
+        assert excinfo.value.reason == "used"  # superseded by the new one
+        assert (await reserve_attempt(db, second, CHALLENGE, now=NOW)).attempts == 1
 
 
 async def test_an_mfa_challenge_end_to_end(auth_db):
-    # What the login flow does: issue at the password step, peek + record failures at the code
-    # step, consume once the code is right.
+    # What the login flow does: issue at the password step; at the code step reserve an attempt,
+    # commit, verify; consume once the code is right.
     user = await seed_user(auth_db)
     async with auth_db() as db:
         raw = await issue_token(db, user.id, CHALLENGE, now=NOW)
-        tok = await peek_token(db, raw, CHALLENGE, now=NOW + timedelta(seconds=10))
-        assert await record_failed_attempt(db, tok, now=NOW + timedelta(seconds=10)) == 4
-        tok = await peek_token(db, raw, CHALLENGE, now=NOW + timedelta(seconds=20))
-        assert tok.attempts == 1
+        await db.commit()
+
+        token = await reserve_attempt(db, raw, CHALLENGE, now=NOW + timedelta(seconds=10))
+        await db.commit()
+        assert MAX_CHALLENGE_ATTEMPTS - token.attempts == 4  # a wrong code: nothing more to record
+
+        token = await reserve_attempt(db, raw, CHALLENGE, now=NOW + timedelta(seconds=20))
+        await db.commit()
+        assert MAX_CHALLENGE_ATTEMPTS - token.attempts == 3
         done = await consume_token(db, raw, CHALLENGE, now=NOW + timedelta(seconds=20))
+        await db.commit()
         assert done.user_id == user.id
-        with pytest.raises(InvalidOneTimeToken):
-            await peek_token(db, raw, CHALLENGE, now=NOW + timedelta(seconds=30))
+        for check in (reserve_attempt, peek_token):
+            with pytest.raises(InvalidOneTimeToken):
+                await check(db, raw, CHALLENGE, now=NOW + timedelta(seconds=30))
 
 
 # --------------------------------------------------------------------------- count_recent_tokens
@@ -591,8 +742,10 @@ async def test_no_token_or_hash_reaches_the_logs(auth_db, caplog):
     user = await seed_user(auth_db)
     raw = await _issue(auth_db, user.id, CHALLENGE)
     async with auth_db() as db:
-        tok = await peek_token(db, raw, CHALLENGE, now=NOW)
-        await record_failed_attempt(db, tok, now=NOW)
+        await peek_token(db, raw, CHALLENGE, now=NOW)
+        await reserve_attempt(db, raw, CHALLENGE, now=NOW)
+        with pytest.raises(InvalidOneTimeToken):
+            await reserve_attempt(db, raw, INVITE, now=NOW)
         with pytest.raises(InvalidOneTimeToken):
             await consume_token(db, raw, INVITE, now=NOW)
         await consume_token(db, raw, CHALLENGE, now=NOW)

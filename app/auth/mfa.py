@@ -48,12 +48,13 @@ import re
 import secrets
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Optional
 
 import pyotp
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
+from app.auth.clock import now_utc
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -128,10 +129,7 @@ def verify_totp(
     if not _TOTP_CODE.fullmatch(code):
         return None
 
-    if now is None:
-        now = datetime.now(UTC)
-    elif now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
+    now = now_utc(now)
     current = int(now.timestamp()) // TOTP_PERIOD
 
     totp = _totp(secret)

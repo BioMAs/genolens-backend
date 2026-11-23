@@ -23,6 +23,7 @@ from uuid import UUID
 
 import jwt
 
+from app.auth.clock import now_utc
 from app.auth.keys import load_signing_keys
 from app.core.config import settings
 
@@ -53,9 +54,7 @@ def issue_access_token(
     now: Optional[datetime] = None,
 ) -> str:
     """Sign an access token for `user_id`, bound to `session_id`, valid for `ACCESS_TOKEN_TTL`."""
-    now = now or datetime.now(UTC)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
+    now = now_utc(now)
     key = load_signing_keys()[0]
     payload = {
         "iss": settings.AUTH_ISSUER,
