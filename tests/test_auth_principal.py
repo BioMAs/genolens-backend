@@ -426,28 +426,66 @@ async def test_one_db_session_per_request(
     local_session_for,
     supabase_token_for,
     settings_override,
+    monkeypatch,
 ):
-    user = await seed_user(auth_db)
+    """A request is served on the single session of `get_db`, here the test's override. Counting
+    the override's calls alone proves nothing (FastAPI caches it per request); what matters is
+    that nothing opens a session another way: the app's factory, read directly or by a second,
+    non-overridden copy of `get_db`, would hold a second pool connection for one request (the
+    pool deadlock of 12/10). So the factory is replaced by a tripwire, everywhere it is reachable
+    (`app.db.session` and every `app` module that imported it by name), and the real engine
+    records any connection attempt."""
+    import sys
 
+    from sqlalchemy import event
+
+    import app.db.session as db_session
+
+    user = await seed_user(auth_db)
     settings_override(AUTH_MODE="local")
     s = await local_session_for(user)
-    db_sessions_opened.opened = 0
-    resp = await auth_client.get(ME, headers=bearer(s.access_token))
-    assert resp.status_code == 200, resp.text
-    assert db_sessions_opened.opened == 1
 
-    db_sessions_opened.opened = 0
-    resp = await auth_client.post(
-        PROJECTS, json=NEW_PROJECT, headers={**access_cookie(s.access_token), **CSRF}
-    )
-    assert resp.status_code == 201, resp.text
-    assert db_sessions_opened.opened == 1
+    tripped: list[str] = []
 
-    settings_override(AUTH_MODE="supabase")
-    db_sessions_opened.opened = 0
-    resp = await auth_client.get(ME, headers=bearer(supabase_token_for(user)))
-    assert resp.status_code == 200, resp.text
-    assert db_sessions_opened.opened == 1
+    def tripwire(*_args, **_kwargs):
+        tripped.append("AsyncSessionLocal")
+        raise AssertionError("a request opened a database session outside get_db")
+
+    patched = []
+    for name, module in list(sys.modules.items()):
+        if (name == "app" or name.startswith("app.")) and hasattr(module, "AsyncSessionLocal"):
+            monkeypatch.setattr(module, "AsyncSessionLocal", tripwire)
+            patched.append(name)
+    assert "app.db.session" in patched and "app.api.deps.subscription" in patched
+
+    def connection_attempt(*_args, **_kwargs):
+        tripped.append("engine")
+
+    event.listen(db_session.engine.sync_engine, "do_connect", connection_attempt)
+    try:
+        requests = [
+            ("GET", ME, bearer(s.access_token), None, 200),
+            ("POST", PROJECTS, {**access_cookie(s.access_token), **CSRF}, NEW_PROJECT, 201),
+        ]
+        for method, path, headers, body, expected in requests:
+            db_sessions_opened.opened = 0
+            resp = await auth_client.request(method, path, headers=headers, json=body)
+            assert resp.status_code == expected, resp.text
+            assert db_sessions_opened.opened == 1  # served through the override
+            assert tripped == [], f"{method} {path}: {tripped}"
+
+        settings_override(AUTH_MODE="supabase")
+        db_sessions_opened.opened = 0
+        resp = await auth_client.get(ME, headers=bearer(supabase_token_for(user)))
+        assert resp.status_code == 200, resp.text
+        assert db_sessions_opened.opened == 1 and tripped == []
+
+        # The tripwire is live: what a duplicate copy of `get_db` would run trips it.
+        with pytest.raises(AssertionError):
+            await db_session.get_db().__anext__()
+        assert tripped == ["AsyncSessionLocal"]
+    finally:
+        event.remove(db_session.engine.sync_engine, "do_connect", connection_attempt)
 
 
 # ── The other dependency (app.api.deps.auth) ─────────────────────────────────
