@@ -147,14 +147,18 @@ async def unlock_user(
     actor_id: Optional[UUID],
     request: Optional[Request] = None,
 ) -> None:
-    """Clear the brute-force lock of the account: no recorded failures, no lock date.
+    """Clear the brute-force lock of the account: no recorded failures (wrong passwords and wrong
+    second-factor codes alike), no lock date. The administrator lets the owner try again, codes
+    included; otherwise the first wrong code after an unlock would lock the account again.
 
     This is the account row only. An address that has no account is locked by the sign-in
     throttle in the rate limiter's storage (so that unknown addresses cannot be told from known
     ones); that lock belongs to no row, is not touched here, and expires by itself.
     """
     await db.execute(
-        update(User).where(User.id == user.id).values(failed_login_count=0, locked_until=None)
+        update(User)
+        .where(User.id == user.id)
+        .values(failed_login_count=0, mfa_failed_count=0, locked_until=None)
     )
     await record_event(
         db,

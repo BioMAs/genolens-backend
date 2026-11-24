@@ -1,6 +1,6 @@
 """
 The e-mails of the local authentication: invitation, e-mail verification, password reset,
-"you already have an account", and the four security notifications.
+"you already have an account", and the five security notifications.
 
 Every one is sent with `required=True` (see `send_email`): if SMTP is not configured, or the server
 refuses the message, the call raises `EmailNotConfiguredError` / `EmailSendError` instead of logging
@@ -204,6 +204,27 @@ async def send_mfa_reset_email(to: str) -> None:
             "An administrator reset two-factor authentication on your GenoLens account. You will "
             "be asked to set it up again the next time you sign in.",
             f"If you did not expect this, contact {settings.SUPPORT_EMAIL} right away.",
+        ],
+    )
+
+
+async def send_mfa_lock_email(to: str) -> None:
+    """After the tenth wrong two-step code in a row that followed a right password: someone else
+    knows the password. The button leads to the page that asks for a reset link."""
+    await _send(
+        to,
+        "Your GenoLens account was temporarily locked",
+        [
+            "Someone entered the correct password of your GenoLens account, then failed the "
+            "two-step verification code several times in a row. Your account is temporarily "
+            "locked.",
+            "Your password is known to someone else: change your password now, then contact "
+            f"{settings.SUPPORT_EMAIL}.",
+        ],
+        ("Change my password", f"{settings.APP_URL.rstrip('/')}/auth/forgot"),
+        [
+            "If it was you, wait 15 minutes before trying again, and use a recovery code if your "
+            "authenticator app no longer gives the right codes.",
         ],
     )
 

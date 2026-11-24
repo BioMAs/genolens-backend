@@ -54,17 +54,20 @@ at most `LINK_EMAILS_PER_HOUR` link e-mails (verification and reset links togeth
 routes counted) within the hour, counted in the database from the tokens issued
 (`count_recent_tokens`); beyond that the answer is the same 202 and nothing is sent.
 
-The account lock. A wrong current password (`/password/change`, `/mfa/rotate/start`) and a wrong
-current TOTP code (`/mfa/rotate/start`, `/mfa/recovery-codes/regenerate`) count toward the lock
-exactly as a failed sign-in, and a locked account gets `429 too_many_attempts` on those routes. As
-at sign-in, the session routes never reset the count: an opened session does, and so does a
-completed `/password/reset`, which clears the count and the lock in the transaction that changes
-the password (whoever proves the inbox must not stay locked out by somebody else's failures; the
-next sign-in still asks for the second factor). A refused reset (bad link, password policy) leaves
-both as they were. A wrong code while confirming a rotation counts too, and also drops the
-pending secret: the rotation starts again from `/mfa/rotate/start` (password and current code), so
-a session holder gets one guess per rotation, never a free run at the code of one the owner began.
-`/mfa/rotate/confirm` also has the per-IP limit of `/mfa/verify`.
+The account lock (its two counts are described in `app.api.endpoints.auth`). A wrong current
+password (`/password/change`, `/mfa/rotate/start`) counts as a wrong password at sign-in; a wrong
+current TOTP code (`/mfa/rotate/start`, `/mfa/rotate/confirm`, `/mfa/recovery-codes/regenerate`)
+counts as a wrong code at `/mfa/verify`, and the tenth one e-mails the owner the same way. A
+locked account gets `429 too_many_attempts` on those routes. The session routes never reset a
+count: an opened session resets both. A completed `/password/reset` clears the password count and
+its lock in the transaction that changes the password (whoever proves the inbox must not stay
+locked out by somebody else's wrong passwords; the next sign-in still asks for the second factor),
+but keeps the code count, and the lock while that count holds one: a reset never refills the code
+guesses. A refused reset (bad link, password policy) leaves everything as it was. A wrong code
+while confirming a rotation also drops the pending secret: the rotation starts again from
+`/mfa/rotate/start` (password and current code), so a session holder gets one guess per rotation,
+never a free run at the code of one the owner began. `/mfa/rotate/confirm` also has the per-IP
+limit of `/mfa/verify`.
 
 Transactions. Each route commits before it answers; its e-mails leave after the response, from a
 background job, best effort (an SMTP failure shows in the audit log, not in the HTTP response).
@@ -90,13 +93,15 @@ from app.api.endpoints.auth import (
     MFA_LIMIT,
     MfaConfirmRequest,
     _accept_totp,
-    _clear_failures,
+    _clear_password_failures,
     _count_failure,
+    _count_mfa_failure,
     _decrypt,
     _find_account,
     _is_locked,
     _load_user,
     _notify,
+    _notify_mfa_lock,
     _refusal,
     _spend,
     _storable,
@@ -502,7 +507,8 @@ async def reset_password(
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     """No session is opened: the next sign-in still asks for the second factor (spec §7.4). The
-    account lock and its count are cleared with the password, in the same transaction."""
+    password count and its lock are cleared with the password, in the same transaction; the code
+    count, and a lock it holds, are not (`_clear_password_failures`)."""
     now = now_utc()
     user = await _account_of_link(db, body.token, Purpose.PASSWORD_RESET, now)
     if user is None:
@@ -520,7 +526,7 @@ async def reset_password(
     user.password_changed_at = now
     if user.email_verified_at is None:
         user.email_verified_at = now  # the link reached the inbox, as a verification link would
-    await _clear_failures(db, user.id)  # an UPDATE: it also wipes a failure counted meanwhile
+    await _clear_password_failures(db, user.id)  # an UPDATE: also a failure counted meanwhile
     revoked = await revoke_all_sessions(db, user.id, RESET_REASON)
     tokens_spent = await invalidate_user_tokens(db, user.id, now=now)
     await record_event(
@@ -627,13 +633,23 @@ async def _wrong_password(
 
 
 async def _wrong_code(
-    db: AsyncSession, request: Request, user: User, step: str, now: datetime
+    db: AsyncSession,
+    background: BackgroundTasks,
+    request: Request,
+    user: User,
+    step: str,
+    now: datetime,
 ) -> JSONResponse:
-    await _count_failure(db, user.id, request, now)
+    """A wrong current code: counted as a second-factor failure (`_count_mfa_failure`), and the
+    owner is told when it starts the lock."""
+    lock_started = await _count_mfa_failure(db, user.id, request, now)
     await record_event(
         db, AuthEventType.MFA_FAILED, user_id=user.id, request=request, method="otp", step=step
     )
+    user_id, email = user.id, user.email
     await db.commit()
+    if lock_started:
+        _notify_mfa_lock(background, request, user_id, email)
     return _bad_request("invalid_code")
 
 
@@ -790,6 +806,7 @@ async def start_mfa_rotation(
     request: Request,
     response: Response,
     body: MfaRotateStartRequest,
+    background: BackgroundTasks,
     caller: LocalCaller = Depends(require_local_session),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
@@ -806,7 +823,7 @@ async def start_mfa_rotation(
     if not check.ok:
         return await _wrong_password(db, request, user, "mfa_rotate", now)
     if not await _accept_totp(db, user, body.code, now):
-        return await _wrong_code(db, request, user, "mfa_rotate", now)
+        return await _wrong_code(db, background, request, user, "mfa_rotate", now)
 
     secret = new_totp_secret()
     user.mfa_pending_secret_enc = encrypt_secret(secret)
@@ -822,6 +839,7 @@ async def confirm_mfa_rotation(
     request: Request,
     response: Response,
     body: MfaConfirmRequest,
+    background: BackgroundTasks,
     caller: LocalCaller = Depends(require_local_session),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
@@ -869,7 +887,7 @@ async def confirm_mfa_rotation(
             .values(mfa_pending_secret_enc=None)
             .execution_options(synchronize_session=False)
         )
-        return await _wrong_code(db, request, user, "mfa_rotate_confirm", now)
+        return await _wrong_code(db, background, request, user, "mfa_rotate_confirm", now)
 
     codes = await _replace_recovery_codes(db, user.id)
     await record_event(db, AuthEventType.MFA_ROTATED, user_id=user.id, request=request)
@@ -883,6 +901,7 @@ async def regenerate_recovery_codes(
     request: Request,
     response: Response,
     body: MfaConfirmRequest,
+    background: BackgroundTasks,
     caller: LocalCaller = Depends(require_local_session),
     db: AsyncSession = Depends(get_db),
 ) -> Any:
@@ -894,7 +913,7 @@ async def regenerate_recovery_codes(
     if _is_locked(user, now):
         return await _locked_out(db, request, user, "recovery_codes")
     if not await _accept_totp(db, user, body.code, now):
-        return await _wrong_code(db, request, user, "recovery_codes", now)
+        return await _wrong_code(db, background, request, user, "recovery_codes", now)
 
     codes = await _replace_recovery_codes(db, user.id)
     await record_event(

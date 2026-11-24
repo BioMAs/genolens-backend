@@ -27,15 +27,23 @@ lock, audited with reason `prelaunch_restricted`). The second factor, `/refresh`
 `/jwks.json` and the session routes of `app.api.endpoints.auth_account` work as after the switch;
 the public self-service routes of that module answer 404 until `AUTH_MODE=local`.
 
-Failures and the account lock. A wrong password and a wrong 2FA code at `/mfa/verify` both count
-toward the account lock: the tenth consecutive failure locks the account for 15 minutes. Once the
-lock has run out its count is spent: the next failure is the first of a new run, and only ten fresh
-failures lock again (so a stranger cannot keep an account locked for ever with one wrong password
-every fifteen minutes). Otherwise the count is reset only when a session opens, NOT after the
-password alone: a password holder could log in again between challenges and guess five codes per
-challenge without ever being locked. A completed password reset clears it too
-(`app.api.endpoints.auth_account`). A locked account gets `429 too_many_attempts` at `/login`,
+Failures and the account lock. Two counts, each with its own rule; either one locks the account
+for 15 minutes (one `locked_until`), and a locked account gets `429 too_many_attempts` at `/login`,
 `/mfa/verify` and `/mfa/setup/confirm`, whatever it sends.
+- Wrong passwords (`failed_login_count`, `_count_failure`): the tenth consecutive one locks. Once
+  that lock has run out its count is spent: the next failure is the first of a new run, and only
+  ten fresh failures lock again, so a stranger cannot keep an account locked for ever with one
+  wrong password every fifteen minutes. An opened session or a completed password reset
+  (`app.api.endpoints.auth_account`) resets it.
+- Wrong second-factor codes after a right password (`mfa_failed_count`, `_count_mfa_failure`): at
+  `/mfa/verify` here, and the session routes that ask for a current code. From the tenth, every
+  failure locks again, with no fresh start, and only an opened session resets the count: NOT the
+  password alone (a password holder could log in again between challenges and guess five codes per
+  challenge), and NOT a password reset (whoever holds the inbox would refill the guesses at will;
+  the reset keeps the lock this count holds). So a password holder gets ten guesses, then one per
+  lock. The tenth wrong code means someone has the password: the owner is e-mailed once
+  (`send_mfa_lock_email`), after the response; the failures after it lock again silently until a
+  sign-in starts a new count.
 Wrong codes while confirming an enrolment spend the step token's attempts but not the account's:
 the caller is confirming a secret it was just given, there is nothing to guess.
 
@@ -95,7 +103,11 @@ from app.api.deps import get_db
 from app.auth import cookies
 from app.auth.audit import record_event
 from app.auth.clock import aware_utc, now_utc
-from app.auth.emails import send_mfa_enabled_email, send_recovery_code_used_email
+from app.auth.emails import (
+    send_mfa_enabled_email,
+    send_mfa_lock_email,
+    send_recovery_code_used_email,
+)
 from app.auth.keys import jwks
 from app.auth.mfa import (
     SecretDecryptionError,
@@ -260,14 +272,41 @@ def _is_locked(user: User, now: datetime) -> bool:
     return user.locked_until is not None and aware_utc(user.locked_until) > now
 
 
-async def _count_failure(db: AsyncSession, user_id: UUID, request: Request, now: datetime) -> None:
-    """One more consecutive failure on the account; from the tenth, a 15-minute lock.
+async def _lock(
+    db: AsyncSession, user_id: UUID, request: Request, now: datetime, **details: Any
+) -> None:
+    """Lock the account for 15 minutes from `now`, and audit it (`details`: which count, how many
+    failures)."""
+    locked_until = now + LOCK_DURATION
+    await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(locked_until=locked_until)
+        .execution_options(synchronize_session=False)
+    )
+    await record_event(
+        db,
+        AuthEventType.ACCOUNT_LOCKED,
+        user_id=user_id,
+        request=request,
+        locked_until=locked_until,
+        **details,
+    )
 
-    A lock that has run out has spent its count: the failure after it is the first of a new run
-    (count 1, lock date cleared), so the next lock takes ten fresh failures. Otherwise anyone could
-    keep an account locked for ever with one wrong password every fifteen minutes. One statement
-    decides and counts, so two concurrent failures cannot both start a new run."""
-    expired = and_(User.locked_until.is_not(None), User.locked_until <= now)
+
+async def _count_failure(db: AsyncSession, user_id: UUID, request: Request, now: datetime) -> None:
+    """One more consecutive wrong password (`failed_login_count`); the tenth locks the account
+    for 15 minutes.
+
+    A password lock that has run out has spent the count: the failure after it is the first of a
+    new run (count 1, lock date cleared), so the next lock takes ten fresh failures. Otherwise
+    anyone could keep an account locked for ever with one wrong password every fifteen minutes. One
+    statement decides and counts, so two concurrent failures cannot both start a new run."""
+    expired = and_(
+        User.failed_login_count >= LOCK_THRESHOLD,
+        User.locked_until.is_not(None),
+        User.locked_until <= now,
+    )
     failures = (
         await db.execute(
             update(User)
@@ -281,28 +320,73 @@ async def _count_failure(db: AsyncSession, user_id: UUID, request: Request, now:
         )
     ).scalar_one_or_none()
     if failures is not None and failures >= LOCK_THRESHOLD:
-        locked_until = now + LOCK_DURATION
+        await _lock(db, user_id, request, now, counter="password", failures=failures)
+
+
+async def _count_mfa_failure(
+    db: AsyncSession, user_id: UUID, request: Request, now: datetime
+) -> bool:
+    """One more consecutive wrong second-factor code, the password having been right
+    (`mfa_failed_count`). From the tenth, EVERY failure locks the account for 15 minutes: no fresh
+    start after a lock, and only an opened session resets this count (not a password reset), so a
+    password holder gets ten guesses, then one per lock.
+
+    Returns True when this failure is the tenth, the one that starts the lock: someone has the
+    password, and the caller tells the owner (`_notify_mfa_lock`) once the failure is committed.
+    The failures after it lock again without a new e-mail until a sign-in has reset the count."""
+    failures = (
         await db.execute(
             update(User)
             .where(User.id == user_id)
-            .values(locked_until=locked_until)
+            .values(mfa_failed_count=User.mfa_failed_count + 1)
+            .returning(User.mfa_failed_count)
             .execution_options(synchronize_session=False)
         )
-        await record_event(
-            db,
-            AuthEventType.ACCOUNT_LOCKED,
-            user_id=user_id,
-            request=request,
-            failures=failures,
-            locked_until=locked_until,
-        )
+    ).scalar_one_or_none()
+    if failures is None or failures < LOCK_THRESHOLD:
+        return False
+    starts = failures == LOCK_THRESHOLD
+    await _lock(db, user_id, request, now, counter="mfa", failures=failures, notify_owner=starts)
+    return starts
+
+
+def _notify_mfa_lock(
+    background: BackgroundTasks, request: Request, user_id: UUID, email: str
+) -> None:
+    """E-mail the owner that the code lock started (after the response, best effort: an e-mail
+    that does not leave is audited on `account_locked`, see `_deliver`)."""
+    _notify(
+        background,
+        request,
+        user_id,
+        AuthEventType.ACCOUNT_LOCKED,
+        lambda: send_mfa_lock_email(email),
+    )
 
 
 async def _clear_failures(db: AsyncSession, user_id: UUID) -> None:
+    """A session opened: both counts and the lock are cleared."""
     await db.execute(
         update(User)
         .where(User.id == user_id)
-        .values(failed_login_count=0, locked_until=None)
+        .values(failed_login_count=0, mfa_failed_count=0, locked_until=None)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def _clear_password_failures(db: AsyncSession, user_id: UUID) -> None:
+    """A password reset completed: the password count and its lock are cleared. The code count is
+    kept, and so is the lock while that count holds one (ten codes or more): a reset must not
+    refill the code guesses of whoever holds the inbox."""
+    await db.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            failed_login_count=0,
+            locked_until=case(
+                (User.mfa_failed_count >= LOCK_THRESHOLD, User.locked_until), else_=null()
+            ),
+        )
         .execution_options(synchronize_session=False)
     )
 
@@ -634,7 +718,7 @@ async def verify_mfa(
         method, accepted = "recovery", await _spend_recovery_code(db, user.id, typed, now)
     if not accepted:
         attempts_left = MAX_CHALLENGE_ATTEMPTS - token.attempts
-        await _count_failure(db, user.id, request, now)
+        lock_started = await _count_mfa_failure(db, user.id, request, now)
         await record_event(
             db,
             AuthEventType.MFA_FAILED,
@@ -643,7 +727,10 @@ async def verify_mfa(
             method=method,
             attempts_left=attempts_left,
         )
+        user_id, email = user.id, user.email
         await db.commit()
+        if lock_started:
+            _notify_mfa_lock(background, request, user_id, email)
         return _invalid_code(attempts_left)
 
     if not await _spend(db, raw, Purpose.MFA_CHALLENGE, now):

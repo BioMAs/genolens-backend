@@ -1,10 +1,10 @@
 """local authentication: users credential columns and the four auth_* tables
 
 users: password_hash, email_verified_at, password_changed_at, mfa_totp_secret_enc,
-mfa_pending_secret_enc, mfa_enabled_at, mfa_last_used_step, failed_login_count (NOT NULL,
-server default 0), locked_until, last_login_at, auth_migrated_at. Every one but the counter is
-nullable: an account that has never signed in locally keeps NULLs and keeps working through
-Supabase until it is migrated.
+mfa_pending_secret_enc, mfa_enabled_at, mfa_last_used_step, failed_login_count and
+mfa_failed_count (NOT NULL, server default 0), locked_until, last_login_at, auth_migrated_at.
+Every one but the two counters is nullable: an account that has never signed in locally keeps
+NULLs and keeps working through Supabase until it is migrated.
 auth_sessions: one login, with a rotating refresh token stored as a sha256 only.
 auth_one_time_tokens: invitation / password reset / e-mail verification / MFA tokens (sha256 only,
 purpose stored as VARCHAR, not a native Postgres enum).
@@ -22,6 +22,7 @@ Create Date: 2026-11-24 10:00:00
 from typing import Sequence, Union
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "local_auth_001"
@@ -31,7 +32,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 PURPOSES = ("invite", "password_reset", "email_verify", "mfa_challenge", "mfa_enroll")
 
-# users columns added by this revision, in order. The counter is handled apart (NOT NULL).
+# users columns added by this revision, in order. The counters are handled apart (NOT NULL).
 USER_COLUMNS: tuple[tuple[str, sa.types.TypeEngine], ...] = (
     ("password_hash", sa.Text()),
     ("email_verified_at", sa.DateTime(timezone=True)),
@@ -45,6 +46,9 @@ USER_COLUMNS: tuple[tuple[str, sa.types.TypeEngine], ...] = (
     ("auth_migrated_at", sa.DateTime(timezone=True)),
 )
 
+# The failure counters of the account lock: wrong passwords, wrong second-factor codes.
+COUNTERS = ("failed_login_count", "mfa_failed_count")
+
 
 def upgrade() -> None:
     inspector = sa.inspect(op.get_bind())
@@ -53,13 +57,12 @@ def upgrade() -> None:
     for name, type_ in USER_COLUMNS:
         if name not in cols:
             op.add_column("users", sa.Column(name, type_, nullable=True))
-    if "failed_login_count" not in cols:
-        op.add_column(
-            "users",
-            sa.Column(
-                "failed_login_count", sa.Integer(), nullable=False, server_default=sa.text("0")
-            ),
-        )
+    for name in COUNTERS:
+        if name not in cols:
+            op.add_column(
+                "users",
+                sa.Column(name, sa.Integer(), nullable=False, server_default=sa.text("0")),
+            )
 
     tables = set(inspector.get_table_names())
 
@@ -186,6 +189,6 @@ def downgrade() -> None:
             op.drop_table(table)
 
     cols = {c["name"] for c in inspector.get_columns("users")}
-    for name in ("failed_login_count", *(name for name, _ in reversed(USER_COLUMNS))):
+    for name in (*reversed(COUNTERS), *(name for name, _ in reversed(USER_COLUMNS))):
         if name in cols:
             op.drop_column("users", name)

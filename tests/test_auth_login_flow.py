@@ -454,26 +454,121 @@ async def test_an_expired_lock_takes_ten_fresh_failures_to_lock_again(
     assert len(await events(auth_db, AuthEventType.ACCOUNT_LOCKED)) == 2
 
 
-async def test_an_expired_lock_earned_with_codes_restarts_the_count_too(
-    auth_client, auth_db, local_auth
-):
-    """The 2FA failures share the account's count, and so its fresh start after a lock."""
-    user, secret = await mfa_user(auth_db)
-    async with auth_db() as s:
-        await s.execute(
-            update(User)
-            .where(User.id == user.id)
-            .values(failed_login_count=10, locked_until=now_utc() - timedelta(seconds=1))
-        )
-        await s.commit()
+async def fail_codes(client, user: User, secret: str, count: int) -> None:
+    """`count` wrong codes from a password holder, over as many challenges as that takes."""
+    while count > 0:
+        assert (await login(client, user.email)).json() == {"next": "mfa"}
+        for _ in range(min(count, 5)):
+            r = await verify(client, code=wrong_code(secret))
+            assert r.status_code == 401 and r.json()["detail"] == "invalid_code"
+        count -= 5
 
+
+def lock_mails(smtp_capture, user: User) -> list:
+    return [m for m in smtp_capture.messages if m.to == user.email and "locked" in m.subject]
+
+
+async def test_after_an_mfa_lock_every_wrong_code_locks_again(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    """The code count has no fresh start: once ten codes are spent, a password holder gets one
+    guess per lock, not ten."""
+    user, secret = await mfa_user(auth_db)
+    await fail_codes(auth_client, user, secret, 10)
+    assert (await login(auth_client, user.email)).json() == TOO_MANY_ATTEMPTS
+
+    await expire_lock(auth_db, user.id)
     assert (await login(auth_client, user.email)).json() == {"next": "mfa"}
     r = await verify(auth_client, code=wrong_code(secret))
 
     assert r.status_code == 401 and r.json()["detail"] == "invalid_code"
+    r = await login(auth_client, user.email)
+    assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
     stored = await reload(auth_db, user.id)
-    assert stored.failed_login_count == 1 and stored.locked_until is None
+    assert stored.mfa_failed_count == 11 and stored.failed_login_count == 0
+    assert aware_utc(stored.locked_until) > now_utc()
+    assert len(await events(auth_db, AuthEventType.ACCOUNT_LOCKED)) == 2
+
+
+async def test_a_completed_sign_in_resets_the_code_count(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    user, secret = await mfa_user(auth_db)
+    await fail_codes(auth_client, user, secret, 9)
+    assert (await reload(auth_db, user.id)).mfa_failed_count == 9
+
     assert (await verify(auth_client, code=code_at(secret))).status_code == 200
+
+    assert (await reload(auth_db, user.id)).mfa_failed_count == 0
+    await fail_codes(auth_client, user, secret, 9)
+    assert (await login(auth_client, user.email)).json() == {"next": "mfa"}  # not locked
+
+
+async def test_password_and_code_failures_are_counted_apart(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    """Each count has its own lock rule; either one locks the account."""
+    user, secret = await mfa_user(auth_db)
+    for _ in range(9):
+        await login(auth_client, user.email, "Wrong-Password-Again-42")
+    await fail_codes(auth_client, user, secret, 9)
+
+    stored = await reload(auth_db, user.id)
+    assert (stored.failed_login_count, stored.mfa_failed_count) == (9, 9)
+    assert stored.locked_until is None
+    await login(auth_client, user.email, "Wrong-Password-Again-42")
+    assert (await login(auth_client, user.email)).json() == TOO_MANY_ATTEMPTS
+    assert lock_mails(local_auth, user) == []  # a password lock tells nobody anything
+
+
+async def test_the_mfa_lock_e_mails_the_owner_once_per_lock(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    """Someone has the password: the owner hears of it when the code lock starts (the tenth wrong
+    code), not at every guess after it, and again only after a completed sign-in started a new
+    count."""
+    from app.core.config import settings
+
+    user, secret = await mfa_user(auth_db)
+    await fail_codes(auth_client, user, secret, 10)
+
+    [mail] = lock_mails(local_auth, user)
+    assert "correct password" in mail.text and "temporarily locked" in mail.text
+    assert f"{settings.APP_URL.rstrip('/')}/auth/forgot" in mail.text
+    assert settings.SUPPORT_EMAIL in mail.text
+    [locked] = await events(auth_db, AuthEventType.ACCOUNT_LOCKED)
+    assert locked.details["counter"] == "mfa" and locked.details["notify_owner"] is True
+
+    assert (await login(auth_client, user.email)).json() == TOO_MANY_ATTEMPTS
+    await expire_lock(auth_db, user.id)
+    await fail_codes(auth_client, user, secret, 1)  # locks again, says nothing more
+    assert len(lock_mails(local_auth, user)) == 1
+    assert [
+        e.details.get("notify_owner") for e in await events(auth_db, AuthEventType.ACCOUNT_LOCKED)
+    ] == [True, False]
+
+    await expire_lock(auth_db, user.id)
+    assert (await login(auth_client, user.email)).json() == {"next": "mfa"}
+    assert (await verify(auth_client, code=code_at(secret))).status_code == 200
+    await fail_codes(auth_client, user, secret, 10)
+    assert len(lock_mails(local_auth, user)) == 2
+
+
+async def test_an_mfa_lock_e_mail_that_cannot_leave_is_audited(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    user, secret = await mfa_user(auth_db)
+    local_auth.fail_with = OSError("smtp down")
+
+    await fail_codes(auth_client, user, secret, 10)
+
+    assert (await login(auth_client, user.email)).json() == TOO_MANY_ATTEMPTS
+    unsent = [
+        e
+        for e in await events(auth_db, AuthEventType.ACCOUNT_LOCKED)
+        if e.details.get("notification") == "not_sent"
+    ]
+    assert len(unsent) == 1 and unsent[0].user_id == user.id
 
 
 async def test_an_unknown_address_follows_the_same_lock_timeline(
@@ -659,7 +754,8 @@ async def test_mfa_failures_count_toward_the_lockout(auth_client, auth_db, local
     r = await login(auth_client, user.email)
     assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
     stored = await reload(auth_db, user.id)
-    assert stored.failed_login_count == 10 and stored.locked_until is not None
+    assert stored.mfa_failed_count == 10 and stored.locked_until is not None
+    assert stored.failed_login_count == 0  # the password was right every time
     assert len(await events(auth_db, AuthEventType.ACCOUNT_LOCKED)) == 1
 
 

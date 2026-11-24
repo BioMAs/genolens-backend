@@ -39,6 +39,8 @@ from tests.test_auth_login_flow import (
     SETUP_START,
     code_at,
     events,
+    expire_lock,
+    fail_codes,
     give_recovery_codes,
     login,
     mfa_user,
@@ -642,6 +644,29 @@ async def test_a_reset_lifts_the_account_lock_and_still_requires_mfa(
     assert (await verify(auth_client, code=code_at(secret))).status_code == 200
 
 
+async def test_a_reset_does_not_refill_the_code_guesses(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    """Whoever holds the inbox could otherwise reset, sign in and guess ten more codes, again
+    and again. The code count survives the reset, and so does the lock it holds; only a completed
+    sign-in clears it."""
+    user, secret = await mfa_user(auth_db)
+    await fail_codes(auth_client, user, secret, 10)
+    await post(auth_client, FORGOT, {"email": user.email})
+    raw = link_token(local_auth.last_text, "/auth/reset")
+
+    r = await post(auth_client, RESET, {"token": raw, "new_password": NEW_PW})
+
+    assert r.status_code == 204, r.text
+    stored = await reload(auth_db, user.id)
+    assert stored.mfa_failed_count == 10 and stored.failed_login_count == 0
+    assert (await login(auth_client, user.email, NEW_PW)).json() == TOO_MANY_ATTEMPTS
+    await expire_lock(auth_db, user.id)
+    assert (await login(auth_client, user.email, NEW_PW)).json() == {"next": "mfa"}
+    assert (await verify(auth_client, code=wrong_code(secret))).status_code == 401
+    assert (await login(auth_client, user.email, NEW_PW)).json() == TOO_MANY_ATTEMPTS
+
+
 # ── Invitation ───────────────────────────────────────────────────────────────
 
 
@@ -963,7 +988,8 @@ async def test_mfa_rotation_requires_password_and_current_code(
         auth_client, ROTATE_START, {"password": PW, "code": wrong_code(old_secret)}, headers
     )
     assert r.status_code == 400 and r.json() == {"detail": "invalid_code"}
-    assert (await reload(auth_db, user.id)).failed_login_count == 2
+    stored = await reload(auth_db, user.id)
+    assert (stored.failed_login_count, stored.mfa_failed_count) == (1, 1)
 
     r = await post(
         auth_client, ROTATE_START, {"password": PW, "code": code_at(old_secret)}, headers
@@ -1017,7 +1043,7 @@ async def test_a_wrong_rotation_code_drops_the_pending_secret(
     stored = await reload(auth_db, user.id)
     assert stored.mfa_pending_secret_enc is None
     assert stored.mfa_totp_secret_enc == user.mfa_totp_secret_enc
-    assert stored.failed_login_count == 1
+    assert stored.mfa_failed_count == 1
     r = await post(auth_client, ROTATE_CONFIRM, {"code": code_at(new_secret)}, headers)
     assert r.status_code == 400 and r.json() == {"detail": "no_rotation_pending"}
     assert (await reload(auth_db, user.id)).mfa_totp_secret_enc == user.mfa_totp_secret_enc
@@ -1026,7 +1052,7 @@ async def test_a_wrong_rotation_code_drops_the_pending_secret(
 async def test_wrong_rotation_codes_lock_the_account(
     auth_client, auth_db, local_auth, local_session_for
 ):
-    user, old_secret = await mfa_user(auth_db, failed_login_count=9)
+    user, old_secret = await mfa_user(auth_db, mfa_failed_count=9)
     headers = bearer((await local_session_for(user)).access_token)
     r = await post(
         auth_client, ROTATE_START, {"password": PW, "code": code_at(old_secret)}, headers
@@ -1037,7 +1063,7 @@ async def test_wrong_rotation_codes_lock_the_account(
     assert r.status_code == 400
 
     stored = await reload(auth_db, user.id)
-    assert stored.failed_login_count == 10 and stored.locked_until is not None
+    assert stored.mfa_failed_count == 10 and stored.locked_until is not None
     [locked] = await events(auth_db, AuthEventType.ACCOUNT_LOCKED)
     assert locked.user_id == user.id
     r = await post(
@@ -1106,16 +1132,46 @@ async def test_rotation_and_regeneration_need_an_enabled_factor(
 async def test_mfa_code_failures_on_session_routes_lock_the_account(
     auth_client, auth_db, local_auth, local_session_for
 ):
-    user, secret = await mfa_user(auth_db, failed_login_count=9)
+    """They share the code count of `/mfa/verify`: the tenth wrong code locks, and tells the
+    owner, from a session route too."""
+    user, secret = await mfa_user(auth_db, mfa_failed_count=9)
     headers = bearer((await local_session_for(user)).access_token)
 
     r = await post(auth_client, REGENERATE, {"code": wrong_code(secret)}, headers)
     assert r.status_code == 400
 
+    assert (await reload(auth_db, user.id)).mfa_failed_count == 10
+    assert [m.to for m in local_auth.messages if "locked" in m.subject] == [user.email]
     r = await post(auth_client, REGENERATE, {"code": code_at(secret)}, headers)
     assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
     r = await post(auth_client, ROTATE_START, {"password": PW, "code": code_at(secret)}, headers)
     assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
+
+
+@pytest.mark.parametrize("step", ["rotate_start", "rotate_confirm", "regenerate"])
+async def test_every_wrong_code_on_a_session_route_counts_as_a_code_failure(
+    auth_client, auth_db, local_auth, local_session_for, step
+):
+    """The password count is left alone: the code was wrong, not the password."""
+    user, secret = await mfa_user(auth_db)
+    headers = bearer((await local_session_for(user)).access_token)
+    if step == "rotate_start":
+        r = await post(
+            auth_client, ROTATE_START, {"password": PW, "code": wrong_code(secret)}, headers
+        )
+    elif step == "rotate_confirm":
+        started = await post(
+            auth_client, ROTATE_START, {"password": PW, "code": code_at(secret)}, headers
+        )
+        r = await post(
+            auth_client, ROTATE_CONFIRM, {"code": wrong_code(started.json()["secret"])}, headers
+        )
+    else:
+        r = await post(auth_client, REGENERATE, {"code": wrong_code(secret)}, headers)
+
+    assert r.status_code == 400 and r.json() == {"detail": "invalid_code"}
+    stored = await reload(auth_db, user.id)
+    assert (stored.failed_login_count, stored.mfa_failed_count) == (0, 1)
 
 
 async def test_regenerate_recovery_codes(auth_client, auth_db, local_auth, local_session_for):
@@ -1125,7 +1181,7 @@ async def test_regenerate_recovery_codes(auth_client, auth_db, local_auth, local
 
     r = await post(auth_client, REGENERATE, {"code": wrong_code(secret)}, headers)
     assert r.status_code == 400 and r.json() == {"detail": "invalid_code"}
-    assert (await reload(auth_db, user.id)).failed_login_count == 1
+    assert (await reload(auth_db, user.id)).mfa_failed_count == 1
 
     code = code_at(secret)
     r = await post(auth_client, REGENERATE, {"code": code}, headers)

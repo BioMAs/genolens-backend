@@ -16,6 +16,7 @@ from app.auth.emails import (
     send_account_exists_email,
     send_invitation_email,
     send_mfa_enabled_email,
+    send_mfa_lock_email,
     send_mfa_reset_email,
     send_password_changed_email,
     send_password_reset_email,
@@ -37,6 +38,7 @@ ALL_EMAILS = [
     pytest.param(lambda: send_mfa_enabled_email(TO), id="mfa_enabled"),
     pytest.param(lambda: send_mfa_reset_email(TO), id="mfa_reset"),
     pytest.param(lambda: send_recovery_code_used_email(TO, 4), id="recovery_code_used"),
+    pytest.param(lambda: send_mfa_lock_email(TO), id="mfa_lock"),
 ]
 
 # The e-mails that carry a one-time link: (sender, path of the link, how long it is valid).
@@ -265,6 +267,7 @@ SUPPORT_EMAILS = [
     pytest.param(lambda: send_mfa_enabled_email(TO), id="mfa_enabled"),
     pytest.param(lambda: send_mfa_reset_email(TO), id="mfa_reset"),
     pytest.param(lambda: send_recovery_code_used_email(TO, 4), id="recovery_code_used"),
+    pytest.param(lambda: send_mfa_lock_email(TO), id="mfa_lock"),
 ]
 
 
@@ -284,6 +287,17 @@ def test_the_support_address_defaults_to_the_one_production_uses():
     from app.core.config import Settings
 
     assert Settings.model_fields["SUPPORT_EMAIL"].default == "support@scilicium.com"
+
+
+async def test_mfa_lock_email_says_the_password_is_known_and_what_to_do(smtp_capture):
+    """After the tenth wrong code that followed a right password: someone else has it."""
+    await send_mfa_lock_email(TO)
+    mail = smtp_capture.last
+    assert mail.to == TO and "locked" in mail.subject.lower()
+    for part in ("correct password", "two-step", "temporarily locked", "change your password"):
+        assert part in mail.text and part in mail.html, part
+    assert f"{app_url()}/auth/forgot" in mail.text and "token=" not in mail.text
+    assert settings.SUPPORT_EMAIL in mail.text and settings.SUPPORT_EMAIL in mail.html
 
 
 async def test_password_changed_email_points_to_the_password_reset_page(smtp_capture):

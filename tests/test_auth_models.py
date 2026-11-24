@@ -59,6 +59,7 @@ async def test_auth_tables_round_trip(auth_db):
     assert session.amr == ["pwd", "otp"] and session.revoked_at is None
     assert token.attempts == 0 and token.purpose is OneTimeTokenPurpose.INVITE
     assert db_user.failed_login_count == 0 and db_user.password_hash is None
+    assert db_user.mfa_failed_count == 0
 
 
 async def test_event_ids_increment_and_purpose_is_stored_as_its_value(auth_db):

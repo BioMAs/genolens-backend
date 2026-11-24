@@ -827,8 +827,13 @@ class User(Base, TimestampMixin):
         BigInteger, nullable=True,
         comment="Last accepted TOTP time step; a code at or below it is a replay."
     )
-    # Brute-force lock: consecutive failures, and the end of the lock they triggered.
+    # Brute-force lock: consecutive failures, and the end of the lock they triggered. Two counts:
+    # wrong passwords, and wrong second-factor codes after a right password (each its own rule,
+    # see app.api.endpoints.auth); either one sets `locked_until`.
     failed_login_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    mfa_failed_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=sa_text("0")
     )
     locked_until: Mapped[Optional[datetime]] = mapped_column(

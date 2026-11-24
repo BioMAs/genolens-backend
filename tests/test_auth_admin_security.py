@@ -881,7 +881,10 @@ async def test_reset_user_mfa_records_the_given_event_and_leaves_the_commit_to_t
 
 async def test_unlock_user_leaves_the_commit_to_the_caller(auth_db):
     target = await seed_user(
-        auth_db, failed_login_count=7, locked_until=now_utc() + timedelta(minutes=5)
+        auth_db,
+        failed_login_count=7,
+        mfa_failed_count=12,
+        locked_until=now_utc() + timedelta(minutes=5),
     )
     actor = uuid4()
 
@@ -889,6 +892,7 @@ async def test_unlock_user_leaves_the_commit_to_the_caller(auth_db):
         user = await s.get(User, target.id)
         await unlock_user(s, user, actor_id=actor)
         assert user.failed_login_count == 0 and user.locked_until is None
+        assert user.mfa_failed_count == 0
         await s.rollback()
     assert (await reload(auth_db, target.id)).failed_login_count == 7
 
@@ -898,6 +902,7 @@ async def test_unlock_user_leaves_the_commit_to_the_caller(auth_db):
         await s.commit()
     after = await reload(auth_db, target.id)
     assert after.failed_login_count == 0 and after.locked_until is None
+    assert after.mfa_failed_count == 0  # the administrator lets the owner try codes again
     [event] = await events_of(auth_db, target.id, AuthEventType.ACCOUNT_UNLOCKED)
     assert event.details == {"actor_id": str(actor)}
 
