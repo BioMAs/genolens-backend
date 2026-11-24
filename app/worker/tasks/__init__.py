@@ -48,6 +48,7 @@ deg_dataset_metadata = _legacy_mod.deg_dataset_metadata  # noqa: F401
 # walks the beat schedule and fails when that happens.
 from app.worker.tasks.quota_tasks import reset_monthly_analysis_quotas  # noqa: F401
 from app.worker.tasks.account_tasks import check_account_expirations  # noqa: F401
+from app.worker.tasks.auth_tasks import purge_auth_records  # noqa: F401
 
 __all__ = [
     "process_dataset_upload",
@@ -56,4 +57,5 @@ __all__ = [
     "run_self_service_analysis",
     "reset_monthly_analysis_quotas",
     "check_account_expirations",
+    "purge_auth_records",
 ]
