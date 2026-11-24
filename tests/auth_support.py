@@ -297,10 +297,12 @@ def local_session_for(auth_db, local_keys):
     """`await local_session_for(user)`: open a local session for `user` and return its tokens.
 
     Opened at the current instant (the API checks tokens and sessions against the wall clock).
+    The default `amr` is a password and a TOTP code, as after a real sign-in: the principal
+    refuses a session without a second factor (`app.auth.principal`).
     """
     from app.auth.sessions import IssuedSession, create_session
 
-    async def open_session(user: User, amr: tuple[str, ...] = ("pwd",)) -> IssuedSession:
+    async def open_session(user: User, amr: tuple[str, ...] = ("pwd", "otp")) -> IssuedSession:
         async with auth_db() as session:
             issued = await create_session(
                 session, user, list(amr), ip="203.0.113.7", user_agent="pytest"

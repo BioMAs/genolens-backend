@@ -193,6 +193,28 @@ async def test_principal_of_a_local_token_comes_from_the_users_row(
     assert principal.service_token_id is None
 
 
+async def test_a_session_without_a_second_factor_is_refused(
+    auth_client, auth_db, local_session_for, settings_override
+):
+    """Every session is opened after a second factor (`otp` or `recovery` in its `amr`): one
+    without is refused wherever it comes from, as a structural invariant, not only because the
+    routes that open sessions happen to check a code first."""
+    settings_override(AUTH_MODE="local")
+    user = await seed_user(auth_db)
+
+    for amr in (("pwd",), (), ("pwd", "mfa")):
+        s = await local_session_for(user, amr=amr)
+        resp = await auth_client.get(ME, headers=bearer(s.access_token))
+        assert resp.status_code == 401, amr
+        assert resp.json() == {"detail": "invalid_token"}
+        assert resp.headers["www-authenticate"] == BEARER_CHALLENGE
+
+    for amr in (("pwd", "otp"), ("pwd", "recovery")):
+        s = await local_session_for(user, amr=amr)
+        resp = await auth_client.get(ME, headers=bearer(s.access_token))
+        assert resp.status_code == 200, (amr, resp.text)
+
+
 # ── CSRF ──────────────────────────────────────────────────────────────────────
 
 

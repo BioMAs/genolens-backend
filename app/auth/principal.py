@@ -22,8 +22,10 @@ Resolution order:
 3. a service token (`glst_`): `resolve_service_token`, unchanged;
 4. a local access token (ES256 header), only while local tokens are accepted: its signature and
    claims, then its session (`get_session_user`): an absent, revoked or expired session, or a
-   deleted account, is 401 `invalid_token`. The principal comes from the `users` row (role and
-   plan as stored), never from the token;
+   deleted account, is 401 `invalid_token`. So is a session whose `amr` (in the token and in the
+   stored session alike) records no second factor (`otp` or `recovery`): sessions are only opened
+   after one, and this keeps that true structurally, whatever a future code path does. The
+   principal comes from the `users` row (role and plan as stored), never from the token;
 5. in supabase mode, the hosted-provider token, as before;
 6. anything else: 401 `invalid_token`.
 
@@ -35,7 +37,7 @@ Everything runs on the request's own database session (`get_db`, cached per requ
 here opens another one.
 """
 
-from typing import TYPE_CHECKING, Awaitable, Callable, Literal, NamedTuple, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal, NamedTuple, Optional, Sequence
 
 from fastapi import HTTPException, Request, status
 from fastapi.security import HTTPBearer
@@ -58,6 +60,10 @@ CredentialSource = Literal["header", "cookie"]
 HostedVerifier = Callable[[str], Awaitable[SupabaseUser]]
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# The `amr` methods that prove a second factor. Every session is opened after one of them
+# (`app.api.endpoints.auth`); a session that records neither is refused all the same.
+_SECOND_FACTORS = frozenset({"otp", "recovery"})
 
 # Raises exactly what the dependencies raised before this module, when a request carried no
 # Bearer credential: kept as FastAPI's own code rather than a copy of its messages.
@@ -128,6 +134,10 @@ async def verify_hosted_token(token: str) -> SupabaseUser:
     return user
 
 
+def _second_factor_proven(amr: Sequence[str]) -> bool:
+    return any(method in _SECOND_FACTORS for method in amr)
+
+
 async def _resolve_local(token: str, db: AsyncSession) -> ResolvedCaller:
     try:
         claims = decode_access_token(token)
@@ -137,6 +147,8 @@ async def _resolve_local(token: str, db: AsyncSession) -> ResolvedCaller:
     if found is None:
         raise _unauthorized("invalid_token")
     user, session = found
+    if not (_second_factor_proven(claims.amr) and _second_factor_proven(session.amr or ())):
+        raise _unauthorized("invalid_token")
     principal = SupabaseUser(
         user_id=user.id,
         email=user.email,
