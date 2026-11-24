@@ -364,6 +364,39 @@ async def test_unlock_clears_the_lock_and_records_it(
     assert err == ""
 
 
+async def test_unlock_does_not_refill_the_second_factor_guesses(
+    auth_client, auth_db, local_keys, enc_keys, smtp_capture, settings_override
+):
+    """The command is the admin action: the code count stays, so the first wrong code after the
+    unlock locks again at once, without a new lock e-mail; a right code opens a session, which
+    clears both counts."""
+    from tests.test_auth_login_flow import code_at, login, mfa_user, verify, wrong_code
+
+    settings_override(AUTH_MODE="local", AUTH_COOKIE_SECURE=False, AUTH_COOKIE_DOMAIN=None)
+    target, secret = await mfa_user(
+        auth_db, mfa_failed_count=10, locked_until=NOW + timedelta(hours=1)
+    )
+
+    code, _, err = await _run(auth_db, "unlock", "--email", target.email)
+
+    assert code == 0, err
+    after = await _reload(auth_db, target.id)
+    assert after.failed_login_count == 0 and after.locked_until is None
+    assert after.mfa_failed_count == 10
+    assert (await login(auth_client, target.email)).json() == {"next": "mfa"}
+    r = await verify(auth_client, code=wrong_code(secret))
+    assert r.status_code == 401 and r.json()["detail"] == "invalid_code"
+    assert (await login(auth_client, target.email)).json() == {"detail": "too_many_attempts"}
+    assert (await _reload(auth_db, target.id)).mfa_failed_count == 11
+    assert smtp_capture.messages == []  # neither the unlock nor the re-lock e-mails anyone
+
+    assert (await _run(auth_db, "unlock", "--email", target.email))[0] == 0
+    assert (await login(auth_client, target.email)).json() == {"next": "mfa"}
+    assert (await verify(auth_client, code=code_at(secret))).status_code == 200
+    after = await _reload(auth_db, target.id)
+    assert (after.failed_login_count, after.mfa_failed_count, after.locked_until) == (0, 0, None)
+
+
 # ── The retention purge ──────────────────────────────────────────────────────
 
 DAY = timedelta(days=1)

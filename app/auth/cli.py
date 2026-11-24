@@ -23,7 +23,8 @@ not a copy of it) and records `BREAK_GLASS` instead of `MFA_RESET_BY_ADMIN`, wit
 no administrator is behind it. The reset is committed, then the account is told by e-mail; that
 e-mail is best effort, as on the endpoint: if it cannot leave, a warning goes to standard error
 and the command still succeeds, because the reset stands. `unlock` clears the brute-force lock of
-the account (`app.auth.admin_actions.unlock_user`) and sends nothing.
+the account (`app.auth.admin_actions.unlock_user`: the wrong-password count and the lock date, not
+the second-factor count, which only a completed sign-in resets) and sends nothing.
 
 Both look the account up on the local `users` table, ignoring case and surrounding spaces, and
 work whatever `AUTH_MODE` says: break-glass has to work during the transition too. An address no

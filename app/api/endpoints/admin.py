@@ -796,10 +796,12 @@ async def unlock_account(
     current_user: SupabaseUser = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Clear the brute-force lock of an account (failure count and lock date). Admin only.
+    """Clear the brute-force lock of an account (wrong-password count and lock date). Admin only.
 
     Any administrator may unlock any account, an administrator's included: unlocking gives no
-    access, it only lets the owner try again.
+    access, it only lets the owner try again. It does not refill the second-factor guesses: the
+    count of wrong codes is kept (only an opened session resets it), so the first wrong code after
+    an unlock locks the account again at once; a right code opens a session and clears both.
 
     The account row only: an address with no account is throttled in the rate limiter's storage,
     which this does not touch.

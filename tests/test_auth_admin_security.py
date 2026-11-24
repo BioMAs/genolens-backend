@@ -654,6 +654,40 @@ async def test_unlock_clears_the_lock_and_audits_it(
     assert (await admin_client.get(ME, headers=bearer(session.access_token))).status_code == 200
 
 
+async def test_an_unlock_does_not_refill_the_second_factor_guesses(
+    admin_client, auth_db, enc_keys, smtp_capture, settings_override
+):
+    """Any administrator may unlock any account: the unlock must not hand ten fresh code guesses
+    to whoever holds the password. The code count stays; the next wrong code locks again at once
+    (silently: the owner was told when the count reached ten), and a right code opens a session,
+    which clears everything."""
+    from tests.test_auth_login_flow import code_at, login, mfa_user, verify, wrong_code
+
+    settings_override(AUTH_MODE="local", AUTH_COOKIE_SECURE=False, AUTH_COOKIE_DOMAIN=None)
+    target, secret = await mfa_user(
+        auth_db, mfa_failed_count=10, locked_until=now_utc() + timedelta(minutes=15)
+    )
+    assert (await login(admin_client, target.email)).json() == {"detail": "too_many_attempts"}
+
+    assert (await admin_client.post(url(target.id, "unlock"))).status_code == 200
+
+    after = await reload(auth_db, target.id)
+    assert after.failed_login_count == 0 and after.locked_until is None
+    assert after.mfa_failed_count == 10
+    assert (await login(admin_client, target.email)).json() == {"next": "mfa"}
+    r = await verify(admin_client, code=wrong_code(secret))
+    assert r.status_code == 401 and r.json()["detail"] == "invalid_code"
+    assert (await login(admin_client, target.email)).json() == {"detail": "too_many_attempts"}
+    assert (await reload(auth_db, target.id)).mfa_failed_count == 11
+    assert [m for m in smtp_capture.messages if "locked" in m.subject] == []
+
+    assert (await admin_client.post(url(target.id, "unlock"))).status_code == 200
+    assert (await login(admin_client, target.email)).json() == {"next": "mfa"}
+    assert (await verify(admin_client, code=code_at(secret))).status_code == 200
+    after = await reload(auth_db, target.id)
+    assert (after.failed_login_count, after.mfa_failed_count, after.locked_until) == (0, 0, None)
+
+
 # ── Sending a password-reset link ────────────────────────────────────────────
 
 
@@ -922,7 +956,7 @@ async def test_unlock_user_leaves_the_commit_to_the_caller(auth_db):
         user = await s.get(User, target.id)
         await unlock_user(s, user, actor_id=actor)
         assert user.failed_login_count == 0 and user.locked_until is None
-        assert user.mfa_failed_count == 0
+        assert user.mfa_failed_count == 12  # only an opened session resets the code count
         await s.rollback()
     assert (await reload(auth_db, target.id)).failed_login_count == 7
 
@@ -932,7 +966,7 @@ async def test_unlock_user_leaves_the_commit_to_the_caller(auth_db):
         await s.commit()
     after = await reload(auth_db, target.id)
     assert after.failed_login_count == 0 and after.locked_until is None
-    assert after.mfa_failed_count == 0  # the administrator lets the owner try codes again
+    assert after.mfa_failed_count == 12
     [event] = await events_of(auth_db, target.id, AuthEventType.ACCOUNT_UNLOCKED)
     assert event.details == {"actor_id": str(actor)}
 

@@ -8,7 +8,7 @@ that "reset the second factor" means exactly one thing wherever it is done.
 - `reset_user_mfa`: remove the second factor, so that the next sign-in is an enrolment.
 - `revoke_user_sessions`: end every session of the account.
 - `revoke_user_service_tokens`: revoke the service tokens the account owns.
-- `unlock_user`: clear the brute-force lock of the account.
+- `unlock_user`: clear the brute-force lock of the account (not its second-factor count).
 
 Conventions shared by all four:
 
@@ -147,18 +147,21 @@ async def unlock_user(
     actor_id: Optional[UUID],
     request: Optional[Request] = None,
 ) -> None:
-    """Clear the brute-force lock of the account: no recorded failures (wrong passwords and wrong
-    second-factor codes alike), no lock date. The administrator lets the owner try again, codes
-    included; otherwise the first wrong code after an unlock would lock the account again.
+    """Clear the brute-force lock of the account: the count of wrong passwords and the lock date.
+
+    The count of wrong second-factor codes (`mfa_failed_count`) is left alone: only an opened
+    session resets it. Any administrator may unlock any account, so clearing it would hand ten
+    fresh code guesses to whoever holds the password at every unlock. After an unlock the owner
+    signs in with the password; a right code opens a session, which clears both counts, while
+    the first wrong code locks the account again at once (without a new lock e-mail, sent only
+    when the count reaches ten).
 
     This is the account row only. An address that has no account is locked by the sign-in
     throttle in the rate limiter's storage (so that unknown addresses cannot be told from known
     ones); that lock belongs to no row, is not touched here, and expires by itself.
     """
     await db.execute(
-        update(User)
-        .where(User.id == user.id)
-        .values(failed_login_count=0, mfa_failed_count=0, locked_until=None)
+        update(User).where(User.id == user.id).values(failed_login_count=0, locked_until=None)
     )
     await record_event(
         db,
