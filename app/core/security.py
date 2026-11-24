@@ -67,7 +67,10 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
         expire = datetime.utcnow() + timedelta(days=7)
     
     to_encode.update({"exp": expire, "aud": "authenticated"})
-    encoded_jwt = jwt.encode(to_encode, settings.SUPABASE_JWT_SECRET, algorithm="HS256")
+    secret = settings.SUPABASE_JWT_SECRET
+    if secret is None:
+        raise RuntimeError("SUPABASE_JWT_SECRET is not set: it signs the hosted provider's tokens")
+    encoded_jwt = jwt.encode(to_encode, secret, algorithm="HS256")
     return encoded_jwt
 
 
@@ -91,6 +94,14 @@ def verify_token(token: str) -> TokenPayload:
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    secret = settings.SUPABASE_JWT_SECRET
+    if secret is None:
+        # AUTH_MODE=local without the hosted provider: none of its tokens is valid.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     try:
         # Use raw secret string as verified by debug script
         # print(f"DEBUG: Verifying token: {token[:10]}...")
@@ -98,7 +109,7 @@ def verify_token(token: str) -> TokenPayload:
         
         payload = jwt.decode(
             token,
-            settings.SUPABASE_JWT_SECRET,
+            secret,
             algorithms=["HS256"],
             audience="authenticated"
         )

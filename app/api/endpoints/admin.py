@@ -363,7 +363,7 @@ async def list_users(
 
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -913,7 +913,7 @@ async def get_user_details(
 
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -1047,7 +1047,7 @@ async def update_user_subscription(
         # If user doesn't exist in local DB (e.g. only in Supabase), create them
         # We need to fetch email/name from Supabase first
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -1461,7 +1461,7 @@ async def update_user_role(
     try:
         if role_source_is_supabase():
             headers = {
-                "apikey": settings.SUPABASE_KEY,
+                "apikey": settings.SUPABASE_KEY or "",
                 "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
                 "Content-Type": "application/json",
                 "Prefer": "return=representation"
@@ -1577,7 +1577,7 @@ async def get_system_stats(
         else:
             # Fetch total users from Supabase (including those not in local DB)
             headers = {
-                "apikey": settings.SUPABASE_KEY,
+                "apikey": settings.SUPABASE_KEY or "",
                 "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
                 "Content-Type": "application/json",
             }
@@ -1677,7 +1677,7 @@ async def create_user(
 
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -1780,7 +1780,7 @@ async def update_user(
 
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
             "Prefer": "return=representation"
@@ -2039,7 +2039,7 @@ async def update_project(
                 # Try to fetch from Supabase to auto-create local user
                 try:
                     headers = {
-                        "apikey": settings.SUPABASE_KEY,
+                        "apikey": settings.SUPABASE_KEY or "",
                         "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
                         "Content-Type": "application/json",
                     }
@@ -2213,7 +2213,7 @@ async def add_project_member(
             user_email, user_full_name = identity.email, identity.full_name
         else:
             headers = {
-                "apikey": settings.SUPABASE_KEY,
+                "apikey": settings.SUPABASE_KEY or "",
                 "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
                 "Content-Type": "application/json",
             }

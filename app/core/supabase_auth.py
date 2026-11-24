@@ -139,7 +139,7 @@ async def fetch_user_role_from_supabase(user_id: UUID) -> Optional[str]:
     """
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -181,11 +181,14 @@ async def verify_supabase_token(token: str) -> Optional[SupabaseUser]:
     """
     if is_service_token(token):
         return None  # never a JWT (see app/core/service_tokens.py)
+    secret = settings.SUPABASE_JWT_SECRET
+    if secret is None:
+        return None  # AUTH_MODE=local without the hosted provider: none of its tokens is valid
     try:
         # Decode JWT using Supabase JWT secret
         payload = jwt.decode(
             token,
-            settings.SUPABASE_JWT_SECRET,
+            secret,
             algorithms=["HS256"],
             audience="authenticated",
             options={"verify_aud": True}

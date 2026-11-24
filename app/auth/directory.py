@@ -200,9 +200,12 @@ async def delete_identity(user_id: UUID) -> None:
 
 def _provider_headers() -> dict[str, str]:
     """The headers the admin endpoints have always sent to the provider's admin API."""
+    key = settings.SUPABASE_KEY
+    if key is None:  # only AUTH_MODE=local leaves it unset, and the provider is never called then
+        raise RuntimeError("SUPABASE_KEY is not set: the hosted provider cannot be called")
     return {
-        "apikey": settings.SUPABASE_KEY,
-        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
+        "apikey": key,
+        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or key}",
         "Content-Type": "application/json",
     }
 

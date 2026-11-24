@@ -63,9 +63,12 @@ def _extract_user_id(request: Request) -> str | None:
             return str(decode_access_token(token).sub)
         if settings.AUTH_MODE != "supabase":
             return None
+        secret = settings.SUPABASE_JWT_SECRET
+        if secret is None:  # unreachable once the settings validated; narrows the type
+            return None
         payload = jwt.decode(
             token,
-            settings.SUPABASE_JWT_SECRET,
+            secret,
             algorithms=["HS256"],
             audience="authenticated",
             options={"verify_aud": True},

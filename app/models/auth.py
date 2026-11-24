@@ -40,7 +40,10 @@ class OneTimeTokenPurpose(str, enum.Enum):
 
 
 class AuthEventType(str, enum.Enum):
-    """Kinds of audit event. The value (stored in `auth_events.event_type`) is the lowercase name."""
+    """Kinds of audit event.
+
+    The value (stored in `auth_events.event_type`) is the lowercase name.
+    """
 
     LOGIN_SUCCEEDED = "login_succeeded"
     LOGIN_FAILED = "login_failed"
@@ -102,7 +105,10 @@ class AuthSession(Base):
     rotated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def __repr__(self) -> str:
-        return f"<AuthSession(id={self.id}, user_id={self.user_id}, revoked={self.revoked_at is not None})>"
+        return (
+            f"<AuthSession(id={self.id}, user_id={self.user_id}, "
+            f"revoked={self.revoked_at is not None})>"
+        )
 
 
 class AuthOneTimeToken(Base):
@@ -160,7 +166,10 @@ class AuthRecoveryCode(Base):
     used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def __repr__(self) -> str:
-        return f"<AuthRecoveryCode(id={self.id}, user_id={self.user_id}, used={self.used_at is not None})>"
+        return (
+            f"<AuthRecoveryCode(id={self.id}, user_id={self.user_id}, "
+            f"used={self.used_at is not None})>"
+        )
 
 
 class AuthEvent(Base):

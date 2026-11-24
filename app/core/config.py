@@ -4,7 +4,7 @@ Loads configuration from environment variables.
 """
 from typing import Literal, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, model_validator
 
 
 class Settings(BaseSettings):
@@ -14,7 +14,9 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
-        extra="ignore"
+        extra="ignore",
+        # A validation error would otherwise print the whole environment it was given (secrets too).
+        hide_input_in_errors=True,
     )
 
     # Application
@@ -53,11 +55,20 @@ class Settings(BaseSettings):
         description="Celery result backend (defaults to REDIS_URL)"
     )
 
-    # Supabase
-    SUPABASE_URL: str = Field(..., description="Supabase project URL")
-    SUPABASE_KEY: str = Field(..., description="Supabase anon key")
+    # Supabase. The three settings below are required only while AUTH_MODE=supabase (see
+    # `require_hosted_provider_settings`): an instance that runs its own authentication has no
+    # hosted provider.
+    SUPABASE_URL: Optional[str] = Field(
+        None, description="Supabase project URL (required when AUTH_MODE=supabase)"
+    )
+    SUPABASE_KEY: Optional[str] = Field(
+        None, description="Supabase anon key (required when AUTH_MODE=supabase)"
+    )
     SUPABASE_SERVICE_ROLE_KEY: Optional[str] = Field(None, description="Supabase service role key (for admin ops)")
-    SUPABASE_JWT_SECRET: str = Field(..., description="Supabase JWT secret for token validation")
+    SUPABASE_JWT_SECRET: Optional[str] = Field(
+        None,
+        description="Supabase JWT secret for token validation (required when AUTH_MODE=supabase)",
+    )
     SUPABASE_STORAGE_BUCKET: str = Field(
         default="genolens-data",
         description="Supabase storage bucket name"
@@ -209,6 +220,29 @@ class Settings(BaseSettings):
     STRIPE_PRICE_STARTER_ANNUAL: str = Field(default="", description="Stripe Price ID for STARTER annual (price_...)")
     STRIPE_PRICE_TEAM_MONTHLY: str = Field(default="", description="Stripe Price ID for TEAM monthly (price_...)")
     STRIPE_PRICE_TEAM_ANNUAL: str = Field(default="", description="Stripe Price ID for TEAM annual (price_...)")
+
+    @model_validator(mode="after")
+    def require_hosted_provider_settings(self) -> "Settings":
+        """In AUTH_MODE=supabase the hosted provider's settings are mandatory, as they always were.
+
+        Only an absent setting counts as missing, exactly what `Field(...)` refused before: a
+        value that is present is never second-guessed here, so a deployment that boots today
+        keeps booting. In AUTH_MODE=local they are optional (the on-premise template sets none).
+        The message names the settings, never a value.
+        """
+        if self.AUTH_MODE != "supabase":
+            return self
+        missing = [
+            name
+            for name in ("SUPABASE_URL", "SUPABASE_KEY", "SUPABASE_JWT_SECRET")
+            if getattr(self, name) is None
+        ]
+        if missing:
+            raise ValueError(
+                f"{', '.join(missing)} must be set while AUTH_MODE=supabase "
+                "(an instance with its own authentication runs with AUTH_MODE=local instead)"
+            )
+        return self
 
     @property
     def celery_broker(self) -> str:
