@@ -260,7 +260,12 @@ async def test_supabase_find_identity_uses_the_current_lookups(
     )
     assert by_email.last_sign_in_at == datetime.fromisoformat(SB_LAST_SIGN_IN)
     assert by_email.email_confirmed_at == datetime.fromisoformat(SB_CONFIRMED)
-    assert fake_supabase.calls[0].params == {"email": "hosted@example.test"}
+    # The lookup as fixed on main: GoTrue filters on `filter` (it ignores `email`), one page.
+    assert fake_supabase.calls[0].params == {
+        "filter": "hosted@example.test",
+        "page": "1",
+        "per_page": "1000",
+    }
     assert fake_supabase.paths("GET") == [
         "/auth/v1/admin/users",
         f"/auth/v1/admin/users/{uid}",
@@ -923,7 +928,7 @@ async def test_add_member_by_email_uses_local_lookup(
         [call] = fake_supabase.calls
         assert (call.method, call.path) == ("GET", "/auth/v1/admin/users")
         # The address as the request schema hands it over (its domain lowercased).
-        assert call.params["email"].lower() == target.email
+        assert call.params["filter"].lower() == target.email
 
 
 async def test_local_add_member_by_unknown_email_is_404(
