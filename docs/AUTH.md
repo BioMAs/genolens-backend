@@ -36,7 +36,7 @@ Ordre de résolution d'un jeton : (1) un jeton `glst_` passe par la résolution 
 | `SUPABASE_SERVICE_ROLE_KEY` | vide | Opérations d'administration du fournisseur externe (mode `supabase`). |
 | `SUPABASE_DB_URL` | vide | Chaîne de connexion de la base du fournisseur externe, pour le seul script de migration des comptes (voir plus bas). Elle contient un mot de passe : elle n'est transmise qu'à cette commande, pas à l'environnement d'un service. |
 | `APP_URL` | `http://localhost:3000` dans le code ; `docker-compose.prod.yml` met `https://app.genolens.com` | URL publique du frontend : l'hôte de tous les liens des e-mails (vérification, réinitialisation, invitation). Le fichier compose n'a pas d'`env_file` : sans son entrée, les liens pointeraient vers `localhost`. |
-| `SMTP_*`, `EMAIL_FROM_ADDRESS` | vides | Les e-mails de sécurité (invitation, vérification, réinitialisation, mot de passe changé, 2FA activée ou réinitialisée, code de secours utilisé) sont envoyés en mode **obligatoire** : sans SMTP configuré, l'envoi échoue au lieu de passer sous silence. |
+| `SMTP_*`, `EMAIL_FROM_ADDRESS` | vides | Les e-mails de sécurité (invitation, vérification, réinitialisation, mot de passe changé, 2FA activée ou réinitialisée, code de secours utilisé) sont envoyés en mode **obligatoire** : sans SMTP configuré, l'envoi échoue au lieu de passer sous silence (l'échec se lit dans le journal d'audit, voir « E-mails : envoyés après la réponse »). |
 
 `.env.example` liste tous ces réglages avec un exemple sûr. `docker-compose.prod.yml` transmet les `AUTH_*` et `APP_URL` à `api`, `worker` et `beat`, avec les défauts ci-dessus : une variable absente du `.env` de l'hôte ne change rien au démarrage en mode `supabase`. Le `r-worker` ne reçoit que `AUTH_MODE` et `AUTH_LOCAL_ENABLED` : il charge les mêmes réglages que les autres, ne signe personne et ne détient aucune clé.
 
@@ -45,6 +45,21 @@ Ordre de résolution d'un jeton : (1) un jeton `glst_` passe par la résolution 
 - `AUTH_MODE=supabase` et `AUTH_LOCAL_ENABLED=false` : aucune clé n'est lue, rien d'autre n'est exigé qu'avant.
 - `AUTH_MODE=local` ou `AUTH_LOCAL_ENABLED=true` : l'API charge les deux jeux de clés au démarrage. Hors production, une clé absente est remplacée par une clé éphémère (tout ce qu'elle a signé ou chiffré disparaît au redémarrage : acceptable pour du développement, jamais ailleurs). **En production (`ENVIRONMENT=production`), une clé absente est une erreur** : mieux vaut un service qui ne démarre pas qu'un service qui déconnecte tout le monde, ou rend illisibles les secrets 2FA, à chaque redémarrage.
 - Les messages d'erreur sur les clés nomment la position de l'entrée fautive, jamais sa valeur.
+
+## Limites par IP : un prérequis sur l'adresse du client
+
+Les limites par IP des routes `/api/v1/auth/*` (connexion, 2FA et enrôlement, renouvellement, inscription, mot de passe oublié, renvoi de vérification) comptent par **adresse du client**, `request.client.host`. Derrière Traefik, cette adresse vient de l'en-tête `X-Forwarded-For` : l'API est lancée avec `uvicorn --proxy-headers --forwarded-allow-ips='*'`, et avec `'*'` uvicorn (0.27) prend **la première adresse** de l'en-tête, la plus à gauche.
+
+Ces limites ne valent donc que si cette première adresse est fiable. Si le proxy **ajoute** l'adresse réelle à un `X-Forwarded-For` envoyé par le client au lieu de le **remplacer**, la première adresse est celle que le client a choisie : en en changeant à chaque requête, il échappe à toutes les limites par IP (le verrouillage par compte, lui, tient toujours). Avant d'ouvrir le système local, vérifier l'une des deux conditions :
+
+- Traefik **écrase** `X-Forwarded-For` pour les requêtes venues d'Internet (point d'entrée sans `forwardedHeaders.insecure`, et sans `forwardedHeaders.trustedIPs` couvrant des clients) ; le contrôler par l'essai : une requête envoyée avec un `X-Forwarded-For: 198.51.100.1` forgé ne doit pas voir cette adresse arriver en tête côté API ;
+- ou bien `--forwarded-allow-ips` est restreint à l'adresse de Traefik sur le réseau Docker au lieu de `'*'` : uvicorn ne lit alors l'en-tête que venant de lui, et y prend la dernière adresse non fiable.
+
+## E-mails : envoyés après la réponse
+
+Les e-mails des parcours utilisateur (vérification d'adresse, mot de passe oublié, « vous avez déjà un compte », mot de passe changé, 2FA activée, code de secours utilisé) partent **après** la réponse HTTP, depuis une tâche de fond de FastAPI : la réponse n'attend jamais le serveur SMTP, ce qui garde des temps de réponse identiques pour une adresse connue et une adresse inconnue, et ne retient jamais des codes de secours derrière un SMTP lent. Conséquence pour l'exploitation : **un échec SMTP n'apparaît pas dans la réponse HTTP** (toujours `202` ou `200`), mais dans les journaux (classe de l'erreur seulement) et dans le **journal d'audit** (`auth_events`), sur l'événement concerné, avec `notification: not_sent` et `error_kind`. C'est là qu'il faut chercher quand un utilisateur dit ne rien avoir reçu.
+
+Les deux envois de l'administration restent synchrones, parce que l'administrateur doit savoir : une invitation qui ne part pas répond `502 invitation_email_failed`, une réinitialisation de mot de passe par l'administration `502 reset_email_failed`.
 
 ## Instance on-premise (déploiement depuis l'administration)
 
