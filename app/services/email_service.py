@@ -10,7 +10,8 @@ Supports:
 All user-facing copy is in English, like the app UI.
 
 Uses async SMTP (aiosmtplib) with configurable SMTP settings.
-Gracefully degrades if email is not configured (logs warning, does not raise).
+Gracefully degrades if email is not configured (logs warning, does not raise) — except for
+e-mails sent with `required=True` (the authentication e-mails), which raise instead.
 """
 import logging
 import re
@@ -276,18 +277,38 @@ def _is_email_configured() -> bool:
     )
 
 
+class EmailNotConfiguredError(RuntimeError):
+    """A required e-mail could not be sent because SMTP is not configured."""
+
+
+class EmailSendError(RuntimeError):
+    """A required e-mail was refused or lost by the SMTP server (the cause is chained)."""
+
+
 async def send_email(
     to: str,
     subject: str,
     html_body: str,
     text_body: str,
+    required: bool = False,
 ) -> bool:
     """
     Send an email via SMTP.
 
     Returns True on success, False on any error (to avoid blocking callers).
+
+    With `required=True` nothing is swallowed: SMTP not configured raises
+    `EmailNotConfiguredError`, a failed send raises `EmailSendError` (chained to the SMTP error).
+    The authentication e-mails use it: a login link or a security alert that was never sent must
+    not look like it was. Bodies are never logged, only the recipient and the subject.
     """
     if not _is_email_configured():
+        if required:
+            logger.error("Email not configured — cannot send required email to %s", to)
+            raise EmailNotConfiguredError(
+                "SMTP is not configured: set SMTP_HOST, SMTP_USER, SMTP_PASSWORD and "
+                "EMAIL_FROM_ADDRESS"
+            )
         logger.warning(
             "Email not configured — skipping notification to %s. "
             "Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM_ADDRESS in .env",
@@ -318,6 +339,8 @@ async def send_email(
         return True
     except Exception as exc:
         logger.error("Failed to send email to %s: %s", to, exc)
+        if required:
+            raise EmailSendError("The SMTP server did not accept the email") from exc
         return False
 
 
@@ -547,10 +570,6 @@ async def send_quota_warning_email(
 # ---------------------------------------------------------------------------
 
 
-# Same address the account-state and license errors give (app/api/deps/).
-SUPPORT_EMAIL = "support@scilicium.com"
-
-
 def _expiry_when(days_remaining: int) -> str:
     """ "today" / "in 1 day" / "in 3 days"."""
     if days_remaining == 0:
@@ -564,6 +583,7 @@ def _expiry_warning_subject(days_remaining: int) -> str:
 
 def _expiry_warning_html(days_remaining: int, ends_on: str, contact_url: str) -> str:
     when = _expiry_when(days_remaining)
+    support = settings.SUPPORT_EMAIL  # read at send time, like every support address
     content = f"""
       <p>Hello,</p>
       <p>
@@ -583,7 +603,7 @@ def _expiry_warning_html(days_remaining: int, ends_on: str, contact_url: str) ->
       </p>
       <a href="{contact_url}" class="btn">Extend my access →</a>
       <div class="meta">
-        <p>Questions? Contact <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>.</p>
+        <p>Questions? Contact <a href="mailto:{support}">{support}</a>.</p>
       </div>
     """
     return _base_layout(_expiry_warning_subject(days_remaining), content)
@@ -599,7 +619,7 @@ def _expiry_warning_text(days_remaining: int, ends_on: str, contact_url: str) ->
         f"and launching analyses will be disabled.\n\n"
         f"Your data is neither deleted nor modified.\n\n"
         f"To extend your access: {contact_url}\n"
-        f"Questions? Contact {SUPPORT_EMAIL}.\n\n"
+        f"Questions? Contact {settings.SUPPORT_EMAIL}.\n\n"
         f"— The GenoLens team"
     )
 

@@ -32,6 +32,7 @@ from typing import Annotated, Optional
 from fastapi import Depends, HTTPException, Request, status
 
 from app.api.deps.subscription import get_or_create_user
+from app.core.config import settings
 from app.models.models import User, UserRole, UserStatus
 
 logger = logging.getLogger(__name__)
@@ -127,7 +128,7 @@ async def require_active_account(
                 "error": "account_inactive",
                 "status": user.status.value,
                 "message": (
-                    "This account is no longer active. " "Please contact support@scilicium.com."
+                    f"This account is no longer active. Please contact {settings.SUPPORT_EMAIL}."
                 ),
             },
         )
@@ -144,7 +145,7 @@ async def require_active_account(
                 "message": (
                     "Your access period has ended. You can still consult your existing "
                     "projects and results, but creating new ones requires renewing your "
-                    "subscription. Please contact support@scilicium.com."
+                    f"subscription. Please contact {settings.SUPPORT_EMAIL}."
                 ),
             },
         )

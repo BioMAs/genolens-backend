@@ -35,6 +35,10 @@ async def get_or_create_user(
 
     For a service token, the token's owner as stored: a token never creates an account, nor
     syncs its role or activates it, so every gate below sees the owner unchanged.
+
+    In local mode (or for a local access token), the account must exist: it is never created
+    (absent: 401 `user_not_found`) and its role is never taken from the caller; the `users` row
+    is the authority. An invited account is still activated on its first authenticated request.
     """
     if current_user.service_token_id is not None:
         owner = await db.get(User, current_user.user_id)  # loaded by the token's resolution
@@ -45,6 +49,21 @@ async def get_or_create_user(
                 headers={"WWW-Authenticate": "Bearer"},
             )
         return owner
+
+    if current_user.auth_source == "local" or settings.AUTH_MODE == "local":
+        # Usually loaded already, in this same session, by the token's resolution.
+        local_user = await db.get(User, current_user.user_id)
+        if local_user is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="user_not_found",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if _activate_invited(local_user):
+            db.add(local_user)
+            await db.commit()
+            await db.refresh(local_user)
+        return local_user
 
     query = select(User).where(User.id == current_user.user_id)
     result = await db.execute(query)
@@ -84,21 +103,7 @@ async def get_or_create_user(
                 user.role = current_user.role
                 dirty = True
 
-        # Invitation accepted. Reaching here means Supabase minted a valid token
-        # for this account, which only happens once the invitee has followed the
-        # magic link and set a password — so PENDING has served its purpose.
-        #
-        # Nothing else in the codebase ever clears PENDING: before this, an
-        # invited user stayed PENDING forever, the admin panel kept offering
-        # "Renvoyer l'invitation" for someone already using the product, and
-        # `resend_invitation` was the only code that read the flag. That was
-        # merely untidy while status was unenforced; once `require_active_account`
-        # treats a non-ACTIVE account as inactive, leaving it here would lock out
-        # every invited user on their first request. This transition is what makes
-        # enforcing status safe.
-        if user.status == UserStatus.PENDING:
-            logger.info("Activating invited user %s on first authenticated request", user.id)
-            user.status = UserStatus.ACTIVE
+        if _activate_invited(user):
             dirty = True
 
         if dirty:
@@ -107,6 +112,29 @@ async def get_or_create_user(
             await db.refresh(user)
 
     return user
+
+
+def _activate_invited(user: User) -> bool:
+    """Activate an invited (PENDING) account; True if it changed. Does not commit.
+
+    Invitation accepted. Reaching here means a valid token was minted for this
+    account (by Supabase, or by the local sign-in), which only happens once the
+    invitee has followed the link and set a password — so PENDING has served its
+    purpose.
+
+    Nothing else in the codebase ever clears PENDING: before this, an invited
+    user stayed PENDING forever, the admin panel kept offering "Renvoyer
+    l'invitation" for someone already using the product, and `resend_invitation`
+    was the only code that read the flag. That was merely untidy while status was
+    unenforced; once `require_active_account` treats a non-ACTIVE account as
+    inactive, leaving it here would lock out every invited user on their first
+    request. This transition is what makes enforcing status safe.
+    """
+    if user.status != UserStatus.PENDING:
+        return False
+    logger.info("Activating invited user %s on first authenticated request", user.id)
+    user.status = UserStatus.ACTIVE
+    return True
 
 
 # ── Admin guard ────────────────────────────────────────────────────────────────
@@ -256,7 +284,7 @@ async def reserve_ai_request(user: User, db: AsyncSession) -> AIRequestReservati
                 "used": limit,
                 "message": (
                     f"This account has used all of its {limit} AI requests. "
-                    "Please contact support@scilicium.com to continue."
+                    f"Please contact {settings.SUPPORT_EMAIL} to continue."
                 ),
             },
         )
@@ -442,7 +470,7 @@ def analysis_quota_renewal_hint(user: User) -> str:
     if user.is_demo:
         return (
             "This demo account has no monthly renewal. "
-            "Please contact support@scilicium.com to continue."
+            f"Please contact {settings.SUPPORT_EMAIL} to continue."
         )
     return "Quota resets on the 1st of next month. Upgrade your plan for more analyses."
 

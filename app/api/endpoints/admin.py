@@ -4,12 +4,36 @@ Requires ADMIN role.
 """
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 import httpx
+
+from app.auth.admin_actions import (
+    reset_user_mfa,
+    revoke_user_service_tokens,
+    revoke_user_sessions,
+    unlock_user,
+)
+from app.auth.audit import record_event
+from app.auth.directory import (
+    AuthIdentity,
+    IdentityDeletionError,
+    IdentityNotFoundError,
+    delete_identity,
+    find_identity_by_id,
+    identities_are_local,
+    list_identities,
+    role_source_is_supabase,
+)
+from app.auth.emails import send_mfa_reset_email, send_password_reset_email
+from app.auth.one_time_tokens import issue_token
+from app.models.auth import AuthEvent, AuthEventType, OneTimeTokenPurpose
+from app.models.service_token import ServiceToken
+from app.services.email_service import EmailNotConfiguredError, EmailSendError
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +43,14 @@ from app.api.deps.license import require_active_license
 from app.core.supabase_auth import SupabaseUser, invalidate_cached_role
 from app.core.config import settings
 from app.models.models import Project, Dataset, ProjectMember, User, UserRole as UserRoleEnum, SubscriptionPlan, AIUsageLog, UserLoginEvent, UserStatus
-from app.services.account_service import AccountService
-from pydantic import BaseModel, Field
+from app.services.account_service import AccountService, InvitationEmailError
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    model_serializer,
+)
 
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
@@ -68,6 +98,84 @@ class UserProfile(BaseModel):
     updated_at: Optional[str] = None
     last_sign_in_at: Optional[str] = None
     confirmed_at: Optional[str] = None
+    # Local sign-in state, read from the `users` row in both modes (see
+    # `_local_auth_fields`). In supabase mode `last_sign_in_at` / `confirmed_at`
+    # above stay the provider's own values. Never a hash or a secret.
+    mfa_enabled: bool = False
+    email_verified: bool = False
+    last_login_at: Optional[datetime] = None
+    locked_until: Optional[datetime] = None
+
+
+class CreatedUserProfile(UserProfile):
+    """What `POST /users` answers.
+
+    In local mode creating an account is an invitation, and `invitation_sent` says
+    the link went out. Supabase mode never sets it, and an unset flag is left out
+    of the response, so that the supabase answer stays exactly what it was.
+    """
+    invitation_sent: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_invitation_flag(self, handler: SerializerFunctionWrapHandler):
+        data = handler(self)
+        if data.get("invitation_sent") is None:
+            data.pop("invitation_sent", None)
+        return data
+
+
+def _local_auth_fields(local_user: Optional[User]) -> dict:
+    """Second factor, verified address, last login and lock of a UserProfile.
+
+    From the local row in both modes; defaults without one. Only whether the
+    second factor is on: never its secret, nor the password hash.
+    """
+    if local_user is None:
+        return {}
+    return {
+        "mfa_enabled": local_user.mfa_enabled_at is not None,
+        "email_verified": local_user.email_verified_at is not None,
+        "last_login_at": local_user.last_login_at,
+        "locked_until": local_user.locked_until,
+    }
+
+
+def _iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _local_profile_fields(user: User) -> dict:
+    """A UserProfile from the `users` row alone (local mode: the row is the identity).
+
+    Same conventions as the supabase path (lowercased role and status, raw module
+    flags); `last_sign_in_at` and `confirmed_at` are the local login and e-mail
+    verification, so the admin panel's existing columns keep their meaning.
+    """
+    return dict(
+        id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        avatar_url=None,
+        role=user.role.value.lower(),
+        status=user.status.value.lower(),
+        subscription_plan=user.subscription_plan.value,
+        ai_interpretations_used=user.ai_interpretations_used,
+        ai_interpretations_remaining=user.ai_interpretations_remaining,
+        ai_tokens_purchased=user.ai_tokens_purchased,
+        ai_tokens_used=user.ai_tokens_used,
+        cosmetics_module_enabled=user.cosmetics_module_enabled,
+        report_customization_module_enabled=user.report_customization_module_enabled,
+        scientific_module_enabled=user.scientific_module_enabled,
+        drug_discovery_module_enabled=user.drug_discovery_module_enabled,
+        subscription_starts_at=user.subscription_starts_at,
+        subscription_ends_at=user.subscription_ends_at,
+        **_demo_fields(user),
+        created_at=_iso(user.created_at),
+        updated_at=_iso(user.updated_at),
+        last_sign_in_at=_iso(user.last_login_at),
+        confirmed_at=_iso(user.email_verified_at),
+        **_local_auth_fields(user),
+    )
 
 
 def _demo_fields(local_user: Optional[User]) -> dict:
@@ -161,11 +269,20 @@ class UserRoleUpdate(BaseModel):
 
 
 class UserCreate(BaseModel):
-    """Schema for creating a new user."""
+    """Schema for creating a new user.
+
+    `password` is required in supabase mode only (see `_require_password`); in
+    local mode creating an account is an invitation and a password is ignored.
+    """
     email: str
-    password: str
+    password: Optional[str] = None
     full_name: Optional[str] = None
     role: str = "user"
+
+
+class _UserCreateWithPassword(UserCreate):
+    """`UserCreate` as it was while every account got the admin's password."""
+    password: str
 
 
 class UserUpdate(BaseModel):
@@ -236,10 +353,16 @@ async def list_users(
     """
     List all users with their profiles, auth info, and subscription status.
     Admin only.
+
+    Local mode: the `users` table alone (no provider call).
     """
+    if identities_are_local():
+        users = (await db.execute(select(User).order_by(User.created_at))).scalars().all()
+        return [UserProfile(**_local_profile_fields(u)) for u in users]
+
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -347,7 +470,8 @@ async def list_users(
                     created_at=profile.get("created_at"),
                     updated_at=profile.get("updated_at"),
                     last_sign_in_at=auth_info.get("last_sign_in_at"),
-                    confirmed_at=auth_info.get("confirmed_at")
+                    confirmed_at=auth_info.get("confirmed_at"),
+                    **_local_auth_fields(local_user),
                 ))
 
             return result
@@ -370,6 +494,10 @@ async def invite_user(
     """
     Create a pending account and send the Supabase invitation magic link.
     Admin only.
+
+    Local mode: the invitation is a one-time link e-mailed by the backend. If the
+    e-mail cannot be sent the answer is 502 `invitation_email_failed`: the account
+    and its link are kept, and `resend-invite` sends a new one.
 
     Declared before the parameterised `/users/{user_id}` routes so the literal
     "invite" segment cannot be captured as a user id.
@@ -395,6 +523,8 @@ async def invite_user(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except InvitationEmailError:
+        raise _invitation_email_failed()
     except RuntimeError as exc:
         # Supabase rejected the invite (already registered, bad address, email
         # sending not configured on the project). Surface its own message.
@@ -403,16 +533,28 @@ async def invite_user(
     return {"id": str(user.id), "email": user.email, "status": user.status.value}
 
 
+def _invitation_email_failed() -> HTTPException:
+    """Local mode: the invitation link exists but its e-mail did not leave. The
+    admin must see it (and can resend); it is never reported as sent."""
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY, detail="invitation_email_failed"
+    )
+
+
 @router.post("/users/{user_id}/resend-invite")
 async def resend_invite(
     user_id: UUID,
     current_user: SupabaseUser = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Re-send the invitation magic link to a pending user. Admin only."""
+    """Re-send the invitation magic link to a pending user. Admin only.
+
+    Local mode: a new link (the previous one stops working); 502
+    `invitation_email_failed` if its e-mail cannot be sent.
+    """
     service = AccountService(db)
     try:
-        user = await service.resend_invitation(user_id)
+        user = await service.resend_invitation(user_id, resent_by_admin_id=current_user.user_id)
     except ValueError as exc:
         message = str(exc)
         code = (
@@ -421,6 +563,8 @@ async def resend_invite(
             else status.HTTP_400_BAD_REQUEST
         )
         raise HTTPException(status_code=code, detail=message)
+    except InvitationEmailError:
+        raise _invitation_email_failed()
     except RuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
 
@@ -462,6 +606,318 @@ async def update_user_status(
     return {"id": str(user.id), "email": user.email, "status": user.status.value}
 
 
+# ── Security actions on an account ────────────────────────────────────────────
+#
+# They act on the local `users` row and its authentication tables, so they work in both AUTH_MODE
+# values and never call the hosted provider. The logic itself is in `app.auth.admin_actions`
+# (shared with the break-glass command); the routes check who may ask, commit, then notify.
+#
+# A service token is revoked by `sessions/revoke` with `revoke_service_tokens` and by nothing
+# else: not by the second-factor reset, the unlock, nor the password link (spec 7.7).
+#
+# On an ADMIN or SCILICIUM_ADMIN account, the second-factor reset, the session revocation and the
+# password link take a SCILICIUM_ADMIN (`_require_scilicium_admin_for`); the unlock does not.
+
+_ADMIN_ROLES = (UserRoleEnum.ADMIN, UserRoleEnum.SCILICIUM_ADMIN)
+
+
+class MfaResetResponse(BaseModel):
+    sessions_revoked: int
+    # False when the account could not be told (the reset stands either way).
+    notification_sent: bool
+
+
+class SessionsRevokeRequest(BaseModel):
+    revoke_service_tokens: bool = False
+
+
+class SessionsRevokeResponse(BaseModel):
+    sessions_revoked: int
+    service_tokens_revoked: int
+
+
+class UnlockResponse(BaseModel):
+    unlocked: bool = True
+
+
+class PasswordResetResponse(BaseModel):
+    email_sent: bool = True
+
+
+class AuthEventResponse(BaseModel):
+    """One line of the audit trail. Secrets never reach the trail (see `app.auth.audit`)."""
+
+    event_type: str
+    created_at: datetime
+    ip: Optional[str] = None
+    user_agent: Optional[str] = None
+    details: dict[str, Any]
+
+
+class ServiceTokenResponse(BaseModel):
+    """A service token of the account. Never the token, nor its hash."""
+
+    id: UUID
+    name: str
+    scopes: List[str]
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+async def _account_or_404(db: AsyncSession, user_id: UUID) -> User:
+    user = await db.scalar(select(User).where(User.id == user_id))
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return user
+
+
+def _require_scilicium_admin_for(target: User, current_user: SupabaseUser) -> None:
+    """Acting on an ADMIN or SCILICIUM_ADMIN account (one's own included) takes a SCILICIUM_ADMIN:
+    else 403 `scilicium_admin_required`, raised before anything is changed. The rule of the
+    second-factor reset, the session revocation and the password link; not of the unlock, which
+    any administrator may do."""
+    if target.role in _ADMIN_ROLES and current_user.role != UserRoleEnum.SCILICIUM_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="scilicium_admin_required"
+        )
+
+
+async def _audit_unsent_notification(
+    db: AsyncSession,
+    request: Request,
+    user_id: UUID,
+    event_type: AuthEventType,
+    error_kind: str,
+) -> None:
+    """Record that the e-mail that goes with `event_type` did not leave. Best effort: the action
+    itself is committed already, and a failure here must not change the answer."""
+    try:
+        await record_event(
+            db,
+            event_type,
+            user_id=user_id,
+            request=request,
+            notification="not_sent",
+            error_kind=error_kind,
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("Could not audit an unsent security e-mail")
+        await db.rollback()
+
+
+async def _notify_mfa_reset(db: AsyncSession, request: Request, user_id: UUID, to: str) -> bool:
+    """Tell the account its second factor was reset, once the reset is committed. Best effort:
+    the reset stands whatever happens here (answering 500 now would hide that it was done), so a
+    failure is logged and audited (`notification: not_sent`) and reported as False."""
+    try:
+        await send_mfa_reset_email(to)
+        return True
+    except (EmailSendError, EmailNotConfiguredError) as exc:
+        logger.warning("MFA reset notice for user %s not sent (%s)", user_id, type(exc).__name__)
+        error_kind = type(exc).__name__
+    except Exception as exc:
+        logger.exception("MFA reset notice for user %s failed unexpectedly", user_id)
+        error_kind = type(exc).__name__
+    await _audit_unsent_notification(
+        db, request, user_id, AuthEventType.MFA_RESET_BY_ADMIN, error_kind
+    )
+    return False
+
+
+@router.post("/users/{user_id}/mfa/reset", response_model=MfaResetResponse)
+async def reset_mfa(
+    user_id: UUID,
+    request: Request,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove the second factor of an account: the next sign-in is an enrolment. Admin only.
+
+    Clears the secret, the enrolment in progress and the recovery codes, ends every session of
+    the account, audits `MFA_RESET_BY_ADMIN` and e-mails the account. Service tokens are kept.
+
+    Resetting the factor of an ADMIN or SCILICIUM_ADMIN (one's own included) takes a
+    SCILICIUM_ADMIN: else 403 `scilicium_admin_required`, and nothing is changed. The e-mail is
+    best effort (`notification_sent` says whether it left); the reset stands either way.
+    """
+    user = await _account_or_404(db, user_id)
+    _require_scilicium_admin_for(user, current_user)
+    to = user.email
+    revoked = await reset_user_mfa(
+        db,
+        user,
+        actor_id=current_user.user_id,
+        event=AuthEventType.MFA_RESET_BY_ADMIN,
+        request=request,
+    )
+    await db.commit()
+    notified = await _notify_mfa_reset(db, request, user_id, to)
+    return MfaResetResponse(sessions_revoked=revoked, notification_sent=notified)
+
+
+@router.post("/users/{user_id}/sessions/revoke", response_model=SessionsRevokeResponse)
+async def revoke_sessions(
+    user_id: UUID,
+    request: Request,
+    body: Optional[SessionsRevokeRequest] = None,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """End every open session of an account. Admin only.
+
+    Service tokens (the pipeline's credentials) are left alone unless the body says
+    `{"revoke_service_tokens": true}`: ending a person's sessions must not stop a machine.
+
+    On an ADMIN or SCILICIUM_ADMIN account (one's own included), with or without the box, it
+    takes a SCILICIUM_ADMIN: else 403 `scilicium_admin_required`, and nothing is changed.
+    """
+    user = await _account_or_404(db, user_id)
+    _require_scilicium_admin_for(user, current_user)
+    sessions_revoked = await revoke_user_sessions(
+        db, user_id, actor_id=current_user.user_id, request=request
+    )
+    service_tokens_revoked = 0
+    if body is not None and body.revoke_service_tokens:
+        service_tokens_revoked = await revoke_user_service_tokens(
+            db, user_id, actor_id=current_user.user_id, request=request
+        )
+    await db.commit()
+    return SessionsRevokeResponse(
+        sessions_revoked=sessions_revoked, service_tokens_revoked=service_tokens_revoked
+    )
+
+
+@router.post("/users/{user_id}/unlock", response_model=UnlockResponse)
+async def unlock_account(
+    user_id: UUID,
+    request: Request,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear the brute-force lock of an account (wrong-password count and lock date). Admin only.
+
+    Any administrator may unlock any account, an administrator's included: unlocking gives no
+    access, it only lets the owner try again. It does not refill the second-factor guesses: the
+    count of wrong codes is kept (only an opened session resets it), so the first wrong code after
+    an unlock locks the account again at once; a right code opens a session and clears both.
+
+    The account row only: an address with no account is throttled in the rate limiter's storage,
+    which this does not touch.
+    """
+    user = await _account_or_404(db, user_id)
+    await unlock_user(db, user, actor_id=current_user.user_id, request=request)
+    await db.commit()
+    return UnlockResponse()
+
+
+@router.post("/users/{user_id}/password-reset", response_model=PasswordResetResponse)
+async def send_password_reset_link(
+    user_id: UUID,
+    request: Request,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """E-mail an account the link to choose a new password. Admin only.
+
+    The same link the account gets from "forgot password", issued by the administrator (and
+    replacing any earlier one). Nothing about the account changes until it is used; its sessions
+    and service tokens are kept. 409 `local_auth_disabled` until `AUTH_MODE=local`: while local
+    authentication is off, and during the pre-launch too (`AUTH_LOCAL_ENABLED` with
+    `AUTH_MODE=supabase`), when the page the link opens is answered 404. As the administrator
+    asked for this e-mail, one that cannot leave is an error: 502 `reset_email_failed`, with the
+    link kept so that a retry sends a new one.
+
+    For an ADMIN or SCILICIUM_ADMIN account (one's own included) it takes a SCILICIUM_ADMIN: else
+    403 `scilicium_admin_required`, and no link is issued nor sent.
+    """
+    user = await _account_or_404(db, user_id)
+    _require_scilicium_admin_for(user, current_user)
+    if settings.AUTH_MODE != "local":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local_auth_disabled")
+    to = user.email
+    raw = await issue_token(
+        db, user_id, OneTimeTokenPurpose.PASSWORD_RESET, created_by=current_user.user_id
+    )
+    await record_event(
+        db,
+        AuthEventType.PASSWORD_RESET_REQUESTED,
+        user_id=user_id,
+        request=request,
+        requested_by=current_user.user_id,
+    )
+    await db.commit()
+    try:
+        await send_password_reset_email(to, raw)
+    except (EmailSendError, EmailNotConfiguredError) as exc:
+        logger.error(
+            "Password-reset e-mail for user %s not sent (%s); the link stays valid for a retry",
+            user_id,
+            type(exc).__name__,
+        )
+        await _audit_unsent_notification(
+            db, request, user_id, AuthEventType.PASSWORD_RESET_REQUESTED, type(exc).__name__
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="reset_email_failed")
+    return PasswordResetResponse()
+
+
+@router.get("/users/{user_id}/auth-events", response_model=List[AuthEventResponse])
+async def list_auth_events(
+    user_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The audit trail of an account (sign-ins, lock, second factor, sessions, administrator
+    actions), newest first: `limit` lines, 50 by default, 200 at most. Admin only."""
+    await _account_or_404(db, user_id)
+    rows = await db.scalars(
+        select(AuthEvent)
+        .where(AuthEvent.user_id == user_id)
+        .order_by(AuthEvent.created_at.desc(), AuthEvent.id.desc())
+        .limit(limit)
+    )
+    return [
+        AuthEventResponse(
+            event_type=row.event_type,
+            created_at=row.created_at,
+            ip=row.ip,
+            user_agent=row.user_agent,
+            details=row.details,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/users/{user_id}/service-tokens", response_model=List[ServiceTokenResponse])
+async def list_service_tokens(
+    user_id: UUID,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The service tokens an account owns, newest first, revoked ones included. Never the token
+    itself nor its hash: the token exists only where it was created. Admin only."""
+    await _account_or_404(db, user_id)
+    rows = await db.scalars(
+        select(ServiceToken)
+        .where(ServiceToken.owner_id == user_id)
+        .order_by(ServiceToken.created_at.desc(), ServiceToken.id)
+    )
+    return [
+        ServiceTokenResponse(
+            id=row.id,
+            name=row.name,
+            scopes=list(row.scopes or []),
+            created_at=row.created_at,
+            last_used_at=row.last_used_at,
+            revoked_at=row.revoked_at,
+        )
+        for row in rows
+    ]
+
+
 @router.get("/users/{user_id}", response_model=UserProfile)
 async def get_user_details(
     user_id: UUID,
@@ -471,10 +927,18 @@ async def get_user_details(
     """
     Get a specific user profile.
     Admin only.
+
+    Local mode: the `users` row alone (404 without one; no provider call).
     """
+    if identities_are_local():
+        local_row = await db.scalar(select(User).where(User.id == user_id))
+        if local_row is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        return UserProfile(**_local_profile_fields(local_row))
+
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -570,7 +1034,8 @@ async def get_user_details(
                         created_at=profile.get("created_at"),
                         updated_at=profile.get("updated_at"),
                         last_sign_in_at=last_sign_in,
-                        confirmed_at=confirmed_at
+                        confirmed_at=confirmed_at,
+                        **_local_auth_fields(local_user),
                     )
             
             raise HTTPException(status_code=404, detail="User not found")
@@ -600,11 +1065,14 @@ async def update_user_subscription(
     result = await db.execute(query)
     user = result.scalar_one_or_none()
     
+    if not user and identities_are_local():
+        # No lazy creation in local mode: an account exists once it is invited.
+        raise HTTPException(status_code=404, detail="User not found")
     if not user:
         # If user doesn't exist in local DB (e.g. only in Supabase), create them
         # We need to fetch email/name from Supabase first
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -1000,6 +1468,10 @@ async def update_user_role(
        analysis quota, AI access, and a free pass through `require_active_account`.
        Writing both sides here keeps that protection intact — it guards against
        claims, not against an explicit admin action.
+
+    `profiles` and the role cache are written only while roles come from the
+    provider (`role_source_is_supabase()`). In local mode `users.role` is the
+    only role there is, and writing it is the whole change (404 without a row).
     """
     # Validate role
     from app.models.models import UserRole
@@ -1012,38 +1484,39 @@ async def update_user_role(
         )
 
     try:
-        headers = {
-            "apikey": settings.SUPABASE_KEY,
-            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation"
-        }
+        if role_source_is_supabase():
+            headers = {
+                "apikey": settings.SUPABASE_KEY or "",
+                "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation"
+            }
 
-        async with httpx.AsyncClient() as client:
-            # Update role in profiles table
-            response = await client.patch(
-                f"{settings.SUPABASE_URL}/rest/v1/profiles",
-                headers=headers,
-                params={"id": f"eq.{user_id}"},
-                json={"role": role_update.role.lower()}
-            )
-
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to update user role: {response.text}"
+            async with httpx.AsyncClient() as client:
+                # Update role in profiles table
+                response = await client.patch(
+                    f"{settings.SUPABASE_URL}/rest/v1/profiles",
+                    headers=headers,
+                    params={"id": f"eq.{user_id}"},
+                    json={"role": role_update.role.lower()}
                 )
 
-            data = response.json()
-            if not data:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="User not found"
-                )
+                if response.status_code != 200:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Failed to update user role: {response.text}"
+                    )
 
-        # The role guards read a per-process cache of `profiles.role`: drop it so
-        # the change applies on the user's next request, not after the TTL.
-        invalidate_cached_role(user_id)
+                data = response.json()
+                if not data:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="User not found"
+                    )
+
+            # The role guards read a per-process cache of `profiles.role`: drop it so
+            # the change applies on the user's next request, not after the TTL.
+            invalidate_cached_role(user_id)
 
         # Mirror onto the local row, which is what every plan and quota guard
         # reads. Skipped silently when the user has no local row yet: it is
@@ -1054,6 +1527,9 @@ async def update_user_role(
         if local_user:
             local_user.role = UserRole(role_update.role.upper())
             await db.commit()
+        elif not role_source_is_supabase():
+            # Local mode: no row, no account (nothing creates it lazily any more).
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
         # Build the response the same way update_user_subscription does, rather
         # than returning the PostgREST row — see the note in the docstring.
@@ -1120,24 +1596,28 @@ async def get_system_stats(
             # One-time token revenue
             estimated_revenue += (u.ai_tokens_purchased * PRICES["TOKEN"])
 
-        # Fetch total users from Supabase (including those not in local DB)
-        headers = {
-            "apikey": settings.SUPABASE_KEY,
-            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
-            "Content-Type": "application/json",
-        }
+        if identities_are_local():
+            # The `users` table is the directory: every account has a row.
+            total_users = len(local_users)
+        else:
+            # Fetch total users from Supabase (including those not in local DB)
+            headers = {
+                "apikey": settings.SUPABASE_KEY or "",
+                "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
+                "Content-Type": "application/json",
+            }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{settings.SUPABASE_URL}/rest/v1/profiles",
-                headers=headers,
-                params={"select": "id"}
-            )
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{settings.SUPABASE_URL}/rest/v1/profiles",
+                    headers=headers,
+                    params={"select": "id"}
+                )
 
-            total_users = 0
-            if response.status_code == 200:
-                total_users = len(response.json())
-        
+                total_users = 0
+                if response.status_code == 200:
+                    total_users = len(response.json())
+
         # Adjust STARTER count for users not in local DB (model default plan)
         local_users_count = sum(users_by_plan.values())
         if total_users > local_users_count:
@@ -1159,16 +1639,42 @@ async def get_system_stats(
         )
 
 
-@router.post("/users", response_model=UserProfile, dependencies=[Depends(require_active_license)])
+async def _require_password(request: Request) -> None:
+    """Supabase mode still creates the account with the admin's password.
+
+    A body without one is refused exactly as when the schema required the field:
+    the same validation errors, raised the way FastAPI raises them, so the 422
+    and its body are unchanged. Only reached once the body passed `UserCreate`.
+    """
+    body = await request.json()
+    try:
+        _UserCreateWithPassword.model_validate(body)
+    except ValidationError as exc:
+        errors = [{**error, "loc": ("body", *error["loc"])} for error in exc.errors()]
+        raise RequestValidationError(errors, body=body) from None
+
+
+@router.post(
+    "/users", response_model=CreatedUserProfile, dependencies=[Depends(require_active_license)]
+)
 async def create_user(
     user_data: UserCreate,
+    request: Request,
     current_user: SupabaseUser = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """
     Create a new user in Supabase Auth and local DB.
     Admin only.
+
+    Local mode: an invitation (`AccountService.invite_user`) with the requested
+    role. The admin no longer chooses a password: one in the request is ignored,
+    and the answer carries `invitation_sent: true` (502 `invitation_email_failed`
+    if the e-mail could not be sent; the account and its link are kept).
     """
+    if not identities_are_local():
+        await _require_password(request)
+
     from app.models.models import UserRole
     try:
         role_enum = UserRole(user_data.role.upper())
@@ -1178,9 +1684,25 @@ async def create_user(
             detail=f"Invalid role. Must be one of: {', '.join([r.value for r in UserRole])}"
         )
 
+    if identities_are_local():
+        service = AccountService(db)
+        try:
+            invited = await service.invite_user(
+                email=user_data.email,
+                full_name=user_data.full_name,
+                plan=SubscriptionPlan.STARTER,
+                invited_by_admin_id=current_user.user_id,
+                role=role_enum,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+        except InvitationEmailError:
+            raise _invitation_email_failed()
+        return CreatedUserProfile(**_local_profile_fields(invited), invitation_sent=True)
+
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -1266,6 +1788,9 @@ async def update_user(
     """
     Update a user's profile.
     Admin only.
+
+    `profiles` (and the role cache) are written only while roles come from the
+    provider. In local mode the `users` row is the profile (404 without one).
     """
     # Validate role if provided
     if user_update.role:
@@ -1280,7 +1805,7 @@ async def update_user(
 
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
             "Prefer": "return=representation"
@@ -1298,6 +1823,17 @@ async def update_user(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No fields to update"
             )
+
+        if not role_source_is_supabase():
+            local_row = await db.scalar(select(User).where(User.id == user_id))
+            if local_row is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+            if user_update.full_name is not None:
+                local_row.full_name = user_update.full_name
+            if user_update.role is not None:
+                local_row.role = UserRoleEnum(user_update.role.upper())
+            await db.commit()
+            return await get_user_details(user_id, current_user, db)
 
         async with httpx.AsyncClient() as client:
             response = await client.patch(
@@ -1338,6 +1874,10 @@ async def delete_user(
     Delete a user from Supabase and local database.
     Admin only.
     WARNING: This permanently deletes the user and all their data (projects, legacy data, etc).
+
+    Local mode: local deletion only (404 for an unknown account). The account's
+    sessions, links and recovery codes go with its row (ON DELETE CASCADE); the
+    Sequencing tables are not touched and the provider is not called.
     """
     # Prevent self-deletion
     if str(user_id) == str(current_user.user_id):
@@ -1348,16 +1888,21 @@ async def delete_user(
 
     try:
         from sqlalchemy import text, delete
-        
-        # 1. Delete legacy 'sequencing_projects' (if exists)
-        # This table causes FK violation if not cleaned up
-        try:
-            # Use nested transaction to prevent breaking the main transaction if table doesn't exist
-            async with db.begin_nested():
-                await db.execute(text("DELETE FROM sequencing_projects WHERE user_id = :uid"), {"uid": user_id})
-        except Exception as e:
-            # Table might not exist or other error, log and continue
-            logger.warning(f"Warning cleaning legacy projects: {e}")
+
+        if identities_are_local():
+            if await db.scalar(select(User.id).where(User.id == user_id)) is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        else:
+            # 1. Delete legacy 'sequencing_projects' (if exists)
+            # This table causes FK violation if not cleaned up
+            try:
+                # Use nested transaction to prevent breaking the main transaction
+                # if table doesn't exist
+                async with db.begin_nested():
+                    await db.execute(text("DELETE FROM sequencing_projects WHERE user_id = :uid"), {"uid": user_id})
+            except Exception as e:
+                # Table might not exist or other error, log and continue
+                logger.warning(f"Warning cleaning legacy projects: {e}")
 
         # 2. Delete modern 'projects' owned by user
         # This will cascade to datasets, samples, members
@@ -1368,54 +1913,20 @@ async def delete_user(
         
         await db.commit()
 
-        # 4. Delete user from Supabase Auth
-        headers = {
-            "apikey": settings.SUPABASE_KEY,
-            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient() as client:
-            # 4.1 Clean up remote Supabase tables (legacy)
-            # 'sequencing_projects' exists in Supabase DB and blocks deletion
-            try:
-                await client.delete(
-                    f"{settings.SUPABASE_URL}/rest/v1/sequencing_projects",
-                    headers=headers,
-                    params={"user_id": f"eq.{user_id}"}
-                )
-            except Exception as e:
-                logger.warning(f"Warning: Failed to clean up remote sequencing_projects: {e}")
-
-            # 4.1b Clean up 'status_history' rows referencing this user, either as
-            # the subject (user_id) or the actor (changed_by). Those FKs have no
-            # ON DELETE rule and otherwise block deleting the user.
-            for column in ("changed_by", "user_id"):
-                try:
-                    await client.delete(
-                        f"{settings.SUPABASE_URL}/rest/v1/status_history",
-                        headers=headers,
-                        params={column: f"eq.{user_id}"}
-                    )
-                except Exception as e:
-                    logger.warning(f"Warning: Failed to clean up status_history.{column}: {e}")
-
-            # 4.2 Delete user via Supabase Admin API
-            response = await client.delete(
-                f"{settings.SUPABASE_URL}/auth/v1/admin/users/{user_id}",
-                headers=headers
+        # 4. Delete the identity: from Supabase Auth, with the provider's legacy
+        # rows that block it (sequencing_projects, status_history); nothing in
+        # local mode. See `delete_identity`.
+        try:
+            await delete_identity(user_id)
+        except IdentityNotFoundError:
+            # If not found in Auth but we cleaned up local DB, consider it success or just gone
+            return {"message": "User deleted (was not found in Supabase Auth)"}
+        except IdentityDeletionError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to delete user from Supabase: {exc}"
             )
-
-            if response.status_code == 200:
-                return {"message": "User deleted successfully"}
-            elif response.status_code == 404:
-                # If not found in Auth but we cleaned up local DB, consider it success or just gone
-                return {"message": "User deleted (was not found in Supabase Auth)"}
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Failed to delete user from Supabase: {response.text}"
-                )
+        return {"message": "User deleted successfully"}
 
     except HTTPException:
         raise
@@ -1465,6 +1976,16 @@ async def delete_project(
         )
 
 
+def _identity_field(
+    identities: dict[UUID, AuthIdentity], user_id: UUID, field: str
+) -> Optional[str]:
+    """`email` or `full_name` of `user_id` in a directory listing, None if absent."""
+    identity = identities.get(user_id)
+    if identity is None:
+        return None
+    return identity.email if field == "email" else identity.full_name
+
+
 @router.get("/projects")
 async def list_all_projects(
     current_user: SupabaseUser = Depends(require_admin),
@@ -1480,29 +2001,9 @@ async def list_all_projects(
         result = await db.execute(select(Project).offset(skip).limit(limit))
         projects = result.scalars().all()
 
-        # Get owner emails from Supabase
-        headers = {
-            "apikey": settings.SUPABASE_KEY,
-            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient() as client:
-            # Get auth users for owner emails
-            auth_response = await client.get(
-                f"{settings.SUPABASE_URL}/auth/v1/admin/users",
-                headers=headers
-            )
-
-            owner_info = {}
-            if auth_response.status_code == 200:
-                auth_data = auth_response.json()
-                users_list = auth_data.get("users", []) if isinstance(auth_data, dict) else auth_data
-                for user in users_list:
-                    owner_info[user["id"]] = {
-                        "email": user.get("email"),
-                        "full_name": user.get("user_metadata", {}).get("full_name")
-                    }
+        # Owner emails and names from the identity directory (the provider's user
+        # list in supabase mode, the `users` table in local mode).
+        owners = await list_identities(db)
 
         return [
             {
@@ -1510,8 +2011,8 @@ async def list_all_projects(
                 "name": p.name,
                 "description": p.description,
                 "owner_id": str(p.owner_id),
-                "owner_email": owner_info.get(str(p.owner_id), {}).get("email"),
-                "owner_full_name": owner_info.get(str(p.owner_id), {}).get("full_name"),
+                "owner_email": _identity_field(owners, p.owner_id, "email"),
+                "owner_full_name": _identity_field(owners, p.owner_id, "full_name"),
                 "created_at": p.created_at.isoformat() if p.created_at else None,
                 "updated_at": p.updated_at.isoformat() if p.updated_at else None
             }
@@ -1557,11 +2058,13 @@ async def update_project(
             user_result = await db.execute(select(User).where(User.id == project_update.owner_id))
             user = user_result.scalar_one_or_none()
             
-            if not user:
+            # Supabase mode only: in local mode an account exists once it is
+            # invited, and nothing creates its row lazily (unknown owner → 404).
+            if not user and not identities_are_local():
                 # Try to fetch from Supabase to auto-create local user
                 try:
                     headers = {
-                        "apikey": settings.SUPABASE_KEY,
+                        "apikey": settings.SUPABASE_KEY or "",
                         "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
                         "Content-Type": "application/json",
                     }
@@ -1639,28 +2142,9 @@ async def list_project_members(
         result = await db.execute(select(ProjectMember).where(ProjectMember.project_id == project_id))
         members = result.scalars().all()
 
-        # Get user information from Supabase
-        headers = {
-            "apikey": settings.SUPABASE_KEY,
-            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient() as client:
-            auth_response = await client.get(
-                f"{settings.SUPABASE_URL}/auth/v1/admin/users",
-                headers=headers
-            )
-
-            user_info = {}
-            if auth_response.status_code == 200:
-                auth_data = auth_response.json()
-                users_list = auth_data.get("users", []) if isinstance(auth_data, dict) else auth_data
-                for user in users_list:
-                    user_info[user["id"]] = {
-                        "email": user.get("email"),
-                        "full_name": user.get("user_metadata", {}).get("full_name")
-                    }
+        # User information from the identity directory (the provider's user list
+        # in supabase mode, the `users` table in local mode).
+        identities = await list_identities(db)
 
         return [
             ProjectMemberResponse(
@@ -1670,8 +2154,8 @@ async def list_project_members(
                 access_level=m.access_level.value if hasattr(m.access_level, 'value') else m.access_level,
                 created_at=m.created_at.isoformat() if m.created_at else None,
                 updated_at=m.updated_at.isoformat() if m.updated_at else None,
-                user_email=user_info.get(str(m.user_id), {}).get("email"),
-                user_full_name=user_info.get(str(m.user_id), {}).get("full_name")
+                user_email=_identity_field(identities, m.user_id, "email"),
+                user_full_name=_identity_field(identities, m.user_id, "full_name")
             )
             for m in members
         ]
@@ -1729,6 +2213,13 @@ async def add_project_member(
                 detail="User is already a member of this project"
             )
 
+        # Local mode: the account must exist (its `users` row is its identity).
+        identity: Optional[AuthIdentity] = None
+        if identities_are_local():
+            identity = await find_identity_by_id(db, member_data.user_id)
+            if identity is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
         # Create new member
         new_member = ProjectMember(
             project_id=project_id,
@@ -1740,23 +2231,27 @@ async def add_project_member(
         await db.refresh(new_member)
 
         # Get user information
-        headers = {
-            "apikey": settings.SUPABASE_KEY,
-            "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
-            "Content-Type": "application/json",
-        }
+        user_email: Optional[str] = None
+        user_full_name: Optional[str] = None
+        if identity is not None:
+            # Local mode: read from the directory above.
+            user_email, user_full_name = identity.email, identity.full_name
+        else:
+            headers = {
+                "apikey": settings.SUPABASE_KEY or "",
+                "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
+                "Content-Type": "application/json",
+            }
 
-        user_email = None
-        user_full_name = None
-        async with httpx.AsyncClient() as client:
-            user_response = await client.get(
-                f"{settings.SUPABASE_URL}/auth/v1/admin/users/{member_data.user_id}",
-                headers=headers
-            )
-            if user_response.status_code == 200:
-                user_data = user_response.json()
-                user_email = user_data.get("email")
-                user_full_name = user_data.get("user_metadata", {}).get("full_name")
+            async with httpx.AsyncClient() as client:
+                user_response = await client.get(
+                    f"{settings.SUPABASE_URL}/auth/v1/admin/users/{member_data.user_id}",
+                    headers=headers
+                )
+                if user_response.status_code == 200:
+                    user_data = user_response.json()
+                    user_email = user_data.get("email")
+                    user_full_name = user_data.get("user_metadata", {}).get("full_name")
 
         return ProjectMemberResponse(
             id=new_member.id,

@@ -13,7 +13,8 @@ from app.api.deps.license import require_active_license
 from app.api.deps.service_token import service_token_scope
 from app.api.deps.subscription import get_or_create_user
 from app.core.service_tokens import SCOPE_PROJECTS_CREATE
-from app.core.supabase_auth import SupabaseUser, lookup_user_by_email
+from app.auth.directory import find_identity_by_email
+from app.core.supabase_auth import SupabaseUser
 from app.models.models import Project, Dataset, ProjectMember, GeneBookmark, GeneList, ProjectComment, DegGene, EnrichmentPathway, DatasetType, DatasetStatus, ActivityEventType, ProjectActivityLog, User
 from app.api.deps.project_access import is_project_admin
 from app.services import email_service, history_service
@@ -594,9 +595,9 @@ async def invite_project_member(
             detail="Only project admins can invite members"
         )
 
-    # ── Step 1: resolve email → Supabase user_id ──────────────────────────
-    supabase_user = await lookup_user_by_email(member_in.user_email)
-    if supabase_user is None:
+    # ── Step 1: resolve email → account id (identity directory) ───────────
+    invitee = await find_identity_by_email(db, member_in.user_email)
+    if invitee is None:
         # User doesn't exist yet — we still create a pending invitation email
         # and return a 202 Accepted (no DB record created yet).
         await email_service.send_project_invitation(
@@ -614,7 +615,7 @@ async def invite_project_member(
             ),
         )
 
-    invitee_user_id = UUID(supabase_user["id"])
+    invitee_user_id = invitee.id
 
     # Prevent adding yourself
     if invitee_user_id == current_user.user_id:

@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_db
 from app.api.deps.account_state import subscription_has_expired
 from app.api.deps.subscription import get_or_create_user
+from app.api.endpoints.auth import _recovery_codes_left
 from app.models.models import Project, User
 from app.schemas import user as user_schemas
 from app.services import email_service
@@ -37,6 +38,15 @@ async def read_user_me(
     # Same predicate `require_active_account` applies when it refuses a write, so
     # the banner and the refusal can never disagree.
     current_user.subscription_expired = subscription_has_expired(current_user)
+    # Local authentication state, read from the account's own columns: an account that never
+    # used the local sign-in (every one in supabase mode until it does) reports no second factor
+    # and, without a verification date, an unverified address. The recovery codes are counted
+    # only for an account with 2FA on.
+    current_user.mfa_enabled = current_user.mfa_enabled_at is not None
+    current_user.email_verified = current_user.email_verified_at is not None
+    current_user.recovery_codes_remaining = (
+        await _recovery_codes_left(db, current_user.id) if current_user.mfa_enabled else None
+    )
     return current_user
 
 # NOTE: PATCH /me/subscription was removed deliberately. It let any authenticated

@@ -45,6 +45,18 @@ services:
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
+      # Self-hosted authentication (docs/AUTH.md). The defaults keep today's behaviour: the hosted provider
+      # stays in charge and the local endpoints answer 404 until AUTH_MODE / AUTH_LOCAL_ENABLED say otherwise.
+      # The defaults are MANDATORY: an unset variable would otherwise reach the container as an empty string
+      # and override the default of the code. The two key settings are empty here on purpose: they are read
+      # only once the local authentication is on, and then from the host's .env (never from the image).
+      - AUTH_MODE=${AUTH_MODE:-supabase}
+      - AUTH_LOCAL_ENABLED=${AUTH_LOCAL_ENABLED:-false}
+      - AUTH_ISSUER=${AUTH_ISSUER:-https://api-v2.genolens.com}
+      - AUTH_JWT_PRIVATE_KEYS=${AUTH_JWT_PRIVATE_KEYS:-}
+      - AUTH_ENCRYPTION_KEYS=${AUTH_ENCRYPTION_KEYS:-}
+      - AUTH_COOKIE_DOMAIN=${AUTH_COOKIE_DOMAIN:-}
+      - AUTH_COOKIE_SECURE=${AUTH_COOKIE_SECURE:-true}
       - ENVIRONMENT=production
       # DEBUG only turns the SQL echo on (every statement in the logs): off in production, in every service.
       - DEBUG=false
@@ -66,6 +78,13 @@ services:
       - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS}
       - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-GenoLens}
       - SALES_EMAIL=${SALES_EMAIL:-contact@scilicium.com}
+      # The host of every link an e-mail carries (verification, reset, invitation). There is no env_file:
+      # without this entry the code's default (http://localhost:3000) would be used.
+      - APP_URL=${APP_URL:-https://app.genolens.com}
+      # The address every e-mail and refusal tells the reader to contact (security notices, expiry
+      # warning, inactive account, licence, quotas). Set it to a real, monitored mailbox before
+      # opening the local authentication; the default is the code's.
+      - SUPPORT_EMAIL=${SUPPORT_EMAIL:-support@scilicium.com}
       # Drug Discovery (service genolens-dd). La clé vient du .env de l'hôte, jamais de
       # l'image : un .env embarqué au build est celui du checkout, donc sans secret, et
       # l'API répondait « non configuré » en production alors que l'hôte avait la clé.
@@ -111,6 +130,14 @@ services:
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
+      # Self-hosted authentication: same settings and same defaults as the api service (docs/AUTH.md).
+      - AUTH_MODE=${AUTH_MODE:-supabase}
+      - AUTH_LOCAL_ENABLED=${AUTH_LOCAL_ENABLED:-false}
+      - AUTH_ISSUER=${AUTH_ISSUER:-https://api-v2.genolens.com}
+      - AUTH_JWT_PRIVATE_KEYS=${AUTH_JWT_PRIVATE_KEYS:-}
+      - AUTH_ENCRYPTION_KEYS=${AUTH_ENCRYPTION_KEYS:-}
+      - AUTH_COOKIE_DOMAIN=${AUTH_COOKIE_DOMAIN:-}
+      - AUTH_COOKIE_SECURE=${AUTH_COOKIE_SECURE:-true}
       - ENVIRONMENT=production
       - DEBUG=false
       - LOCAL_STORAGE_PATH=/app/data
@@ -130,6 +157,13 @@ services:
       - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS}
       - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-GenoLens}
       - SALES_EMAIL=${SALES_EMAIL:-contact@scilicium.com}
+      # The host of every link an e-mail carries (verification, reset, invitation). There is no env_file:
+      # without this entry the code's default (http://localhost:3000) would be used.
+      - APP_URL=${APP_URL:-https://app.genolens.com}
+      # The address every e-mail and refusal tells the reader to contact (security notices, expiry
+      # warning, inactive account, licence, quotas). Set it to a real, monitored mailbox before
+      # opening the local authentication; the default is the code's.
+      - SUPPORT_EMAIL=${SUPPORT_EMAIL:-support@scilicium.com}
     volumes:
       - genolens_storage:/app/data
     depends_on:
@@ -164,6 +198,14 @@ services:
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
+      # Self-hosted authentication: same settings and same defaults as the api service (docs/AUTH.md).
+      - AUTH_MODE=${AUTH_MODE:-supabase}
+      - AUTH_LOCAL_ENABLED=${AUTH_LOCAL_ENABLED:-false}
+      - AUTH_ISSUER=${AUTH_ISSUER:-https://api-v2.genolens.com}
+      - AUTH_JWT_PRIVATE_KEYS=${AUTH_JWT_PRIVATE_KEYS:-}
+      - AUTH_ENCRYPTION_KEYS=${AUTH_ENCRYPTION_KEYS:-}
+      - AUTH_COOKIE_DOMAIN=${AUTH_COOKIE_DOMAIN:-}
+      - AUTH_COOKIE_SECURE=${AUTH_COOKIE_SECURE:-true}
       - ENVIRONMENT=production
       - DEBUG=false
       - LOCAL_STORAGE_PATH=/app/data
@@ -183,6 +225,13 @@ services:
       - EMAIL_FROM_ADDRESS=${EMAIL_FROM_ADDRESS}
       - EMAIL_FROM_NAME=${EMAIL_FROM_NAME:-GenoLens}
       - SALES_EMAIL=${SALES_EMAIL:-contact@scilicium.com}
+      # The host of every link an e-mail carries (verification, reset, invitation). There is no env_file:
+      # without this entry the code's default (http://localhost:3000) would be used.
+      - APP_URL=${APP_URL:-https://app.genolens.com}
+      # The address every e-mail and refusal tells the reader to contact (security notices, expiry
+      # warning, inactive account, licence, quotas). Set it to a real, monitored mailbox before
+      # opening the local authentication; the default is the code's.
+      - SUPPORT_EMAIL=${SUPPORT_EMAIL:-support@scilicium.com}
     volumes:
       - genolens_storage:/app/data
     depends_on:
@@ -209,6 +258,10 @@ services:
       - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
       - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
       - SUPABASE_STORAGE_BUCKET=${SUPABASE_STORAGE_BUCKET:-genolens-data}
+      # Loads the same settings as the other services, so it needs the same authentication mode (it signs
+      # nobody in and holds no key): see docs/AUTH.md.
+      - AUTH_MODE=${AUTH_MODE:-supabase}
+      - AUTH_LOCAL_ENABLED=${AUTH_LOCAL_ENABLED:-false}
       - ENVIRONMENT=production
       - DEBUG=false
       - LOCAL_STORAGE_PATH=/app/data

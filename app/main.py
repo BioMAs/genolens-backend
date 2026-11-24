@@ -12,10 +12,12 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from slowapi.errors import RateLimitExceeded
 
+from app.auth.keys import load_signing_keys
+from app.auth.mfa import load_cipher
 from app.core.config import settings
 from app.core.supabase_auth import close_supabase_http_client
 from app.db.session import close_db
-from app.api.endpoints import projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmomics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
+from app.api.endpoints import auth, auth_account, projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmomics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,16 @@ async def lifespan(app: FastAPI):
     logger.info(f"🌐 CORS Origins: {settings.CORS_ORIGINS}")
     logger.info(f"📊 Database: Connected")
     logger.info(f"🔄 Celery: Worker configured")
+
+    # Self-hosted authentication: read the signing keys and the encryption keys (second-factor
+    # secrets, recovery-code hashes) now, so that a production deployment without them fails at
+    # start-up instead of at the first sign-in or enrolment. Nothing changes while the hosted
+    # provider is the only one in charge (AUTH_MODE=supabase, AUTH_LOCAL_ENABLED off).
+    if settings.AUTH_MODE == "local" or settings.AUTH_LOCAL_ENABLED:
+        keys = load_signing_keys()
+        logger.info(f"🔑 Local authentication: {len(keys)} signing key(s) loaded")
+        load_cipher()
+        logger.info("🔑 Local authentication: encryption keys loaded")
 
     yield
 
@@ -94,6 +106,13 @@ app.state.limiter = limiter
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
     """Handle rate limit exceeded errors."""
+    if request.url.path.startswith(f"{settings.API_V1_PREFIX}/auth/"):
+        # The sign-in routes answer a per-IP limit exactly as a locked account (spec §7.4): one
+        # generic "too many attempts" that says nothing about the account.
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "too_many_attempts"},
+        )
     return JSONResponse(
         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
         content={
@@ -235,6 +254,20 @@ async def database_test(current_user=Depends(get_current_user)):
 #   license, health  infrastructure status, needed precisely when access is broken
 #   admin, admin_deployment, admin_ai_costs
 #                    admin-only already; privileged roles bypass the guard anyway
+#   auth, auth_account
+#                    sign-in, 2FA, refresh, logout, sign-up, password and session
+#                    management: a suspended account must still sign in to be told why;
+#                    both answer 404 themselves while local auth is off
+
+app.include_router(
+    auth.router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    auth_account.router,
+    prefix=settings.API_V1_PREFIX,
+)
 
 app.include_router(
     projects.router,

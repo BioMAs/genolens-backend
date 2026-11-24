@@ -4,7 +4,7 @@ Supabase JWT validation utilities.
 import asyncio
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 from uuid import UUID
 import jwt
 from jwt import PyJWTError
@@ -120,6 +120,10 @@ class SupabaseUser(BaseModel):
     user_metadata: dict = {}
     # Set when the request came with a service token: the user is then the token's owner.
     service_token_id: Optional[UUID] = None
+    # Set for a local access token: the session it is bound to (see app.auth.principal).
+    session_id: Optional[UUID] = None
+    # Which credential authenticated the request.
+    auth_source: Literal["service_token", "local", "supabase"] = "supabase"
 
 
 async def fetch_user_role_from_supabase(user_id: UUID) -> Optional[str]:
@@ -135,7 +139,7 @@ async def fetch_user_role_from_supabase(user_id: UUID) -> Optional[str]:
     """
     try:
         headers = {
-            "apikey": settings.SUPABASE_KEY,
+            "apikey": settings.SUPABASE_KEY or "",
             "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_KEY}",
             "Content-Type": "application/json",
         }
@@ -177,11 +181,14 @@ async def verify_supabase_token(token: str) -> Optional[SupabaseUser]:
     """
     if is_service_token(token):
         return None  # never a JWT (see app/core/service_tokens.py)
+    secret = settings.SUPABASE_JWT_SECRET
+    if secret is None:
+        return None  # AUTH_MODE=local without the hosted provider: none of its tokens is valid
     try:
         # Decode JWT using Supabase JWT secret
         payload = jwt.decode(
             token,
-            settings.SUPABASE_JWT_SECRET,
+            secret,
             algorithms=["HS256"],
             audience="authenticated",
             options={"verify_aud": True}

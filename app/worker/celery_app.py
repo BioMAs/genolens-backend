@@ -45,6 +45,7 @@ celery_app.conf.include = [
     "app.worker.tasks",
     "app.worker.tasks.quota_tasks",
     "app.worker.tasks.account_tasks",
+    "app.worker.tasks.auth_tasks",
     "app.worker.tasks.deployment_task",
     "app.worker.tasks.report_task",
     "app.worker.tasks.intersection_enrichment_task",
@@ -66,5 +67,14 @@ celery_app.conf.beat_schedule = {
         # The task is idempotent (User.expiry_warning_sent_for), so a double run
         # after a restart costs nothing, and a missed day is caught up on the
         # next pass instead of losing that warning.
+    },
+    "purge-auth-records": {
+        "task": "app.worker.tasks.auth_tasks.purge_auth_records",
+        "schedule": crontab(minute=15, hour=3),
+        # Daily at 03:15 UTC — after the 02:00 database backup, before the 06:30
+        # expiry warnings. Deletes the audit events older than a year, the spent or
+        # expired one-time links older than a week and the dead sessions older than a
+        # month (see auth_tasks.py). Idempotent: the rules are about age only, so a
+        # double run or a missed day costs nothing.
     },
 }
