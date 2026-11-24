@@ -4,7 +4,7 @@ Supabase JWT validation utilities.
 import asyncio
 import logging
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 from uuid import UUID
 import jwt
 from jwt import PyJWTError
@@ -120,6 +120,10 @@ class SupabaseUser(BaseModel):
     user_metadata: dict = {}
     # Set when the request came with a service token: the user is then the token's owner.
     service_token_id: Optional[UUID] = None
+    # Set for a local access token: the session it is bound to (see app.auth.principal).
+    session_id: Optional[UUID] = None
+    # Which credential authenticated the request.
+    auth_source: Literal["service_token", "local", "supabase"] = "supabase"
 
 
 async def fetch_user_role_from_supabase(user_id: UUID) -> Optional[str]:

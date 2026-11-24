@@ -8,28 +8,39 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps.service_token import resolve_service_token
+from app.auth.principal import read_credentials, resolve_caller
 from app.core.security import verify_token, get_user_from_token, CurrentUser
 from app.core.service_tokens import is_service_token
+from app.core.supabase_auth import SupabaseUser
 from app.db.session import get_db
 from app.models.models import User, UserRole
 
 
-# HTTP Bearer token scheme
-security = HTTPBearer()
+# Declares the Bearer scheme in the OpenAPI schema. It refuses nothing itself: the
+# credential (header or `gl_at` cookie) is read and checked by `app.auth.principal`.
+security = HTTPBearer(auto_error=False)
+
+
+async def _verify_supabase_jwt(token: str) -> SupabaseUser:
+    """A Supabase JWT, refused with this dependency's own messages ("Token has expired", "Could
+    not validate credentials"). Only the user id matters: the user is read from the database."""
+    token_payload = verify_token(token)
+    return SupabaseUser(user_id=get_user_from_token(token_payload), email=token_payload.email or "")
 
 
 async def get_current_user(
     request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> CurrentUser:
     """
     Dependency to get the current authenticated user from JWT token.
 
-    A service token (`glst_…`) is never parsed as a JWT: it stands for its owner, and only on
-    the routes its scopes open (`app.api.deps.service_token`; 401 if invalid or revoked, 403
-    elsewhere).
+    The credential is resolved by `app.auth.principal.resolve_caller`, as for every protected
+    route: a service token (`glst_…`) stands for its owner, and only on the routes its scopes open
+    (`app.api.deps.service_token`; 401 if invalid or revoked, 403 elsewhere); a local access token
+    is accepted with `AUTH_MODE=local` or `AUTH_LOCAL_ENABLED`; a Supabase JWT in supabase mode
+    only. The user is then read from the database.
 
     Usage:
         @app.get("/protected")
@@ -37,7 +48,8 @@ async def get_current_user(
             return {"user_id": user.id}
 
     Args:
-        credentials: HTTP Bearer credentials from request header
+        request: The request (its `Authorization` header, or `gl_at` cookie)
+        credentials: Unused; declares the Bearer scheme in the OpenAPI schema
         db: Database session
 
     Returns:
@@ -46,15 +58,10 @@ async def get_current_user(
     Raises:
         HTTPException: If authentication fails
     """
-    token = credentials.credentials
-    if is_service_token(token):
-        db_user = (await resolve_service_token(request, token, db)).owner
-    else:
-        token_payload = verify_token(token)
-        user_id = get_user_from_token(token_payload)
-
+    principal, db_user = await resolve_caller(request, db, verify_hosted=_verify_supabase_jwt)
+    if db_user is None:
         # Load user from database
-        result = await db.execute(select(User).where(User.id == user_id))
+        result = await db.execute(select(User).where(User.id == principal.user_id))
         db_user = result.scalar_one_or_none()
 
     if not db_user:
@@ -83,12 +90,13 @@ async def get_current_user(
 
 
 async def get_current_user_optional(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> Optional[CurrentUser]:
     """
     Dependency to optionally get the current user.
-    Returns None if no valid token is provided.
+    Returns None if no valid credential is provided.
 
     Usage:
         @app.get("/public-or-private")
@@ -98,38 +106,20 @@ async def get_current_user_optional(
             return {"message": "Hello anonymous"}
 
     Args:
-        credentials: Optional HTTP Bearer credentials
+        request: The request (its `Authorization` header, or `gl_at` cookie)
+        credentials: Unused; declares the Bearer scheme in the OpenAPI schema
         db: Database session
 
     Returns:
         Optional[CurrentUser]: User if authenticated, None otherwise
     """
+    token, _source = read_credentials(request)
     # A service token is never a JWT, and opens no optional route: anonymous.
-    if not credentials or is_service_token(credentials.credentials):
+    if token is None or is_service_token(token):
         return None
 
     try:
-        token = credentials.credentials
-        token_payload = verify_token(token)
-        user_id = get_user_from_token(token_payload)
-
-        result = await db.execute(select(User).where(User.id == user_id))
-        db_user = result.scalar_one_or_none()
-
-        if not db_user or not db_user.is_active:
-            return None
-
-        return CurrentUser(
-            id=db_user.id,
-            email=db_user.email,
-            full_name=db_user.full_name,
-            role=db_user.role,
-            subscription_tier=db_user.subscription_tier,
-            max_projects=db_user.max_projects,
-            current_project_count=db_user.current_project_count,
-            features_access=db_user.features_access or {},
-            is_active=db_user.is_active,
-        )
+        return await get_current_user(request, credentials, db)
     except HTTPException:
         return None
 

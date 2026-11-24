@@ -9,10 +9,12 @@ Everything runs against an in-memory SQLite database. Nothing hosted is called.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
+import jwt
 import pytest
 import pytest_asyncio
 
@@ -21,6 +23,21 @@ from app.models.service_token import ServiceToken
 
 # A fixed instant, so expiry arithmetic in the tests never depends on the wall clock.
 NOW = datetime(2026, 11, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+# The header the web client sends on every request; required on cookie-authenticated writes.
+CSRF = {"X-GenoLens-Client": "test"}
+
+# A password the policy accepts (length, not the e-mail, not common). Never a real one.
+PW = "Lantern-Otter-Harbour-27"
+
+
+def bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def access_cookie(token: str) -> dict:
+    """The `gl_at` cookie as a request header (httpx deprecates per-request `cookies=`)."""
+    return {"Cookie": f"gl_at={token}"}
 
 
 @pytest_asyncio.fixture
@@ -190,3 +207,136 @@ def smtp_capture(monkeypatch):
     capture = SmtpCapture()
     monkeypatch.setattr("app.services.email_service.aiosmtplib.send", capture.send)
     return capture
+
+
+@pytest.fixture
+def settings_override(monkeypatch):
+    """`settings_override(AUTH_MODE="local", ...)`: set settings for the rest of the test.
+
+    Restored afterwards by `monkeypatch`. A name that is not a setting is an error, so a typo
+    cannot silently test the default configuration.
+    """
+    from app.core.config import settings
+
+    def apply(**values) -> None:
+        for name, value in values.items():
+            if not hasattr(settings, name):
+                raise AttributeError(f"no setting named {name}")
+            monkeypatch.setattr(settings, name, value)
+
+    return apply
+
+
+@dataclass
+class DbSessionCounter:
+    """How many database sessions the app opened through `get_db` (see `auth_client`)."""
+
+    opened: int = 0
+
+
+@pytest.fixture
+def db_sessions_opened() -> DbSessionCounter:
+    return DbSessionCounter()
+
+
+@pytest_asyncio.fixture
+async def auth_client(auth_db, db_sessions_opened, monkeypatch):
+    """The app on the `auth_db` database, with the real authentication chain.
+
+    Modelled on the `client` fixture of `tests/test_service_token.py`: every dependency override
+    is cleared first (conftest's default account must not stand in for the caller), then only
+    the database and the licence check are replaced. Nothing hosted is reached: the Supabase role
+    lookup fails the test if called, and login events (which open a session of their own) are not
+    recorded. The rate limiter starts and ends empty.
+
+    Response schemas validate e-mails, and `.test` is a special-use domain the validator refuses
+    unless told it runs in a test environment: its documented switch is turned on, so that the
+    fictitious `@example.test` accounts can be returned.
+    """
+    import email_validator
+    from httpx import ASGITransport, AsyncClient
+
+    from app.api.deps.license import require_active_license
+    from app.db.session import get_db
+    from app.main import app
+    from app.middleware.rate_limit import limiter
+
+    async def _get_db():
+        db_sessions_opened.opened += 1
+        async with auth_db() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+    async def _no_supabase(*_args, **_kwargs):
+        raise AssertionError("Supabase was called")
+
+    monkeypatch.setattr(email_validator, "TEST_ENVIRONMENT", True)
+    limiter.reset()
+    app.dependency_overrides.clear()
+    app.dependency_overrides[get_db] = _get_db
+    app.dependency_overrides[require_active_license] = lambda: None
+    try:
+        with (
+            patch("app.core.supabase_auth.fetch_user_role_from_supabase", new=_no_supabase),
+            patch("app.middleware.login_tracking._record_login_event", new=AsyncMock()),
+        ):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+                yield client
+    finally:
+        app.dependency_overrides.clear()
+        limiter.reset()
+
+
+@pytest.fixture
+def local_session_for(auth_db, local_keys):
+    """`await local_session_for(user)`: open a local session for `user` and return its tokens.
+
+    Opened at the current instant (the API checks tokens and sessions against the wall clock).
+    """
+    from app.auth.sessions import IssuedSession, create_session
+
+    async def open_session(user: User, amr: tuple[str, ...] = ("pwd",)) -> IssuedSession:
+        async with auth_db() as session:
+            issued = await create_session(
+                session, user, list(amr), ip="203.0.113.7", user_agent="pytest"
+            )
+            await session.commit()
+        return issued
+
+    return open_session
+
+
+@pytest.fixture
+def supabase_token_for(monkeypatch):
+    """`supabase_token_for(user)`: a hosted-provider token of `user` (HS256, one hour).
+
+    The role lookup it triggers is answered here with the role of the row the token was minted
+    for (what the hosted profile of a synced account holds); nothing hosted is reached. Extra
+    `claims` override the default ones.
+    """
+    from app.core.config import settings
+
+    roles: dict = {}
+
+    async def _role(user_id):
+        return roles.get(user_id)
+
+    monkeypatch.setattr("app.core.supabase_auth.get_cached_user_role", _role)
+
+    def mint(user: User, **claims) -> str:
+        roles[user.id] = user.role.value.lower()
+        payload = {
+            "sub": str(user.id),
+            "email": user.email,
+            "aud": "authenticated",
+            "exp": datetime.now(timezone.utc) + timedelta(hours=1),
+        }
+        payload.update(claims)
+        return jwt.encode(payload, settings.SUPABASE_JWT_SECRET, algorithm="HS256")
+
+    return mint

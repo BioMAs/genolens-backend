@@ -14,6 +14,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from app.auth.principal import local_tokens_accepted, read_credentials
+from app.auth.tokens import decode_access_token, is_local_token
 from app.core.config import settings
 from app.core.service_tokens import is_service_token
 from app.db.session import AsyncSessionLocal
@@ -44,17 +46,23 @@ def _should_record(user_id: str, now: float | None = None) -> bool:
     return True
 
 
-def _extract_user_id(authorization: str) -> str | None:
+def _extract_user_id(request: Request) -> str | None:
     """
-    Decode the Bearer JWT and return the 'sub' claim (Supabase user UUID).
-    Returns None on any failure — never raises.
+    The user id ('sub') of the request's credential, read where `resolve_principal` reads it
+    (the Bearer header, or the `gl_at` cookie while local tokens are accepted): a local access
+    token while local tokens are accepted, a Supabase JWT in supabase mode only.
+
+    Signatures and claims only: the session is not looked up, so no database session is opened
+    here. Returns None on any failure — never raises.
     """
     try:
-        if not authorization or not authorization.startswith("Bearer "):
-            return None
-        token = authorization.removeprefix("Bearer ").strip()
-        if is_service_token(token):
+        token, _source = read_credentials(request)
+        if token is None or is_service_token(token):
             return None  # never a JWT, and not a login
+        if local_tokens_accepted() and is_local_token(token):
+            return str(decode_access_token(token).sub)
+        if settings.AUTH_MODE != "supabase":
+            return None
         payload = jwt.decode(
             token,
             settings.SUPABASE_JWT_SECRET,
@@ -62,7 +70,8 @@ def _extract_user_id(authorization: str) -> str | None:
             audience="authenticated",
             options={"verify_aud": True},
         )
-        return payload.get("sub")
+        sub: str | None = payload.get("sub")
+        return sub
     except Exception:
         return None
 
@@ -98,13 +107,13 @@ async def _record_login_event(user_id: str) -> None:
 
 class LoginTrackingMiddleware(BaseHTTPMiddleware):
     """
-    For every authenticated request (Authorization: Bearer …), dispatch a
-    non-blocking background task that may insert a UserLoginEvent.
+    For every authenticated request (Authorization: Bearer …, or the `gl_at`
+    cookie while local tokens are accepted), dispatch a non-blocking background
+    task that may insert a UserLoginEvent.
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        authorization = request.headers.get("Authorization", "")
-        user_id = _extract_user_id(authorization) if authorization else None
+        user_id = _extract_user_id(request)
 
         response: Response = await call_next(request)
 
