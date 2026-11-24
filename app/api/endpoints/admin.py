@@ -4,14 +4,21 @@ Requires ADMIN role.
 """
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 from uuid import UUID
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 import httpx
 
+from app.auth.admin_actions import (
+    reset_user_mfa,
+    revoke_user_service_tokens,
+    revoke_user_sessions,
+    unlock_user,
+)
+from app.auth.audit import record_event
 from app.auth.directory import (
     AuthIdentity,
     IdentityDeletionError,
@@ -22,6 +29,12 @@ from app.auth.directory import (
     list_identities,
     role_source_is_supabase,
 )
+from app.auth.emails import send_mfa_reset_email, send_password_reset_email
+from app.auth.one_time_tokens import issue_token
+from app.auth.principal import local_tokens_accepted
+from app.models.auth import AuthEvent, AuthEventType, OneTimeTokenPurpose
+from app.models.service_token import ServiceToken
+from app.services.email_service import EmailNotConfiguredError, EmailSendError
 
 logger = logging.getLogger(__name__)
 
@@ -592,6 +605,292 @@ async def update_user_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     return {"id": str(user.id), "email": user.email, "status": user.status.value}
+
+
+# ── Security actions on an account ────────────────────────────────────────────
+#
+# They act on the local `users` row and its authentication tables, so they work in both AUTH_MODE
+# values and never call the hosted provider. The logic itself is in `app.auth.admin_actions`
+# (shared with the break-glass command); the routes check who may ask, commit, then notify.
+#
+# A service token is revoked by `sessions/revoke` with `revoke_service_tokens` and by nothing
+# else: not by the second-factor reset, the unlock, nor the password link (spec 7.7).
+
+_ADMIN_ROLES = (UserRoleEnum.ADMIN, UserRoleEnum.SCILICIUM_ADMIN)
+
+
+class MfaResetResponse(BaseModel):
+    sessions_revoked: int
+    # False when the account could not be told (the reset stands either way).
+    notification_sent: bool
+
+
+class SessionsRevokeRequest(BaseModel):
+    revoke_service_tokens: bool = False
+
+
+class SessionsRevokeResponse(BaseModel):
+    sessions_revoked: int
+    service_tokens_revoked: int
+
+
+class UnlockResponse(BaseModel):
+    unlocked: bool = True
+
+
+class PasswordResetResponse(BaseModel):
+    email_sent: bool = True
+
+
+class AuthEventResponse(BaseModel):
+    """One line of the audit trail. Secrets never reach the trail (see `app.auth.audit`)."""
+
+    event_type: str
+    created_at: datetime
+    ip: Optional[str] = None
+    user_agent: Optional[str] = None
+    details: dict[str, Any]
+
+
+class ServiceTokenResponse(BaseModel):
+    """A service token of the account. Never the token, nor its hash."""
+
+    id: UUID
+    name: str
+    scopes: List[str]
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+async def _account_or_404(db: AsyncSession, user_id: UUID) -> User:
+    user = await db.scalar(select(User).where(User.id == user_id))
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return user
+
+
+async def _audit_unsent_notification(
+    db: AsyncSession,
+    request: Request,
+    user_id: UUID,
+    event_type: AuthEventType,
+    error_kind: str,
+) -> None:
+    """Record that the e-mail that goes with `event_type` did not leave. Best effort: the action
+    itself is committed already, and a failure here must not change the answer."""
+    try:
+        await record_event(
+            db,
+            event_type,
+            user_id=user_id,
+            request=request,
+            notification="not_sent",
+            error_kind=error_kind,
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("Could not audit an unsent security e-mail")
+        await db.rollback()
+
+
+async def _notify_mfa_reset(db: AsyncSession, request: Request, user_id: UUID, to: str) -> bool:
+    """Tell the account its second factor was reset, once the reset is committed. Best effort:
+    the reset stands whatever happens here (answering 500 now would hide that it was done), so a
+    failure is logged and audited (`notification: not_sent`) and reported as False."""
+    try:
+        await send_mfa_reset_email(to)
+        return True
+    except (EmailSendError, EmailNotConfiguredError) as exc:
+        logger.warning("MFA reset notice for user %s not sent (%s)", user_id, type(exc).__name__)
+        error_kind = type(exc).__name__
+    except Exception as exc:
+        logger.exception("MFA reset notice for user %s failed unexpectedly", user_id)
+        error_kind = type(exc).__name__
+    await _audit_unsent_notification(
+        db, request, user_id, AuthEventType.MFA_RESET_BY_ADMIN, error_kind
+    )
+    return False
+
+
+@router.post("/users/{user_id}/mfa/reset", response_model=MfaResetResponse)
+async def reset_mfa(
+    user_id: UUID,
+    request: Request,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove the second factor of an account: the next sign-in is an enrolment. Admin only.
+
+    Clears the secret, the enrolment in progress and the recovery codes, ends every session of
+    the account, audits `MFA_RESET_BY_ADMIN` and e-mails the account. Service tokens are kept.
+
+    Resetting the factor of an ADMIN or SCILICIUM_ADMIN (one's own included) takes a
+    SCILICIUM_ADMIN: else 403 `scilicium_admin_required`, and nothing is changed. The e-mail is
+    best effort (`notification_sent` says whether it left); the reset stands either way.
+    """
+    user = await _account_or_404(db, user_id)
+    if user.role in _ADMIN_ROLES and current_user.role != UserRoleEnum.SCILICIUM_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="scilicium_admin_required"
+        )
+    to = user.email
+    revoked = await reset_user_mfa(
+        db,
+        user,
+        actor_id=current_user.user_id,
+        event=AuthEventType.MFA_RESET_BY_ADMIN,
+        request=request,
+    )
+    await db.commit()
+    notified = await _notify_mfa_reset(db, request, user_id, to)
+    return MfaResetResponse(sessions_revoked=revoked, notification_sent=notified)
+
+
+@router.post("/users/{user_id}/sessions/revoke", response_model=SessionsRevokeResponse)
+async def revoke_sessions(
+    user_id: UUID,
+    request: Request,
+    body: Optional[SessionsRevokeRequest] = None,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """End every open session of an account. Admin only.
+
+    Service tokens (the pipeline's credentials) are left alone unless the body says
+    `{"revoke_service_tokens": true}`: ending a person's sessions must not stop a machine.
+    """
+    await _account_or_404(db, user_id)
+    sessions_revoked = await revoke_user_sessions(
+        db, user_id, actor_id=current_user.user_id, request=request
+    )
+    service_tokens_revoked = 0
+    if body is not None and body.revoke_service_tokens:
+        service_tokens_revoked = await revoke_user_service_tokens(
+            db, user_id, actor_id=current_user.user_id, request=request
+        )
+    await db.commit()
+    return SessionsRevokeResponse(
+        sessions_revoked=sessions_revoked, service_tokens_revoked=service_tokens_revoked
+    )
+
+
+@router.post("/users/{user_id}/unlock", response_model=UnlockResponse)
+async def unlock_account(
+    user_id: UUID,
+    request: Request,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear the brute-force lock of an account (failure count and lock date). Admin only.
+
+    The account row only: an address with no account is throttled in the rate limiter's storage,
+    which this does not touch.
+    """
+    user = await _account_or_404(db, user_id)
+    await unlock_user(db, user, actor_id=current_user.user_id, request=request)
+    await db.commit()
+    return UnlockResponse()
+
+
+@router.post("/users/{user_id}/password-reset", response_model=PasswordResetResponse)
+async def send_password_reset_link(
+    user_id: UUID,
+    request: Request,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """E-mail an account the link to choose a new password. Admin only.
+
+    The same link the account gets from "forgot password", issued by the administrator (and
+    replacing any earlier one). Nothing about the account changes until it is used; its sessions
+    and service tokens are kept. 409 `local_auth_disabled` while local authentication is off. As
+    the administrator asked for this e-mail, one that cannot leave is an error: 502
+    `reset_email_failed`, with the link kept so that a retry sends a new one.
+    """
+    user = await _account_or_404(db, user_id)
+    if not local_tokens_accepted():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local_auth_disabled")
+    to = user.email
+    raw = await issue_token(
+        db, user_id, OneTimeTokenPurpose.PASSWORD_RESET, created_by=current_user.user_id
+    )
+    await record_event(
+        db,
+        AuthEventType.PASSWORD_RESET_REQUESTED,
+        user_id=user_id,
+        request=request,
+        requested_by=current_user.user_id,
+    )
+    await db.commit()
+    try:
+        await send_password_reset_email(to, raw)
+    except (EmailSendError, EmailNotConfiguredError) as exc:
+        logger.error(
+            "Password-reset e-mail for user %s not sent (%s); the link stays valid for a retry",
+            user_id,
+            type(exc).__name__,
+        )
+        await _audit_unsent_notification(
+            db, request, user_id, AuthEventType.PASSWORD_RESET_REQUESTED, type(exc).__name__
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="reset_email_failed")
+    return PasswordResetResponse()
+
+
+@router.get("/users/{user_id}/auth-events", response_model=List[AuthEventResponse])
+async def list_auth_events(
+    user_id: UUID,
+    limit: int = Query(50, ge=1, le=200),
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The audit trail of an account (sign-ins, lock, second factor, sessions, administrator
+    actions), newest first: `limit` lines, 50 by default, 200 at most. Admin only."""
+    await _account_or_404(db, user_id)
+    rows = await db.scalars(
+        select(AuthEvent)
+        .where(AuthEvent.user_id == user_id)
+        .order_by(AuthEvent.created_at.desc(), AuthEvent.id.desc())
+        .limit(limit)
+    )
+    return [
+        AuthEventResponse(
+            event_type=row.event_type,
+            created_at=row.created_at,
+            ip=row.ip,
+            user_agent=row.user_agent,
+            details=row.details,
+        )
+        for row in rows
+    ]
+
+
+@router.get("/users/{user_id}/service-tokens", response_model=List[ServiceTokenResponse])
+async def list_service_tokens(
+    user_id: UUID,
+    current_user: SupabaseUser = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The service tokens an account owns, newest first, revoked ones included. Never the token
+    itself nor its hash: the token exists only where it was created. Admin only."""
+    await _account_or_404(db, user_id)
+    rows = await db.scalars(
+        select(ServiceToken)
+        .where(ServiceToken.owner_id == user_id)
+        .order_by(ServiceToken.created_at.desc(), ServiceToken.id)
+    )
+    return [
+        ServiceTokenResponse(
+            id=row.id,
+            name=row.name,
+            scopes=list(row.scopes or []),
+            created_at=row.created_at,
+            last_used_at=row.last_used_at,
+            revoked_at=row.revoked_at,
+        )
+        for row in rows
+    ]
 
 
 @router.get("/users/{user_id}", response_model=UserProfile)
