@@ -234,6 +234,10 @@ async def verify_supabase_token(token: str) -> Optional[SupabaseUser]:
         return None
 
 
+_EMAIL_LOOKUP_PER_PAGE = 1000
+_EMAIL_LOOKUP_MAX_PAGES = 10
+
+
 async def lookup_user_by_email(email: str) -> Optional[dict]:
     """
     Look up a Supabase Auth user by email address using the Admin API.
@@ -241,8 +245,18 @@ async def lookup_user_by_email(email: str) -> Optional[dict]:
     Requires SUPABASE_SERVICE_ROLE_KEY to be set.
 
     Returns a dict with at least ``id`` and ``email`` keys, or None if not found.
+
+    GoTrue's ``GET /admin/users`` has no ``email`` parameter: it ignores one and lists
+    every user, newest first. Its ``filter`` is a LIKE substring match on the email
+    (``_`` and ``%`` are wildcards) or on the full name, so it only narrows the list;
+    the exact, case-insensitive comparison below decides. ``page``/``per_page`` are
+    always sent, which also keeps GoTrue off its experimental cursor pagination.
     """
     if not settings.SUPABASE_SERVICE_ROLE_KEY:
+        return None
+
+    wanted = email.strip().lower()
+    if not wanted:
         return None
 
     headers = {
@@ -253,16 +267,25 @@ async def lookup_user_by_email(email: str) -> Optional[dict]:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(
-                f"{settings.SUPABASE_URL}/auth/v1/admin/users",
-                headers=headers,
-                params={"email": email},
-            )
+            for page in range(1, _EMAIL_LOOKUP_MAX_PAGES + 1):
+                response = await client.get(
+                    f"{settings.SUPABASE_URL}/auth/v1/admin/users",
+                    headers=headers,
+                    params={
+                        "filter": wanted,
+                        "page": page,
+                        "per_page": _EMAIL_LOOKUP_PER_PAGE,
+                    },
+                )
+                if response.status_code != 200:
+                    return None
 
-            if response.status_code == 200:
-                data = response.json()
-                users = data.get("users", [])
-                return users[0] if users else None
+                users = response.json().get("users", [])
+                for user in users:
+                    if (user.get("email") or "").lower() == wanted:
+                        return user
+                if len(users) < _EMAIL_LOOKUP_PER_PAGE:
+                    return None
 
             return None
     except Exception as exc:
