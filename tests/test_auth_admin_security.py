@@ -5,7 +5,9 @@ send a password-reset link, and read the audit trail and the service tokens.
 
 What is pinned down:
 - who may do what: administrators only; resetting the second factor of an ADMIN or SCILICIUM_ADMIN
-  (the caller's own included) needs a SCILICIUM_ADMIN, and a refusal changes nothing;
+  (the caller's own included), ending their sessions (with or without the service tokens) and
+  sending them a password link need a SCILICIUM_ADMIN, and a refusal changes nothing; any
+  administrator unlocks any account;
 - the reset leaves nothing of the second factor behind (secret, pending secret, recovery codes,
   replay counter), ends every session, and forces an enrolment at the next sign-in; the
   notification e-mail is best effort and never undoes the reset;
@@ -368,6 +370,110 @@ async def test_an_administrator_resetting_their_own_mfa_follows_the_same_rule(
 
     assert r.status_code == (200 if allowed else 403), r.text
     assert ((await reload(auth_db, me.id)).mfa_enabled_at is None) is allowed
+
+
+# ── The same rule for the sessions and the password link ─────────────────────
+
+PRIVILEGE_CASES = [
+    (UserRole.ADMIN, UserRole.ADMIN, False),
+    (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN, False),
+    (UserRole.ADMIN, UserRole.USER, True),
+    (UserRole.SCILICIUM_ADMIN, UserRole.ADMIN, True),
+    (UserRole.SCILICIUM_ADMIN, UserRole.SCILICIUM_ADMIN, True),
+    (UserRole.SCILICIUM_ADMIN, UserRole.USER, True),
+]
+
+
+async def plant_service_token(auth_db, owner: User) -> None:
+    """A live service token of `owner`, written directly: the command refuses an administrator as
+    owner, but a token minted before a promotion still exists."""
+    async with auth_db() as s:
+        s.add(
+            ServiceToken(
+                name="before-promotion",
+                owner_id=owner.id,
+                token_sha256=uuid4().hex + uuid4().hex,
+                scopes=["projects:create"],
+            )
+        )
+        await s.commit()
+
+
+@pytest.mark.parametrize("box", [False, True], ids=["sessions", "sessions_and_tokens"])
+@pytest.mark.parametrize("caller_role,target_role,allowed", PRIVILEGE_CASES)
+async def test_only_a_scilicium_admin_ends_an_admins_sessions(
+    admin_client, auth_db, local_session_for, caller_role, target_role, allowed, box
+):
+    _, headers = await caller(local_session_for, auth_db, caller_role)
+    target = await seed_user(auth_db, role=target_role)
+    await local_session_for(target)
+    await plant_service_token(auth_db, target)
+
+    r = await admin_client.post(
+        url(target.id, "sessions/revoke"), headers=headers, json={"revoke_service_tokens": box}
+    )
+
+    [session] = await sessions_of(auth_db, target.id)
+    [token] = await token_rows(auth_db, target.id)
+    if allowed:
+        assert r.status_code == 200, r.text
+        assert r.json() == {"sessions_revoked": 1, "service_tokens_revoked": int(box)}
+        assert session.revoked_at is not None
+        assert (token.revoked_at is not None) is box
+    else:
+        assert r.status_code == 403
+        assert r.json() == {"detail": "scilicium_admin_required"}
+        assert session.revoked_at is None and token.revoked_at is None
+        assert await count(auth_db, AuthEvent, user_id=target.id) == 0
+
+
+@pytest.mark.parametrize("caller_role,target_role,allowed", PRIVILEGE_CASES)
+async def test_only_a_scilicium_admin_sends_an_admin_a_password_link(
+    admin_client, auth_db, local_session_for, smtp_capture, caller_role, target_role, allowed
+):
+    _, headers = await caller(local_session_for, auth_db, caller_role)
+    target = await seed_user(auth_db, role=target_role)
+
+    r = await admin_client.post(url(target.id, "password-reset"), headers=headers)
+
+    links = [t for t in await _all(auth_db, AuthOneTimeToken) if t.user_id == target.id]
+    if allowed:
+        assert r.status_code == 200 and r.json() == {"email_sent": True}, r.text
+        assert len(links) == 1 and [m.to for m in smtp_capture.messages] == [target.email]
+    else:
+        assert r.status_code == 403
+        assert r.json() == {"detail": "scilicium_admin_required"}
+        assert links == [] and smtp_capture.messages == []
+        assert await count(auth_db, AuthEvent, user_id=target.id) == 0
+
+
+@pytest.mark.parametrize("suffix", ["sessions/revoke", "password-reset"])
+async def test_an_admin_acting_on_their_own_account_follows_the_same_rule(
+    admin_client, auth_db, local_session_for, smtp_capture, suffix
+):
+    me, headers = await caller(local_session_for, auth_db, UserRole.ADMIN)
+
+    r = await admin_client.post(url(me.id, suffix), headers=headers)
+
+    assert r.status_code == 403 and r.json() == {"detail": "scilicium_admin_required"}
+    assert [s.revoked_at for s in await sessions_of(auth_db, me.id)] == [None]
+    assert smtp_capture.messages == []
+
+
+async def test_any_administrator_unlocks_an_administrator(admin_client, auth_db, local_session_for):
+    _, headers = await caller(local_session_for, auth_db, UserRole.ADMIN)
+    target = await seed_user(
+        auth_db,
+        role=UserRole.SCILICIUM_ADMIN,
+        failed_login_count=10,
+        locked_until=now_utc() + timedelta(minutes=15),
+    )
+
+    r = await admin_client.post(url(target.id, "unlock"), headers=headers)
+
+    assert r.status_code == 200, r.text
+    after = await reload(auth_db, target.id)
+    assert after.failed_login_count == 0 and after.locked_until is None
 
 
 @pytest.mark.parametrize("failure", ["send_fails", "not_configured"])

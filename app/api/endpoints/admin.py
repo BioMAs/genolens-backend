@@ -615,6 +615,9 @@ async def update_user_status(
 #
 # A service token is revoked by `sessions/revoke` with `revoke_service_tokens` and by nothing
 # else: not by the second-factor reset, the unlock, nor the password link (spec 7.7).
+#
+# On an ADMIN or SCILICIUM_ADMIN account, the second-factor reset, the session revocation and the
+# password link take a SCILICIUM_ADMIN (`_require_scilicium_admin_for`); the unlock does not.
 
 _ADMIN_ROLES = (UserRoleEnum.ADMIN, UserRoleEnum.SCILICIUM_ADMIN)
 
@@ -668,6 +671,17 @@ async def _account_or_404(db: AsyncSession, user_id: UUID) -> User:
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return user
+
+
+def _require_scilicium_admin_for(target: User, current_user: SupabaseUser) -> None:
+    """Acting on an ADMIN or SCILICIUM_ADMIN account (one's own included) takes a SCILICIUM_ADMIN:
+    else 403 `scilicium_admin_required`, raised before anything is changed. The rule of the
+    second-factor reset, the session revocation and the password link; not of the unlock, which
+    any administrator may do."""
+    if target.role in _ADMIN_ROLES and current_user.role != UserRoleEnum.SCILICIUM_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="scilicium_admin_required"
+        )
 
 
 async def _audit_unsent_notification(
@@ -730,10 +744,7 @@ async def reset_mfa(
     best effort (`notification_sent` says whether it left); the reset stands either way.
     """
     user = await _account_or_404(db, user_id)
-    if user.role in _ADMIN_ROLES and current_user.role != UserRoleEnum.SCILICIUM_ADMIN:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="scilicium_admin_required"
-        )
+    _require_scilicium_admin_for(user, current_user)
     to = user.email
     revoked = await reset_user_mfa(
         db,
@@ -759,8 +770,12 @@ async def revoke_sessions(
 
     Service tokens (the pipeline's credentials) are left alone unless the body says
     `{"revoke_service_tokens": true}`: ending a person's sessions must not stop a machine.
+
+    On an ADMIN or SCILICIUM_ADMIN account (one's own included), with or without the box, it
+    takes a SCILICIUM_ADMIN: else 403 `scilicium_admin_required`, and nothing is changed.
     """
-    await _account_or_404(db, user_id)
+    user = await _account_or_404(db, user_id)
+    _require_scilicium_admin_for(user, current_user)
     sessions_revoked = await revoke_user_sessions(
         db, user_id, actor_id=current_user.user_id, request=request
     )
@@ -783,6 +798,9 @@ async def unlock_account(
     db: AsyncSession = Depends(get_db),
 ):
     """Clear the brute-force lock of an account (failure count and lock date). Admin only.
+
+    Any administrator may unlock any account, an administrator's included: unlocking gives no
+    access, it only lets the owner try again.
 
     The account row only: an address with no account is throttled in the rate limiter's storage,
     which this does not touch.
@@ -807,8 +825,12 @@ async def send_password_reset_link(
     and service tokens are kept. 409 `local_auth_disabled` while local authentication is off. As
     the administrator asked for this e-mail, one that cannot leave is an error: 502
     `reset_email_failed`, with the link kept so that a retry sends a new one.
+
+    For an ADMIN or SCILICIUM_ADMIN account (one's own included) it takes a SCILICIUM_ADMIN: else
+    403 `scilicium_admin_required`, and no link is issued nor sent.
     """
     user = await _account_or_404(db, user_id)
+    _require_scilicium_admin_for(user, current_user)
     if not local_tokens_accepted():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local_auth_disabled")
     to = user.email

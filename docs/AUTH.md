@@ -143,6 +143,8 @@ docker compose -f docker-compose.prod.yml exec api python -m app.auth.cli unlock
 
 Les actions équivalentes existent dans l'administration pour un administrateur qui peut encore se connecter (réinitialiser la 2FA, révoquer les sessions, lever un verrouillage) ; la commande est la voie de secours quand plus aucun administrateur ne le peut.
 
+**Qui peut agir sur un administrateur.** Sur un compte `ADMIN` ou `SCILICIUM_ADMIN` (le sien compris), trois actions de l'administration exigent un appelant `SCILICIUM_ADMIN` : réinitialiser la 2FA (`/admin/users/<id>/mfa/reset`), révoquer les sessions, avec ou sans les jetons de service (`/sessions/revoke`), et envoyer un lien de réinitialisation du mot de passe (`/password-reset`). Un `ADMIN` reçoit `403 scilicium_admin_required` et rien n'est modifié : aucune session révoquée, aucun lien émis, aucun e-mail, aucune ligne d'audit. Sur un compte non administrateur, tout administrateur peut les faire. Lever un verrouillage (`/unlock`) reste ouvert à tout administrateur, sur tout compte : cela ne donne aucun accès, cela laisse seulement le titulaire réessayer. Les commandes du serveur (`reset-mfa`, `unlock`) ne sont pas concernées : l'accès SSH fait foi.
+
 ## Migration des comptes depuis Supabase
 
 `python -m app.auth.migrate_from_supabase` copie les identifiants des comptes de la table locale `users` depuis la base du fournisseur externe (lecture seule de `auth.users` et de `public.profiles`). Elle ne concerne que **le temps d'avant la bascule**.
