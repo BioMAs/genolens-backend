@@ -353,35 +353,46 @@ def test_duplicate_local_emails_are_reported_for_each_account():
 
 
 def test_never_overwrites_a_password_changed_after_migration():
-    changed, untouched, never_migrated, tie = (uuid4() for _ in range(4))
+    # (c) migrated at T, changed at T+1: kept.
+    # (d) migrated at T, changed before T (or never, or exactly at T): applied.
+    changed, before, never_changed, tie = (uuid4() for _ in range(4))
     migrated = NOW - timedelta(days=10)
     plan = plan_migration(
         [
             L(changed, password_changed_at=migrated + timedelta(days=1), auth_migrated_at=migrated),
-            L(
-                untouched,
-                password_changed_at=migrated - timedelta(days=1),
-                auth_migrated_at=migrated,
-            ),
-            L(never_migrated, password_changed_at=None, auth_migrated_at=None),
+            L(before, password_changed_at=migrated - timedelta(days=1), auth_migrated_at=migrated),
+            L(never_changed, password_changed_at=None, auth_migrated_at=migrated),
             L(tie, password_changed_at=migrated, auth_migrated_at=migrated),
         ],
-        [R(uid, pw=BCRYPT_X) for uid in (changed, untouched, never_migrated, tie)],
+        [R(uid, pw=BCRYPT_X) for uid in (changed, before, never_changed, tie)],
         now=NOW,
     )
     update = by_id(plan.updates, changed)
     assert update.keep_password is True and update.password_hash is None
-    for uid in (untouched, never_migrated, tie):
+    for uid in (before, never_changed, tie):
         update = by_id(plan.updates, uid)
         assert update.keep_password is False and update.password_hash == BCRYPT_X
 
 
-def test_a_never_migrated_account_gets_the_password():
+def test_a_password_set_in_the_new_system_is_kept_even_before_the_first_migration():
+    # (a) never migrated + password_changed_at set: only the new system writes that column, so the
+    # Supabase hash must not replace it.
     uid = uuid4()
     plan = plan_migration(
         [L(uid, password_changed_at=NOW - timedelta(days=1), auth_migrated_at=None)],
         [R(uid, pw=BCRYPT_X)],
         now=NOW,
+    )
+    update = by_id(plan.updates, uid)
+    assert update.keep_password is True and update.password_hash is None
+    assert plan.anomalies == []  # it has a password: no reset link needed
+
+
+def test_a_never_migrated_account_without_a_local_password_change_gets_the_password():
+    # (b) never migrated + password_changed_at NULL: applied.
+    uid = uuid4()
+    plan = plan_migration(
+        [L(uid, password_changed_at=None, auth_migrated_at=None)], [R(uid, pw=BCRYPT_X)], now=NOW
     )
     update = by_id(plan.updates, uid)
     assert update.keep_password is False and update.password_hash == BCRYPT_X
@@ -572,6 +583,53 @@ async def test_apply_cannot_overwrite_a_password_changed_after_the_plan_was_made
     async with auth_db() as db:
         await apply_plan(db, plan, NOW)
     assert (await _row(auth_db, user.id)).password_hash == chosen
+
+
+async def test_apply_keeps_a_password_set_before_the_first_migration_through_every_run(auth_db):
+    # Never migrated, password chosen in the new system: kept by the first run AND by the next
+    # ones (the account is not stamped, or the stamp would date the password before the migration).
+    mine = hash_password(PW)
+    user = await seed_user(auth_db, password_hash=mine, password_changed_at=NOW - timedelta(days=3))
+
+    async def run(at: datetime) -> int:
+        async with auth_db() as db:
+            local = await load_local_users(db)
+        plan = plan_migration(
+            local, [R(user.id, email=user.email, pw=BCRYPT_X, confirmed=NOW)], now=at
+        )
+        assert by_id(plan.updates, user.id).keep_password is True
+        async with auth_db() as db:
+            return await apply_plan(db, plan, at)
+
+    for days in (0, 2, 5):
+        assert await run(NOW + timedelta(days=days)) == 1
+        row = await _row(auth_db, user.id)
+        assert row.password_hash == mine
+        assert row.auth_migrated_at is None
+        assert aware_utc(row.email_verified_at) == NOW  # the rest is still synchronised
+
+
+async def test_apply_cannot_overwrite_a_password_set_after_the_plan_of_a_never_migrated_account(
+    auth_db,
+):
+    # The plan saw an account with no local password change and never migrated; the owner chooses
+    # a password before `apply` runs.
+    user = await seed_user(auth_db)
+    plan = plan_migration(
+        [LocalUser(user.id, user.email, user.role, None, None)],
+        [R(user.id, email=user.email, pw=BCRYPT_X)],
+        now=NOW,
+    )
+    assert by_id(plan.updates, user.id).keep_password is False
+    chosen = hash_password(PW)
+    async with auth_db() as s:
+        row = await s.get(User, user.id)
+        row.password_hash, row.password_changed_at = chosen, NOW - timedelta(days=1)
+        await s.commit()
+    async with auth_db() as db:
+        await apply_plan(db, plan, NOW)
+    row = await _row(auth_db, user.id)
+    assert row.password_hash == chosen and row.auth_migrated_at is None
 
 
 async def test_a_protected_password_stays_protected_through_later_runs(auth_db):
@@ -1092,7 +1150,7 @@ async def test_apply_against_a_real_postgres():
         async with engine.begin() as conn:
             await conn.run_sync(lambda sync_conn: User.__table__.create(sync_conn))
         sessions = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-        fresh, changed = uuid4(), uuid4()
+        fresh, changed, local_only = uuid4(), uuid4(), uuid4()
         mine = hash_password(PW)
         migrated = NOW - timedelta(days=5)
         for uid, email, extra in (
@@ -1105,6 +1163,11 @@ async def test_apply_against_a_real_postgres():
                     password_changed_at=NOW - timedelta(days=1),
                     auth_migrated_at=migrated,
                 ),
+            ),
+            (  # a password chosen in the new system before the account was ever migrated
+                local_only,
+                "local@example.test",
+                dict(password_hash=mine, password_changed_at=NOW - timedelta(days=2)),
             ),
         ):
             async with sessions() as s:
@@ -1128,13 +1191,15 @@ async def test_apply_against_a_real_postgres():
                 profile_role="analyst",
             ),
             R(changed, email="changed@example.test", pw=BCRYPT_Y, confirmed=NOW),
+            R(local_only, email="local@example.test", pw=BCRYPT_Y, confirmed=NOW),
         ]
         for run_at in (NOW, NOW + timedelta(days=3)):  # and a replay, later
             async with sessions() as db:
                 plan = plan_migration(await load_local_users(db), remote, run_at)
-                assert await apply_plan(db, plan, run_at) == 2
+                assert await apply_plan(db, plan, run_at) == 3
         async with sessions() as s:
             first, second = await s.get(User, fresh), await s.get(User, changed)
+            third = await s.get(User, local_only)
         assert (first.email, first.role, first.password_hash) == (
             "renamed@example.test",
             UserRole.ANALYST,
@@ -1143,6 +1208,7 @@ async def test_apply_against_a_real_postgres():
         assert aware_utc(first.auth_migrated_at) == NOW  # set once, not moved by the replay
         assert second.password_hash == mine  # chosen after the migration: kept
         assert aware_utc(second.auth_migrated_at) == migrated
+        assert third.password_hash == mine and third.auth_migrated_at is None
     finally:
         async with base.begin() as conn:
             await conn.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))

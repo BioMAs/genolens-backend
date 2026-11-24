@@ -18,8 +18,11 @@ writes it in a single transaction. The plan is a pure function of the two lists
 - role: a local ADMIN / SCILICIUM_ADMIN stays; otherwise `profiles.role` in capitals if it is a
   `UserRole`, else the local role stays (`role_invalid`);
 - banned or deleted at Supabase: reported (`banned`, `deleted`), nothing applied;
-- never overwrite a password changed in the new system (`password_changed_at` later than
-  `auth_migrated_at`).
+- never overwrite a password set in the new system: `password_changed_at` can only have been
+  written by the new system (reset, change, invitation), so a local `password_changed_at` that is
+  set keeps the local password when the account was never migrated (`auth_migrated_at` NULL) or
+  when it is later than `auth_migrated_at`. A Supabase hash is applied only to an account that
+  has no local password change, or whose change predates the migration.
 
 Conventions that make a replay harmless:
 
@@ -27,7 +30,9 @@ Conventions that make a replay harmless:
   it". A local password, verification date or last sign-in that Supabase cannot match is kept.
 - `auth_migrated_at` is the day the account FIRST moved, so it is set once and never moved
   forward. If every run moved it, the run after a password change would see that password as
-  older than the migration and overwrite it.
+  older than the migration and overwrite it. For the same reason an account whose password was
+  set in the new system BEFORE it was ever migrated is not stamped at all: a stamp would date
+  that password before the migration and the next run would overwrite it.
 - The password write carries its own guard in the UPDATE (not only in the plan), so a password
   chosen between the planning and the writing is kept too.
 
@@ -55,7 +60,7 @@ from typing import Awaitable, Callable, Literal, NoReturn, Optional, TextIO, get
 from uuid import UUID
 
 import asyncpg
-from sqlalchemy import case, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -121,8 +126,8 @@ class LocalUser:
 class UserUpdate:
     """What to copy onto one local account. A None field is not written (see the module docstring).
 
-    `keep_password` is True when the account changed its password in the new system after it was
-    migrated: `password_hash` is then None whatever Supabase holds.
+    `keep_password` is True when the account set its password in the new system (never migrated,
+    or after it was migrated): `password_hash` is then None whatever Supabase holds.
     """
 
     user_id: UUID
@@ -159,12 +164,18 @@ def _email_key(email: str) -> str:
 
 
 def _password_changed_since_migration(local: LocalUser) -> bool:
-    """True when `password_changed_at` is later than `auth_migrated_at`. An account that was never
-    migrated has no `auth_migrated_at`: nothing was migrated that a change could postdate, so its
-    password is applied."""
+    """True when the local password was set in the new system and must not be overwritten.
+
+    `password_changed_at` is only ever written by the new system, so when it is set the password
+    is kept if the account was never migrated (`auth_migrated_at` NULL: nothing predates it) or
+    if the change is later than the migration. Not kept: no local change at all, or a change
+    that predates the migration (the Supabase hash then replaces what the migration superseded).
+    """
     changed, migrated = local.password_changed_at, local.auth_migrated_at
-    if changed is None or migrated is None:
+    if changed is None:
         return False
+    if migrated is None:
+        return True
     return aware_utc(changed) > aware_utc(migrated)
 
 
@@ -370,8 +381,12 @@ async def apply_plan(db: AsyncSession, plan: MigrationPlan, now: datetime) -> in
     try:
         for item in plan.updates:
             values: dict = {
-                # The day the account first moved: kept once set.
-                "auth_migrated_at": func.coalesce(User.auth_migrated_at, now),
+                # The day the account first moved: kept once set, and never given to an account
+                # that has a password set in the new system (see the module docstring).
+                "auth_migrated_at": case(
+                    (User.password_changed_at.is_not(None), User.auth_migrated_at),
+                    else_=func.coalesce(User.auth_migrated_at, now),
+                ),
             }
             if item.email is not None:
                 values["email"] = item.email
@@ -388,8 +403,10 @@ async def apply_plan(db: AsyncSession, plan: MigrationPlan, now: datetime) -> in
                     (
                         or_(
                             User.password_changed_at.is_(None),
-                            User.auth_migrated_at.is_(None),
-                            User.password_changed_at <= User.auth_migrated_at,
+                            and_(
+                                User.auth_migrated_at.is_not(None),
+                                User.password_changed_at <= User.auth_migrated_at,
+                            ),
                         ),
                         item.password_hash,
                     ),
