@@ -37,6 +37,7 @@ EXEMPT_PREFIXES = (
     "/api/v1/billing",  # a cancelled account must reach checkout to renew
     "/api/v1/pricing",  # public by design, read before sign-in
     "/api/v1/license",  # infrastructure status
+    "/api/v1/auth",  # sign-in itself: a suspended account must sign in to be told why
 )
 
 
