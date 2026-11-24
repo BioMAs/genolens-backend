@@ -311,6 +311,136 @@ def local_session_for(auth_db, local_keys):
     return open_session
 
 
+@dataclass(frozen=True)
+class SupabaseCall:
+    """One request the app sent to the hosted provider (see `fake_supabase`)."""
+
+    method: str
+    path: str
+    params: dict
+    json: object
+
+
+class FakeSupabase:
+    """What `fake_supabase` yields: every request sent to `settings.SUPABASE_URL`, answered here.
+
+    `calls` lists them, oldest first. `respond(method, path, status, json)` sets the answer of one
+    route; otherwise the defaults are minimal valid answers: an invitation or a creation returns
+    `{"id": <new uuid>}` (the ids handed out are in `issued_ids`), a deletion `200`, a list an
+    empty list, a `profiles` update the row it was asked to write, anything else `404`.
+    """
+
+    BASE_URL = "https://supabase.example.test"
+
+    def __init__(self) -> None:
+        self.calls: list[SupabaseCall] = []
+        self.issued_ids: list[str] = []
+        self.calls_in_local_mode: list[SupabaseCall] = []
+        self._routes: dict[tuple[str, str], tuple[int, object]] = {}
+
+    def respond(self, method: str, path: str, status: int = 200, json: object = None) -> None:
+        self._routes[(method.upper(), path)] = (status, json)
+
+    def paths(self, method: Optional[str] = None) -> list[str]:
+        return [c.path for c in self.calls if method is None or c.method == method]
+
+    def _default(self, call: SupabaseCall) -> tuple[int, object]:
+        if call.method == "POST" and call.path in ("/auth/v1/invite", "/auth/v1/admin/users"):
+            self.issued_ids.append(str(uuid4()))
+            return 200, {"id": self.issued_ids[-1]}
+        if call.method == "DELETE":
+            return 200, {}
+        if call.method == "GET" and call.path == "/rest/v1/profiles":
+            return 200, []
+        if call.method == "GET" and call.path == "/auth/v1/admin/users":
+            return 200, {"users": []}
+        if call.method == "PATCH" and call.path == "/rest/v1/profiles":
+            row_id = str(call.params.get("id", "")).removeprefix("eq.")
+            return 200, [{"id": row_id, **(call.json or {})}]
+        return 404, {"msg": "not found"}
+
+    def handle(self, request):
+        import json as _json
+
+        import httpx
+
+        from app.core.config import settings
+
+        body = request.content
+        call = SupabaseCall(
+            method=request.method,
+            path=request.url.path,
+            params=dict(request.url.params),
+            json=_json.loads(body) if body else None,
+        )
+        self.calls.append(call)
+        if settings.AUTH_MODE == "local":
+            self.calls_in_local_mode.append(call)
+            raise AssertionError(f"Supabase was called in local mode: {call}")
+        status, payload = self._routes.get((call.method, call.path)) or self._default(call)
+        return httpx.Response(status, json=payload, request=request)
+
+
+@pytest.fixture
+def fake_supabase(monkeypatch):
+    """Stand in for the hosted provider: every `httpx` request to `settings.SUPABASE_URL` is
+    answered by a `FakeSupabase` instead of leaving the process.
+
+    The provider settings are replaced by placeholders (`supabase.example.test`), so the fixture
+    knows which requests are the provider's, and nothing real can be reached with them. Other
+    requests (the test client's own) go through untouched. In `AUTH_MODE=local` a provider call
+    is a bug: it raises where it is made, and the test FAILS at teardown even if the code under
+    test swallowed the error.
+    """
+    import httpx
+
+    from app.core.config import settings
+
+    for name, value in (
+        ("SUPABASE_URL", FakeSupabase.BASE_URL),
+        ("SUPABASE_KEY", "anon-placeholder"),
+        ("SUPABASE_SERVICE_ROLE_KEY", "service-role-placeholder"),
+    ):
+        monkeypatch.setattr(settings, name, value)
+
+    fake = FakeSupabase()
+    original_send = httpx.AsyncClient.send
+
+    async def send(client, request, **kwargs):
+        if str(request.url).startswith(FakeSupabase.BASE_URL):
+            return fake.handle(request)
+        return await original_send(client, request, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    yield fake
+    if fake.calls_in_local_mode:
+        pytest.fail(f"Supabase was called in AUTH_MODE=local: {fake.calls_in_local_mode}")
+
+
+@pytest_asyncio.fixture
+async def admin_user(auth_db) -> User:
+    """A SCILICIUM_ADMIN account, the caller of `admin_client`."""
+    return await seed_user(
+        auth_db,
+        email=f"admin-{uuid4().hex[:8]}@example.test",
+        role=UserRole.SCILICIUM_ADMIN,
+    )
+
+
+@pytest_asyncio.fixture
+async def admin_client(auth_client, admin_user, local_session_for, settings_override):
+    """`auth_client` whose every request carries the local access token of `admin_user`.
+
+    Local tokens are accepted in both modes (`AUTH_LOCAL_ENABLED=true`), so a test can pick
+    `AUTH_MODE` after the fixture is set up: the caller stays the same administrator, and the
+    role it is granted comes from its `users` row, never from the hosted provider.
+    """
+    settings_override(AUTH_LOCAL_ENABLED=True)
+    issued = await local_session_for(admin_user)
+    auth_client.headers.update(bearer(issued.access_token))
+    return auth_client
+
+
 @pytest.fixture
 def supabase_token_for(monkeypatch):
     """`supabase_token_for(user)`: a hosted-provider token of `user` (HS256, one hour).

@@ -25,7 +25,7 @@ from app.schemas.comment import (
 )
 from app.services.comments_service import comments_service
 from app.services import history_service, email_service
-from app.core.supabase_auth import lookup_user_by_id
+from app.auth.directory import find_identity_by_id
 from app.models.models import ActivityEventType
 
 logger = logging.getLogger(__name__)
@@ -186,9 +186,9 @@ async def create_comment(
 
         # 2. Reply notification to parent comment author
         if parent and parent.user_id != user_id:
-            parent_user = await lookup_user_by_id(parent.user_id)
-            if parent_user:
-                parent_author_email = parent_user.get("email", "")
+            parent_author = await find_identity_by_id(db, parent.user_id)
+            if parent_author:
+                parent_author_email = parent_author.email or ""
                 if parent_author_email and parent_author_email != author_email:
                     await email_service.send_reply_notification(
                         parent_author_email=parent_author_email,
