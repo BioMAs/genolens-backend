@@ -81,6 +81,9 @@ services:
       # The host of every link an e-mail carries (verification, reset, invitation). There is no env_file:
       # without this entry the code's default (http://localhost:3000) would be used.
       - APP_URL=${APP_URL:-https://app.genolens.com}
+      # The address the security e-mails tell the reader to contact. Set it to a real, monitored
+      # mailbox before opening the local authentication; the default is the code's.
+      - SUPPORT_EMAIL=${SUPPORT_EMAIL:-support@scilicium.com}
       # Drug Discovery (service genolens-dd). La clé vient du .env de l'hôte, jamais de
       # l'image : un .env embarqué au build est celui du checkout, donc sans secret, et
       # l'API répondait « non configuré » en production alors que l'hôte avait la clé.
@@ -156,6 +159,9 @@ services:
       # The host of every link an e-mail carries (verification, reset, invitation). There is no env_file:
       # without this entry the code's default (http://localhost:3000) would be used.
       - APP_URL=${APP_URL:-https://app.genolens.com}
+      # The address the security e-mails tell the reader to contact. Set it to a real, monitored
+      # mailbox before opening the local authentication; the default is the code's.
+      - SUPPORT_EMAIL=${SUPPORT_EMAIL:-support@scilicium.com}
     volumes:
       - genolens_storage:/app/data
     depends_on:
@@ -220,6 +226,9 @@ services:
       # The host of every link an e-mail carries (verification, reset, invitation). There is no env_file:
       # without this entry the code's default (http://localhost:3000) would be used.
       - APP_URL=${APP_URL:-https://app.genolens.com}
+      # The address the security e-mails tell the reader to contact. Set it to a real, monitored
+      # mailbox before opening the local authentication; the default is the code's.
+      - SUPPORT_EMAIL=${SUPPORT_EMAIL:-support@scilicium.com}
     volumes:
       - genolens_storage:/app/data
     depends_on:

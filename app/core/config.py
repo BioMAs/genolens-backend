@@ -212,6 +212,11 @@ class Settings(BaseSettings):
     EMAIL_FROM_ADDRESS: Optional[str] = Field(None, description="From address for outgoing emails")
     EMAIL_FROM_NAME: str = Field(default="GenoLens", description="Display name for outgoing emails")
     SALES_EMAIL: str = Field(default="contact@scilicium.com", description="Recipient for plan / module access requests")
+    SUPPORT_EMAIL: str = Field(
+        default="support@scilicium.com",
+        description="Address the security e-mails of the local authentication tell the reader to "
+        "contact. Set it to a real, monitored mailbox before opening the local authentication.",
+    )
 
     # Stripe
     STRIPE_SECRET_KEY: Optional[str] = Field(None, description="Stripe secret key (sk_live_... or sk_test_...)")

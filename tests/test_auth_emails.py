@@ -259,6 +259,33 @@ async def test_notifications_go_to_the_recipient_and_tell_what_to_do_if_unexpect
     assert unexpected in mail.html
 
 
+# The e-mails that name the support address.
+SUPPORT_EMAILS = [
+    pytest.param(lambda: send_password_changed_email(TO), id="password_changed"),
+    pytest.param(lambda: send_mfa_enabled_email(TO), id="mfa_enabled"),
+    pytest.param(lambda: send_mfa_reset_email(TO), id="mfa_reset"),
+    pytest.param(lambda: send_recovery_code_used_email(TO, 4), id="recovery_code_used"),
+]
+
+
+@pytest.mark.parametrize("send", SUPPORT_EMAILS)
+async def test_the_support_address_is_the_configured_one(smtp_capture, settings_override, send):
+    """Read from the settings when the e-mail is sent, not when the module was imported."""
+    settings_override(SUPPORT_EMAIL="help-desk@example.test")
+
+    await send()
+
+    mail = smtp_capture.last
+    assert "help-desk@example.test" in mail.text and "help-desk@example.test" in mail.html
+    assert "support@scilicium.com" not in mail.text + mail.html
+
+
+def test_the_support_address_defaults_to_the_one_production_uses():
+    from app.core.config import Settings
+
+    assert Settings.model_fields["SUPPORT_EMAIL"].default == "support@scilicium.com"
+
+
 async def test_password_changed_email_points_to_the_password_reset_page(smtp_capture):
     await send_password_changed_email(TO)
     assert f"{app_url()}/auth/forgot" in smtp_capture.last_text

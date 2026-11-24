@@ -9,7 +9,7 @@ Callers decide what to do with the failure; nothing is swallowed here, and nothi
 
 Copy is English, like the rest of the app, short and plain: one action per e-mail, how long a link
 is valid where there is one, and what to do if the reader did not expect the message. No customer
-is named.
+is named. The address to contact is the `SUPPORT_EMAIL` setting, read when the e-mail is sent.
 
 Secrets. A raw token appears only in the link (URL-encoded, so that no character of it can break
 the link or the HTML) and is never logged, neither here nor by `send_email`, which logs the
@@ -23,7 +23,7 @@ from urllib.parse import quote
 from app.auth.one_time_tokens import TOKEN_TTL
 from app.core.config import settings
 from app.models.auth import OneTimeTokenPurpose
-from app.services.email_service import SUPPORT_EMAIL, _base_layout, send_email
+from app.services.email_service import _base_layout, send_email
 
 # A button: (its label, the URL it opens).
 _Action = tuple[str, str]
@@ -175,7 +175,7 @@ async def send_password_changed_email(to: str) -> None:
         [
             "The password of your GenoLens account was just changed.",
             "If this was you, no action is needed. If this was not you, reset your password now "
-            f"and contact {SUPPORT_EMAIL}.",
+            f"and contact {settings.SUPPORT_EMAIL}.",
         ],
         ("Reset my password", f"{settings.APP_URL.rstrip('/')}/auth/forgot"),
     )
@@ -189,7 +189,8 @@ async def send_mfa_enabled_email(to: str) -> None:
         [
             "Two-factor authentication was just turned on for your GenoLens account. From now "
             "on, signing in requires a code from your authenticator app.",
-            "If this was not you, reset your password and contact " f"{SUPPORT_EMAIL} right away.",
+            "If this was not you, reset your password and contact "
+            f"{settings.SUPPORT_EMAIL} right away.",
         ],
     )
 
@@ -202,7 +203,7 @@ async def send_mfa_reset_email(to: str) -> None:
         [
             "An administrator reset two-factor authentication on your GenoLens account. You will "
             "be asked to set it up again the next time you sign in.",
-            f"If you did not expect this, contact {SUPPORT_EMAIL} right away.",
+            f"If you did not expect this, contact {settings.SUPPORT_EMAIL} right away.",
         ],
     )
 
@@ -227,6 +228,7 @@ async def send_recovery_code_used_email(to: str, remaining: int) -> None:
             "security settings."
         )
     intro.append(
-        f"If this was not you, reset your password and contact {SUPPORT_EMAIL} right away."
+        "If this was not you, reset your password and contact "
+        f"{settings.SUPPORT_EMAIL} right away."
     )
     await _send(to, "A recovery code was used on your GenoLens account", intro)

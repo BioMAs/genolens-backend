@@ -170,6 +170,27 @@ def test_the_services_that_send_e_mail_know_the_address_of_the_app():
         assert _environment(service).get("APP_URL") == APP_URL_ENTRY, service
 
 
+# --------------------------------------------------------------------------------------------
+# SUPPORT_EMAIL: the address the security e-mails tell the reader to contact
+# --------------------------------------------------------------------------------------------
+
+SUPPORT_EMAIL_DEFAULT = "support@scilicium.com"
+SUPPORT_EMAIL_ENTRY = "${SUPPORT_EMAIL:-%s}" % SUPPORT_EMAIL_DEFAULT
+
+
+def test_the_services_that_send_e_mail_know_the_support_address():
+    """Configurable (a real, monitored mailbox before the local authentication opens), with
+    today's address as the default in the compose file and in the code alike: production keeps
+    sending exactly what it sent."""
+    from app.core.config import Settings
+
+    senders = [s for s in sorted(_compose_services() - INFRA) if "SMTP_HOST" in _environment(s)]
+    assert {"api", "worker", "beat"} <= set(senders)
+    for service in senders:
+        assert _environment(service).get("SUPPORT_EMAIL") == SUPPORT_EMAIL_ENTRY, service
+    assert Settings.model_fields["SUPPORT_EMAIL"].default == SUPPORT_EMAIL_DEFAULT
+
+
 def test_the_r_worker_sends_no_e_mail():
     """It runs the R analyses and the reports, neither of which mails anyone: it has no SMTP
     settings, hence no need for APP_URL. If it ever gets them, it needs APP_URL too (above)."""
