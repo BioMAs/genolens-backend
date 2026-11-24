@@ -24,6 +24,12 @@ writes it in a single transaction. The plan is a pure function of the two lists
   when it is later than `auth_migrated_at`. A Supabase hash is applied only to an account that
   has no local password change, or whose change predates the migration.
 
+A tool for BEFORE the cutover. Once `AUTH_MODE=local` the local data is authoritative: Supabase's
+roles, e-mails and last sign-ins are frozen at their cutover values (the admin routes stop
+writing `profiles` then), so another `--apply` would put them back over what has changed here,
+a demoted admin included. `--apply` and `apply_plan` therefore refuse in `AUTH_MODE=local`
+(`MigrationError`, exit code 2); the dry run and `--report` read only and stay available.
+
 Conventions that make a replay harmless:
 
 - A field of a `UserUpdate` that is None is never written: it means "nothing to copy", not "blank
@@ -92,6 +98,17 @@ _PROTECTED_ROLES = (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN)
 
 class MigrationError(Exception):
     """A refusal the command explains on standard error (usage or configuration: exit code 2)."""
+
+
+def _refuse_after_cutover() -> None:
+    """The migration writes Supabase's values over local accounts: only until the cutover."""
+    if settings.AUTH_MODE == "local":
+        raise MigrationError(
+            "applying the Supabase migration (--apply) is refused in AUTH_MODE=local: it is a "
+            "pre-cutover tool, and since the cutover the local data (roles, e-mails, passwords, "
+            "last sign-ins) is the authority, so a run would put the values Supabase froze at "
+            "the cutover back over it. The dry run and --report still work"
+        )
 
 
 # ---- data --------------------------------------------------------------------------------------
@@ -375,7 +392,9 @@ async def apply_plan(db: AsyncSession, plan: MigrationPlan, now: datetime) -> in
 
     Returns how many accounts were updated: one that no longer exists is not counted. Replaying
     the same plan leaves the same rows (see the module docstring for what is never written).
+    Raises `MigrationError`, writing nothing, in `AUTH_MODE=local` (see the module docstring).
     """
+    _refuse_after_cutover()
     now = now_utc(now)
     updated = 0
     try:
@@ -576,6 +595,8 @@ async def _migrate(
     out: TextIO,
     now: datetime,
 ) -> None:
+    if args.apply:
+        _refuse_after_cutover()  # before anything is read or written, a report included
     dsn = settings.SUPABASE_DB_URL
     if not dsn:
         raise MigrationError(

@@ -659,6 +659,28 @@ async def test_a_protected_password_stays_protected_through_later_runs(auth_db):
     assert aware_utc(row.auth_migrated_at) == first_run  # the date the account moved, kept
 
 
+async def test_apply_plan_refuses_after_cutover(auth_db, settings_override):
+    # In AUTH_MODE=local the local data is the authority: a plan made from Supabase's frozen
+    # values would revert roles, e-mails and last sign-ins, so a caller cannot bypass the CLI guard.
+    user = await seed_user(auth_db, role=UserRole.VIEWER)
+    plan = plan_migration(
+        [LocalUser(user.id, user.email, user.role, None, None)],
+        [R(user.id, email="reverted@example.test", pw=BCRYPT_X, profile_role="admin")],
+        now=NOW,
+    )
+    settings_override(AUTH_MODE="local")
+    async with auth_db() as db:
+        with pytest.raises(migration.MigrationError, match="AUTH_MODE=local"):
+            await apply_plan(db, plan, NOW)
+    row = await _row(auth_db, user.id)
+    assert (row.email, row.role, row.password_hash, row.auth_migrated_at) == (
+        user.email,
+        UserRole.VIEWER,
+        None,
+        None,
+    )
+
+
 async def test_apply_is_all_or_nothing(auth_db):
     first = await seed_user(auth_db, email="first@example.test")
     second = await seed_user(auth_db, email="second@example.test")
@@ -797,6 +819,53 @@ async def test_the_summary_is_made_of_counts(auth_db, settings_override):
         assert lines[kind] == str(count), (kind, out)
 
 
+async def test_apply_is_refused_after_cutover_and_writes_nothing(auth_db, settings_override):
+    remote, (ok, *_rest) = await _scenario(auth_db)
+    settings_override(SUPABASE_DB_URL=SECRET_DSN, AUTH_MODE="local")
+    fetch, out, err = _Fetch(remote), StringIO(), StringIO()
+    code = await migration.run(
+        ["--apply"], session_factory=auth_db, fetch=fetch, out=out, err=err, now=NOW
+    )
+    assert code == 2
+    assert "AUTH_MODE=local" in err.getvalue() and "--apply" in err.getvalue()
+    assert "s3cret" not in out.getvalue() + err.getvalue()
+    assert out.getvalue() == ""
+    assert fetch.dsns == []  # refused before Supabase was even read
+    row = await _row(auth_db, ok.id)
+    assert (row.role, row.password_hash, row.auth_migrated_at) == (UserRole.VIEWER, None, None)
+    async with auth_db() as s:
+        assert await s.scalar(select(func.count()).where(User.auth_migrated_at.is_not(None))) == 0
+
+
+async def test_a_refused_apply_leaves_no_report(auth_db, settings_override, tmp_path):
+    remote, _users = await _scenario(auth_db)
+    settings_override(SUPABASE_DB_URL=SECRET_DSN, AUTH_MODE="local")
+    out, err = StringIO(), StringIO()
+    report = tmp_path / "report.json"
+    code = await migration.run(
+        ["--apply", "--report", str(report)],
+        session_factory=auth_db,
+        fetch=_Fetch(remote),
+        out=out,
+        err=err,
+        now=NOW,
+    )
+    assert code == 2 and not report.exists()
+
+
+async def test_dry_run_and_report_still_work_in_local_mode(auth_db, settings_override, tmp_path):
+    remote, (ok, *_rest) = await _scenario(auth_db)
+    settings_override(AUTH_MODE="local")
+    report = tmp_path / "report.json"
+    code, out, err = await _command(["--report", str(report)], auth_db, remote, settings_override)
+    assert code == 0, err
+    assert "dry run" in out.lower() and "updates: 2" in out
+    data = json.loads(report.read_text())
+    assert data["mode"] == "dry-run" and data["counts"]["updates"] == 2
+    row = await _row(auth_db, ok.id)  # read-only on our side
+    assert (row.role, row.password_hash, row.auth_migrated_at) == (UserRole.VIEWER, None, None)
+
+
 async def test_apply_writes_and_says_how_many(auth_db, settings_override):
     remote, (ok, no_pw, _orphan, banned) = await _scenario(auth_db)
     code, out, err = await _command(["--apply"], auth_db, remote, settings_override)
@@ -916,6 +985,14 @@ def test_main_without_a_connection_string_returns_2(settings_override, capsys):
     settings_override(SUPABASE_DB_URL=None)
     assert migration.main([]) == 2
     assert "SUPABASE_DB_URL" in capsys.readouterr().err
+
+
+def test_main_refuses_apply_in_local_mode(settings_override, capsys):
+    # Before any connection: the address is unreachable and would fail with exit 1 otherwise.
+    settings_override(AUTH_MODE="local", SUPABASE_DB_URL="postgresql://u:p@127.0.0.1:1/db")
+    assert migration.main(["--apply"]) == 2
+    captured = capsys.readouterr()
+    assert "AUTH_MODE=local" in captured.err and captured.out == ""
 
 
 def test_main_refuses_resets_outside_local_mode(settings_override, capsys):
