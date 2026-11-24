@@ -214,8 +214,9 @@ class Settings(BaseSettings):
     SALES_EMAIL: str = Field(default="contact@scilicium.com", description="Recipient for plan / module access requests")
     SUPPORT_EMAIL: str = Field(
         default="support@scilicium.com",
-        description="Address the security e-mails of the local authentication tell the reader to "
-        "contact. Set it to a real, monitored mailbox before opening the local authentication.",
+        description="Address every e-mail and refusal tells the reader to contact (security "
+        "e-mails, expiry warning, inactive or expired account, licence, quotas). Set it to a real, "
+        "monitored mailbox before opening the local authentication.",
     )
 
     # Stripe

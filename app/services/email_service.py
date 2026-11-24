@@ -570,10 +570,6 @@ async def send_quota_warning_email(
 # ---------------------------------------------------------------------------
 
 
-# Same address the account-state and license errors give (app/api/deps/).
-SUPPORT_EMAIL = "support@scilicium.com"
-
-
 def _expiry_when(days_remaining: int) -> str:
     """ "today" / "in 1 day" / "in 3 days"."""
     if days_remaining == 0:
@@ -587,6 +583,7 @@ def _expiry_warning_subject(days_remaining: int) -> str:
 
 def _expiry_warning_html(days_remaining: int, ends_on: str, contact_url: str) -> str:
     when = _expiry_when(days_remaining)
+    support = settings.SUPPORT_EMAIL  # read at send time, like every support address
     content = f"""
       <p>Hello,</p>
       <p>
@@ -606,7 +603,7 @@ def _expiry_warning_html(days_remaining: int, ends_on: str, contact_url: str) ->
       </p>
       <a href="{contact_url}" class="btn">Extend my access →</a>
       <div class="meta">
-        <p>Questions? Contact <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>.</p>
+        <p>Questions? Contact <a href="mailto:{support}">{support}</a>.</p>
       </div>
     """
     return _base_layout(_expiry_warning_subject(days_remaining), content)
@@ -622,7 +619,7 @@ def _expiry_warning_text(days_remaining: int, ends_on: str, contact_url: str) ->
         f"and launching analyses will be disabled.\n\n"
         f"Your data is neither deleted nor modified.\n\n"
         f"To extend your access: {contact_url}\n"
-        f"Questions? Contact {SUPPORT_EMAIL}.\n\n"
+        f"Questions? Contact {settings.SUPPORT_EMAIL}.\n\n"
         f"— The GenoLens team"
     )
 

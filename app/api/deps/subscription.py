@@ -284,7 +284,7 @@ async def reserve_ai_request(user: User, db: AsyncSession) -> AIRequestReservati
                 "used": limit,
                 "message": (
                     f"This account has used all of its {limit} AI requests. "
-                    "Please contact support@scilicium.com to continue."
+                    f"Please contact {settings.SUPPORT_EMAIL} to continue."
                 ),
             },
         )
@@ -470,7 +470,7 @@ def analysis_quota_renewal_hint(user: User) -> str:
     if user.is_demo:
         return (
             "This demo account has no monthly renewal. "
-            "Please contact support@scilicium.com to continue."
+            f"Please contact {settings.SUPPORT_EMAIL} to continue."
         )
     return "Quota resets on the 1st of next month. Upgrade your plan for more analyses."
 

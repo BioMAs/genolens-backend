@@ -3,6 +3,7 @@ License enforcement dependency for protected endpoints.
 """
 from fastapi import HTTPException, status
 
+from app.core.config import settings
 from app.core.license import get_license_status
 
 
@@ -17,7 +18,7 @@ async def require_active_license() -> None:
                 "expires_at": lic.expires_at,
                 "message": (
                     "Your GenoLens application license has expired or is not configured. "
-                    "Please contact support@scilicium.com to renew your license."
+                    f"Please contact {settings.SUPPORT_EMAIL} to renew your license."
                 ),
             },
         )
