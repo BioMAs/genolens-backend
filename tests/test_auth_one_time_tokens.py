@@ -30,6 +30,7 @@ from app.auth.one_time_tokens import (
     InvalidOneTimeToken,
     consume_token,
     count_recent_tokens,
+    invalidate_user_tokens,
     issue_token,
     peek_token,
     reserve_attempt,
@@ -730,6 +731,46 @@ async def test_count_recent_tokens_includes_spent_ones(auth_db):
     await _consume(auth_db, raw, RESET)
     async with auth_db() as db:
         assert await count_recent_tokens(db, user.id, RESET, NOW - timedelta(minutes=1)) == 1
+
+
+# --------------------------------------------------------------------------- invalidate_user_tokens
+
+
+async def test_invalidate_user_tokens_spends_every_live_token_of_every_purpose(auth_db):
+    user, other = await seed_user(auth_db), await seed_user(auth_db)
+    # An older reset link, already spent: it keeps its own `used_at`.
+    spent = await _issue(auth_db, user.id, RESET, now=NOW - timedelta(minutes=30))
+    assert await _consume(auth_db, spent, RESET, now=NOW - timedelta(minutes=29))
+    earlier_used_at = _aware((await _row(auth_db, spent)).used_at)
+    live = {p: await _issue(auth_db, user.id, p) for p in OneTimeTokenPurpose}
+    others = await _issue(auth_db, other.id, CHALLENGE)
+
+    later = NOW + timedelta(minutes=1)
+    async with auth_db() as db:
+        assert await invalidate_user_tokens(db, user.id, now=later) == len(OneTimeTokenPurpose)
+        await db.commit()
+
+    for purpose, raw in live.items():
+        assert _aware((await _row(auth_db, raw)).used_at) == later, purpose
+        async with auth_db() as db:
+            with pytest.raises(InvalidOneTimeToken) as refused:
+                await peek_token(db, raw, purpose, now=later)
+        assert refused.value.reason == "used"
+    assert _aware((await _row(auth_db, spent)).used_at) == earlier_used_at  # kept its own date
+    assert (await _row(auth_db, others)).used_at is None  # another account is untouched
+    async with auth_db() as db:
+        assert await invalidate_user_tokens(db, user.id, now=later) == 0  # nothing left
+
+
+async def test_invalidate_user_tokens_does_not_commit(auth_db):
+    user = await seed_user(auth_db)
+    raw = await _issue(auth_db, user.id, CHALLENGE)
+
+    async with auth_db() as db:
+        assert await invalidate_user_tokens(db, user.id, now=NOW) == 1
+        await db.rollback()
+
+    assert (await _row(auth_db, raw)).used_at is None
 
 
 # --------------------------------------------------------------------------- hygiene

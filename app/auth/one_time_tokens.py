@@ -12,7 +12,8 @@ at the exact instant its lifetime ends.
 
 Single use. `consume_token` spends a token; a spent token is refused for ever. A new token of a
 purpose replaces the user's earlier ones of that purpose (`issue_token` marks them used), so only
-the last link sent is live. Other purposes and other users are never touched.
+the last link sent is live. Other purposes and other users are never touched, except by
+`invalidate_user_tokens`, which spends every live token of one user when the password changes.
 
 MFA step tokens (`MFA_CHALLENGE` after the password, `MFA_ENROLL` while a user sets a second factor
 up) are the same rows with an attempt counter. The flow that checks a code is `reserve_attempt` ->
@@ -280,6 +281,30 @@ async def reserve_attempt(
     # Nothing was reserved. A token that is of this purpose, unused and unexpired, yet did not
     # match, can only have failed the one condition `_refusal` does not look at: the attempts.
     raise InvalidOneTimeToken(_refusal(token, purpose, now) or "exhausted")
+
+
+async def invalidate_user_tokens(
+    db: AsyncSession, user_id: UUID, now: Optional[datetime] = None
+) -> int:
+    """Spend every unused token of `user_id`, whatever its purpose (links and step tokens alike),
+    and return how many were spent.
+
+    For the moments a password changes (reset, change): a step token handed out after the old
+    password (an MFA challenge or enrolment) must not outlive it, nor should a link mailed before
+    the change. Tokens already used keep their own `used_at`; other users are untouched. Expired
+    ones are spent too: harmless, and the statement stays a plain one. One UPDATE, no commit: the
+    caller writes it in the transaction that changes the password.
+    """
+    now = now_utc(now)
+    result = await db.execute(
+        update(AuthOneTimeToken).where(
+            AuthOneTimeToken.user_id == user_id, AuthOneTimeToken.used_at.is_(None)
+        )
+        # No `synchronize_session` override: a token this session already holds (the one a reset
+        # just peeked at) must not still look usable to it.
+        .values(used_at=now)
+    )
+    return int(result.rowcount or 0)
 
 
 async def count_recent_tokens(

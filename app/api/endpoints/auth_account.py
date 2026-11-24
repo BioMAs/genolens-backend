@@ -27,6 +27,11 @@ Session routes (a local session only: a service token or a hosted-provider token
 Every route answers 404 while local authentication is off. A refusal on a session route is never a
 401 (except for a missing or dead session): the web client reads 401 as "signed out".
 
+A new password kills what the old one opened. `/password/reset` and `/password/change` revoke the
+sessions (all of them, or all but the caller's) and, in the same transaction, spend every unused
+one-time token of the account (`invalidate_user_tokens`): an MFA challenge or enrolment step won
+with the old password, and any link mailed before the change, stop working with it.
+
 Anti-enumeration. `/signup`, `/password/forgot` and `/verify-email/resend` answer the same `202`
 body whether the address has an account or not, whatever happens next. Every e-mail of this module
 leaves after the response, from a FastAPI background job (`_notify` in `app.api.endpoints.auth`):
@@ -114,6 +119,7 @@ from app.auth.one_time_tokens import (
     InvalidOneTimeToken,
     consume_token,
     count_recent_tokens,
+    invalidate_user_tokens,
     issue_token,
     peek_token,
 )
@@ -505,12 +511,14 @@ async def reset_password(
     if user.email_verified_at is None:
         user.email_verified_at = now  # the link reached the inbox, as a verification link would
     revoked = await revoke_all_sessions(db, user.id, RESET_REASON)
+    tokens_spent = await invalidate_user_tokens(db, user.id, now=now)
     await record_event(
         db,
         AuthEventType.PASSWORD_RESET_COMPLETED,
         user_id=user.id,
         request=request,
         sessions_revoked=revoked,
+        one_time_revoked=tokens_spent,
     )
     user_id, email = user.id, user.email
     await db.commit()
@@ -643,12 +651,14 @@ async def change_password(
     revoked = await revoke_all_sessions(
         db, user.id, CHANGE_REASON, keep_session_id=caller.session_id
     )
+    tokens_spent = await invalidate_user_tokens(db, user.id, now=now)
     await record_event(
         db,
         AuthEventType.PASSWORD_CHANGED,
         user_id=user.id,
         request=request,
         sessions_revoked=revoked,
+        one_time_revoked=tokens_spent,
     )
     user_id, email = user.id, user.email
     await db.commit()

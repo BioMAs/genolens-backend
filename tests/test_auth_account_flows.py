@@ -34,6 +34,8 @@ from app.models.auth import OneTimeTokenPurpose as Purpose
 from app.models.models import SubscriptionPlan, User, UserRole, UserStatus
 from tests.auth_support import CSRF, PW, access_cookie, bearer, call_app_directly, seed_user
 from tests.test_auth_login_flow import (
+    CHALLENGE_EXPIRED,
+    SETUP_CONFIRM,
     SETUP_START,
     code_at,
     events,
@@ -558,6 +560,60 @@ async def test_reset_proves_the_address(auth_client, auth_db, local_auth):
     await post(auth_client, RESET, {"token": raw, "new_password": NEW_PW})
 
     assert (await reload(auth_db, user.id)).email_verified_at is not None
+
+
+async def test_a_reset_kills_the_enrolment_step_of_whoever_had_the_old_password(
+    auth_client, auth_db, local_auth
+):
+    """Someone signs in with a stolen password (no second factor yet: enrolment) and starts the
+    enrolment; the owner resets the password. The step token dies with the old password: neither
+    enrolment step works any more, even with a right code, and no session is opened."""
+    user = await verified_user(auth_db)
+    assert (await login(auth_client, user.email)).json() == {"next": "mfa_setup"}
+    secret = (await auth_client.post(SETUP_START, headers=CSRF)).json()["secret"]
+
+    await post(auth_client, FORGOT, {"email": user.email})
+    raw = link_token(local_auth.last_text, "/auth/reset")
+    reset = await post(auth_client, RESET, {"token": raw, "new_password": NEW_PW})
+    assert reset.status_code == 204, reset.text
+
+    # The client still holds its `gl_mfa` cookie (the reset answered with no cookie).
+    start = await auth_client.post(SETUP_START, headers=CSRF)
+    assert start.status_code == 401 and start.json() == CHALLENGE_EXPIRED
+    confirm = await auth_client.post(SETUP_CONFIRM, json={"code": code_at(secret)}, headers=CSRF)
+    assert confirm.status_code == 401 and confirm.json() == CHALLENGE_EXPIRED
+    assert await sessions_of(auth_db, user.id) == []
+    assert (await reload(auth_db, user.id)).mfa_enabled_at is None
+    async with auth_db() as s:
+        live = await s.scalar(
+            select(func.count())
+            .select_from(AuthOneTimeToken)
+            .where(AuthOneTimeToken.user_id == user.id, AuthOneTimeToken.used_at.is_(None))
+        )
+    assert live == 0
+
+
+async def test_a_password_change_kills_a_pending_challenge(
+    auth_client, auth_db, local_auth, local_session_for
+):
+    """The thief passed the password step and holds a challenge; the owner, signed in elsewhere,
+    changes the password. The challenge dies: even a right code opens nothing."""
+    user, secret = await mfa_user(auth_db)
+    owner = await local_session_for(user)
+    assert (await login(auth_client, user.email)).json() == {"next": "mfa"}
+
+    changed = await post(
+        auth_client,
+        CHANGE,
+        {"current_password": PW, "new_password": NEW_PW},
+        bearer(owner.access_token),
+    )
+    assert changed.status_code == 204, changed.text
+
+    r = await verify(auth_client, code=code_at(secret))
+    assert r.status_code == 401 and r.json() == CHALLENGE_EXPIRED
+    assert [s.id for s in await live_sessions(auth_db, user.id)] == [owner.session_id]
+    assert len(await sessions_of(auth_db, user.id)) == 1
 
 
 async def test_reset_does_not_lift_the_account_lock(auth_client, auth_db, local_auth):
