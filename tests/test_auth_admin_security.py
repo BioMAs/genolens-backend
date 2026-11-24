@@ -14,10 +14,12 @@ What is pinned down:
 - a service token is only ever revoked by the explicit `revoke_service_tokens` box, never by the
   reset, the unlock, the password link or a plain session revocation (spec 7.7);
 - the password link is the one the account itself would ask for, issued by the administrator, and
-  an e-mail that cannot leave is reported (502) with the link kept;
+  an e-mail that cannot leave is reported (502) with the link kept; it is refused (409) until
+  AUTH_MODE=local, the pre-launch included, since its page answers 404 before the switch;
 - every action is audited against the account, with the administrator as actor;
 - the audit trail and the token list are bounded and never carry a secret or a token hash;
-- the routes work on local data in both modes and never call the hosted provider;
+- the routes work on local data in both modes (the password link aside) and never call the
+  hosted provider;
 - the shared logic (`app.auth.admin_actions`), which the break-glass command reuses, does not
   commit.
 
@@ -429,8 +431,16 @@ async def test_only_a_scilicium_admin_ends_an_admins_sessions(
 
 @pytest.mark.parametrize("caller_role,target_role,allowed", PRIVILEGE_CASES)
 async def test_only_a_scilicium_admin_sends_an_admin_a_password_link(
-    admin_client, auth_db, local_session_for, smtp_capture, caller_role, target_role, allowed
+    admin_client,
+    auth_db,
+    local_session_for,
+    smtp_capture,
+    settings_override,
+    caller_role,
+    target_role,
+    allowed,
 ):
+    settings_override(AUTH_MODE="local")  # a password link is sent from the switch on
     _, headers = await caller(local_session_for, auth_db, caller_role)
     target = await seed_user(auth_db, role=target_role)
 
@@ -596,8 +606,9 @@ async def test_revoke_sessions_refuses_a_box_that_is_not_a_boolean(admin_client,
 
 @pytest.mark.parametrize("suffix", ["mfa/reset", "unlock", "password-reset", "sessions/revoke"])
 async def test_nothing_but_the_explicit_box_revokes_a_service_token(
-    admin_client, auth_db, smtp_capture, suffix
+    admin_client, auth_db, smtp_capture, settings_override, suffix
 ):
+    settings_override(AUTH_MODE="local")  # where every one of these actions is open
     target = await enrolled(auth_db, locked_until=now_utc() + timedelta(minutes=10))
     _, token = await mint_token(auth_db, target)
 
@@ -646,11 +657,10 @@ async def test_unlock_clears_the_lock_and_audits_it(
 # ── Sending a password-reset link ────────────────────────────────────────────
 
 
-@MODES
 async def test_password_reset_sends_the_link_the_account_would_ask_for(
-    admin_client, admin_user, auth_db, local_session_for, smtp_capture, settings_override, mode
+    admin_client, admin_user, auth_db, local_session_for, smtp_capture, settings_override
 ):
-    settings_override(AUTH_MODE=mode)
+    settings_override(AUTH_MODE="local")
     target = await enrolled(auth_db, password_hash="$argon2id$placeholder")
     live = await local_session_for(target)
 
@@ -695,10 +705,28 @@ async def test_password_reset_needs_local_authentication(
     assert (await auth_client.post(url(target.id, "unlock"), headers=headers)).status_code == 200
 
 
+async def test_password_reset_is_refused_before_the_launch(
+    admin_client, auth_db, smtp_capture, settings_override
+):
+    """Pre-launch (AUTH_MODE=supabase, AUTH_LOCAL_ENABLED=true): the link would lead to
+    `/auth/password/reset`, which answers 404 until AUTH_MODE=local. Refused, nothing issued."""
+    settings_override(AUTH_MODE="supabase", AUTH_LOCAL_ENABLED=True)
+    target = await seed_user(auth_db)
+
+    r = await admin_client.post(url(target.id, "password-reset"))
+
+    assert r.status_code == 409
+    assert r.json() == {"detail": "local_auth_disabled"}
+    assert await _all(auth_db, AuthOneTimeToken) == []
+    assert smtp_capture.messages == []
+    assert await count(auth_db, AuthEvent, user_id=target.id) == 0
+
+
 @pytest.mark.parametrize("failure", ["send_fails", "not_configured"])
 async def test_password_reset_reports_an_email_that_cannot_leave_and_keeps_the_link(
     admin_client, auth_db, smtp_capture, settings_override, failure
 ):
+    settings_override(AUTH_MODE="local")
     target = await seed_user(auth_db)
     if failure == "send_fails":
         smtp_capture.fail_with = OSError("smtp down")
@@ -834,7 +862,9 @@ async def test_security_actions_work_on_local_data_and_never_call_the_provider(
 
     for method, suffix in ROUTES:
         r = await admin_client.request(method, url(target.id, suffix))
-        assert r.status_code == 200, (mode, suffix, r.text)
+        # The password link waits for AUTH_MODE=local (its page answers 404 before the switch).
+        expected = 409 if (mode, suffix) == ("supabase", "password-reset") else 200
+        assert r.status_code == expected, (mode, suffix, r.text)
 
     assert fake_supabase.calls == []
     after = await reload(auth_db, target.id)

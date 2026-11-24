@@ -31,7 +31,6 @@ from app.auth.directory import (
 )
 from app.auth.emails import send_mfa_reset_email, send_password_reset_email
 from app.auth.one_time_tokens import issue_token
-from app.auth.principal import local_tokens_accepted
 from app.models.auth import AuthEvent, AuthEventType, OneTimeTokenPurpose
 from app.models.service_token import ServiceToken
 from app.services.email_service import EmailNotConfiguredError, EmailSendError
@@ -822,16 +821,18 @@ async def send_password_reset_link(
 
     The same link the account gets from "forgot password", issued by the administrator (and
     replacing any earlier one). Nothing about the account changes until it is used; its sessions
-    and service tokens are kept. 409 `local_auth_disabled` while local authentication is off. As
-    the administrator asked for this e-mail, one that cannot leave is an error: 502
-    `reset_email_failed`, with the link kept so that a retry sends a new one.
+    and service tokens are kept. 409 `local_auth_disabled` until `AUTH_MODE=local`: while local
+    authentication is off, and during the pre-launch too (`AUTH_LOCAL_ENABLED` with
+    `AUTH_MODE=supabase`), when the page the link opens is answered 404. As the administrator
+    asked for this e-mail, one that cannot leave is an error: 502 `reset_email_failed`, with the
+    link kept so that a retry sends a new one.
 
     For an ADMIN or SCILICIUM_ADMIN account (one's own included) it takes a SCILICIUM_ADMIN: else
     403 `scilicium_admin_required`, and no link is issued nor sent.
     """
     user = await _account_or_404(db, user_id)
     _require_scilicium_admin_for(user, current_user)
-    if not local_tokens_accepted():
+    if settings.AUTH_MODE != "local":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local_auth_disabled")
     to = user.email
     raw = await issue_token(
