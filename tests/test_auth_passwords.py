@@ -305,3 +305,13 @@ def test_common_password_list_ships_with_the_package_and_is_loaded_once():
     assert 9_000 <= len(common) <= 11_000
     assert "unbelievable" in common
     assert passwords._common_passwords() is common
+
+
+def test_the_seclists_licence_travels_with_the_embedded_list():
+    """SecLists is MIT-licensed: a copy of the list carries its copyright and permission notice."""
+    licence = passwords._COMMON_PASSWORDS_FILE.with_name("LICENSE-SecLists.txt")
+    text = licence.read_text(encoding="utf-8")
+    assert text.startswith("MIT License\n")
+    assert "Copyright (c) 2018 Daniel Miessler" in text
+    assert "The above copyright notice and this permission notice shall be included" in text
+    assert "LICENSE-SecLists.txt" in (passwords.__doc__ or "")

@@ -9,8 +9,9 @@ Pure and database-free: nothing here reads a user, a session or the network.
 - A password is used as it is received: its UTF-8 bytes, never Unicode-normalised. That is what
   Supabase did, so a migrated account keeps working with the password its owner typed.
 - The "too common" list is SecLists `Passwords/Common-Credentials/10k-most-common.txt`
-  (https://github.com/danielmiessler/SecLists, MIT licence), embedded in `data/` so that no
-  external call is made.
+  (https://github.com/danielmiessler/SecLists, MIT licence, Copyright (c) 2018 Daniel Miessler),
+  embedded in `data/` so that no external call is made. The licence travels with the copy:
+  `data/LICENSE-SecLists.txt`, next to `data/common_passwords.txt`.
 """
 
 import logging
