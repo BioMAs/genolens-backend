@@ -10,11 +10,14 @@ each local account would receive; without `--apply` that is all it does (a dry r
 writes it in a single transaction. The plan is a pure function of the two lists
 (`plan_migration`) and the rules are those of section 8:
 
-- scope: the accounts of `users` only (the Supabase project is shared with another application);
+- scope: the accounts of `users` only (the Supabase project is shared with another application).
+  Only their rows are fetched (`WHERE id = ANY(<local ids>)`); the other accounts are counted
+  (`out_of_scope`), never read, their hashes included;
 - `password_hash` <- `encrypted_password` when it is a bcrypt hash (`$2...`), else nothing, and the
   account is reported (`no_password`): it gets a reset link (`--send-resets`);
 - `email_verified_at` <- `email_confirmed_at`, `last_login_at` <- `last_sign_in_at`;
-- e-mail: Supabase's wins, unless another local account has it already (`email_conflict`);
+- e-mail: Supabase's wins, lowercased and stripped as every stored address (section 7.1), unless
+  another local account has it already, ignoring case (`email_conflict`);
 - role: a local ADMIN / SCILICIUM_ADMIN stays; otherwise `profiles.role` in capitals if it is a
   `UserRole`, else the local role stays (`role_invalid`);
 - banned or deleted at Supabase: reported (`banned`, `deleted`), nothing applied;
@@ -46,7 +49,14 @@ Secrets. A hash is read, compared and written, and never printed, logged or put 
 the standard output holds counts, the report holds `user_id`, kind and a detail line (with
 e-mail addresses, so it is created readable by its owner only and belongs outside git), and the
 connection string, which contains a password, is never echoed, not even in an error. The engine
-this command opens hides statement parameters, so a database error cannot print a hash either.
+this command opens hides statement parameters, so a database error cannot print a hash either, and
+an error is printed as its class, its SQLSTATE and the first line of its message only (`_describe`:
+asyncpg's `DETAIL:` line can quote the failing row). The dataclasses that carry a hash leave it out
+of their `repr`.
+
+Reset links (`--send-resets`, `AUTH_MODE=local` only) go to the migrated accounts left without a
+password that hold no live reset link; the link of an e-mail that did not leave is withdrawn, so a
+rerun mails exactly the failures.
 
 Exit codes: 0 done; 1 something failed while running (Supabase unreachable, a database error, a
 reset e-mail that did not leave); 2 usage or configuration (a missing `SUPABASE_DB_URL`, resets
@@ -62,7 +72,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Awaitable, Callable, Literal, NoReturn, Optional, TextIO, get_args
+from typing import Awaitable, Callable, Literal, NoReturn, Optional, Sequence, TextIO, get_args
 from uuid import UUID
 
 import asyncpg
@@ -73,9 +83,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.audit import record_event
 from app.auth.clock import aware_utc, now_utc
 from app.auth.emails import send_password_reset_email
-from app.auth.one_time_tokens import issue_token
+from app.auth.one_time_tokens import InvalidOneTimeToken, consume_token, issue_token
 from app.core.config import settings
-from app.models.auth import AuthEventType, OneTimeTokenPurpose
+from app.models.auth import AuthEventType, AuthOneTimeToken, OneTimeTokenPurpose
 from app.models.models import User, UserRole, UserStatus
 from app.services.email_service import EmailNotConfiguredError, EmailSendError
 
@@ -91,6 +101,9 @@ AnomalyKind = Literal[
     "duplicate_email",
 ]
 ANOMALY_KINDS: tuple[str, ...] = get_args(AnomalyKind)
+
+# Reads the Supabase accounts of the given local ids: `fetch_remote_users`, or a test's stand-in.
+Fetch = Callable[[str, list[UUID]], Awaitable["RemoteAccounts"]]
 
 # A local account with one of these roles keeps it whatever the Supabase profile says.
 _PROTECTED_ROLES = (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN)
@@ -120,12 +133,21 @@ class RemoteUser:
 
     id: UUID
     email: str
-    encrypted_password: Optional[str] = None
+    encrypted_password: Optional[str] = field(default=None, repr=False)  # a hash: never printed
     email_confirmed_at: Optional[datetime] = None
     last_sign_in_at: Optional[datetime] = None
     banned_until: Optional[datetime] = None
     deleted_at: Optional[datetime] = None
     profile_role: Optional[str] = None
+
+
+@dataclass
+class RemoteAccounts:
+    """What the read of the hosted database returns: the accounts of the local ids it was given
+    (`users`), and how many accounts the project holds in all (`total`), the others counted only."""
+
+    users: list[RemoteUser]
+    total: int
 
 
 @dataclass
@@ -148,7 +170,7 @@ class UserUpdate:
     """
 
     user_id: UUID
-    password_hash: Optional[str] = None
+    password_hash: Optional[str] = field(default=None, repr=False)  # a hash: never printed
     email: Optional[str] = None
     email_verified_at: Optional[datetime] = None
     last_login_at: Optional[datetime] = None
@@ -213,17 +235,25 @@ def _role_for(local: LocalUser, remote: RemoteUser) -> tuple[Optional[UserRole],
 
 
 def plan_migration(
-    local: list[LocalUser], remote: list[RemoteUser], now: Optional[datetime] = None
+    local: list[LocalUser],
+    remote: list[RemoteUser],
+    now: Optional[datetime] = None,
+    remote_total: Optional[int] = None,
 ) -> MigrationPlan:
     """What each local account would receive from Supabase, and what needs a human. No I/O.
 
     `now` is the instant a ban is judged at (`banned_until` later than it is a ban); it defaults
     to the current time, and a test or a replay passes its own so that the plan is deterministic.
+    `remote_total` is how many accounts the Supabase project holds in all, when `remote` lists only
+    those of the local ids (what `fetch_remote_users` reads): `out_of_scope` is then that total
+    minus the local accounts found. Without it, `remote` is taken as the whole project.
     """
     now = now_utc(now)
     remote_by_id = {r.id: r for r in remote}
     local_ids = {u.id for u in local}
-    plan = MigrationPlan(out_of_scope=sum(1 for rid in remote_by_id if rid not in local_ids))
+    found = sum(1 for rid in remote_by_id if rid in local_ids)
+    total = len(remote_by_id) if remote_total is None else remote_total
+    plan = MigrationPlan(out_of_scope=max(total - found, 0))
 
     holders: dict[str, list[LocalUser]] = {}
     for user in local:
@@ -308,7 +338,7 @@ def plan_migration(
                     )
                 )
             else:
-                update_.email = wanted_email
+                update_.email = key  # stored lowercased and stripped (spec section 7.1)
                 claimed[key] = user.id
 
         role, problem = _role_for(user, theirs)
@@ -329,7 +359,10 @@ SELECT u.id, u.email, u.encrypted_password, u.email_confirmed_at, u.last_sign_in
        u.banned_until, u.deleted_at, p.role
 FROM auth.users u
 LEFT JOIN public.profiles p ON p.id = u.id
+WHERE u.id = ANY($1::uuid[])
 """
+# The other application's accounts are counted, never read (nor their hashes).
+_REMOTE_COUNT = "SELECT count(*) FROM auth.users"
 
 _DRIVER_SUFFIX = re.compile(r"^(postgres(?:ql)?)\+\w+://")
 
@@ -340,19 +373,22 @@ def _asyncpg_dsn(dsn: str) -> str:
     return _DRIVER_SUFFIX.sub(r"\1://", dsn)
 
 
-async def fetch_remote_users(dsn: str) -> list[RemoteUser]:
-    """Every account of the Supabase project, read in a read-only transaction.
+async def fetch_remote_users(dsn: str, local_ids: Sequence[UUID]) -> RemoteAccounts:
+    """The Supabase accounts of `local_ids` (the scope: the project is shared with another
+    application, whose accounts and hashes are not fetched), and the number of accounts of the
+    whole project, read in one read-only transaction.
 
     `dsn` is the connection string of the pooler, in either form (`postgresql://` or
     `postgresql+asyncpg://`). It carries a password: it is passed to the driver and nowhere else.
-    The result is ordered by id so that a report does not depend on the server's row order.
+    The accounts are ordered by id so that a report does not depend on the server's row order.
     """
     # No statement cache: a pooler in transaction mode would lose the prepared statements.
     conn = await asyncpg.connect(_asyncpg_dsn(dsn), statement_cache_size=0)
     try:
         async with conn.transaction():
             await conn.execute("SET TRANSACTION READ ONLY")
-            rows = await conn.fetch(_REMOTE_QUERY)
+            rows = await conn.fetch(_REMOTE_QUERY, list(local_ids))
+            total = await conn.fetchval(_REMOTE_COUNT)
     finally:
         await conn.close()
 
@@ -372,7 +408,7 @@ async def fetch_remote_users(dsn: str) -> list[RemoteUser]:
         )
         for row in rows
     ]
-    return sorted(users, key=lambda u: str(u.id))
+    return RemoteAccounts(users=sorted(users, key=lambda u: str(u.id)), total=int(total or 0))
 
 
 async def load_local_users(db: AsyncSession) -> list[LocalUser]:
@@ -440,28 +476,56 @@ async def apply_plan(db: AsyncSession, plan: MigrationPlan, now: datetime) -> in
     return updated
 
 
+async def _withdraw(db: AsyncSession, raw_token: str) -> None:
+    """Spend the link of an e-mail that did not leave, so that it does not count as live."""
+    try:
+        await consume_token(db, raw_token, OneTimeTokenPurpose.PASSWORD_RESET)
+    except InvalidOneTimeToken:
+        pass  # already spent or replaced meanwhile: nothing live is left either way
+    await db.commit()
+
+
 async def send_reset_links(db: AsyncSession, failed: Optional[list[UUID]] = None) -> int:
-    """E-mail a password-reset link to every ACTIVE or PENDING account that has no password.
+    """E-mail a password-reset link to every migrated account (`auth_migrated_at` set) that is
+    ACTIVE or PENDING, has no password, and holds no live reset link (unused, unexpired).
 
     Returns how many e-mails were sent. One that cannot be sent does not stop the others: the
-    account's id is appended to `failed` (when given) and the run goes on; its link stays valid
-    and a later run replaces it. SMTP not being configured at all stops the run, since every
-    other e-mail would fail the same way. Only `AUTH_MODE=local` can send them: the link leads to
-    the local reset page, which cannot sign anyone in while the hosted provider is the authority.
+    account's id is appended to `failed` (when given), its link is withdrawn (spent), and the run
+    goes on. So a rerun mails exactly the accounts that did not get their e-mail: those that did
+    hold a live link and are skipped (for the hour the link lives; after that an account still
+    without a password is mailed again). An account that asked for a link itself is skipped the
+    same way. SMTP not being configured at all stops the run (the link just issued is withdrawn
+    too), since every other e-mail would fail the same way. Only `AUTH_MODE=local` can send them:
+    the link leads to the local reset page, which cannot sign anyone in while the hosted provider
+    is the authority.
 
     Each link is committed before it is sent, so a crash never leaves an e-mail whose link does
-    not exist. A link is never logged.
+    not exist; a crash between the two leaves a live link nobody received, and the account is
+    mailed by a run after it expires. A link is never logged.
     """
     if settings.AUTH_MODE != "local":
         raise MigrationError(
             "reset links are sent in AUTH_MODE=local only: until then the hosted provider "
             "authenticates and the link would lead nowhere"
         )
+    now = now_utc()
+    live_link = (
+        select(AuthOneTimeToken.id)
+        .where(
+            AuthOneTimeToken.user_id == User.id,
+            AuthOneTimeToken.purpose == OneTimeTokenPurpose.PASSWORD_RESET,
+            AuthOneTimeToken.used_at.is_(None),
+            AuthOneTimeToken.expires_at > now,
+        )
+        .exists()
+    )
     rows = await db.execute(
         select(User.id, User.email)
         .where(
             User.password_hash.is_(None),
             User.status.in_((UserStatus.ACTIVE, UserStatus.PENDING)),
+            User.auth_migrated_at.is_not(None),
+            ~live_link,
         )
         .order_by(User.email, User.id)
     )
@@ -478,12 +542,14 @@ async def send_reset_links(db: AsyncSession, failed: Optional[list[UUID]] = None
         try:
             await send_password_reset_email(email, raw_token)
         except EmailNotConfiguredError as exc:
+            await _withdraw(db, raw_token)
             raise MigrationError(
                 "SMTP is not configured (SMTP_HOST, SMTP_USER, SMTP_PASSWORD, "
                 "EMAIL_FROM_ADDRESS): no other e-mail was attempted"
             ) from exc
         except EmailSendError as exc:
             logger.error("Reset e-mail for user %s not sent (%s)", user_id, type(exc).__name__)
+            await _withdraw(db, raw_token)
             if failed is not None:
                 failed.append(user_id)
         else:
@@ -566,18 +632,36 @@ def _write_report(
         raise MigrationError(f"cannot write the report to {path}: {exc.strerror or exc}") from exc
 
 
+def _sqlstate(exc: BaseException) -> Optional[str]:
+    """The SQLSTATE of a database error, wherever the driver or SQLAlchemy put it."""
+    orig = getattr(exc, "orig", None)
+    for candidate in (exc, orig, getattr(orig, "__cause__", None), exc.__cause__):
+        for attribute in ("sqlstate", "pgcode"):
+            code = getattr(candidate, attribute, None)
+            if isinstance(code, str) and code:
+                return code
+    return None
+
+
 def _describe(exc: BaseException, secrets: tuple[Optional[str], ...]) -> str:
-    """One line about a failure, with the connection string (and its password) taken out.
-    A SQLAlchemy error is described by its driver's message only: the statement it carries could
-    hold the parameters, a hash among them."""
+    """One line about a failure: the exception's class, its SQLSTATE if it has one, and the FIRST
+    line of its message, with the connection string (and its password) taken out.
+
+    Only the first line: asyncpg appends `DETAIL:` (and `HINT:`) lines to its messages, and a
+    DETAIL can quote the row that failed (an address, a hash). A SQLAlchemy error is described by
+    its driver's message, never its own: the statement it carries could hold the parameters."""
     if isinstance(exc, SQLAlchemyError):
         text = str(getattr(exc, "orig", None) or "database error")
     else:
         text = str(exc)
+    lines = text.strip().splitlines()
+    first = lines[0].strip() if lines else ""
     for secret in secrets:
         if secret:
-            text = text.replace(secret, "***")
-    return f"{type(exc).__name__}: {text}".strip()
+            first = first.replace(secret, "***")
+    state = _sqlstate(exc)
+    head = type(exc).__name__ + (f" [SQLSTATE {state}]" if state else "")
+    return f"{head}: {first}" if first else head
 
 
 def _secrets_of(dsn: Optional[str]) -> tuple[Optional[str], ...]:
@@ -591,7 +675,7 @@ async def _migrate(
     args: argparse.Namespace,
     *,
     session_factory,
-    fetch: Callable[[str], Awaitable[list[RemoteUser]]],
+    fetch: Fetch,
     out: TextIO,
     now: datetime,
 ) -> None:
@@ -603,10 +687,11 @@ async def _migrate(
             "SUPABASE_DB_URL is not set: it is the connection string of the Supabase pooler "
             "(session mode), read-only use only"
         )
-    remote = await fetch(dsn)
     async with session_factory() as db:
         local = await load_local_users(db)
-        plan = plan_migration(local, remote, now)
+        await db.rollback()  # no transaction is held open while the hosted database is read
+        remote = await fetch(dsn, [user.id for user in local])
+        plan = plan_migration(local, remote.users, now, remote_total=remote.total)
         mode = "apply" if args.apply else "dry-run"
         if args.report:
             _write_report(args.report, mode, now, plan, len(local))
@@ -635,7 +720,8 @@ async def _resets(*, session_factory, out: TextIO, err: TextIO) -> int:
         print(
             "error: the e-mail could not be sent for account(s) "
             + ", ".join(str(user_id) for user_id in failed)
-            + "; run --send-resets again once SMTP answers (a new link replaces the old one)",
+            + "; run --send-resets again once SMTP answers: it mails only the accounts whose "
+            "e-mail did not leave (an account that got its link is skipped while the link lives)",
             file=err,
         )
         return 1
@@ -646,14 +732,15 @@ async def run(
     argv: list[str],
     *,
     session_factory,
-    fetch: Optional[Callable[[str], Awaitable[list[RemoteUser]]]] = None,
+    fetch: Optional[Fetch] = None,
     out: Optional[TextIO] = None,
     err: Optional[TextIO] = None,
     now: Optional[datetime] = None,
 ) -> int:
     """The command, on the database `session_factory` opens. Returns the exit code.
 
-    `fetch` reads the Supabase accounts (default: `fetch_remote_users`), `now` fixes the clock.
+    `fetch` reads the Supabase accounts of the given local ids (default: `fetch_remote_users`),
+    `now` fixes the clock.
     """
     out = sys.stdout if out is None else out
     err = sys.stderr if err is None else err

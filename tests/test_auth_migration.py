@@ -230,6 +230,40 @@ def test_an_account_without_a_remote_address_keeps_its_own():
     assert update.email is None
 
 
+def test_the_supabase_address_is_written_lowercased_and_stripped():
+    """Addresses are stored lowercased (spec section 7.1): the sign-in looks them up that way."""
+    moved, own_in_capitals = uuid4(), uuid4()
+    plan = plan_migration(
+        [L(moved, email="old@example.test"), L(own_in_capitals, email="Mine@Example.test")],
+        [
+            R(moved, email="  New.Person@Example.TEST "),
+            R(own_in_capitals, email="MINE@example.test"),
+        ],
+        now=NOW,
+    )
+    assert by_id(plan.updates, moved).email == "new.person@example.test"
+    assert by_id(plan.updates, own_in_capitals).email == "mine@example.test"
+    assert plan.anomalies == []
+
+
+def test_out_of_scope_comes_from_the_hosted_count_when_it_is_given():
+    """The read fetches the local accounts only and counts the others (`remote_total`)."""
+    mine, missing = uuid4(), uuid4()
+    plan = plan_migration([L(mine), L(missing)], [R(mine)], now=NOW, remote_total=7)
+    assert plan.out_of_scope == 6
+    assert plan_migration([L(mine)], [R(mine)], now=NOW, remote_total=1).out_of_scope == 0
+
+
+def test_a_hash_never_shows_in_a_repr():
+    uid = uuid4()
+    remote = R(uid, pw=BCRYPT_X)
+    plan = plan_migration([L(uid)], [remote], now=NOW)
+    assert by_id(plan.updates, uid).password_hash == BCRYPT_X
+    explicit = migration.UserUpdate(user_id=uid, password_hash=BCRYPT_Y)
+    for text in (repr(remote), repr(plan), str(plan), repr(explicit)):
+        assert BCRYPT_X not in text and BCRYPT_Y not in text and "$2a$" not in text
+
+
 @pytest.mark.parametrize("local_role", [UserRole.ADMIN, UserRole.SCILICIUM_ADMIN])
 @pytest.mark.parametrize("profile_role", ["user", "viewer", "nonsense", None])
 def test_local_admins_are_never_touched_by_the_profile_role(local_role, profile_role):
@@ -742,15 +776,22 @@ async def test_load_local_users_reads_what_the_plan_needs(auth_db):
 
 
 class _Fetch:
-    """Stands in for the read of the hosted database; records the connection string it got."""
+    """Stands in for the read of the hosted database, which holds `users`: answers, as the real
+    query does, with the accounts whose id it is given, plus the count of all of them. Records the
+    connection string and the ids it got."""
 
     def __init__(self, users):
         self.users = users
         self.dsns: list[str] = []
+        self.ids_asked: list[list[UUID]] = []
 
-    async def __call__(self, dsn: str):
+    async def __call__(self, dsn: str, local_ids):
         self.dsns.append(dsn)
-        return list(self.users)
+        self.ids_asked.append(list(local_ids))
+        wanted = set(local_ids)
+        return migration.RemoteAccounts(
+            users=[u for u in self.users if u.id in wanted], total=len(self.users)
+        )
 
 
 SECRET_DSN = "postgresql://postgres.abc:s3cret-Pa55@pooler.example.test:5432/postgres"
@@ -936,10 +977,75 @@ async def test_the_connection_string_is_passed_on_but_never_printed(auth_db, set
     assert "s3cret" not in out.getvalue() + err.getvalue()
 
 
+async def test_only_the_local_accounts_are_read_from_supabase(auth_db, settings_override):
+    """The hosted project is shared with another application: its other accounts (and their
+    hashes) are never fetched, only counted."""
+    remote, users = await _scenario(auth_db)
+    settings_override(SUPABASE_DB_URL=SECRET_DSN)
+    fetch, out, err = _Fetch(remote), StringIO(), StringIO()
+    code = await migration.run([], session_factory=auth_db, fetch=fetch, out=out, err=err, now=NOW)
+    assert code == 0, err.getvalue()
+    [asked] = fetch.ids_asked
+    assert sorted(asked, key=str) == sorted((u.id for u in users), key=str)
+    assert "out of scope: 1" in out.getvalue()  # the stranger, counted, never read
+
+
+async def test_a_database_failure_prints_one_line_without_the_row(auth_db, settings_override):
+    """asyncpg appends `DETAIL:` (which can quote the failing row) to its messages, and a
+    SQLAlchemy error carries the statement and its parameters: only the class, the SQLSTATE and
+    the first line of the message are printed."""
+    from sqlalchemy.exc import IntegrityError
+
+    class UniqueViolation(Exception):
+        sqlstate = "23505"
+
+    async def failing_apply(*_args, **_kwargs):
+        raise IntegrityError(
+            "UPDATE users SET password_hash=$1",
+            (BCRYPT_X,),
+            UniqueViolation(
+                'duplicate key value violates unique constraint "users_email_key"\n'
+                "DETAIL:  Key (email)=(row-owner@example.test) already exists."
+            ),
+        )
+
+    remote, _users = await _scenario(auth_db)
+    settings_override(SUPABASE_DB_URL=SECRET_DSN)
+    out, err = StringIO(), StringIO()
+    original = migration.apply_plan
+    migration.apply_plan = failing_apply
+    try:
+        code = await migration.run(
+            ["--apply"], session_factory=auth_db, fetch=_Fetch(remote), out=out, err=err, now=NOW
+        )
+    finally:
+        migration.apply_plan = original
+    assert code == 1
+    assert err.getvalue() == (
+        "error: IntegrityError [SQLSTATE 23505]: duplicate key value violates unique "
+        'constraint "users_email_key"\n'
+    )
+
+
+def test_describe_keeps_the_first_line_and_drops_the_connection_string():
+    class InsufficientPrivilege(Exception):
+        sqlstate = "42501"
+
+    text = migration._describe(
+        InsufficientPrivilege(
+            f"permission denied with {SECRET_DSN}\nDETAIL: (row-owner@example.test, {BCRYPT_X})"
+        ),
+        migration._secrets_of(SECRET_DSN),
+    )
+    assert text == "InsufficientPrivilege [SQLSTATE 42501]: permission denied with ***"
+    assert migration._describe(RuntimeError(""), ()) == "RuntimeError"
+    assert migration._describe(ValueError("bad\nworse"), ()) == "ValueError: bad"
+
+
 async def test_a_failure_of_the_hosted_read_is_explained_without_the_connection_string(
     auth_db, settings_override
 ):
-    async def unreachable(dsn):
+    async def unreachable(dsn, _local_ids):
         raise ConnectionError(f"could not connect with {dsn}")
 
     settings_override(SUPABASE_DB_URL=SECRET_DSN)
@@ -1016,9 +1122,11 @@ class _FakeTransaction:
 
 
 class _FakeConnection:
-    def __init__(self, rows):
+    def __init__(self, rows, total=None):
         self.rows = rows
+        self.total = len(rows) if total is None else total
         self.statements: list[str] = []
+        self.arguments: list[tuple] = []
         self.closed = False
 
     def transaction(self, **_options):
@@ -1027,9 +1135,15 @@ class _FakeConnection:
     async def execute(self, sql, *_args):
         self.statements.append(" ".join(sql.split()))
 
-    async def fetch(self, sql, *_args):
+    async def fetch(self, sql, *args):
         self.statements.append(" ".join(sql.split()))
+        self.arguments.append(args)
         return self.rows
+
+    async def fetchval(self, sql, *args):
+        self.statements.append(" ".join(sql.split()))
+        self.arguments.append(args)
+        return self.total
 
     async def close(self):
         self.closed = True
@@ -1062,8 +1176,8 @@ def _row_of(user_id, **overrides):
     ],
 )
 async def test_the_hosted_read_is_read_only_and_accepts_both_dsn_forms(monkeypatch, given, passed):
-    uid = uuid4()
-    conn = _FakeConnection([_row_of(uid)])
+    uid, other_local = uuid4(), uuid4()
+    conn = _FakeConnection([_row_of(uid)], total=40)
     seen = []
 
     async def connect(dsn, **_options):
@@ -1071,7 +1185,7 @@ async def test_the_hosted_read_is_read_only_and_accepts_both_dsn_forms(monkeypat
         return conn
 
     monkeypatch.setattr(migration.asyncpg, "connect", connect)
-    users = await fetch_remote_users(given)
+    accounts = await fetch_remote_users(given, [uid, other_local])
     assert seen == [passed]
     assert conn.closed
     assert conn.statements[0] == "BEGIN"
@@ -1080,10 +1194,15 @@ async def test_the_hosted_read_is_read_only_and_accepts_both_dsn_forms(monkeypat
     select_sql = conn.statements[2].lower()
     assert select_sql.startswith("select")
     assert "from auth.users" in select_sql and "left join public.profiles" in select_sql
+    # Only the local accounts are fetched; the others are counted, never read.
+    assert select_sql.endswith("where u.id = any($1::uuid[])")
+    assert conn.arguments[0] == ([uid, other_local],)
+    assert conn.statements[3].lower() == "select count(*) from auth.users"
+    assert accounts.total == 40
     assert not any(
         word in " ".join(conn.statements).lower() for word in ("insert ", "update ", "delete ")
     )
-    (user,) = users
+    (user,) = accounts.users
     assert user == RemoteUser(
         id=uid,
         email="remote@example.test",
@@ -1109,7 +1228,7 @@ async def test_the_hosted_read_closes_the_connection_on_failure(monkeypatch):
 
     monkeypatch.setattr(migration.asyncpg, "connect", connect)
     with pytest.raises(RuntimeError):
-        await fetch_remote_users(SECRET_DSN)
+        await fetch_remote_users(SECRET_DSN, [uuid4()])
     assert conn.closed and conn.statements[-1] == "ROLLBACK"
 
 
@@ -1121,7 +1240,7 @@ async def test_the_hosted_read_copes_with_accounts_that_have_no_e_mail_and_sorts
         return conn
 
     monkeypatch.setattr(migration.asyncpg, "connect", connect)
-    users = await fetch_remote_users(SECRET_DSN)
+    users = (await fetch_remote_users(SECRET_DSN, [high, low])).users
     assert [u.id for u in users] == [low, high]
     assert users[1].email == "" and users[0].profile_role is None
 
@@ -1170,24 +1289,27 @@ async def _throwaway_hosted_schema():
 
 
 async def test_the_hosted_read_against_a_real_postgres():
-    with_profile, without_profile = uuid4(), uuid4()
+    with_profile, without_profile, stranger = uuid4(), uuid4(), uuid4()
     async with _throwaway_hosted_schema() as conn:
         await conn.execute(
             "INSERT INTO auth.users VALUES ($1, 'a@example.test', $2, $3, $3, NULL, NULL), "
-            "($4, 'b@example.test', NULL, NULL, NULL, $5, $3)",
+            "($4, 'b@example.test', NULL, NULL, NULL, $5, $3), "
+            "($6, 'other-app@example.test', $2, NULL, NULL, NULL, NULL)",
             with_profile,
             BCRYPT_X,
             NOW,
             without_profile,
             NOW + timedelta(days=1),
+            stranger,
         )
         await conn.execute("INSERT INTO public.profiles VALUES ($1, 'analyst')", with_profile)
-        users = {
-            u.id: u
-            for u in await fetch_remote_users(
-                TEST_PG.replace("postgresql://", "postgresql+asyncpg://")
-            )
-        }
+        accounts = await fetch_remote_users(
+            TEST_PG.replace("postgresql://", "postgresql+asyncpg://"),
+            [with_profile, without_profile, uuid4()],  # the last one has no Supabase account
+        )
+        assert accounts.total == 3
+        users = {u.id: u for u in accounts.users}
+        assert set(users) == {with_profile, without_profile}  # the stranger is never read
         assert users[with_profile] == RemoteUser(
             id=UUID(str(with_profile)),
             email="a@example.test",
@@ -1202,7 +1324,7 @@ async def test_the_hosted_read_against_a_real_postgres():
         assert users[without_profile].deleted_at == NOW
         assert users[without_profile].banned_until == NOW + timedelta(days=1)
         # the read really is read-only: the same statement shape cannot write
-        assert await conn.fetchval("SELECT count(*) FROM auth.users") == 2
+        assert await conn.fetchval("SELECT count(*) FROM auth.users") == 3
 
 
 async def test_apply_against_a_real_postgres():
@@ -1304,32 +1426,48 @@ async def test_reset_links_refuse_outside_local_mode(auth_db, settings_override,
     assert smtp_capture.messages == []
 
 
-async def test_reset_links_go_to_the_accounts_without_a_password(
-    auth_db, settings_override, smtp_capture
-):
-    settings_override(AUTH_MODE="local", APP_URL="https://app.example.test")
-    needs_1 = await seed_user(auth_db, email="n1@example.test")
-    needs_2 = await seed_user(auth_db, email="n2@example.test", status=UserStatus.PENDING)
-    has_password = await seed_user(
-        auth_db, email="has@example.test", password_hash=hash_password(PW)
-    )
-    suspended = await seed_user(auth_db, email="susp@example.test", status=UserStatus.SUSPENDED)
-    cancelled = await seed_user(auth_db, email="canc@example.test", status=UserStatus.CANCELLED)
-    async with auth_db() as db:
-        assert await send_reset_links(db) == 2
-    assert sorted(m.to for m in smtp_capture.messages) == ["n1@example.test", "n2@example.test"]
+async def _migrated_user(auth_db, **fields) -> User:
+    """An account the migration moved (`auth_migrated_at` set), without a password unless given."""
+    return await seed_user(auth_db, auth_migrated_at=NOW - timedelta(days=1), **fields)
+
+
+async def _reset_tokens(auth_db) -> list[AuthOneTimeToken]:
     async with auth_db() as s:
-        owners = set(
+        return list(
             (
                 await s.scalars(
-                    select(AuthOneTimeToken.user_id).where(
+                    select(AuthOneTimeToken).where(
                         AuthOneTimeToken.purpose == OneTimeTokenPurpose.PASSWORD_RESET
                     )
                 )
             ).all()
         )
+
+
+async def test_reset_links_go_to_the_accounts_without_a_password(
+    auth_db, settings_override, smtp_capture
+):
+    settings_override(AUTH_MODE="local", APP_URL="https://app.example.test")
+    needs_1 = await _migrated_user(auth_db, email="n1@example.test")
+    needs_2 = await _migrated_user(auth_db, email="n2@example.test", status=UserStatus.PENDING)
+    has_password = await _migrated_user(
+        auth_db, email="has@example.test", password_hash=hash_password(PW)
+    )
+    suspended = await _migrated_user(
+        auth_db, email="susp@example.test", status=UserStatus.SUSPENDED
+    )
+    cancelled = await _migrated_user(
+        auth_db, email="canc@example.test", status=UserStatus.CANCELLED
+    )
+    # Never migrated (an invitation of the new system, say): not this command's business.
+    never_migrated = await seed_user(auth_db, email="invited@example.test")
+    async with auth_db() as db:
+        assert await send_reset_links(db) == 2
+    assert sorted(m.to for m in smtp_capture.messages) == ["n1@example.test", "n2@example.test"]
+    async with auth_db() as s:
+        owners = {t.user_id for t in await _reset_tokens(auth_db)}
         assert owners == {needs_1.id, needs_2.id}
-        assert {has_password.id, suspended.id, cancelled.id}.isdisjoint(owners)
+        assert {has_password.id, suspended.id, cancelled.id, never_migrated.id}.isdisjoint(owners)
         events = (await s.scalars(select(AuthEvent))).all()
         assert {e.event_type for e in events} == {AuthEventType.PASSWORD_RESET_REQUESTED.value}
         assert {e.user_id for e in events} == {needs_1.id, needs_2.id}
@@ -1338,11 +1476,41 @@ async def test_reset_links_go_to_the_accounts_without_a_password(
         assert "https://app.example.test/auth/reset?token=" in message.text
 
 
-async def test_a_failed_e_mail_does_not_stop_the_others_and_is_counted(
+async def test_reset_links_skip_an_account_that_holds_a_live_link(
+    auth_db, settings_override, smtp_capture
+):
+    """An account with an unused, unexpired reset link (from an earlier run, or one it asked for
+    itself) is not mailed again; an expired or spent link does not count."""
+    from app.auth.clock import now_utc
+    from app.auth.one_time_tokens import consume_token, issue_token
+
+    settings_override(AUTH_MODE="local")
+    live = await _migrated_user(auth_db, email="live@example.test")
+    expired = await _migrated_user(auth_db, email="expired@example.test")
+    spent = await _migrated_user(auth_db, email="spent@example.test")
+    async with auth_db() as db:
+        await issue_token(db, live.id, OneTimeTokenPurpose.PASSWORD_RESET)
+        await issue_token(
+            db, expired.id, OneTimeTokenPurpose.PASSWORD_RESET, now=now_utc() - timedelta(hours=2)
+        )
+        raw = await issue_token(db, spent.id, OneTimeTokenPurpose.PASSWORD_RESET)
+        await consume_token(db, raw, OneTimeTokenPurpose.PASSWORD_RESET)
+        await db.commit()
+
+    async with auth_db() as db:
+        assert await send_reset_links(db) == 2
+    assert sorted(m.to for m in smtp_capture.messages) == [
+        "expired@example.test",
+        "spent@example.test",
+    ]
+
+
+async def test_a_failed_e_mail_does_not_stop_the_others_and_a_rerun_mails_only_it(
     auth_db, settings_override, smtp_capture, caplog
 ):
     settings_override(AUTH_MODE="local", APP_URL="https://app.example.test")
-    users = [await seed_user(auth_db, email=f"u{i}@example.test") for i in range(3)]
+    users = [await _migrated_user(auth_db, email=f"u{i}@example.test") for i in range(3)]
+    unlucky = next(u.id for u in users if u.email == "u1@example.test")
     sent_to = []
 
     async def flaky(message, **_options):
@@ -1361,20 +1529,45 @@ async def test_a_failed_e_mail_does_not_stop_the_others_and_is_counted(
     finally:
         email_service.aiosmtplib.send = original
     assert sorted(sent_to) == ["u0@example.test", "u2@example.test"]
-    assert failed == [next(u.id for u in users if u.email == "u1@example.test")]
-    # the tokens of the accounts whose e-mail failed stay issued (a retry replaces them), and no
-    # token ever reaches the logs
-    async with auth_db() as s:
-        assert await s.scalar(select(func.count()).select_from(AuthOneTimeToken)) == 3
+    assert failed == [unlucky]
+    # The link of the e-mail that did not leave is withdrawn (spent), so that it is not mistaken
+    # for a live link; the others stay live. No token ever reaches the logs.
+    tokens = {t.user_id: t for t in await _reset_tokens(auth_db)}
+    assert len(tokens) == 3
+    assert tokens[unlucky].used_at is not None
+    assert all(t.used_at is None for uid, t in tokens.items() if uid != unlucky)
     assert "token=" not in caplog.text
+
+    # SMTP answers again: the rerun mails the failure only.
+    async with auth_db() as db:
+        assert await send_reset_links(db) == 1
+    assert [m.to for m in smtp_capture.messages] == ["u1@example.test"]
+
+
+async def test_smtp_not_configured_stops_the_run_and_withdraws_the_link(
+    auth_db, settings_override, smtp_capture
+):
+    settings_override(AUTH_MODE="local", SMTP_HOST=None)
+    first = await _migrated_user(auth_db, email="a1@example.test")
+    await _migrated_user(auth_db, email="a2@example.test")
+    async with auth_db() as db:
+        with pytest.raises(migration.MigrationError, match="SMTP"):
+            await send_reset_links(db)
+    [token] = await _reset_tokens(auth_db)  # only the first was tried
+    assert token.user_id == first.id and token.used_at is not None
+
+    settings_override(SMTP_HOST="smtp.example.test")
+    async with auth_db() as db:
+        assert await send_reset_links(db) == 2  # nobody was left out
+    assert sorted(m.to for m in smtp_capture.messages) == ["a1@example.test", "a2@example.test"]
 
 
 async def test_the_command_sends_resets_and_reports_counts(
     auth_db, settings_override, smtp_capture
 ):
     settings_override(AUTH_MODE="local", SUPABASE_DB_URL=None)
-    await seed_user(auth_db, email="n1@example.test")
-    await seed_user(auth_db, email="n2@example.test")
+    await _migrated_user(auth_db, email="n1@example.test")
+    await _migrated_user(auth_db, email="n2@example.test")
     out, err = StringIO(), StringIO()
     code = await migration.run(
         ["--send-resets"], session_factory=auth_db, fetch=_Fetch([]), out=out, err=err, now=NOW
@@ -1388,7 +1581,7 @@ async def test_the_command_exits_1_when_some_resets_could_not_be_sent(
     auth_db, settings_override, smtp_capture
 ):
     settings_override(AUTH_MODE="local")
-    await seed_user(auth_db, email="n1@example.test")
+    await _migrated_user(auth_db, email="n1@example.test")
     smtp_capture.fail_with = OSError("unreachable")
     out, err = StringIO(), StringIO()
     code = await migration.run(
@@ -1396,6 +1589,9 @@ async def test_the_command_exits_1_when_some_resets_could_not_be_sent(
     )
     assert code == 1
     assert "1" in out.getvalue() and "failed" in out.getvalue().lower()
+    # The advice says what a rerun does: mail the failures only.
+    assert "run --send-resets again" in err.getvalue()
+    assert "only the accounts whose e-mail did not leave" in err.getvalue()
 
 
 async def test_the_command_refuses_resets_in_supabase_mode(
