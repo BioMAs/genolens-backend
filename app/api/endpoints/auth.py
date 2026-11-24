@@ -49,9 +49,14 @@ existing one. The client offers to resend the verification link after a failed s
 Transactions. Each route commits its own writes before it answers. `reserve_attempt` is committed
 at once, before the code is checked, so a refusal cannot hand the attempt back. A refresh commits
 on every outcome: the row lock `rotate_refresh` takes must not be held, and the revocation of a
-reused session must survive the 401. The notification e-mails (2FA turned on, recovery code used)
-are sent after the commit and are best effort: an SMTP failure is logged and audited, the request
-still succeeds (the recovery codes are shown only once).
+reused session must survive the 401.
+
+E-mails. The notifications (2FA turned on, recovery code used) are scheduled once the event is
+committed and leave after the response, from a FastAPI background job (`_notify`): the response
+never waits for SMTP, so an SMTP stall cannot hold back the recovery codes it carries. They are
+best effort: a failure is logged and audited (`notification: not_sent`) by the job, in a short
+database session of its own (the request's is closed by then), and never reaches the HTTP response.
+`app.api.endpoints.auth_account` sends its e-mails the same way.
 """
 
 import hashlib
@@ -60,7 +65,7 @@ from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from slowapi.util import get_remote_address
@@ -405,39 +410,62 @@ async def _recovery_codes_left(db: AsyncSession, user_id: UUID) -> int:
     return int(count or 0)
 
 
-async def _notify(
-    db: AsyncSession,
+def _job_session() -> AsyncSession:
+    """A database session of the job's own. A background job runs after the response, when the
+    request's session (`get_db`) is already closed: it opens one, briefly, and closes it. Looked up
+    at call time, so that the tests can point the factory at their database."""
+    from app.db import session as db_session
+
+    return db_session.AsyncSessionLocal()
+
+
+async def _deliver(
     request: Request,
     user_id: UUID,
     event_type: AuthEventType,
     send: Callable[[], Awaitable[None]],
 ) -> None:
-    """Send a security notification once the event it reports is committed. Best effort: the
-    session is already open, so a failure is logged and audited (`notification: not_sent`), never
-    raised. Anything else that goes wrong is caught too, after a traceback is logged: answering 500
-    now would lose what the response carries (the recovery codes, shown once)."""
+    """The background job behind `_notify`: send the e-mail; if it does not leave, log it (the
+    exception's class only, never the message or the link) and audit `event_type` with
+    `notification: not_sent` in a session of its own. Never raises: there is no response left to
+    fail, and an exception would only reach the server's error log without the audit row."""
     try:
         await send()
         return
     except (EmailSendError, EmailNotConfiguredError) as exc:
-        logger.warning("Security notification not sent (%s)", type(exc).__name__)
+        logger.warning("Auth e-mail not sent (%s)", type(exc).__name__)
         error_kind = type(exc).__name__
     except Exception as exc:
-        logger.exception("Security notification failed unexpectedly")
+        logger.error("Auth e-mail failed unexpectedly (%s)", type(exc).__name__)
         error_kind = type(exc).__name__
     try:
-        await record_event(
-            db,
-            event_type,
-            user_id=user_id,
-            request=request,
-            notification="not_sent",
-            error_kind=error_kind,
-        )
-        await db.commit()
-    except Exception:
-        logger.exception("Could not audit an unsent security notification")
-        await db.rollback()
+        async with _job_session() as db:
+            await record_event(
+                db,
+                event_type,
+                user_id=user_id,
+                request=request,
+                notification="not_sent",
+                error_kind=error_kind,
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.error("Could not audit an unsent auth e-mail (%s)", type(exc).__name__)
+
+
+def _notify(
+    background: BackgroundTasks,
+    request: Request,
+    user_id: UUID,
+    event_type: AuthEventType,
+    send: Callable[[], Awaitable[None]],
+) -> None:
+    """Have `send()` run after the response, as a background job (`_deliver`). Called once the
+    event the e-mail reports is committed; the response never waits for SMTP, so its time does not
+    depend on whether an e-mail leaves (anti-enumeration), and an SMTP stall cannot hold back what
+    the response carries (recovery codes, shown once). Best effort: a failure is logged and audited
+    (`notification: not_sent`), it never reaches the HTTP response."""
+    background.add_task(_deliver, request, user_id, event_type, send)
 
 
 async def _open_session(
@@ -530,6 +558,7 @@ async def verify_mfa(
     request: Request,
     response: Response,
     body: MfaVerifyRequest,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> Any:
     now = now_utc()
@@ -593,8 +622,8 @@ async def verify_mfa(
     cookies.clear_step_cookie(response)
     if remaining is not None:
         left = remaining
-        await _notify(
-            db,
+        _notify(
+            background,
             request,
             user_id,
             AuthEventType.RECOVERY_CODE_USED,
@@ -632,6 +661,7 @@ async def confirm_mfa_setup(
     request: Request,
     response: Response,
     body: MfaConfirmRequest,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> Any:
     now = now_utc()
@@ -699,8 +729,12 @@ async def confirm_mfa_setup(
     cookies.set_session_cookies(response, issued)
     cookies.clear_step_cookie(response)
     response.headers["Cache-Control"] = "no-store"
-    await _notify(
-        db, request, user_id, AuthEventType.MFA_ENROLLED, lambda: send_mfa_enabled_email(email)
+    _notify(
+        background,
+        request,
+        user_id,
+        AuthEventType.MFA_ENROLLED,
+        lambda: send_mfa_enabled_email(email),
     )
     return {"recovery_codes": codes, "next": "app"}
 

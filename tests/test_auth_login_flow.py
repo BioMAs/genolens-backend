@@ -45,7 +45,7 @@ from app.models.auth import (
     AuthSession,
 )
 from app.models.models import User
-from tests.auth_support import CSRF, NOW, PW, access_cookie, bearer, seed_user
+from tests.auth_support import CSRF, NOW, PW, access_cookie, bearer, call_app_directly, seed_user
 
 AUTH = "/api/v1/auth"
 LOGIN = f"{AUTH}/login"
@@ -633,6 +633,44 @@ async def test_recovery_alert_failure_does_not_fail_the_login(auth_client, auth_
     assert "gl_at" in r.cookies
     used = await events(auth_db, AuthEventType.RECOVERY_CODE_USED)
     assert [e.details.get("notification") for e in used] == [None, "not_sent"]
+
+
+async def test_security_notices_leave_after_the_response(auth_client, auth_db, local_auth):
+    """The recovery codes of an enrolment and the session of a recovery-code sign-in are answered
+    without waiting for the notification e-mail: a stalled SMTP server cannot hold them back, and
+    a failure after the response is still audited."""
+    user, _ = await mfa_user(auth_db)
+    [code] = await give_recovery_codes(auth_db, user, count=1)
+    step = (await login(auth_client, user.email)).cookies["gl_mfa"]
+
+    used = await call_app_directly(
+        local_auth,
+        "POST",
+        VERIFY,
+        {"recovery_code": code},
+        {**CSRF, "Cookie": f"gl_mfa={step}"},
+    )
+    assert used.status == 200 and used.json() == {"next": "app"}
+    assert used.emails_attempted == 1 and "no recovery codes" in local_auth.last_text
+
+    newcomer = await verified_user(auth_db)
+    auth_client.cookies.clear()
+    await login(auth_client, newcomer.email)
+    secret = (await auth_client.post(SETUP_START, headers=CSRF)).json()["secret"]
+    step = auth_client.cookies["gl_mfa"]
+    local_auth.fail_with = ConnectionRefusedError("down")
+
+    enrolled = await call_app_directly(
+        local_auth,
+        "POST",
+        SETUP_CONFIRM,
+        {"code": code_at(secret)},
+        {**CSRF, "Cookie": f"gl_mfa={step}"},
+    )
+    assert enrolled.status == 200 and len(enrolled.json()["recovery_codes"]) == 10
+    assert enrolled.emails_attempted == 1
+    unsent = await events(auth_db, AuthEventType.MFA_ENROLLED)
+    assert [e.details.get("notification") for e in unsent] == [None, "not_sent"]
 
 
 async def test_enrolment_completes_without_mail(

@@ -32,7 +32,7 @@ from app.auth.passwords import hash_password, verify_password
 from app.models.auth import AuthEventType, AuthOneTimeToken, AuthRecoveryCode, AuthSession
 from app.models.auth import OneTimeTokenPurpose as Purpose
 from app.models.models import SubscriptionPlan, User, UserRole, UserStatus
-from tests.auth_support import CSRF, PW, access_cookie, bearer, seed_user
+from tests.auth_support import CSRF, PW, access_cookie, bearer, call_app_directly, seed_user
 from tests.test_auth_login_flow import (
     SETUP_START,
     code_at,
@@ -380,6 +380,108 @@ async def test_forgot_answers_the_same_while_smtp_is_down(auth_client, auth_db, 
     assert r.status_code == 202 and r.json() == ACCEPTED
     requested = await events(auth_db, AuthEventType.PASSWORD_RESET_REQUESTED)
     assert [e.details.get("notification") for e in requested] == [None, "not_sent"]
+
+
+# ── E-mails leave after the response ─────────────────────────────────────────
+
+
+async def direct(local_auth, path: str, body: dict, headers: dict = CSRF, method: str = "POST"):
+    """`path` driven straight through the ASGI app, with an SMTP server that answers only once the
+    response is sent (`call_app_directly`): a route that waited for SMTP would never finish."""
+    return await call_app_directly(local_auth, method, path, body, headers)
+
+
+@pytest.mark.parametrize("case", ["forgot", "resend", "signup_new", "signup_existing"])
+async def test_link_e_mails_leave_after_the_response(auth_client, auth_db, local_auth, case):
+    verified = await verified_user(auth_db)
+    unverified = await seed_user(auth_db, password_hash=hash_password(PW))
+    path, body, to = {
+        "forgot": (FORGOT, {"email": verified.email}, verified.email),
+        "resend": (RESEND, {"email": unverified.email}, unverified.email),
+        "signup_new": (SIGNUP, {"email": "new@example.test", "password": PW}, "new@example.test"),
+        "signup_existing": (SIGNUP, {"email": verified.email, "password": PW}, verified.email),
+    }[case]
+
+    exchange = await direct(local_auth, path, body)
+
+    assert exchange.status == 202 and exchange.json() == ACCEPTED
+    assert exchange.emails_attempted == 1
+    [message] = local_auth.messages  # sent by the background job, once the response was out
+    assert message.to == to
+
+
+async def test_known_and_unknown_addresses_get_the_same_answer_before_any_e_mail(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    """Same status, body and headers, and none of them waits for SMTP: the e-mail of a known
+    address leaves after the response, so the response time does not tell the two apart. The
+    throttled sign-up (an address that already had its three links this hour) sends nothing and is
+    answered the same way too."""
+    verified = await verified_user(auth_db)
+    unverified = await seed_user(auth_db, password_hash=hash_password(PW))
+    throttled = await verified_user(auth_db)
+    async with auth_db() as s:
+        for _ in range(3):
+            await issue_token(s, throttled.id, Purpose.PASSWORD_RESET)
+        await s.commit()
+
+    cases = [
+        (FORGOT, {"email": verified.email}, 1),
+        (FORGOT, {"email": "nobody@example.test"}, 0),
+        (RESEND, {"email": unverified.email}, 1),
+        (RESEND, {"email": verified.email}, 0),
+        (RESEND, {"email": "nobody@example.test"}, 0),
+        (SIGNUP, {"email": verified.email, "password": PW}, 1),
+        (SIGNUP, {"email": "fresh@example.test", "password": PW}, 1),
+        (SIGNUP, {"email": throttled.email, "password": PW}, 0),
+    ]
+    answers = []
+    for path, body, emails in cases:
+        sent_before = len(local_auth.messages)
+        exchange = await direct(local_auth, path, body)
+        assert exchange.emails_attempted == emails, (path, body)
+        assert len(local_auth.messages) - sent_before == emails, (path, body)
+        answers.append((exchange.status, exchange.body, exchange.headers))
+
+    assert answers[0][0] == 202
+    assert all(answer == answers[0] for answer in answers), answers
+
+
+async def test_an_e_mail_that_fails_after_the_response_is_audited(auth_client, auth_db, local_auth):
+    user = await verified_user(auth_db)
+    local_auth.fail_with = ConnectionRefusedError("down")
+
+    exchange = await direct(local_auth, FORGOT, {"email": user.email})
+
+    assert exchange.status == 202 and exchange.json() == ACCEPTED
+    assert exchange.emails_attempted == 1 and local_auth.messages == []
+    requested = await events(auth_db, AuthEventType.PASSWORD_RESET_REQUESTED)
+    assert [e.details.get("notification") for e in requested] == [None, "not_sent"]
+    assert requested[1].details["error_kind"] == "EmailSendError"
+    assert requested[1].user_id == user.id and requested[1].ip == "203.0.113.9"
+
+
+async def test_password_change_notices_leave_after_the_response(
+    auth_client, auth_db, local_auth, local_session_for
+):
+    user = await verified_user(auth_db)
+    await post(auth_client, FORGOT, {"email": user.email})
+    raw = link_token(local_auth.last_text, "/auth/reset")
+    local_auth.messages.clear()
+
+    reset = await direct(local_auth, RESET, {"token": raw, "new_password": NEW_PW})
+    assert reset.status == 204 and reset.emails_attempted == 1
+    assert "was just changed" in local_auth.last_text
+
+    session = await local_session_for(user)
+    change = await direct(
+        local_auth,
+        CHANGE,
+        {"current_password": NEW_PW, "new_password": PW},
+        headers=bearer(session.access_token),
+    )
+    assert change.status == 204 and change.emails_attempted == 1
+    assert len(local_auth.messages) == 2 and "was just changed" in local_auth.last_text
 
 
 async def test_public_routes_are_limited_to_five_per_hour_per_ip(auth_client, local_auth):

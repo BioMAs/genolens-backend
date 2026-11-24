@@ -8,9 +8,11 @@ helpers, fake mailer, ...); keep it free of anything specific to a single test f
 Everything runs against an in-memory SQLite database. Nothing hosted is called.
 """
 
-from dataclasses import dataclass
+import asyncio
+import json
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -152,11 +154,14 @@ class SmtpCapture:
     """What `smtp_capture` yields: the messages that would have gone out, oldest first.
 
     Set `fail_with` to an exception and every later send raises it, like an unreachable server.
+    Set `before_send` to a coroutine function and every send awaits it first, like a slow server
+    (see `call_app_directly`).
     """
 
     def __init__(self) -> None:
         self.messages: list[CapturedEmail] = []
         self.fail_with: Optional[Exception] = None
+        self.before_send: Optional[Callable[[], Awaitable[None]]] = None
 
     @property
     def last(self) -> CapturedEmail:
@@ -168,6 +173,8 @@ class SmtpCapture:
         return self.last.text
 
     async def send(self, message, **_smtp_options) -> None:
+        if self.before_send is not None:
+            await self.before_send()
         if self.fail_with is not None:
             raise self.fail_with
         # Serialise as the SMTP library would: a message that cannot be sent fails here too.
@@ -252,6 +259,14 @@ async def auth_client(auth_db, db_sessions_opened, monkeypatch):
     Response schemas validate e-mails, and `.test` is a special-use domain the validator refuses
     unless told it runs in a test environment: its documented switch is turned on, so that the
     fictitious `@example.test` accounts can be returned.
+
+    The application's own session factory (`app.db.session.AsyncSessionLocal`) is pointed at the
+    same database: a background job that runs after the response (the e-mails of the auth routes)
+    opens its own session from it, as in production.
+
+    httpx's ASGI transport returns only once the application has finished, background jobs
+    included: what a test reads after `await client.post(...)` includes what those jobs did. To see
+    what happens before the response is sent, drive the app with `call_app_directly`.
     """
     import email_validator
     from httpx import ASGITransport, AsyncClient
@@ -275,6 +290,7 @@ async def auth_client(auth_db, db_sessions_opened, monkeypatch):
         raise AssertionError("Supabase was called")
 
     monkeypatch.setattr(email_validator, "TEST_ENVIRONMENT", True)
+    monkeypatch.setattr("app.db.session.AsyncSessionLocal", auth_db)
     limiter.reset()
     app.dependency_overrides.clear()
     app.dependency_overrides[get_db] = _get_db
@@ -290,6 +306,115 @@ async def auth_client(auth_db, db_sessions_opened, monkeypatch):
     finally:
         app.dependency_overrides.clear()
         limiter.reset()
+
+
+@dataclass
+class DirectExchange:
+    """One request driven by `call_app_directly`: the response, and what happened around it.
+
+    `timeline` holds `"response"` once the last byte of the response was handed to the server, and
+    `"smtp"` each time an e-mail send started (an SMTP server that answers only after the response,
+    see `call_app_directly`).
+    """
+
+    status: int
+    headers: dict[str, str]
+    body: bytes
+    timeline: list[str] = field(default_factory=list)
+
+    def json(self):
+        return json.loads(self.body)
+
+    @property
+    def emails_attempted(self) -> int:
+        return self.timeline.count("smtp")
+
+
+async def call_app_directly(
+    smtp: SmtpCapture,
+    method: str,
+    path: str,
+    body: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    timeout: float = 3.0,
+) -> DirectExchange:
+    """Send one request straight to the ASGI app (set up by `auth_client`), with an SMTP server
+    that cannot answer before the response has been sent.
+
+    httpx's ASGI transport waits for the whole application, background jobs included, before it
+    returns anything: it cannot tell an e-mail sent before the response from one sent after it.
+    Here the server's `send` is ours: the moment the response is complete is recorded, and every
+    SMTP send (`smtp.before_send`) waits for that moment. A route that awaited SMTP before
+    answering would wait for ever: it fails this call after `timeout` seconds instead. When the
+    call returns, the background jobs have run too (`smtp.messages`, the audit rows).
+    """
+    from app.main import app
+
+    timeline: list[str] = []
+    response_sent = asyncio.Event()
+    previous = smtp.before_send
+
+    async def answers_after_the_response() -> None:
+        timeline.append("smtp")
+        await response_sent.wait()
+        if previous is not None:
+            await previous()
+
+    payload = b"" if body is None else json.dumps(body).encode()
+    raw_headers = [(b"host", b"testserver"), (b"content-length", str(len(payload)).encode())]
+    if body is not None:
+        raw_headers.append((b"content-type", b"application/json"))
+    raw_headers += [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": raw_headers,
+        "client": ("203.0.113.9", 50000),
+        "server": ("testserver", 80),
+    }
+    request_read = False
+    status = 0
+    response_headers: dict[str, str] = {}
+    chunks: list[bytes] = []
+
+    async def receive() -> dict:
+        nonlocal request_read
+        if not request_read:
+            request_read = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        await response_sent.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict) -> None:
+        nonlocal status
+        if message["type"] == "http.response.start":
+            status = message["status"]
+            for name, value in message.get("headers", []):
+                response_headers[name.decode().lower()] = value.decode()
+        elif message["type"] == "http.response.body":
+            chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                timeline.append("response")
+                response_sent.set()
+
+    smtp.before_send = answers_after_the_response
+    try:
+        await asyncio.wait_for(app(scope, receive, send), timeout)
+    except asyncio.TimeoutError:
+        raise AssertionError(
+            f"{method} {path} never finished: the response waited for an SMTP server that answers "
+            f"only once the response is sent (timeline: {timeline})"
+        ) from None
+    finally:
+        smtp.before_send = previous
+    return DirectExchange(status, response_headers, b"".join(chunks), timeline)
 
 
 @pytest.fixture

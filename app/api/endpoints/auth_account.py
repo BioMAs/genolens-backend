@@ -28,14 +28,17 @@ Every route answers 404 while local authentication is off. A refusal on a sessio
 401 (except for a missing or dead session): the web client reads 401 as "signed out".
 
 Anti-enumeration. `/signup`, `/password/forgot` and `/verify-email/resend` answer the same `202`
-body whether the address has an account or not, whatever happens next: an SMTP outage is logged
-and audited (`notification: not_sent`, see `_notify`), never answered, since a 500 on the known
-addresses only would tell which ones have an account. The password policy is checked before the
-address is looked up, so a weak password gets the same 400 for a known and an unknown address.
-Both sign-up branches pay for one argon2 hash in the threadpool (the new account stores it, the
-existing one throws it away), write a token and an audit row, and send exactly one e-mail. What
-`/password/forgot` and `/verify-email/resend` do not equalise is the time of the SMTP exchange
-itself, spent for a known address only.
+body whether the address has an account or not, whatever happens next. Every e-mail of this module
+leaves after the response, from a FastAPI background job (`_notify` in `app.api.endpoints.auth`):
+the SMTP exchange is in no response's time, so a known address is not answered more slowly than an
+unknown one, and an SMTP outage is logged and audited (`notification: not_sent`) by the job, never
+answered (a 500 on the known addresses only would tell which ones have an account). The password
+policy is checked before the address is looked up, so a weak password gets the same 400 for a known
+and an unknown address. Both sign-up branches pay for one argon2 hash in the threadpool (the new
+account stores it, the existing one throws it away), write a token and an audit row, and schedule
+exactly one e-mail. What remains unequal between a known and an unknown address at
+`/password/forgot` and `/verify-email/resend` is a few database statements (the link issued, the
+audit row): no network exchange.
 
 Limits. Five requests per IP and per hour on each of the three routes that send an e-mail (the
 limiter's 429 is the generic `too_many_attempts` of the sign-in routes, `app.main`). Per address,
@@ -53,7 +56,8 @@ pending secret: the rotation starts again from `/mfa/rotate/start` (password and
 a session holder gets one guess per rotation, never a free run at the code of one the owner began.
 `/mfa/rotate/confirm` also has the per-IP limit of `/mfa/verify`.
 
-Transactions. Each route commits before it answers; e-mails are sent after the commit, best effort.
+Transactions. Each route commits before it answers; its e-mails leave after the response, from a
+background job, best effort (an SMTP failure shows in the audit log, not in the HTTP response).
 """
 
 import logging
@@ -61,7 +65,7 @@ from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, NamedTuple, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 from pydantic.networks import validate_email
@@ -282,6 +286,7 @@ async def _link_emails_sent(db: AsyncSession, user_id: UUID, now: datetime) -> i
 
 async def _send_link(
     db: AsyncSession,
+    background: BackgroundTasks,
     request: Request,
     account: User,
     purpose: Purpose,
@@ -290,10 +295,10 @@ async def _send_link(
     now: datetime,
     **details: Any,
 ) -> None:
-    """Issue a `purpose` link for `account`, audit `event_type`, commit, then e-mail the link with
-    `send(to, raw_token)`. Within the hourly budget of the address only: beyond it, the request is
-    audited (`throttled`) and nothing is issued nor sent. An SMTP failure is audited by `_notify`
-    and never raised."""
+    """Issue a `purpose` link for `account`, audit `event_type`, commit, then have the link
+    e-mailed with `send(to, raw_token)` after the response (`_notify`). Within the hourly budget of
+    the address only: beyond it, the request is audited (`throttled`) and nothing is issued nor
+    sent. An SMTP failure is audited by the background job and never reaches the response."""
     if await _link_emails_sent(db, account.id, now) >= LINK_EMAILS_PER_HOUR:
         await record_event(
             db, event_type, user_id=account.id, request=request, throttled=True, **details
@@ -304,7 +309,7 @@ async def _send_link(
     await record_event(db, event_type, user_id=account.id, request=request, **details)
     user_id, to = account.id, account.email
     await db.commit()
-    await _notify(db, request, user_id, event_type, lambda: send(to, raw))
+    _notify(background, request, user_id, event_type, lambda: send(to, raw))
 
 
 async def _address_in_use(db: AsyncSession, email: str) -> bool:
@@ -323,7 +328,11 @@ async def _address_in_use(db: AsyncSession, email: str) -> bool:
 @router.post("/signup", status_code=status.HTTP_202_ACCEPTED, dependencies=_csrf)
 @limiter.limit(EMAIL_LIMIT, key_func=get_remote_address)
 async def signup(
-    request: Request, response: Response, body: SignupRequest, db: AsyncSession = Depends(get_db)
+    request: Request,
+    response: Response,
+    body: SignupRequest,
+    background: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
 ) -> Any:
     now = now_utc()
     email = body.email
@@ -338,6 +347,7 @@ async def signup(
     if account is not None:
         await _send_link(
             db,
+            background,
             request,
             account,
             Purpose.PASSWORD_RESET,
@@ -371,6 +381,7 @@ async def signup(
         return ACCEPTED
     await _send_link(
         db,
+        background,
         request,
         user,
         Purpose.EMAIL_VERIFY,
@@ -406,13 +417,18 @@ async def verify_email(
 @router.post("/verify-email/resend", status_code=status.HTTP_202_ACCEPTED, dependencies=_csrf)
 @limiter.limit(EMAIL_LIMIT, key_func=get_remote_address)
 async def resend_verification(
-    request: Request, response: Response, body: EmailRequest, db: AsyncSession = Depends(get_db)
+    request: Request,
+    response: Response,
+    body: EmailRequest,
+    background: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
 ) -> Any:
     now = now_utc()
     account = await _find_account(db, body.email)
     if account is not None and account.email_verified_at is None:
         await _send_link(
             db,
+            background,
             request,
             account,
             Purpose.EMAIL_VERIFY,
@@ -427,13 +443,18 @@ async def resend_verification(
 @router.post("/password/forgot", status_code=status.HTTP_202_ACCEPTED, dependencies=_csrf)
 @limiter.limit(EMAIL_LIMIT, key_func=get_remote_address)
 async def forgot_password(
-    request: Request, response: Response, body: EmailRequest, db: AsyncSession = Depends(get_db)
+    request: Request,
+    response: Response,
+    body: EmailRequest,
+    background: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
 ) -> Any:
     now = now_utc()
     account = await _find_account(db, body.email)
     if account is not None:
         await _send_link(
             db,
+            background,
             request,
             account,
             Purpose.PASSWORD_RESET,
@@ -462,6 +483,7 @@ async def reset_password(
     request: Request,
     response: Response,
     body: PasswordResetRequest,
+    background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> Response:
     """No session is opened: the next sign-in still asks for the second factor (spec §7.4)."""
@@ -492,8 +514,8 @@ async def reset_password(
     )
     user_id, email = user.id, user.email
     await db.commit()
-    await _notify(
-        db,
+    _notify(
+        background,
         request,
         user_id,
         AuthEventType.PASSWORD_RESET_COMPLETED,
@@ -600,6 +622,7 @@ async def _wrong_code(
 async def change_password(
     request: Request,
     body: PasswordChangeRequest,
+    background: BackgroundTasks,
     caller: LocalCaller = Depends(require_local_session),
     db: AsyncSession = Depends(get_db),
 ) -> Response:
@@ -629,8 +652,8 @@ async def change_password(
     )
     user_id, email = user.id, user.email
     await db.commit()
-    await _notify(
-        db,
+    _notify(
+        background,
         request,
         user_id,
         AuthEventType.PASSWORD_CHANGED,
