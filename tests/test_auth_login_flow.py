@@ -36,6 +36,7 @@ from app.auth.mfa import (
 )
 from app.auth.passwords import hash_password, verify_password
 from app.auth.sessions import IssuedSession, RefreshOutcome
+from app.auth.tokens import issue_access_token
 from app.models.auth import (
     AuthEvent,
     AuthEventType,
@@ -729,27 +730,114 @@ async def test_refresh_without_a_usable_cookie(auth_client, local_auth):
         assert all(is_cleared(found[name]) for name in ("gl_at", "gl_rt", "gl_session"))
 
 
+ALL_AUTH_COOKIES = ("gl_at", "gl_rt", "gl_session", "gl_mfa")
+
+
+def assert_all_cleared_with_their_scopes(response, domain=None) -> None:
+    """Every auth cookie removed, each with the Path and Domain it was set with."""
+    found = set_cookies(response)
+    assert all(is_cleared(found[name]) for name in ALL_AUTH_COOKIES)
+    for name in ("gl_at", "gl_session"):
+        assert found[name]["path"] == "/" and found[name].get("domain") == domain
+    for name in ("gl_rt", "gl_mfa"):
+        assert found[name]["path"] == "/api/v1/auth" and "domain" not in found[name]
+
+
 async def test_logout_revokes(auth_client, auth_db, local_auth):
     user, _ = await signed_in(auth_client, auth_db)
     access = auth_client.cookies["gl_at"]
 
     r = await auth_client.post(LOGOUT)  # a cookie write without the CSRF header
     assert r.status_code == 403 and r.json() == {"detail": "csrf_header_missing"}
+    assert "set-cookie" not in r.headers  # cookies untouched
+    [session] = await sessions_of(auth_db, user.id)
+    assert session.revoked_at is None
 
     r = await auth_client.post(LOGOUT, headers=CSRF)
     assert r.status_code == 204
-    found = set_cookies(r)
-    assert all(is_cleared(found[name]) for name in ("gl_at", "gl_rt", "gl_session"))
+    assert_all_cleared_with_their_scopes(r)
     assert (await auth_client.get(ME, headers=bearer(access))).status_code == 401
     [session] = await sessions_of(auth_db, user.id)
     assert session.revoked_at is not None and session.revoked_reason == "logout"
     [revoked] = await events(auth_db, AuthEventType.SESSION_REVOKED)
-    assert revoked.user_id == user.id
+    assert revoked.user_id == user.id and revoked.details["session_id"] == str(session.id)
 
 
-async def test_logout_needs_a_session(auth_client, local_auth):
-    r = await auth_client.post(LOGOUT, headers=CSRF)
-    assert r.status_code == 401
+async def test_logout_with_an_expired_access_cookie_revokes_through_the_refresh_cookie(
+    auth_client, auth_db, local_auth, settings_override
+):
+    """On a shared computer: the 15-minute cookie is gone, the 30-day one must not survive."""
+    user, refresh_token = await signed_in(auth_client, auth_db)
+    [session] = await sessions_of(auth_db, user.id)
+    expired = issue_access_token(
+        user.id, session.id, ["pwd", "otp"], now=now_utc() - timedelta(minutes=20)
+    )
+    settings_override(AUTH_COOKIE_SECURE=True, AUTH_COOKIE_DOMAIN=".example.test")
+    auth_client.cookies.clear()
+
+    r = await auth_client.post(
+        LOGOUT, headers={**CSRF, "Cookie": f"gl_at={expired}; gl_rt={refresh_token}"}
+    )
+
+    assert r.status_code == 204
+    assert_all_cleared_with_their_scopes(r, domain=".example.test")
+    found = set_cookies(r)
+    for name in ALL_AUTH_COOKIES:
+        assert found[name]["secure"] is True
+    assert all(found[name]["httponly"] is True for name in ("gl_at", "gl_rt", "gl_mfa"))
+    assert found["gl_mfa"]["samesite"].lower() == "strict"
+    [session] = await sessions_of(auth_db, user.id)
+    assert session.revoked_at is not None and session.revoked_reason == "logout"
+    assert len(await events(auth_db, AuthEventType.SESSION_REVOKED)) == 1
+    r = await auth_client.post(REFRESH, headers={**CSRF, "Cookie": f"gl_rt={refresh_token}"})
+    assert r.status_code == 401 and r.json() == {"detail": "invalid_refresh"}
+
+
+async def test_logout_with_the_previous_refresh_token(auth_client, auth_db, local_auth):
+    """A tab that still holds the refresh token another tab just rotated logs the session out."""
+    user, old = await signed_in(auth_client, auth_db)
+    assert (await auth_client.post(REFRESH, headers=CSRF)).status_code == 200
+    auth_client.cookies.clear()
+
+    r = await auth_client.post(LOGOUT, headers={**CSRF, "Cookie": f"gl_rt={old}"})
+
+    assert r.status_code == 204
+    [session] = await sessions_of(auth_db, user.id)
+    assert session.revoked_at is not None and session.revoked_reason == "logout"
+
+
+async def test_logout_without_credentials_still_clears(auth_client, auth_db, local_auth):
+    for headers in (
+        CSRF,
+        {**CSRF, "Cookie": "gl_at=garbage; gl_rt=unknown"},
+        {**CSRF, "Authorization": "Bearer garbage"},
+    ):
+        r = await auth_client.post(LOGOUT, headers=headers)
+        assert r.status_code == 204, headers
+        assert_all_cleared_with_their_scopes(r)
+    assert await events(auth_db, AuthEventType.SESSION_REVOKED) == []
+
+
+async def test_logout_with_a_bearer_token_needs_no_csrf_header(auth_client, auth_db, local_auth):
+    user, _ = await signed_in(auth_client, auth_db)
+    access = auth_client.cookies["gl_at"]
+    auth_client.cookies.clear()
+
+    r = await auth_client.post(LOGOUT, headers=bearer(access))
+
+    assert r.status_code == 204
+    [session] = await sessions_of(auth_db, user.id)
+    assert session.revoked_at is not None
+
+
+async def test_logout_of_an_ended_session_records_nothing_more(auth_client, auth_db, local_auth):
+    user, refresh_token = await signed_in(auth_client, auth_db)
+    assert (await auth_client.post(LOGOUT, headers=CSRF)).status_code == 204
+
+    r = await auth_client.post(LOGOUT, headers={**CSRF, "Cookie": f"gl_rt={refresh_token}"})
+
+    assert r.status_code == 204
+    assert len(await events(auth_db, AuthEventType.SESSION_REVOKED)) == 1
 
 
 # ── Switches and limits ──────────────────────────────────────────────────────

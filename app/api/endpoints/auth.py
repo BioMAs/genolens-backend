@@ -16,8 +16,8 @@ the step token that unlocks the next step, and a step token only opens its own s
 
 Every route but `/jwks.json` answers 404 while local authentication is off (`AUTH_MODE=supabase`
 and `AUTH_LOCAL_ENABLED` false). Cookie-carried requests need the `X-GenoLens-Client` header (the
-login too, spec §7.3); `/logout` gets that check from the principal resolution, which exempts a
-Bearer caller.
+login too, spec §7.3); `/logout` exempts a Bearer caller, as the principal resolution does.
+`/logout` always answers 204 and clears every auth cookie, whatever credentials it got.
 
 Failures and the account lock. A wrong password and a wrong 2FA code at `/mfa/verify` both count
 toward the account lock: from the tenth consecutive failure the account is locked for 15 minutes,
@@ -61,7 +61,7 @@ from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_db
 from app.auth import cookies
 from app.auth.audit import record_event
 from app.auth.clock import aware_utc, now_utc
@@ -87,17 +87,17 @@ from app.auth.one_time_tokens import (
     reserve_attempt,
 )
 from app.auth.passwords import verify_password
-from app.auth.principal import CSRF_HEADER, local_tokens_accepted
+from app.auth.principal import CSRF_HEADER, local_tokens_accepted, read_credentials
 from app.auth.sessions import (
     IssuedSession,
     RefreshRejected,
     create_session,
+    get_session_user,
     revoke_session,
     rotate_refresh,
 )
-from app.auth.tokens import hash_token
+from app.auth.tokens import InvalidAccessToken, decode_access_token, hash_token, is_local_token
 from app.core.config import settings
-from app.core.supabase_auth import SupabaseUser
 from app.middleware.rate_limit import limiter
 from app.models.auth import AuthEventType, AuthOneTimeToken, AuthRecoveryCode, AuthSession
 from app.models.auth import OneTimeTokenPurpose as Purpose
@@ -736,25 +736,67 @@ async def refresh(request: Request, response: Response, db: AsyncSession = Depen
     return {"refreshed": True}
 
 
+async def _session_to_end(
+    db: AsyncSession, access_token: Optional[str], refresh_token: Optional[str]
+) -> Optional[AuthSession]:
+    """The session a logout ends: the one of a valid local access token, else the one whose current
+    or previous refresh hash is the `gl_rt` presented (looked up only: no rotation, no reuse
+    check), else None."""
+    if access_token and is_local_token(access_token):
+        try:
+            claims = decode_access_token(access_token)
+        except InvalidAccessToken:
+            claims = None  # typically expired: the refresh cookie still names the session
+        if claims is not None:
+            found = await get_session_user(db, claims.sid, claims.sub)
+            if found is not None:
+                return found[1]
+    if refresh_token:
+        hashed = hash_token(refresh_token)
+        return (
+            (
+                await db.execute(
+                    select(AuthSession).where(
+                        or_(
+                            AuthSession.refresh_token_hash == hashed,
+                            AuthSession.previous_refresh_token_hash == hashed,
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+    return None
+
+
 @_local.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(
-    request: Request,
-    principal: SupabaseUser = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-) -> Response:
-    if principal.session_id is not None:
-        await revoke_session(db, principal.session_id, LOGOUT_REASON)
+async def logout(request: Request, db: AsyncSession = Depends(get_db)) -> Response:
+    """Always 204, and always clears every auth cookie, credentials or not: on a shared computer an
+    expired `gl_at` must not leave a 30-day `gl_rt` behind. The session ended is the access
+    token's, else the refresh cookie's (`_session_to_end`).
+
+    A cookie-carried request needs the CSRF header (403, cookies untouched); a request with an
+    `Authorization: Bearer` header is exempt, as everywhere (a page cannot set that header).
+    """
+    access_token, source = read_credentials(request)
+    if source != "header":
+        require_csrf_header(request)
+    session = await _session_to_end(db, access_token, request.cookies.get(cookies.REFRESH_COOKIE))
+    if session is not None and session.revoked_at is None:
+        await revoke_session(db, session.id, LOGOUT_REASON)
         await record_event(
             db,
             AuthEventType.SESSION_REVOKED,
-            user_id=principal.user_id,
+            user_id=session.user_id,
             request=request,
-            session_id=principal.session_id,
+            session_id=session.id,
             reason=LOGOUT_REASON,
         )
-        await db.commit()
+    await db.commit()
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
     cookies.clear_session_cookies(response)
+    cookies.clear_step_cookie(response)
     return response
 
 
