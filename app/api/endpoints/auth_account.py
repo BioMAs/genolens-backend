@@ -24,8 +24,11 @@ Session routes (a local session only: a service token or a hosted-provider token
     POST   /mfa/rotate/confirm {code}                         -> {"recovery_codes"}
     POST   /mfa/recovery-codes/regenerate {code}              -> {"recovery_codes"}
 
-Every route answers 404 while local authentication is off. A refusal on a session route is never a
-401 (except for a missing or dead session): the web client reads 401 as "signed out".
+Every route answers 404 while local authentication is off. The public routes also answer 404, in
+the same way, during the pre-launch (`AUTH_MODE=supabase` with `AUTH_LOCAL_ENABLED` true, see
+`app.api.endpoints.auth`): no self-service sign-up, link or invitation before `AUTH_MODE=local`,
+while the administrators who signed in keep every session route. A refusal on a session route is
+never a 401 (except for a missing or dead session): the web client reads 401 as "signed out".
 
 A new password kills what the old one opened. `/password/reset` and `/password/change` revoke the
 sessions (all of them, or all but the caller's) and, in the same transaction, spend every unused
@@ -100,6 +103,7 @@ from app.api.endpoints.auth import (
     _too_many_attempts,
     require_csrf_header,
     require_local_auth,
+    require_local_mode,
 )
 from app.auth import cookies
 from app.auth.audit import record_event
@@ -155,7 +159,9 @@ USER_REVOKED_ALL_REASON = "user_revoked_all"
 ACCEPTED = {"status": "accepted"}
 
 router = APIRouter(prefix="/auth", tags=["auth"], dependencies=[Depends(require_local_auth)])
-_csrf = [Depends(require_csrf_header)]
+# The public routes: closed until AUTH_MODE=local (checked first, so that a closed route answers 404
+# whatever the request carries, as when local authentication is off), then the CSRF header.
+_public = [Depends(require_local_mode), Depends(require_csrf_header)]
 
 
 # ── Refusals ─────────────────────────────────────────────────────────────────
@@ -334,7 +340,7 @@ async def _address_in_use(db: AsyncSession, email: str) -> bool:
 # ── Public routes ────────────────────────────────────────────────────────────
 
 
-@router.post("/signup", status_code=status.HTTP_202_ACCEPTED, dependencies=_csrf)
+@router.post("/signup", status_code=status.HTTP_202_ACCEPTED, dependencies=_public)
 @limiter.limit(EMAIL_LIMIT, key_func=get_remote_address)
 async def signup(
     request: Request,
@@ -402,7 +408,7 @@ async def signup(
     return ACCEPTED
 
 
-@router.post("/verify-email", status_code=status.HTTP_204_NO_CONTENT, dependencies=_csrf)
+@router.post("/verify-email", status_code=status.HTTP_204_NO_CONTENT, dependencies=_public)
 @limiter.limit(TOKEN_LIMIT, key_func=get_remote_address)
 async def verify_email(
     request: Request, response: Response, body: TokenRequest, db: AsyncSession = Depends(get_db)
@@ -423,7 +429,7 @@ async def verify_email(
     return _no_content()
 
 
-@router.post("/verify-email/resend", status_code=status.HTTP_202_ACCEPTED, dependencies=_csrf)
+@router.post("/verify-email/resend", status_code=status.HTTP_202_ACCEPTED, dependencies=_public)
 @limiter.limit(EMAIL_LIMIT, key_func=get_remote_address)
 async def resend_verification(
     request: Request,
@@ -449,7 +455,7 @@ async def resend_verification(
     return ACCEPTED
 
 
-@router.post("/password/forgot", status_code=status.HTTP_202_ACCEPTED, dependencies=_csrf)
+@router.post("/password/forgot", status_code=status.HTTP_202_ACCEPTED, dependencies=_public)
 @limiter.limit(EMAIL_LIMIT, key_func=get_remote_address)
 async def forgot_password(
     request: Request,
@@ -486,7 +492,7 @@ async def _account_of_link(
     return await _load_user(db, token.user_id)
 
 
-@router.post("/password/reset", status_code=status.HTTP_204_NO_CONTENT, dependencies=_csrf)
+@router.post("/password/reset", status_code=status.HTTP_204_NO_CONTENT, dependencies=_public)
 @limiter.limit(TOKEN_LIMIT, key_func=get_remote_address)
 async def reset_password(
     request: Request,
@@ -537,7 +543,7 @@ async def reset_password(
     return _no_content()
 
 
-@router.post("/invite/accept", dependencies=_csrf)
+@router.post("/invite/accept", dependencies=_public)
 @limiter.limit(TOKEN_LIMIT, key_func=get_remote_address)
 async def accept_invitation(
     request: Request,

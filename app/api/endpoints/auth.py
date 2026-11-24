@@ -19,6 +19,14 @@ and `AUTH_LOCAL_ENABLED` false). Cookie-carried requests need the `X-GenoLens-Cl
 login too, spec §7.3); `/logout` exempts a Bearer caller, as the principal resolution does.
 `/logout` always answers 204 and clears every auth cookie, whatever credentials it got.
 
+The pre-launch (`AUTH_MODE=supabase` with `AUTH_LOCAL_ENABLED` true, `prelaunch`): the hosted
+provider is still in charge and the local system is open for the administrators to try it.
+`/login` lets only ADMIN and SCILICIUM_ADMIN accounts through; any other account, with the right
+password or not, gets exactly the wrong-password answer (same 401, same cost, counted toward its
+lock, audited with reason `prelaunch_restricted`). The second factor, `/refresh`, `/logout`,
+`/jwks.json` and the session routes of `app.api.endpoints.auth_account` work as after the switch;
+the public self-service routes of that module answer 404 until `AUTH_MODE=local`.
+
 Failures and the account lock. A wrong password and a wrong 2FA code at `/mfa/verify` both count
 toward the account lock: the tenth consecutive failure locks the account for 15 minutes. Once the
 lock has run out its count is spent: the next failure is the first of a new run, and only ten fresh
@@ -53,6 +61,8 @@ right one: `401 invalid_credentials`, the same failure count and lock, the same 
 is added to the right argon2 password). Otherwise sign-up then login would tell addresses apart:
 sign-up makes an unverified account with the password typed for a new address, and only e-mails an
 existing one. The client offers to resend the verification link after a failed sign-in instead.
+The pre-launch refusal of a non-administrator (above) is the same answer, cost, count and audit
+row, with reason `prelaunch_restricted`.
 
 Transactions. Each route commits its own writes before it answers. `reserve_attempt` is committed
 at once, before the code is checked, so a refusal cannot hand the attempt back. A refresh commits
@@ -121,7 +131,7 @@ from app.core.config import settings
 from app.middleware.rate_limit import limiter
 from app.models.auth import AuthEventType, AuthOneTimeToken, AuthRecoveryCode, AuthSession
 from app.models.auth import OneTimeTokenPurpose as Purpose
-from app.models.models import User
+from app.models.models import User, UserRole
 from app.services.email_service import EmailNotConfiguredError, EmailSendError
 
 logger = logging.getLogger(__name__)
@@ -129,6 +139,9 @@ logger = logging.getLogger(__name__)
 LOCK_THRESHOLD = 10
 LOCK_DURATION = timedelta(minutes=15)
 UNKNOWN_ADDRESS_MEMORY = timedelta(days=1)
+
+# The accounts the local sign-in lets through during the pre-launch (`prelaunch`).
+PRELAUNCH_ROLES = (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN)
 
 LOGIN_LIMIT = "10/minute;50/hour"
 MFA_LIMIT = "30/hour"
@@ -143,6 +156,20 @@ LOGOUT_REASON = "logout"
 def require_local_auth() -> None:
     """404, as for a route that does not exist, while local authentication is off."""
     if not local_tokens_accepted():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+def prelaunch() -> bool:
+    """Is the local system open before the switch (`AUTH_MODE=supabase`, the hosted provider still
+    in charge)? Only meaningful while local authentication is on (`require_local_auth`): then the
+    local sign-in is for the administrators only, and the public self-service routes are closed."""
+    return settings.AUTH_MODE != "local"
+
+
+def require_local_mode() -> None:
+    """404, exactly as `require_local_auth`, until `AUTH_MODE=local`: the public self-service
+    routes (sign-up, e-mail links, invitations) open with the switch, not with the pre-launch."""
+    if prelaunch():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
 
@@ -529,14 +556,20 @@ async def login(
 
     stored_hash = user.password_hash if user is not None else None
     check = await run_in_threadpool(verify_password, body.password, stored_hash)
-    unverified = check.ok and user is not None and user.email_verified_at is None
-    if unverified:
-        # The right password of an unverified account is answered as a wrong one (see the module
-        # docstring). A right argon2 password paid one argon2 check; a refusal also pays a bcrypt
-        # one: added here so that the time does not tell them apart either.
+    # The right password of an account that may not sign in (yet) is answered as a wrong one (see
+    # the module docstring); why is only in the audit trail.
+    withheld: Optional[str] = None
+    if check.ok and user is not None:
+        if prelaunch() and user.role not in PRELAUNCH_ROLES:
+            withheld = "prelaunch_restricted"
+        elif user.email_verified_at is None:
+            withheld = "email_not_verified"
+    if withheld is not None:
+        # A right argon2 password paid one argon2 check; a refusal also pays a bcrypt one: added
+        # here so that the time does not tell them apart either.
         legacy = not (stored_hash or "").startswith("$argon2")
         await run_in_threadpool(_top_up, body.password, _Spent(argon2=True, bcrypt=legacy))
-    if not check.ok or user is None or unverified:
+    if not check.ok or user is None or withheld is not None:
         if user is not None:
             await _count_failure(db, user.id, request, now)
         else:
@@ -546,7 +579,7 @@ async def login(
             AuthEventType.LOGIN_FAILED,
             user_id=user_id,
             request=request,
-            reason="email_not_verified" if unverified else "invalid_credentials",
+            reason=withheld or "invalid_credentials",
         )
         await db.commit()
         return _refusal(status.HTTP_401_UNAUTHORIZED, "invalid_credentials")

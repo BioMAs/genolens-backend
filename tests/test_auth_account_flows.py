@@ -1199,6 +1199,81 @@ async def test_account_endpoints_404_when_disabled(auth_client, settings_overrid
         assert r.status_code == 404, (method, path)
 
 
+async def test_before_the_launch_the_public_routes_answer_404(
+    auth_client, auth_db, local_auth, settings_override
+):
+    """Pre-launch (AUTH_MODE=supabase with AUTH_LOCAL_ENABLED): the self-service routes answer
+    exactly as when local authentication is off, with or without the header, and do nothing,
+    even with a valid link."""
+    settings_override(AUTH_MODE="supabase", AUTH_LOCAL_ENABLED=True)
+    user = await verified_user(auth_db)
+    pending = await seed_user(auth_db, status=UserStatus.PENDING)
+    async with auth_db() as s:
+        reset = await issue_token(s, user.id, Purpose.PASSWORD_RESET)
+        check = await issue_token(s, user.id, Purpose.EMAIL_VERIFY)
+        await s.commit()
+    invitation = await invite_token(auth_db, pending)
+    bodies = {
+        SIGNUP: {"email": "new@example.test", "password": PW},
+        VERIFY_EMAIL: {"token": check},
+        RESEND: {"email": user.email},
+        FORGOT: {"email": user.email},
+        RESET: {"token": reset, "new_password": NEW_PW},
+        INVITE_ACCEPT: {"token": invitation, "password": NEW_PW},
+    }
+
+    for path in PUBLIC_ROUTES:
+        for headers in (CSRF, {}):
+            r = await post(auth_client, path, bodies[path], headers)
+            assert r.status_code == 404 and r.json() == {"detail": "Not Found"}, path
+            assert "set-cookie" not in r.headers
+
+    assert local_auth.messages == []
+    assert await user_by_email(auth_db, "new@example.test") is None
+    assert verify_password(PW, (await reload(auth_db, user.id)).password_hash).ok
+    assert (await reload(auth_db, pending.id)).status == UserStatus.PENDING
+    async with auth_db() as s:
+        spent = await s.scalar(
+            select(func.count())
+            .select_from(AuthOneTimeToken)
+            .where(AuthOneTimeToken.used_at.is_not(None))
+        )
+    assert spent == 0
+
+
+@pytest.mark.parametrize("mode, expected", [("supabase", 404), ("local", 422)])
+async def test_the_public_routes_open_with_the_switch_to_local(
+    auth_client, local_auth, settings_override, mode, expected
+):
+    """Local authentication on in both cases: the public routes exist only in AUTH_MODE=local
+    (an empty body is then refused by validation, 422)."""
+    settings_override(AUTH_MODE=mode, AUTH_LOCAL_ENABLED=True)
+    for path in PUBLIC_ROUTES:
+        r = await post(auth_client, path, {})
+        assert r.status_code == expected, (mode, path)
+
+
+async def test_before_the_launch_the_session_routes_keep_working(
+    auth_client, auth_db, local_auth, settings_override, local_session_for
+):
+    """An administrator signed in during the pre-launch manages their sessions, password and
+    second factor as after the launch."""
+    settings_override(AUTH_MODE="supabase", AUTH_LOCAL_ENABLED=True)
+    admin, secret = await mfa_user(auth_db, role=UserRole.ADMIN)
+    current = await local_session_for(admin)
+    await local_session_for(admin)
+    headers = bearer(current.access_token)
+
+    listed = await call(auth_client, "GET", SESSIONS, headers)
+    assert listed.status_code == 200 and len(listed.json()) == 2
+    changed = await post(
+        auth_client, CHANGE, {"current_password": PW, "new_password": NEW_PW}, headers
+    )
+    assert changed.status_code == 204, changed.text
+    regenerated = await post(auth_client, REGENERATE, {"code": code_at(secret)}, headers)
+    assert regenerated.status_code == 200 and len(regenerated.json()["recovery_codes"]) == 10
+
+
 async def test_public_routes_need_the_csrf_header(auth_client, auth_db, local_auth):
     for path in PUBLIC_ROUTES:
         r = await auth_client.post(path, json={})

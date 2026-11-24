@@ -44,7 +44,7 @@ from app.models.auth import (
     AuthRecoveryCode,
     AuthSession,
 )
-from app.models.models import User
+from app.models.models import User, UserRole
 from tests.auth_support import CSRF, NOW, PW, access_cookie, bearer, call_app_directly, seed_user
 
 AUTH = "/api/v1/auth"
@@ -1017,15 +1017,98 @@ async def test_endpoints_404_when_disabled(auth_client, settings_override):
     assert r.json() == {"keys": []}  # nothing configured, nothing signs
 
 
-async def test_migration_window_serves_the_endpoints(
-    auth_client, auth_db, local_auth, settings_override
-):
+@pytest.fixture
+def prelaunch(local_auth, settings_override):
+    """The pre-launch: local sign-in open (`AUTH_LOCAL_ENABLED`) while the hosted provider is
+    still the one in charge (`AUTH_MODE=supabase`)."""
     settings_override(AUTH_MODE="supabase", AUTH_LOCAL_ENABLED=True)
-    user = await verified_user(auth_db)
+    return local_auth
+
+
+@pytest.mark.parametrize("enrolled", [True, False], ids=["challenge", "enrolment"])
+async def test_the_prelaunch_serves_the_whole_sign_in_to_an_administrator(
+    auth_client, auth_db, prelaunch, enrolled
+):
+    """Login, second factor (challenge or enrolment), renewal, the session routes and logout."""
+    if enrolled:
+        user, secret = await mfa_user(auth_db, role=UserRole.ADMIN)
+        assert (await login(auth_client, user.email)).json() == {"next": "mfa"}
+        r = await verify(auth_client, code=code_at(secret))
+    else:
+        user = await verified_user(auth_db, role=UserRole.SCILICIUM_ADMIN)
+        assert (await login(auth_client, user.email)).json() == {"next": "mfa_setup"}
+        secret = (await auth_client.post(SETUP_START, headers=CSRF)).json()["secret"]
+        r = await auth_client.post(SETUP_CONFIRM, json={"code": code_at(secret)}, headers=CSRF)
+    assert r.status_code == 200 and r.json()["next"] == "app"
+
+    assert (await auth_client.post(REFRESH, headers=CSRF)).status_code == 200
+    listed = await auth_client.get(f"{AUTH}/sessions", headers=CSRF)
+    assert listed.status_code == 200 and len(listed.json()) == 1
+    assert (await auth_client.get(JWKS)).json()["keys"]
+    assert (await auth_client.post(LOGOUT, headers=CSRF)).status_code == 204
+    assert [s.revoked_at is not None for s in await sessions_of(auth_db, user.id)] == [True]
+
+
+@pytest.mark.parametrize("mode", ["supabase", "local"])
+@pytest.mark.parametrize("role", list(UserRole), ids=lambda role: role.value)
+async def test_before_the_launch_only_administrators_sign_in(
+    auth_client, auth_db, local_auth, settings_override, mode, role
+):
+    """While AUTH_MODE=supabase the local sign-in is for ADMIN and SCILICIUM_ADMIN only; from
+    AUTH_MODE=local, for every account as before."""
+    settings_override(AUTH_MODE=mode, AUTH_LOCAL_ENABLED=True)
+    user = await verified_user(auth_db, role=role)
 
     r = await login(auth_client, user.email)
 
-    assert r.status_code == 200 and r.json() == {"next": "mfa_setup"}
+    if mode == "local" or role in (UserRole.ADMIN, UserRole.SCILICIUM_ADMIN):
+        assert r.status_code == 200 and r.json() == {"next": "mfa_setup"}
+        assert "gl_mfa" in r.cookies
+    else:
+        assert r.status_code == 401 and r.json() == INVALID_CREDENTIALS
+        assert "set-cookie" not in r.headers
+
+
+async def test_a_prelaunch_refusal_is_the_wrong_password_answer(
+    auth_client, auth_db, prelaunch, monkeypatch
+):
+    """Same answer, same cost, same count as a wrong password: the reason is in the audit trail,
+    never in the response."""
+    from starlette.concurrency import run_in_threadpool
+
+    import app.api.endpoints.auth as auth_endpoints
+    from app.auth.passwords import _top_up
+
+    seen = []
+
+    async def spy(func, *args, **kwargs):
+        seen.append(func)
+        return await run_in_threadpool(func, *args, **kwargs)
+
+    monkeypatch.setattr(auth_endpoints, "run_in_threadpool", spy)
+    user = await verified_user(auth_db, role=UserRole.USER)
+
+    right = await login(auth_client, user.email)
+    wrong = await login(auth_client, user.email, "Wrong-Password-Again-42")
+
+    assert right.status_code == wrong.status_code == 401
+    assert right.json() == wrong.json() == INVALID_CREDENTIALS
+    assert "set-cookie" not in right.headers
+    # The right password paid only its argon2 check: the bcrypt check of a refusal is added.
+    assert seen == [verify_password, _top_up, verify_password]
+    assert (await reload(auth_db, user.id)).failed_login_count == 2
+    failed = await events(auth_db, AuthEventType.LOGIN_FAILED)
+    assert [e.details["reason"] for e in failed] == ["prelaunch_restricted", "invalid_credentials"]
+
+
+async def test_prelaunch_refusals_lock_the_account(auth_client, auth_db, prelaunch, no_ip_limit):
+    user = await verified_user(auth_db, role=UserRole.USER)
+
+    for _ in range(10):
+        assert (await login(auth_client, user.email)).json() == INVALID_CREDENTIALS
+
+    r = await login(auth_client, user.email)
+    assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
 
 
 async def test_jwks_publishes_the_signing_keys(auth_client, local_keys, settings_override):

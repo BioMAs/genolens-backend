@@ -14,12 +14,23 @@ Deux réglages gouvernent toute la transition. `AUTH_MODE` dit **quel fournisseu
 | Rôle d'un utilisateur | comportement actuel (`profiles`, synchronisé dans `users`) | `users.role` seul |
 | Ligne `users` d'un compte inconnu | créée à la première requête (conservé) | jamais créée : ligne absente → `401` |
 | Administration : inviter, créer, supprimer, lister, chercher par e-mail | code Supabase actuel | code local |
-| Endpoints `/api/v1/auth/*` | `404` tant que `AUTH_LOCAL_ENABLED=false` (sauf `jwks.json`) ; ouverts s'il est `true` | ouverts |
+| Endpoints `/api/v1/auth/*` | `404` tant que `AUTH_LOCAL_ENABLED=false` (sauf `jwks.json`) ; s'il est `true` (pré-lancement) : connexion réservée aux administrateurs, routes publiques en `404` (voir « Pré-lancement ») | ouverts à tous les comptes |
 | `SUPABASE_URL`, `SUPABASE_KEY`, `SUPABASE_JWT_SECRET` | **obligatoires** : sans eux le service refuse de démarrer | facultatifs |
 
 Ordre de résolution d'un jeton : (1) un jeton `glst_` passe par la résolution des jetons de service, sans changement ; (2) un jeton local ES256 ; (3) un jeton Supabase HS256, seulement en mode `supabase`. Les jetons locaux sont acceptés quand `AUTH_MODE=local` **ou** `AUTH_LOCAL_ENABLED=true`.
 
 `GET /api/v1/auth/jwks.json` répond toujours. Tant que le système local est fermé et qu'aucune clé n'est configurée, il rend un jeu vide plutôt qu'une erreur.
+
+### Pré-lancement (`AUTH_MODE=supabase` avec `AUTH_LOCAL_ENABLED=true`)
+
+Le fournisseur externe fait encore foi ; le système local est ouvert **pour que les administrateurs l'essaient**, pas pour le public :
+
+- **`/login` ne laisse passer que les comptes `ADMIN` et `SCILICIUM_ADMIN`.** Tout autre compte, bon mot de passe ou non, reçoit exactement la réponse d'un mauvais mot de passe : `401 invalid_credentials`, même coût, échec compté pour son verrou comme un mauvais mot de passe. La raison (`prelaunch_restricted`) n'apparaît que dans le journal d'audit (`login_failed`), jamais dans la réponse.
+- **Les routes publiques en libre-service répondent `404`**, comme si le système local était fermé, avec ou sans en-tête : `/signup`, `/verify-email`, `/verify-email/resend`, `/password/forgot`, `/password/reset`, `/invite/accept`. Un lien déjà émis n'y est pas consommé.
+- Pour l'administrateur connecté, tout le reste fonctionne comme après la bascule : second facteur (`/mfa/*`), `/refresh`, `/logout`, `/jwks.json`, et les routes de session (sessions, changement de mot de passe, rotation de la 2FA, codes de secours).
+- Conséquence : pendant le pré-lancement, un administrateur ne peut se connecter localement qu'avec un mot de passe déjà présent dans `users` (repris de Supabase par la migration, ou choisi auparavant). Le lien de réinitialisation, y compris celui qu'envoie l'administration, mène à une route fermée jusqu'à `AUTH_MODE=local`.
+
+En `AUTH_MODE=local`, rien de tout cela ne s'applique : connexion ouverte à tous les comptes, routes publiques ouvertes.
 
 ## Variables
 

@@ -261,7 +261,8 @@ async def test_mfa_reset_clears_the_second_factor_and_audits_it(
 async def test_mfa_reset_forces_reenrollment(
     admin_client, auth_db, local_session_for, settings_override
 ):
-    settings_override(AUTH_COOKIE_SECURE=False, AUTH_COOKIE_DOMAIN=None)
+    # A regular account signs in: AUTH_MODE=local (the pre-launch admits administrators only).
+    settings_override(AUTH_MODE="local", AUTH_COOKIE_SECURE=False, AUTH_COOKIE_DOMAIN=None)
     target = await enrolled(auth_db, password_hash=hash_password(PW))
     issued = await local_session_for(target)
     me = bearer(issued.access_token)
@@ -287,7 +288,8 @@ async def test_mfa_reset_cancels_a_challenge_that_was_already_open(
     factor the administrator just removed."""
     import pyotp
 
-    settings_override(AUTH_COOKIE_SECURE=False, AUTH_COOKIE_DOMAIN=None)
+    # A regular account signs in: AUTH_MODE=local (the pre-launch admits administrators only).
+    settings_override(AUTH_MODE="local", AUTH_COOKIE_SECURE=False, AUTH_COOKIE_DOMAIN=None)
     secret = new_totp_secret()
     target = await enrolled(
         auth_db, password_hash=hash_password(PW), mfa_totp_secret_enc=encrypt_secret(secret)
@@ -505,8 +507,9 @@ async def test_nothing_but_the_explicit_box_revokes_a_service_token(
 
 
 async def test_unlock_clears_the_lock_and_audits_it(
-    admin_client, admin_user, auth_db, local_session_for
+    admin_client, admin_user, auth_db, local_session_for, settings_override
 ):
+    settings_override(AUTH_MODE="local")  # a regular account signs in (not in the pre-launch)
     target = await seed_user(
         auth_db,
         password_hash=hash_password(PW),
