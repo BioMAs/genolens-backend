@@ -11,7 +11,8 @@ Public routes (CSRF header required, like the login):
     POST /verify-email/resend {email}               -> 202, always
     POST /password/forgot {email}                   -> 202, always
     POST /password/reset {token, new_password}      -> 204, every session revoked, none opened
-    POST /invite/accept {token, password}           -> `gl_mfa` (enrolment), {"next": "mfa_setup"}
+    POST /invite/accept {token, password}           -> `gl_mfa` (enrolment), {"next": "mfa_setup"};
+                                                       a pending account without a password only
 
 Session routes (a local session only: a service token or a hosted-provider token gets 403):
 
@@ -47,8 +48,10 @@ current TOTP code (`/mfa/rotate/start`, `/mfa/recovery-codes/regenerate`) count 
 exactly as a failed sign-in, and a locked account gets `429 too_many_attempts` on those routes. As
 at sign-in, nothing here resets the count: only an opened session does. A password reset does not
 lift a lock either: whoever controls the inbox but not the phone would otherwise refill the budget
-of code guesses at will. A wrong code while confirming a rotation does not count: the caller is
-confirming a secret it was just given, there is nothing to guess.
+of code guesses at will. A wrong code while confirming a rotation counts too, and also drops the
+pending secret: the rotation starts again from `/mfa/rotate/start` (password and current code), so
+a session holder gets one guess per rotation, never a free run at the code of one the owner began.
+`/mfa/rotate/confirm` also has the per-IP limit of `/mfa/verify`.
 
 Transactions. Each route commits before it answers; e-mails are sent after the commit, best effort.
 """
@@ -70,6 +73,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import get_db
 from app.api.endpoints.auth import (
+    MFA_LIMIT,
     MfaConfirmRequest,
     _accept_totp,
     _count_failure,
@@ -507,10 +511,18 @@ async def accept_invitation(
     db: AsyncSession = Depends(get_db),
 ) -> Any:
     """The password chosen, the address proven, a pending account activated; then, as after a
-    password sign-in, the step token of the second factor (its enrolment, normally)."""
+    password sign-in, the step token of the second factor (its enrolment, normally). Only for a
+    PENDING account without a password: any other is refused (`invalid_token`, link spent)."""
     now = now_utc()
     user = await _account_of_link(db, body.token, Purpose.INVITE, now)
     if user is None:
+        return _invalid_token()
+    if user.password_hash is not None or user.status != UserStatus.PENDING:
+        # A stale or forwarded invitation must not become a silent password reset: refused, and
+        # spent so that it cannot be tried again.
+        await _spend(db, body.token, Purpose.INVITE, now)
+        await db.commit()
+        logger.warning("Invitation refused: the account is not pending or already has a password")
         return _invalid_token()
     try:
         validate_new_password(body.password, user.email)
@@ -761,6 +773,7 @@ async def start_mfa_rotation(
 
 
 @router.post("/mfa/rotate/confirm")
+@limiter.limit(MFA_LIMIT, key_func=get_remote_address)
 async def confirm_mfa_rotation(
     request: Request,
     response: Response,
@@ -774,7 +787,11 @@ async def confirm_mfa_rotation(
     secret was ever accepted, and the step just used with the old secret (at `/start`, often the
     same 30 seconds) says nothing about it. The swap stores the step of this code as the last one
     used, and is conditional on the pending secret still being the one checked, so two concurrent
-    confirmations cannot both pass."""
+    confirmations cannot both pass.
+
+    A wrong code ends the rotation: the pending secret is dropped (start again, with the password
+    and a code of the current secret) and the failure counts toward the account lock. One guess per
+    rotation started, so a session holder cannot guess the code of a rotation the owner began."""
     now = now_utc()
     user = caller.user
     pending = user.mfa_pending_secret_enc
@@ -801,16 +818,14 @@ async def confirm_mfa_rotation(
         )
         swapped = result.rowcount == 1
     if not swapped:
-        await record_event(
-            db,
-            AuthEventType.MFA_FAILED,
-            user_id=user.id,
-            request=request,
-            method="otp",
-            step="mfa_rotate_confirm",
+        # Only the secret this code was checked against: a newer `/start` keeps its own.
+        await db.execute(
+            update(User)
+            .where(User.id == user.id, User.mfa_pending_secret_enc == pending)
+            .values(mfa_pending_secret_enc=None)
+            .execution_options(synchronize_session=False)
         )
-        await db.commit()
-        return _bad_request("invalid_code")
+        return await _wrong_code(db, request, user, "mfa_rotate_confirm", now)
 
     codes = await _replace_recovery_codes(db, user.id)
     await record_event(db, AuthEventType.MFA_ROTATED, user_id=user.id, request=request)

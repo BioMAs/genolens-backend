@@ -29,7 +29,7 @@ from app.auth.clock import now_utc
 from app.auth.mfa import recovery_code_matches
 from app.auth.one_time_tokens import issue_token
 from app.auth.passwords import hash_password, verify_password
-from app.models.auth import AuthEventType, AuthRecoveryCode, AuthSession
+from app.models.auth import AuthEventType, AuthOneTimeToken, AuthRecoveryCode, AuthSession
 from app.models.auth import OneTimeTokenPurpose as Purpose
 from app.models.models import SubscriptionPlan, User, UserRole, UserStatus
 from tests.auth_support import CSRF, PW, access_cookie, bearer, seed_user
@@ -67,6 +67,7 @@ NEW_PW = "Quarry-Heron-Lattice-58"
 WRONG_PW = "Wrong-Password-Again-42"
 ACCEPTED = {"status": "accepted"}
 INVALID_TOKEN = {"detail": "invalid_token"}
+INVALID_CREDENTIALS = {"detail": "invalid_credentials"}
 TOO_MANY_ATTEMPTS = {"detail": "too_many_attempts"}
 LOCAL_SESSION_REQUIRED = {"detail": "local_session_required"}
 
@@ -127,6 +128,18 @@ async def stored_codes(auth_db, user_id) -> list[AuthRecoveryCode]:
     async with auth_db() as s:
         rows = await s.execute(select(AuthRecoveryCode).where(AuthRecoveryCode.user_id == user_id))
         return list(rows.scalars())
+
+
+async def token_used(auth_db, user_id, purpose) -> bool:
+    """Is every token of `purpose` issued to the account spent?"""
+    async with auth_db() as s:
+        rows = await s.execute(
+            select(AuthOneTimeToken.used_at).where(
+                AuthOneTimeToken.user_id == user_id, AuthOneTimeToken.purpose == purpose
+            )
+        )
+        used = list(rows.scalars())
+    return bool(used) and all(at is not None for at in used)
 
 
 async def invite_token(auth_db, user) -> str:
@@ -255,9 +268,7 @@ async def test_signup_then_verify_then_sign_in(auth_client, auth_db, local_auth)
         {"email": "flow@example.test", "password": PW, "full_name": "Ada Example"},
     )
     raw = link_token(local_auth.last_text, "/auth/verify-email")
-    assert (await login(auth_client, "flow@example.test")).json() == {
-        "detail": "email_not_verified"
-    }
+    assert (await login(auth_client, "flow@example.test")).json() == INVALID_CREDENTIALS
 
     r = await post(auth_client, VERIFY_EMAIL, {"token": raw})
     assert r.status_code == 204, r.text
@@ -268,6 +279,21 @@ async def test_signup_then_verify_then_sign_in(auth_client, auth_db, local_auth)
     assert (await post(auth_client, VERIFY_EMAIL, {"token": raw})).json() == INVALID_TOKEN
     r = await login(auth_client, "flow@example.test")
     assert r.status_code == 200 and r.json() == {"next": "mfa_setup"}
+
+
+async def test_signup_then_login_tells_nothing_about_the_address(auth_client, auth_db, local_auth):
+    """An unverified account signs in exactly like a wrong password: sign-up then login with the
+    same password cannot tell a new address from a known one."""
+    existing = await verified_user(auth_db, password_hash=hash_password(NEW_PW))
+
+    await post(auth_client, SIGNUP, {"email": "unknown@example.test", "password": PW})
+    fresh = await login(auth_client, "unknown@example.test")
+    await post(auth_client, SIGNUP, {"email": existing.email, "password": PW})
+    known = await login(auth_client, existing.email)
+
+    assert fresh.status_code == known.status_code == 401
+    assert fresh.json() == known.json() == INVALID_CREDENTIALS
+    assert "set-cookie" not in fresh.headers and "set-cookie" not in known.headers
 
 
 async def test_verify_email_refuses_a_bad_token(auth_client, auth_db, local_auth):
@@ -495,13 +521,40 @@ async def test_invite_accept_checks_the_policy_before_spending_the_link(
 async def test_invite_accept_on_an_account_with_2fa_asks_for_a_code(
     auth_client, auth_db, local_auth
 ):
-    user, secret = await mfa_user(auth_db, password_hash=None)
+    user, secret = await mfa_user(auth_db, password_hash=None, status=UserStatus.PENDING)
     raw = await invite_token(auth_db, user)
 
     r = await post(auth_client, INVITE_ACCEPT, {"token": raw, "password": PW})
 
     assert r.status_code == 200 and r.json() == {"next": "mfa"}
     assert (await verify(auth_client, code=code_at(secret))).status_code == 200
+
+
+async def test_invite_for_an_account_with_a_password_is_refused_and_spent(
+    auth_client, auth_db, local_auth
+):
+    """A stale or forwarded invitation must not become a silent password reset."""
+    user = await seed_user(auth_db, status=UserStatus.PENDING, password_hash=hash_password(PW))
+    raw = await invite_token(auth_db, user)
+
+    r = await post(auth_client, INVITE_ACCEPT, {"token": raw, "password": NEW_PW})
+
+    assert r.status_code == 400 and r.json() == INVALID_TOKEN
+    assert "gl_mfa" not in r.cookies
+    stored = await reload(auth_db, user.id)
+    assert verify_password(PW, stored.password_hash).ok and stored.status == UserStatus.PENDING
+    assert await token_used(auth_db, user.id, Purpose.INVITE)
+
+
+async def test_invite_for_an_active_account_is_refused_and_spent(auth_client, auth_db, local_auth):
+    user = await seed_user(auth_db, status=UserStatus.ACTIVE)  # no password
+    raw = await invite_token(auth_db, user)
+
+    r = await post(auth_client, INVITE_ACCEPT, {"token": raw, "password": PW})
+
+    assert r.status_code == 400 and r.json() == INVALID_TOKEN
+    assert (await reload(auth_db, user.id)).password_hash is None
+    assert await token_used(auth_db, user.id, Purpose.INVITE)
 
 
 async def test_invite_accept_refuses_a_bad_token(auth_client, auth_db, local_auth):
@@ -751,9 +804,6 @@ async def test_mfa_rotation_requires_password_and_current_code(
     stored = await reload(auth_db, user.id)
     assert stored.mfa_pending_secret_enc and stored.mfa_totp_secret_enc == user.mfa_totp_secret_enc
 
-    r = await post(auth_client, ROTATE_CONFIRM, {"code": wrong_code(new_secret)}, headers)
-    assert r.status_code == 400 and r.json() == {"detail": "invalid_code"}
-
     # The code of the same 30-second step as the one just used with the old secret.
     r = await post(auth_client, ROTATE_CONFIRM, {"code": code_at(new_secret)}, headers)
     assert r.status_code == 200, r.text
@@ -777,6 +827,86 @@ async def test_mfa_rotation_requires_password_and_current_code(
     assert r.status_code == 401
     r = await verify(auth_client, code=code_at(new_secret, 1))
     assert r.status_code == 200, r.text
+
+
+async def test_a_wrong_rotation_code_drops_the_pending_secret(
+    auth_client, auth_db, local_auth, local_session_for
+):
+    """Otherwise a session holder could guess the code of a rotation the owner started."""
+    user, old_secret = await mfa_user(auth_db)
+    headers = bearer((await local_session_for(user)).access_token)
+    r = await post(
+        auth_client, ROTATE_START, {"password": PW, "code": code_at(old_secret)}, headers
+    )
+    new_secret = r.json()["secret"]
+
+    r = await post(auth_client, ROTATE_CONFIRM, {"code": wrong_code(new_secret)}, headers)
+
+    assert r.status_code == 400 and r.json() == {"detail": "invalid_code"}
+    stored = await reload(auth_db, user.id)
+    assert stored.mfa_pending_secret_enc is None
+    assert stored.mfa_totp_secret_enc == user.mfa_totp_secret_enc
+    assert stored.failed_login_count == 1
+    r = await post(auth_client, ROTATE_CONFIRM, {"code": code_at(new_secret)}, headers)
+    assert r.status_code == 400 and r.json() == {"detail": "no_rotation_pending"}
+    assert (await reload(auth_db, user.id)).mfa_totp_secret_enc == user.mfa_totp_secret_enc
+
+
+async def test_wrong_rotation_codes_lock_the_account(
+    auth_client, auth_db, local_auth, local_session_for
+):
+    user, old_secret = await mfa_user(auth_db, failed_login_count=9)
+    headers = bearer((await local_session_for(user)).access_token)
+    r = await post(
+        auth_client, ROTATE_START, {"password": PW, "code": code_at(old_secret)}, headers
+    )
+    new_secret = r.json()["secret"]
+
+    r = await post(auth_client, ROTATE_CONFIRM, {"code": wrong_code(new_secret)}, headers)
+    assert r.status_code == 400
+
+    stored = await reload(auth_db, user.id)
+    assert stored.failed_login_count == 10 and stored.locked_until is not None
+    [locked] = await events(auth_db, AuthEventType.ACCOUNT_LOCKED)
+    assert locked.user_id == user.id
+    r = await post(
+        auth_client, ROTATE_START, {"password": PW, "code": code_at(old_secret, 1)}, headers
+    )
+    assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
+
+
+async def test_a_locked_account_cannot_confirm_a_rotation(
+    auth_client, auth_db, local_auth, local_session_for
+):
+    from app.auth.mfa import encrypt_secret, new_totp_secret
+
+    pending = new_totp_secret()
+    user, _ = await mfa_user(
+        auth_db,
+        failed_login_count=10,
+        locked_until=now_utc() + timedelta(minutes=10),
+        mfa_pending_secret_enc=encrypt_secret(pending),
+    )
+    headers = bearer((await local_session_for(user)).access_token)
+
+    r = await post(auth_client, ROTATE_CONFIRM, {"code": code_at(pending)}, headers)
+
+    assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
+    assert (await reload(auth_db, user.id)).mfa_totp_secret_enc == user.mfa_totp_secret_enc
+
+
+async def test_rotation_confirm_is_limited_per_ip(
+    auth_client, auth_db, local_auth, local_session_for
+):
+    user, _ = await mfa_user(auth_db)
+    headers = bearer((await local_session_for(user)).access_token)
+
+    for _ in range(30):
+        r = await post(auth_client, ROTATE_CONFIRM, {"code": "123456"}, headers)
+        assert r.status_code == 400  # nothing pending
+
+    r = await post(auth_client, ROTATE_CONFIRM, {"code": "123456"}, headers)
+    assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
 
 
 async def test_rotation_confirm_without_a_pending_secret(

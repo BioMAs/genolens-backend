@@ -426,16 +426,46 @@ async def test_legacy_hash_upgraded_on_login(auth_client, auth_db, local_auth):
     assert verify_password(PW, stored.password_hash).ok
 
 
-async def test_unverified_email_blocked(auth_client, auth_db, local_auth):
+async def test_unverified_email_is_answered_as_a_wrong_password(
+    auth_client, auth_db, local_auth, monkeypatch
+):
+    """Otherwise sign-up then login would tell a new address (an unverified account, just made
+    with that password) from a known one. Same answer, same cost, same count, same audit."""
+    from starlette.concurrency import run_in_threadpool
+
+    import app.api.endpoints.auth as auth_endpoints
+    from app.auth.passwords import _top_up
+
+    seen = []
+
+    async def spy(func, *args, **kwargs):
+        seen.append(func)
+        return await run_in_threadpool(func, *args, **kwargs)
+
+    monkeypatch.setattr(auth_endpoints, "run_in_threadpool", spy)
     user = await verified_user(auth_db, email_verified_at=None)
 
-    r = await login(auth_client, user.email)
-    assert r.status_code == 403 and r.json() == {"detail": "email_not_verified"}
-    assert "gl_mfa" not in r.cookies
+    right = await login(auth_client, user.email)
+    wrong = await login(auth_client, user.email, "Wrong-Password-Again-42")
 
-    # Only the right password learns that the address is unverified.
-    r = await login(auth_client, user.email, "Wrong-Password-Again-42")
-    assert r.status_code == 401 and r.json() == INVALID_CREDENTIALS
+    assert right.status_code == wrong.status_code == 401
+    assert right.json() == wrong.json() == INVALID_CREDENTIALS
+    assert "set-cookie" not in right.headers
+    # The right password paid only its argon2 check: the bcrypt check of a refusal is added.
+    assert seen == [verify_password, _top_up, verify_password]
+    assert (await reload(auth_db, user.id)).failed_login_count == 2
+    failed = await events(auth_db, AuthEventType.LOGIN_FAILED)
+    assert [e.details["reason"] for e in failed] == ["email_not_verified", "invalid_credentials"]
+
+
+async def test_unverified_logins_lock_the_account(auth_client, auth_db, local_auth, no_ip_limit):
+    user = await verified_user(auth_db, email_verified_at=None)
+
+    for _ in range(10):
+        assert (await login(auth_client, user.email)).json() == INVALID_CREDENTIALS
+
+    r = await login(auth_client, user.email)
+    assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
 
 
 async def test_csrf_header_required(auth_client, auth_db, local_auth):

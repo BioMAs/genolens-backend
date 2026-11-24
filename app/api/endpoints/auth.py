@@ -37,7 +37,14 @@ has an account. That state lives in the rate limiter's storage (Redis in product
 SHA-256 of the address and forgotten one day after its first failure; an account's count waits
 for a successful sign-in instead, so the two can still be told apart by someone who fails ten
 times, waits a day, and fails again. The per-IP limits answer with the same `too_many_attempts`
-body (`app.main`). `email_not_verified` is only ever said to the holder of the right password.
+body (`app.main`).
+
+An account whose address is not verified yet is answered exactly as a wrong password, even for the
+right one: `401 invalid_credentials`, the same failure count and lock, the same audit row (reason
+`email_not_verified`, never in the response), and the same cost (the bcrypt check a refusal pays
+is added to the right argon2 password). Otherwise sign-up then login would tell addresses apart:
+sign-up makes an unverified account with the password typed for a new address, and only e-mails an
+existing one. The client offers to resend the verification link after a failed sign-in instead.
 
 Transactions. Each route commits its own writes before it answers. `reserve_attempt` is committed
 at once, before the code is checked, so a refusal cannot hand the attempt back. A refresh commits
@@ -86,7 +93,7 @@ from app.auth.one_time_tokens import (
     peek_token,
     reserve_attempt,
 )
-from app.auth.passwords import verify_password
+from app.auth.passwords import _Spent, _top_up, verify_password
 from app.auth.principal import CSRF_HEADER, local_tokens_accepted, read_credentials
 from app.auth.sessions import (
     IssuedSession,
@@ -474,7 +481,14 @@ async def login(
 
     stored_hash = user.password_hash if user is not None else None
     check = await run_in_threadpool(verify_password, body.password, stored_hash)
-    if not check.ok or user is None:
+    unverified = check.ok and user is not None and user.email_verified_at is None
+    if unverified:
+        # The right password of an unverified account is answered as a wrong one (see the module
+        # docstring). A right argon2 password paid one argon2 check; a refusal also pays a bcrypt
+        # one: added here so that the time does not tell them apart either.
+        legacy = not (stored_hash or "").startswith("$argon2")
+        await run_in_threadpool(_top_up, body.password, _Spent(argon2=True, bcrypt=legacy))
+    if not check.ok or user is None or unverified:
         if user is not None:
             await _count_failure(db, user.id, request, now)
         else:
@@ -484,23 +498,13 @@ async def login(
             AuthEventType.LOGIN_FAILED,
             user_id=user_id,
             request=request,
-            reason="invalid_credentials",
+            reason="email_not_verified" if unverified else "invalid_credentials",
         )
         await db.commit()
         return _refusal(status.HTTP_401_UNAUTHORIZED, "invalid_credentials")
 
     if check.upgraded_hash:
         user.password_hash = check.upgraded_hash
-    if user.email_verified_at is None:
-        await record_event(
-            db,
-            AuthEventType.LOGIN_FAILED,
-            user_id=user.id,
-            request=request,
-            reason="email_not_verified",
-        )
-        await db.commit()
-        return _refusal(status.HTTP_403_FORBIDDEN, "email_not_verified")
 
     if user.mfa_enabled_at is not None:
         purpose, next_step = Purpose.MFA_CHALLENGE, "mfa"
