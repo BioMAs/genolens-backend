@@ -67,6 +67,11 @@ class UserSelf(User):
     ai_requests_limit: Optional[int] = None
     ai_requests_used: int = 0
     ai_requests_remaining: Optional[int] = None
+    # Local authentication (computed in `read_user_me`). `recovery_codes_remaining` is None while
+    # two-factor authentication is off; the client warns from two left (spec §7.4).
+    mfa_enabled: bool = False
+    email_verified: bool = False
+    recovery_codes_remaining: Optional[int] = None
 
     @field_validator("is_demo", "ai_requests_used", mode="before")
     @classmethod

@@ -17,7 +17,7 @@ from app.auth.mfa import load_cipher
 from app.core.config import settings
 from app.core.supabase_auth import close_supabase_http_client
 from app.db.session import close_db
-from app.api.endpoints import auth, projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmomics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
+from app.api.endpoints import auth, auth_account, projects, comparisons, datasets, admin, admin_deployment, admin_ai_costs, users, ontology, enrichment, bookmarks, genes, comments, history, integrations, license, pricing, billing, reports, report_settings, analyses, cosmomics, intersection_enrichment, chat, gsea, gene_sets, drug_discovery
 from app.middleware import SecurityHeadersMiddleware, limiter, LoginTrackingMiddleware
 
 logger = logging.getLogger(__name__)
@@ -254,11 +254,18 @@ async def database_test(current_user=Depends(get_current_user)):
 #   license, health  infrastructure status, needed precisely when access is broken
 #   admin, admin_deployment, admin_ai_costs
 #                    admin-only already; privileged roles bypass the guard anyway
-#   auth             sign-in, 2FA, refresh, logout: a suspended account must still sign
-#                    in to be told why; answers 404 itself while local auth is off
+#   auth, auth_account
+#                    sign-in, 2FA, refresh, logout, sign-up, password and session
+#                    management: a suspended account must still sign in to be told why;
+#                    both answer 404 themselves while local auth is off
 
 app.include_router(
     auth.router,
+    prefix=settings.API_V1_PREFIX,
+)
+
+app.include_router(
+    auth_account.router,
     prefix=settings.API_V1_PREFIX,
 )
 
