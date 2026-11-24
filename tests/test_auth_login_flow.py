@@ -414,6 +414,100 @@ async def test_an_expired_lock_lets_the_right_password_through(auth_client, auth
     assert r.status_code == 200 and r.json() == {"next": "mfa_setup"}
 
 
+async def expire_lock(auth_db, user_id) -> None:
+    """The account's lock has run out (instead of waiting fifteen minutes)."""
+    async with auth_db() as s:
+        await s.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(locked_until=now_utc() - timedelta(seconds=1))
+        )
+        await s.commit()
+
+
+async def test_an_expired_lock_takes_ten_fresh_failures_to_lock_again(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    """Otherwise one wrong password every fifteen minutes, from anyone, would keep the account
+    locked for ever."""
+    user = await verified_user(auth_db)
+    for _ in range(10):
+        await login(auth_client, user.email, "Wrong-Password-Again-42")
+    assert (await login(auth_client, user.email)).json() == TOO_MANY_ATTEMPTS
+
+    await expire_lock(auth_db, user.id)
+    r = await login(auth_client, user.email, "Wrong-Password-Again-42")
+
+    assert r.status_code == 401 and r.json() == INVALID_CREDENTIALS
+    stored = await reload(auth_db, user.id)
+    assert stored.failed_login_count == 1 and stored.locked_until is None
+    for _ in range(8):  # fresh failures 2 to 9: still not locked
+        r = await login(auth_client, user.email, "Wrong-Password-Again-42")
+        assert r.status_code == 401 and r.json() == INVALID_CREDENTIALS
+    assert (await login(auth_client, user.email)).json() == {"next": "mfa_setup"}
+
+    r = await login(auth_client, user.email, "Wrong-Password-Again-42")  # the tenth fresh one
+    assert r.status_code == 401 and r.json() == INVALID_CREDENTIALS
+    r = await login(auth_client, user.email)
+    assert r.status_code == 429 and r.json() == TOO_MANY_ATTEMPTS
+    assert (await reload(auth_db, user.id)).failed_login_count == 10
+    assert len(await events(auth_db, AuthEventType.ACCOUNT_LOCKED)) == 2
+
+
+async def test_an_expired_lock_earned_with_codes_restarts_the_count_too(
+    auth_client, auth_db, local_auth
+):
+    """The 2FA failures share the account's count, and so its fresh start after a lock."""
+    user, secret = await mfa_user(auth_db)
+    async with auth_db() as s:
+        await s.execute(
+            update(User)
+            .where(User.id == user.id)
+            .values(failed_login_count=10, locked_until=now_utc() - timedelta(seconds=1))
+        )
+        await s.commit()
+
+    assert (await login(auth_client, user.email)).json() == {"next": "mfa"}
+    r = await verify(auth_client, code=wrong_code(secret))
+
+    assert r.status_code == 401 and r.json()["detail"] == "invalid_code"
+    stored = await reload(auth_db, user.id)
+    assert stored.failed_login_count == 1 and stored.locked_until is None
+    assert (await verify(auth_client, code=code_at(secret))).status_code == 200
+
+
+async def test_an_unknown_address_follows_the_same_lock_timeline(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    """Locked, expired, ten fresh failures, locked again: answer for answer, an address without
+    an account goes through what an account goes through."""
+    from app.api.endpoints.auth import _unknown_address_keys
+    from app.middleware.rate_limit import limiter
+
+    user = await verified_user(auth_db)
+    unknown = "nobody@example.test"
+
+    async def expire(email: str) -> None:
+        if email == user.email:
+            await expire_lock(auth_db, user.id)
+        else:
+            limiter.limiter.storage.clear(_unknown_address_keys(email)[1])
+
+    timelines = {}
+    for email in (unknown, user.email):
+        seen = []
+        for attempt in range(22):
+            if attempt == 11:
+                await expire(email)
+            r = await login(auth_client, email, "Wrong-Password-Again-42")
+            seen.append((r.status_code, r.json()))
+        timelines[email] = seen
+
+    failed, locked = (401, INVALID_CREDENTIALS), (429, TOO_MANY_ATTEMPTS)
+    assert timelines[unknown] == timelines[user.email]
+    assert timelines[unknown] == [failed] * 10 + [locked] + [failed] * 10 + [locked]
+
+
 async def test_legacy_hash_upgraded_on_login(auth_client, auth_db, local_auth):
     legacy = bcrypt.hashpw(PW.encode(), bcrypt.gensalt(rounds=4, prefix=b"2a")).decode()
     user = await verified_user(auth_db, password_hash=legacy)

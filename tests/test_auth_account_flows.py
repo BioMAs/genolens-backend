@@ -616,17 +616,30 @@ async def test_a_password_change_kills_a_pending_challenge(
     assert len(await sessions_of(auth_db, user.id)) == 1
 
 
-async def test_reset_does_not_lift_the_account_lock(auth_client, auth_db, local_auth):
-    """The lock bounds guessing of second-factor codes: a reset must not refill the budget."""
-    locked_until = now_utc() + timedelta(minutes=10)
-    user = await verified_user(auth_db, failed_login_count=10, locked_until=locked_until)
+async def test_a_reset_lifts_the_account_lock_and_still_requires_mfa(
+    auth_client, auth_db, local_auth, no_ip_limit
+):
+    """Whoever proves the inbox is not kept out by ten failures of somebody else: a completed
+    reset clears the count and the lock. The second factor is still asked."""
+    user, secret = await mfa_user(auth_db)
+    for _ in range(10):
+        await login(auth_client, user.email, WRONG_PW)
+    assert (await login(auth_client, user.email)).json() == TOO_MANY_ATTEMPTS
     await post(auth_client, FORGOT, {"email": user.email})
     raw = link_token(local_auth.last_text, "/auth/reset")
 
-    await post(auth_client, RESET, {"token": raw, "new_password": NEW_PW})
+    refused = await post(auth_client, RESET, {"token": raw, "new_password": user.email})
+    assert refused.status_code == 400  # the policy: nothing changed, the lock included
+    assert (await reload(auth_db, user.id)).locked_until is not None
+    r = await post(auth_client, RESET, {"token": raw, "new_password": NEW_PW})
 
+    assert r.status_code == 204, r.text
     stored = await reload(auth_db, user.id)
-    assert stored.failed_login_count == 10 and stored.locked_until is not None
+    assert stored.failed_login_count == 0 and stored.locked_until is None
+    r = await login(auth_client, user.email, NEW_PW)
+    assert r.status_code == 200 and r.json() == {"next": "mfa"}
+    assert await sessions_of(auth_db, user.id) == []
+    assert (await verify(auth_client, code=code_at(secret))).status_code == 200
 
 
 # ── Invitation ───────────────────────────────────────────────────────────────

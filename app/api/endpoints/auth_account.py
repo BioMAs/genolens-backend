@@ -54,9 +54,11 @@ routes counted) within the hour, counted in the database from the tokens issued
 The account lock. A wrong current password (`/password/change`, `/mfa/rotate/start`) and a wrong
 current TOTP code (`/mfa/rotate/start`, `/mfa/recovery-codes/regenerate`) count toward the lock
 exactly as a failed sign-in, and a locked account gets `429 too_many_attempts` on those routes. As
-at sign-in, nothing here resets the count: only an opened session does. A password reset does not
-lift a lock either: whoever controls the inbox but not the phone would otherwise refill the budget
-of code guesses at will. A wrong code while confirming a rotation counts too, and also drops the
+at sign-in, the session routes never reset the count: an opened session does, and so does a
+completed `/password/reset`, which clears the count and the lock in the transaction that changes
+the password (whoever proves the inbox must not stay locked out by somebody else's failures; the
+next sign-in still asks for the second factor). A refused reset (bad link, password policy) leaves
+both as they were. A wrong code while confirming a rotation counts too, and also drops the
 pending secret: the rotation starts again from `/mfa/rotate/start` (password and current code), so
 a session holder gets one guess per rotation, never a free run at the code of one the owner began.
 `/mfa/rotate/confirm` also has the per-IP limit of `/mfa/verify`.
@@ -85,6 +87,7 @@ from app.api.endpoints.auth import (
     MFA_LIMIT,
     MfaConfirmRequest,
     _accept_totp,
+    _clear_failures,
     _count_failure,
     _decrypt,
     _find_account,
@@ -492,7 +495,8 @@ async def reset_password(
     background: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> Response:
-    """No session is opened: the next sign-in still asks for the second factor (spec §7.4)."""
+    """No session is opened: the next sign-in still asks for the second factor (spec §7.4). The
+    account lock and its count are cleared with the password, in the same transaction."""
     now = now_utc()
     user = await _account_of_link(db, body.token, Purpose.PASSWORD_RESET, now)
     if user is None:
@@ -510,6 +514,7 @@ async def reset_password(
     user.password_changed_at = now
     if user.email_verified_at is None:
         user.email_verified_at = now  # the link reached the inbox, as a verification link would
+    await _clear_failures(db, user.id)  # an UPDATE: it also wipes a failure counted meanwhile
     revoked = await revoke_all_sessions(db, user.id, RESET_REASON)
     tokens_spent = await invalidate_user_tokens(db, user.id, now=now)
     await record_event(

@@ -20,11 +20,14 @@ login too, spec §7.3); `/logout` exempts a Bearer caller, as the principal reso
 `/logout` always answers 204 and clears every auth cookie, whatever credentials it got.
 
 Failures and the account lock. A wrong password and a wrong 2FA code at `/mfa/verify` both count
-toward the account lock: from the tenth consecutive failure the account is locked for 15 minutes,
-and every further failure locks it again, until a sign-in completes. The count is reset only when a
-session opens, NOT after the password alone: otherwise a password holder could log in again
-between challenges and guess five codes per challenge for ever. A locked account gets
-`429 too_many_attempts` at `/login`, `/mfa/verify` and `/mfa/setup/confirm`, whatever it sends.
+toward the account lock: the tenth consecutive failure locks the account for 15 minutes. Once the
+lock has run out its count is spent: the next failure is the first of a new run, and only ten fresh
+failures lock again (so a stranger cannot keep an account locked for ever with one wrong password
+every fifteen minutes). Otherwise the count is reset only when a session opens, NOT after the
+password alone: a password holder could log in again between challenges and guess five codes per
+challenge without ever being locked. A completed password reset clears it too
+(`app.api.endpoints.auth_account`). A locked account gets `429 too_many_attempts` at `/login`,
+`/mfa/verify` and `/mfa/setup/confirm`, whatever it sends.
 Wrong codes while confirming an enrolment spend the step token's attempts but not the account's:
 the caller is confirming a secret it was just given, there is nothing to guess.
 
@@ -35,13 +38,14 @@ Per-IP limits (`app.middleware.rate_limit`): `LOGIN_LIMIT` on `/login`, `MFA_LIM
 Anti-enumeration. An unknown address, an account without a password and a wrong password get the
 same `401 invalid_credentials`, after the same work (`verify_password` pays for one argon2 and one
 bcrypt check whatever the case) and the same database writes (the counter of an account, or an
-audit row). An unknown address is locked like an account too: ten failures lock it for 15 minutes
-and every further one locks it again, so the eleventh attempt does not tell whether the address
-has an account. That state lives in the rate limiter's storage (Redis in production), keyed by a
-SHA-256 of the address and forgotten one day after its first failure; an account's count waits
-for a successful sign-in instead, so the two can still be told apart by someone who fails ten
-times, waits a day, and fails again. The per-IP limits answer with the same `too_many_attempts`
-body (`app.main`).
+audit row). An unknown address is locked like an account too: ten failures lock it for 15 minutes,
+and once that lock has run out ten fresh failures lock it again, so neither the eleventh attempt
+nor the ones after the lock tell whether the address has an account. That state lives in the rate
+limiter's storage (Redis in production), keyed by a SHA-256 of the address; its count is forgotten
+one day after its first failure, while an account's count waits for a successful sign-in instead,
+so the two can still be told apart by someone who fails nine times, waits a day, then fails once
+more: that failure locks an account, not an address without one. The per-IP limits answer with the
+same `too_many_attempts` body (`app.main`).
 
 An account whose address is not verified yet is answered exactly as a wrong password, even for the
 right one: `401 invalid_credentials`, the same failure count and lock, the same audit row (reason
@@ -73,7 +77,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from slowapi.util import get_remote_address
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, null, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -230,12 +234,21 @@ def _is_locked(user: User, now: datetime) -> bool:
 
 
 async def _count_failure(db: AsyncSession, user_id: UUID, request: Request, now: datetime) -> None:
-    """One more consecutive failure on the account; from the tenth, a 15-minute lock."""
+    """One more consecutive failure on the account; from the tenth, a 15-minute lock.
+
+    A lock that has run out has spent its count: the failure after it is the first of a new run
+    (count 1, lock date cleared), so the next lock takes ten fresh failures. Otherwise anyone could
+    keep an account locked for ever with one wrong password every fifteen minutes. One statement
+    decides and counts, so two concurrent failures cannot both start a new run."""
+    expired = and_(User.locked_until.is_not(None), User.locked_until <= now)
     failures = (
         await db.execute(
             update(User)
             .where(User.id == user_id)
-            .values(failed_login_count=User.failed_login_count + 1)
+            .values(
+                failed_login_count=case((expired, 1), else_=User.failed_login_count + 1),
+                locked_until=case((expired, null()), else_=User.locked_until),
+            )
             .returning(User.failed_login_count)
             .execution_options(synchronize_session=False)
         )
@@ -283,13 +296,16 @@ def _unknown_address_locked(email: str) -> bool:
 
 
 def _count_unknown_address_failure(email: str) -> None:
-    """The account lock, played for an address that has no account (see the module docstring)."""
+    """The account lock, played for an address that has no account (see the module docstring).
+    The lock spends the count, as an account's lock does once it runs out (`_count_failure`): no
+    failure is counted while it holds, and after it the next lock takes ten fresh failures."""
     failures_key, lock_key = _unknown_address_keys(email)
     try:
         storage = limiter.limiter.storage
         failures = storage.incr(failures_key, int(UNKNOWN_ADDRESS_MEMORY.total_seconds()))
         if failures >= LOCK_THRESHOLD:
             storage.incr(lock_key, int(LOCK_DURATION.total_seconds()))
+            storage.clear(failures_key)
     except Exception as exc:
         logger.warning("Unknown-address failure not counted (%s)", type(exc).__name__)
 
