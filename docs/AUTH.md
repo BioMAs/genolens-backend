@@ -35,10 +35,10 @@ Ordre de résolution d'un jeton : (1) un jeton `glst_` passe par la résolution 
 | `SUPABASE_URL`, `SUPABASE_KEY`, `SUPABASE_JWT_SECRET` | aucun | Fournisseur externe. **Obligatoires seulement en `AUTH_MODE=supabase`** : le démarrage échoue avec un message qui nomme ceux qui manquent. Leur valeur n'est jamais écrite dans le message. |
 | `SUPABASE_SERVICE_ROLE_KEY` | vide | Opérations d'administration du fournisseur externe (mode `supabase`). |
 | `SUPABASE_DB_URL` | vide | Chaîne de connexion de la base du fournisseur externe, pour le seul script de migration des comptes (voir plus bas). Elle contient un mot de passe : elle n'est transmise qu'à cette commande, pas à l'environnement d'un service. |
-| `APP_URL` | `http://localhost:3000` | URL publique du frontend, utilisée dans les liens des e-mails de sécurité. |
+| `APP_URL` | `http://localhost:3000` dans le code ; `docker-compose.prod.yml` met `https://app.genolens.com` | URL publique du frontend : l'hôte de tous les liens des e-mails (vérification, réinitialisation, invitation). Le fichier compose n'a pas d'`env_file` : sans son entrée, les liens pointeraient vers `localhost`. |
 | `SMTP_*`, `EMAIL_FROM_ADDRESS` | vides | Les e-mails de sécurité (invitation, vérification, réinitialisation, mot de passe changé, 2FA activée ou réinitialisée, code de secours utilisé) sont envoyés en mode **obligatoire** : sans SMTP configuré, l'envoi échoue au lieu de passer sous silence. |
 
-`.env.example` liste tous ces réglages avec un exemple sûr. `docker-compose.prod.yml` transmet les `AUTH_*` à `api`, `worker` et `beat`, avec les défauts ci-dessus : une variable absente du `.env` de l'hôte ne change rien au démarrage en mode `supabase`. Le `r-worker` ne reçoit que `AUTH_MODE` et `AUTH_LOCAL_ENABLED` : il charge les mêmes réglages que les autres, ne signe personne et ne détient aucune clé.
+`.env.example` liste tous ces réglages avec un exemple sûr. `docker-compose.prod.yml` transmet les `AUTH_*` et `APP_URL` à `api`, `worker` et `beat`, avec les défauts ci-dessus : une variable absente du `.env` de l'hôte ne change rien au démarrage en mode `supabase`. Le `r-worker` ne reçoit que `AUTH_MODE` et `AUTH_LOCAL_ENABLED` : il charge les mêmes réglages que les autres, ne signe personne et ne détient aucune clé.
 
 ### Démarrage
 

@@ -10,6 +10,7 @@ The GitHub Actions deploy (.github/workflows/ci.yml) carries the same list, but
 `.github/` is excluded from the image these tests run in, so it cannot be checked
 here — keep the two in step by hand.
 """
+
 import re
 from pathlib import Path
 
@@ -150,3 +151,26 @@ def test_every_service_that_gets_the_hosted_provider_also_gets_the_mode():
         environment = _environment(service)
         if "SUPABASE_URL" in environment:
             assert "AUTH_MODE" in environment, f"{service} loads settings without the mode"
+
+
+# --------------------------------------------------------------------------------------------
+# APP_URL: the host of every link an e-mail carries
+# --------------------------------------------------------------------------------------------
+
+APP_URL_ENTRY = "${APP_URL:-https://app.genolens.com}"
+
+
+def test_the_services_that_send_e_mail_know_the_address_of_the_app():
+    """The compose file has no `env_file`: a setting it does not pass is the code's default, and
+    the default of APP_URL is `http://localhost:3000`, so every link of an e-mail (sign-up
+    verification, password reset, invitation) pointed to localhost in production."""
+    senders = [s for s in sorted(_compose_services() - INFRA) if "SMTP_HOST" in _environment(s)]
+    assert {"api", "worker", "beat"} <= set(senders)
+    for service in senders:
+        assert _environment(service).get("APP_URL") == APP_URL_ENTRY, service
+
+
+def test_the_r_worker_sends_no_e_mail():
+    """It runs the R analyses and the reports, neither of which mails anyone: it has no SMTP
+    settings, hence no need for APP_URL. If it ever gets them, it needs APP_URL too (above)."""
+    assert "SMTP_HOST" not in _environment("r-worker")
