@@ -28,6 +28,10 @@ between challenges and guess five codes per challenge for ever. A locked account
 Wrong codes while confirming an enrolment spend the step token's attempts but not the account's:
 the caller is confirming a secret it was just given, there is nothing to guess.
 
+Per-IP limits (`app.middleware.rate_limit`): `LOGIN_LIMIT` on `/login`, `MFA_LIMIT` on
+`/mfa/verify`, `/mfa/setup/start` and `/mfa/setup/confirm` (each counted on its own), and
+`REFRESH_LIMIT` on `/refresh`.
+
 Anti-enumeration. An unknown address, an account without a password and a wrong password get the
 same `401 invalid_credentials`, after the same work (`verify_password` pays for one argon2 and one
 bcrypt check whatever the case) and the same database writes (the counter of an account, or an
@@ -633,6 +637,7 @@ async def verify_mfa(
 
 
 @_local.post("/mfa/setup/start", dependencies=_csrf)
+@limiter.limit(MFA_LIMIT, key_func=get_remote_address)
 async def start_mfa_setup(
     request: Request, response: Response, db: AsyncSession = Depends(get_db)
 ) -> Any:
@@ -657,6 +662,7 @@ async def start_mfa_setup(
 
 
 @_local.post("/mfa/setup/confirm", dependencies=_csrf)
+@limiter.limit(MFA_LIMIT, key_func=get_remote_address)
 async def confirm_mfa_setup(
     request: Request,
     response: Response,

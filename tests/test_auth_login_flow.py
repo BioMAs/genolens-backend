@@ -956,6 +956,19 @@ async def test_login_rate_limit(auth_client, local_auth):
     assert r.json() == TOO_MANY_ATTEMPTS  # the same generic answer as a locked account
 
 
+@pytest.mark.parametrize("path, body", [(SETUP_START, None), (SETUP_CONFIRM, {"code": "123456"})])
+async def test_enrolment_routes_are_limited_per_ip(auth_client, local_auth, path, body):
+    """The per-IP limit of `/mfa/verify` (30 an hour) applies to both enrolment steps too."""
+    for _ in range(30):
+        r = await auth_client.post(path, json=body, headers=CSRF)
+        assert r.status_code == 401 and r.json() == CHALLENGE_EXPIRED  # no step token
+
+    r = await auth_client.post(path, json=body, headers=CSRF)
+
+    assert r.status_code == 429
+    assert r.json() == TOO_MANY_ATTEMPTS
+
+
 async def test_step_tokens_are_stored_hashed(auth_client, auth_db, local_auth):
     user = await verified_user(auth_db)
     r = await login(auth_client, user.email)
