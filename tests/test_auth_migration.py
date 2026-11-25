@@ -1473,7 +1473,7 @@ async def test_reset_links_go_to_the_accounts_without_a_password(
         assert {e.user_id for e in events} == {needs_1.id, needs_2.id}
         assert all((e.details or {}).get("source") == "supabase_migration" for e in events)
     for message in smtp_capture.messages:
-        assert "https://app.example.test/auth/reset?token=" in message.text
+        assert "https://app.example.test/auth/reset#token=" in message.text
 
 
 async def test_reset_links_skip_an_account_that_holds_a_live_link(

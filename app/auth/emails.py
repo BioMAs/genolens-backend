@@ -11,9 +11,9 @@ Copy is English, like the rest of the app, short and plain: one action per e-mai
 is valid where there is one, and what to do if the reader did not expect the message. No customer
 is named. The address to contact is the `SUPPORT_EMAIL` setting, read when the e-mail is sent.
 
-Secrets. A raw token appears only in the link (URL-encoded, so that no character of it can break
-the link or the HTML) and is never logged, neither here nor by `send_email`, which logs the
-recipient and the subject only. Values interpolated in HTML are escaped.
+Secrets. A raw token appears only in the fragment of the link (URL-encoded, so that no character
+of it can break the link or the HTML) and is never logged, neither here nor by `send_email`, which
+logs the recipient and the subject only. Values interpolated in HTML are escaped.
 """
 
 from html import escape
@@ -30,8 +30,13 @@ _Action = tuple[str, str]
 
 
 def _link(path: str, raw_token: str) -> str:
-    """`path` on the app, carrying the token: `<APP_URL><path>?token=<url-encoded token>`."""
-    return f"{settings.APP_URL.rstrip('/')}{path}?token={quote(raw_token, safe='')}"
+    """`path` on the app, carrying the token: `<APP_URL><path>#token=<url-encoded token>`.
+
+    In the fragment, not the query string: a browser never sends the fragment to a server, so the
+    token stays out of access logs (the app's host included) and out of `Referer`. The app reads it
+    there first and still accepts `?token=` from links sent before the change.
+    """
+    return f"{settings.APP_URL.rstrip('/')}{path}#token={quote(raw_token, safe='')}"
 
 
 def _duration(seconds: int) -> str:
