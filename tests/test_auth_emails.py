@@ -5,8 +5,9 @@ placeholder SMTP settings. The recipient is always an `@example.test` address.
 """
 
 import logging
-from html import escape
-from urllib.parse import quote
+import re
+from html import escape, unescape
+from urllib.parse import parse_qs, quote, urlsplit
 
 import pytest
 
@@ -133,7 +134,7 @@ async def test_optional_email_is_still_sent_when_configured(smtp_capture):
 
 async def test_links_point_to_app(monkeypatch, smtp_capture):
     await send_invitation_email("u@example.test", "RAW")
-    assert f"{settings.APP_URL}/auth/invite?token=RAW" in smtp_capture.last_text
+    assert f"{settings.APP_URL}/auth/invite#token=RAW" in smtp_capture.last_text
 
 
 @pytest.mark.parametrize("send, path, validity", LINK_EMAILS)
@@ -142,10 +143,27 @@ async def test_link_is_in_both_bodies_and_the_mail_goes_to_the_recipient(
 ):
     await send(TO, "RAW")
     mail = smtp_capture.last
-    link = f"{app_url()}{path}?token=RAW"
+    link = f"{app_url()}{path}#token=RAW"
     assert mail.to == TO
     assert link in mail.text
     assert f'href="{link}"' in mail.html
+
+
+@pytest.mark.parametrize("send, path, validity", LINK_EMAILS)
+async def test_token_rides_in_the_fragment_never_in_the_query(smtp_capture, send, path, validity):
+    """A browser never sends the fragment to a server; it sends the query string with the request,
+    to the access logs and, from the page, in `Referer`. The token must be in the fragment only."""
+    await send(TO, "RAW")
+    mail = smtp_capture.last
+    for body in (mail.text, mail.html):
+        links = [urlsplit(unescape(url)) for url in re.findall(r"https?://[^\s\"<]+", body)]
+        carrying = [link for link in links if "RAW" in link.geturl()]
+        assert carrying, "no link carries the token"
+        for link in carrying:
+            assert link.path == path
+            assert link.query == ""
+            assert parse_qs(link.fragment) == {"token": ["RAW"]}
+        assert "?token=" not in body
 
 
 @pytest.mark.parametrize("send, path, validity", LINK_EMAILS)
@@ -153,7 +171,7 @@ async def test_token_is_url_encoded_in_the_link(smtp_capture, send, path, validi
     raw = "a+b/c d&e=f?g#h%"
     await send(TO, raw)
     mail = smtp_capture.last
-    link = f"{app_url()}{path}?token={quote(raw, safe='')}"
+    link = f"{app_url()}{path}#token={quote(raw, safe='')}"
     assert link in mail.text
     assert link in mail.html
     assert raw not in mail.text
@@ -166,7 +184,7 @@ async def test_trailing_slash_of_app_url_is_not_doubled(
 ):
     monkeypatch.setattr(settings, "APP_URL", "https://app.example.test/")
     await send(TO, "RAW")
-    assert f"https://app.example.test{path}?token=RAW" in smtp_capture.last_text
+    assert f"https://app.example.test{path}#token=RAW" in smtp_capture.last_text
     assert "test//auth" not in smtp_capture.last_text
     assert "test//auth" not in smtp_capture.last.html
 
@@ -175,7 +193,7 @@ async def test_trailing_slash_of_app_url_is_not_doubled(
 async def test_link_is_escaped_in_html(monkeypatch, smtp_capture, send, path, validity):
     monkeypatch.setattr(settings, "APP_URL", 'https://app.example.test/?a=1&b="<2>"')
     await send(TO, "RAW")
-    link = f'https://app.example.test/?a=1&b="<2>"{path}?token=RAW'
+    link = f'https://app.example.test/?a=1&b="<2>"{path}#token=RAW'
     html = smtp_capture.last.html
     assert escape(link) in html
     assert link not in html
@@ -205,7 +223,7 @@ async def test_link_emails_say_what_to_do_if_not_asked_for(smtp_capture, send, p
 async def test_account_exists_email_offers_the_reset_link_and_reveals_nothing_more(smtp_capture):
     await send_account_exists_email(TO, "RAW")
     text = smtp_capture.last_text
-    assert f"{app_url()}/auth/reset?token=RAW" in text
+    assert f"{app_url()}/auth/reset#token=RAW" in text
     assert "already" in text.lower()
 
 

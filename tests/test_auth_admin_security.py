@@ -173,7 +173,7 @@ async def token_rows(auth_db, owner_id) -> list[ServiceToken]:
 
 
 def reset_link_token(email_text: str) -> str:
-    match = re.search(r"/auth/reset\?token=(\S+)", email_text)
+    match = re.search(r"/auth/reset#token=(\S+)", email_text)
     assert match, email_text
     return unquote(match.group(1))
 

@@ -120,7 +120,7 @@ def same_instant(value: str, expected: datetime) -> bool:
 
 
 def invite_link_token(email_text: str) -> str:
-    match = re.search(r"/auth/invite\?token=(\S+)", email_text)
+    match = re.search(r"/auth/invite#token=(\S+)", email_text)
     assert match, email_text
     return unquote(match.group(1))
 
@@ -299,7 +299,7 @@ async def test_invite(
     )
 
     if mode == "local":
-        assert fake_supabase.calls == [] and "/auth/invite?token=" in smtp_capture.last_text
+        assert fake_supabase.calls == [] and "/auth/invite#token=" in smtp_capture.last_text
         assert smtp_capture.last.to == "i@example.test"
         [token] = tokens
         assert token.purpose is Purpose.INVITE

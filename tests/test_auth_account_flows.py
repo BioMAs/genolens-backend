@@ -105,8 +105,8 @@ def no_ip_limit(monkeypatch):
 
 
 def link_token(text: str, path: str) -> str:
-    """The token of the `<path>?token=…` link in an e-mail body."""
-    match = re.search(re.escape(path) + r"\?token=([^\s\"<]+)", text)
+    """The token of the `<path>#token=…` link in an e-mail body."""
+    match = re.search(re.escape(path) + r"#token=([^\s\"<]+)", text)
     assert match, f"no {path} link in the e-mail"
     return unquote(match.group(1))
 
@@ -165,8 +165,8 @@ async def test_signup_anti_enumeration(auth_client, auth_db, local_auth):
     assert new.status_code == dup.status_code == 202, (new.text, dup.text)
     assert new.json() == dup.json() == ACCEPTED
     assert [m.to for m in local_auth.messages] == ["n@example.test", existing.email]
-    assert "/auth/verify-email?token=" in local_auth.messages[0].text
-    assert "/auth/reset?token=" in local_auth.messages[1].text
+    assert "/auth/verify-email#token=" in local_auth.messages[0].text
+    assert "/auth/reset#token=" in local_auth.messages[1].text
     assert "already have" in local_auth.messages[1].text
 
     created = await user_by_email(auth_db, "n@example.test")
@@ -342,7 +342,7 @@ async def test_forgot_answers_the_same_for_an_unknown_address(auth_client, auth_
     assert known.status_code == unknown.status_code == 202
     assert known.json() == unknown.json() == ACCEPTED
     [message] = local_auth.messages
-    assert message.to == user.email and "/auth/reset?token=" in message.text
+    assert message.to == user.email and "/auth/reset#token=" in message.text
     [requested] = await events(auth_db, AuthEventType.PASSWORD_RESET_REQUESTED)
     assert requested.user_id == user.id
 
